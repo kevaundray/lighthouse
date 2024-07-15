@@ -39,11 +39,6 @@ pub fn parse_cells_and_proofs(
 pub fn parse_cell(cell: &str) -> Result<Cell, Error> {
     hex::decode(strip_0x(cell)?)
         .map_err(|e| Error::FailedToParseTest(format!("Failed to parse cell: {:?}", e)))
-        .and_then(|bytes| {
-            bytes
-                .try_into()
-                .map_err(|e| Error::FailedToParseTest(format!("Failed to parse cell: {:?}", e)))
-        })
 }
 
 pub fn parse_proof(proof: &str) -> Result<KzgProof, Error> {

@@ -17,7 +17,7 @@ use mockall::automock;
 
 pub use peerdas_kzg::{
     constants::{BYTES_PER_CELL, CELLS_PER_EXT_BLOB},
-    Cell, CellID, CellRef, TrustedSetup as PeerDASTrustedSetup,
+    Cell, CellIndex as CellID, CellRef, TrustedSetup as PeerDASTrustedSetup,
 };
 use peerdas_kzg::{prover::ProverError, verifier::VerifierError, PeerDASContext};
 pub type CellsAndKzgProofs = ([Cell; CELLS_PER_EXT_BLOB], [KzgProof; CELLS_PER_EXT_BLOB]);
@@ -183,7 +183,6 @@ impl Kzg {
 
         let (cells, proofs) = self
             .context
-            .prover_ctx()
             .compute_cells_and_kzg_proofs(blob_bytes)
             .map_err(Error::ProverKZG)?;
 
@@ -214,7 +213,7 @@ impl Kzg {
             .iter()
             .map(|commitment| commitment.as_ref())
             .collect();
-        let verification_result = self.context.verifier_ctx().verify_cell_kzg_proof_batch(
+        let verification_result = self.context.verify_cell_kzg_proof_batch(
             commitments.to_vec(),
             rows,
             columns,
@@ -238,7 +237,6 @@ impl Kzg {
     ) -> Result<CellsAndKzgProofs, Error> {
         let (cells, proofs) = self
             .context
-            .prover_ctx()
             .recover_cells_and_proofs(cell_ids.to_vec(), cells.to_vec())
             .map_err(Error::ProverKZG)?;
 
@@ -249,12 +247,12 @@ impl Kzg {
 }
 
 pub mod mock {
-    use crate::{Blob, Cell, CellsAndKzgProofs, BYTES_PER_CELL, CELLS_PER_EXT_BLOB};
+    use crate::{Blob, Cell, CellsAndKzgProofs, CELLS_PER_EXT_BLOB};
     use crate::{Error, KzgProof};
 
     #[allow(clippy::type_complexity)]
     pub fn compute_cells_and_proofs(_blob: &Blob) -> Result<CellsAndKzgProofs, Error> {
-        let empty_cells = vec![Cell::new([0; BYTES_PER_CELL]); CELLS_PER_EXT_BLOB]
+        let empty_cells = vec![Cell::new(); CELLS_PER_EXT_BLOB]
             .try_into()
             .expect("expected {CELLS_PER_EXT_BLOB} number of items");
         Ok((empty_cells, [KzgProof::empty(); CELLS_PER_EXT_BLOB]))
