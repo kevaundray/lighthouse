@@ -92,14 +92,14 @@ bytes = "1"
 clap = { version = "4.5.4", features = ["cargo", "wrap_help"] }
 # Turn off c-kzg's default features which include `blst/portable`. We can turn on blst's portable
 # feature ourselves when desired.
-c-kzg = { version = "1", default-features =  false }
+c-kzg = { version = "1", default-features = false }
 compare_fields_derive = { path = "common/compare_fields_derive" }
 criterion = "0.5"
 delay_map = "0.3"
 derivative = "2"
 dirs = "3"
 either = "1.9"
-peerdas-kzg = { git = "https://github.com/crate-crypto/peerdas-kzg", rev = "bb8295011cf27dc663699539c7f9a17fe273e896", package = "eip7594" }
+peerdas-kzg = { git = "https://github.com/crate-crypto/peerdas-kzg", rev = "5eaf826c63f7acac58cce7a41442068cbbf9b708", package = "eip7594" }
 discv5 = { version = "0.4.1", features = ["libp2p"] }
 env_logger = "0.9"
 error-chain = "0.12"
@@ -135,7 +135,13 @@ r2d2 = "0.8"
 rand = "0.8"
 rayon = "1.7"
 regex = "1"
-reqwest = { version = "0.11", default-features = false, features = ["blocking", "json", "stream", "rustls-tls", "native-tls-vendored"] }
+reqwest = { version = "0.11", default-features = false, features = [
+    "blocking",
+    "json",
+    "stream",
+    "rustls-tls",
+    "native-tls-vendored",
+] }
 ring = "0.16"
 rpds = "0.11"
 rusqlite = { version = "0.28", features = ["bundled"] }
@@ -144,7 +150,11 @@ serde_json = "1"
 serde_repr = "0.1"
 serde_yaml = "0.9"
 sha2 = "0.9"
-slog = { version = "2", features = ["max_level_trace", "release_max_level_trace", "nested-values"] }
+slog = { version = "2", features = [
+    "max_level_trace",
+    "release_max_level_trace",
+    "nested-values",
+] }
 slog-async = "2"
 slog-term = "2"
 sloggers = { version = "2", features = ["json"] }
