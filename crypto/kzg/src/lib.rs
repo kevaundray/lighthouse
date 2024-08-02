@@ -19,17 +19,15 @@ pub use peerdas_kzg::{
     constants::{BYTES_PER_CELL, CELLS_PER_EXT_BLOB},
     Cell, CellIndex as CellID, CellRef, TrustedSetup as PeerDASTrustedSetup,
 };
-use peerdas_kzg::{prover::ProverError, verifier::VerifierError, PeerDASContext};
+use peerdas_kzg::DASContext as PeerDASContext;
 pub type CellsAndKzgProofs = ([Cell; CELLS_PER_EXT_BLOB], [KzgProof; CELLS_PER_EXT_BLOB]);
 
 #[derive(Debug)]
 pub enum Error {
     /// An error from the underlying kzg library.
     Kzg(c_kzg::Error),
-    /// A prover error from the PeerdasKZG library
-    ProverKZG(ProverError),
-    /// A verifier error from the PeerdasKZG library
-    VerifierKZG(VerifierError),
+    /// A prover/verifier error from the rust-eth-kzg library
+    PeerDASKZG(peerdas_kzg::Error),
     /// The kzg verification failed
     KzgVerificationFailed,
     /// Misc indexing error
@@ -182,7 +180,7 @@ impl Kzg {
         let (cells, proofs) = self
             .context
             .compute_cells_and_kzg_proofs(blob_bytes)
-            .map_err(Error::ProverKZG)?;
+            .map_err(Error::PeerDASKZG)?;
 
         // Convert the proof type to a c-kzg proof type
         let c_kzg_proof = proofs.map(KzgProof);
@@ -211,9 +209,10 @@ impl Kzg {
             .iter()
             .map(|commitment| commitment.as_ref())
             .collect();
+        
+        let commitments_duplicated : Vec<_>= rows.into_iter().map(|row_index| commitments[row_index as usize]).collect();
         let verification_result = self.context.verify_cell_kzg_proof_batch(
-            commitments.to_vec(),
-            rows,
+            commitments_duplicated,
             columns,
             cells.to_vec(),
             proofs.to_vec(),
@@ -222,8 +221,8 @@ impl Kzg {
         // Modify the result so it matches roughly what the previous method was doing.
         match verification_result {
             Ok(_) => Ok(()),
-            Err(VerifierError::InvalidProof) => Err(Error::KzgVerificationFailed),
-            Err(e) => Err(Error::VerifierKZG(e)),
+            Err(x) if x.invalid_proof() => Err(Error::KzgVerificationFailed),
+            Err(e) => Err(Error::PeerDASKZG(e)),
         }
     }
 
@@ -236,7 +235,7 @@ impl Kzg {
         let (cells, proofs) = self
             .context
             .recover_cells_and_proofs(cell_ids.to_vec(), cells.to_vec())
-            .map_err(Error::ProverKZG)?;
+            .map_err(Error::PeerDASKZG)?;
 
         // Convert the proof type to a c-kzg proof type
         let c_kzg_proof = proofs.map(KzgProof);
