@@ -1534,7 +1534,7 @@ dependencies = [
 [[package]]
 name = "crate_crypto_internal_eth_kzg_bls12_381"
 version = "0.4.1"
-source = "git+https://github.com/crate-crypto/rust-eth-kzg?branch=kw/remove-thread-pool#427ff41211fb2d3446f7538a5a4423f513edda8e"
+source = "git+https://github.com/crate-crypto/rust-eth-kzg?branch=kw/maybe-rayon#118c1c06c04bbece16fa9962fd2b7fdfbdcdb8d7"
 dependencies = [
  "blst",
  "blstrs",
@@ -1547,16 +1547,21 @@ dependencies = [
 [[package]]
 name = "crate_crypto_internal_eth_kzg_erasure_codes"
 version = "0.4.1"
-source = "git+https://github.com/crate-crypto/rust-eth-kzg?branch=kw/remove-thread-pool#427ff41211fb2d3446f7538a5a4423f513edda8e"
+source = "git+https://github.com/crate-crypto/rust-eth-kzg?branch=kw/maybe-rayon#118c1c06c04bbece16fa9962fd2b7fdfbdcdb8d7"
 dependencies = [
  "crate_crypto_internal_eth_kzg_bls12_381",
  "crate_crypto_internal_eth_kzg_polynomial",
 ]
 
 [[package]]
+name = "crate_crypto_internal_eth_kzg_maybe_rayon"
+version = "0.4.1"
+source = "git+https://github.com/crate-crypto/rust-eth-kzg?branch=kw/maybe-rayon#118c1c06c04bbece16fa9962fd2b7fdfbdcdb8d7"
+
+[[package]]
 name = "crate_crypto_internal_eth_kzg_polynomial"
 version = "0.4.1"
-source = "git+https://github.com/crate-crypto/rust-eth-kzg?branch=kw/remove-thread-pool#427ff41211fb2d3446f7538a5a4423f513edda8e"
+source = "git+https://github.com/crate-crypto/rust-eth-kzg?branch=kw/maybe-rayon#118c1c06c04bbece16fa9962fd2b7fdfbdcdb8d7"
 dependencies = [
  "crate_crypto_internal_eth_kzg_bls12_381",
 ]
@@ -1564,12 +1569,12 @@ dependencies = [
 [[package]]
 name = "crate_crypto_kzg_multi_open_fk20"
 version = "0.4.1"
-source = "git+https://github.com/crate-crypto/rust-eth-kzg?branch=kw/remove-thread-pool#427ff41211fb2d3446f7538a5a4423f513edda8e"
+source = "git+https://github.com/crate-crypto/rust-eth-kzg?branch=kw/maybe-rayon#118c1c06c04bbece16fa9962fd2b7fdfbdcdb8d7"
 dependencies = [
  "crate_crypto_internal_eth_kzg_bls12_381",
+ "crate_crypto_internal_eth_kzg_maybe_rayon",
  "crate_crypto_internal_eth_kzg_polynomial",
  "hex",
- "rayon",
  "sha2 0.10.8",
 ]
 
@@ -7096,13 +7101,12 @@ dependencies = [
 [[package]]
 name = "rust_eth_kzg"
 version = "0.4.1"
-source = "git+https://github.com/crate-crypto/rust-eth-kzg?branch=kw/remove-thread-pool#427ff41211fb2d3446f7538a5a4423f513edda8e"
+source = "git+https://github.com/crate-crypto/rust-eth-kzg?branch=kw/maybe-rayon#118c1c06c04bbece16fa9962fd2b7fdfbdcdb8d7"
 dependencies = [
  "crate_crypto_internal_eth_kzg_bls12_381",
  "crate_crypto_internal_eth_kzg_erasure_codes",
  "crate_crypto_kzg_multi_open_fk20",
  "hex",
- "rayon",
  "serde",
  "serde_json",
 ]
