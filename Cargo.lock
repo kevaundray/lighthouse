@@ -1534,7 +1534,7 @@ dependencies = [
 [[package]]
 name = "crate_crypto_internal_eth_kzg_bls12_381"
 version = "0.4.1"
-source = "git+https://github.com/crate-crypto/rust-eth-kzg?branch=master#c00bbe0054185e1654853af6e5c150cd18a6211c"
+source = "git+https://github.com/crate-crypto/rust-eth-kzg?branch=kw/remove-thread-pool#427ff41211fb2d3446f7538a5a4423f513edda8e"
 dependencies = [
  "blst",
  "blstrs",
@@ -1547,7 +1547,7 @@ dependencies = [
 [[package]]
 name = "crate_crypto_internal_eth_kzg_erasure_codes"
 version = "0.4.1"
-source = "git+https://github.com/crate-crypto/rust-eth-kzg?branch=master#c00bbe0054185e1654853af6e5c150cd18a6211c"
+source = "git+https://github.com/crate-crypto/rust-eth-kzg?branch=kw/remove-thread-pool#427ff41211fb2d3446f7538a5a4423f513edda8e"
 dependencies = [
  "crate_crypto_internal_eth_kzg_bls12_381",
  "crate_crypto_internal_eth_kzg_polynomial",
@@ -1556,7 +1556,7 @@ dependencies = [
 [[package]]
 name = "crate_crypto_internal_eth_kzg_polynomial"
 version = "0.4.1"
-source = "git+https://github.com/crate-crypto/rust-eth-kzg?branch=master#c00bbe0054185e1654853af6e5c150cd18a6211c"
+source = "git+https://github.com/crate-crypto/rust-eth-kzg?branch=kw/remove-thread-pool#427ff41211fb2d3446f7538a5a4423f513edda8e"
 dependencies = [
  "crate_crypto_internal_eth_kzg_bls12_381",
 ]
@@ -1564,7 +1564,7 @@ dependencies = [
 [[package]]
 name = "crate_crypto_kzg_multi_open_fk20"
 version = "0.4.1"
-source = "git+https://github.com/crate-crypto/rust-eth-kzg?branch=master#c00bbe0054185e1654853af6e5c150cd18a6211c"
+source = "git+https://github.com/crate-crypto/rust-eth-kzg?branch=kw/remove-thread-pool#427ff41211fb2d3446f7538a5a4423f513edda8e"
 dependencies = [
  "crate_crypto_internal_eth_kzg_bls12_381",
  "crate_crypto_internal_eth_kzg_polynomial",
@@ -7096,7 +7096,7 @@ dependencies = [
 [[package]]
 name = "rust_eth_kzg"
 version = "0.4.1"
-source = "git+https://github.com/crate-crypto/rust-eth-kzg?branch=master#c00bbe0054185e1654853af6e5c150cd18a6211c"
+source = "git+https://github.com/crate-crypto/rust-eth-kzg?branch=kw/remove-thread-pool#427ff41211fb2d3446f7538a5a4423f513edda8e"
 dependencies = [
  "crate_crypto_internal_eth_kzg_bls12_381",
  "crate_crypto_internal_eth_kzg_erasure_codes",

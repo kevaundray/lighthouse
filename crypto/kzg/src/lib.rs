@@ -73,9 +73,8 @@ impl Kzg {
         // json string.
         let peerdas_trusted_setup = PeerDASTrustedSetup::from(&trusted_setup);
 
-        let context = DASContext::with_threads(
+        let context = DASContext::new(
             &peerdas_trusted_setup,
-            rust_eth_kzg::ThreadCount::Single,
             rust_eth_kzg::UsePrecomp::No,
         );
 
