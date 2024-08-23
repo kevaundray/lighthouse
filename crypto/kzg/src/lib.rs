@@ -75,7 +75,9 @@ impl Kzg {
 
         let context = DASContext::new(
             &peerdas_trusted_setup,
-            rust_eth_kzg::UsePrecomp::No,
+            rust_eth_kzg::UsePrecomp::Yes {
+                width: rust_eth_kzg::constants::RECOMMENDED_PRECOMP_WIDTH,
+            },
         );
 
         Ok(Self {
