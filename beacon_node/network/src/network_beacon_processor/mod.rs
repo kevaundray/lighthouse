@@ -398,6 +398,32 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
         })
     }
 
+    /// Create a new `Work` event for some execution proof.
+    pub fn send_gossip_execution_proof(
+        self: &Arc<Self>,
+        message_id: MessageId,
+        peer_id: PeerId,
+        execution_proof: ExecutionProof,
+        subnet_id: ProofSubnetId,
+        seen_timestamp: Duration,
+    ) -> Result<(), Error<T::EthSpec>> {
+        let processor = self.clone();
+        let process_fn = move || {
+            processor.process_gossip_execution_proof(
+                message_id,
+                peer_id,
+                execution_proof,
+                subnet_id,
+                seen_timestamp,
+            )
+        };
+
+        self.try_send(BeaconWorkEvent {
+            drop_during_sync: false,
+            work: Work::GossipExecutionProof(Box::new(process_fn)),
+        })
+    }
+
     /// Create a new `Work` event for some block, where the result from computation (if any) is
     /// sent to the other side of `result_tx`.
     pub fn send_rpc_beacon_block(

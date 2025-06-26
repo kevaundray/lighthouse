@@ -846,6 +846,29 @@ pub fn get_config<E: EthSpec>(
     client_config.chain.optimistic_finalized_sync =
         !cli_args.get_flag("disable-optimistic-finalized-sync");
 
+    // Execution proof configuration
+    client_config.chain.proof_config.enabled = cli_args.get_flag("enable-execution-proofs");
+    
+    if let Some(optimistic_acceptance) = clap_utils::parse_optional(cli_args, "proof-optimistic-acceptance")? {
+        client_config.chain.proof_config.optimistic_acceptance = optimistic_acceptance;
+    }
+    
+    if let Some(fallback_to_execution) = clap_utils::parse_optional(cli_args, "proof-fallback-to-execution")? {
+        client_config.chain.proof_config.fallback_to_execution = fallback_to_execution;
+    }
+    
+    if let Some(verification_timeout_ms) = clap_utils::parse_optional(cli_args, "proof-verification-timeout")? {
+        client_config.chain.proof_config.verification_timeout_ms = verification_timeout_ms;
+    }
+    
+    if let Some(max_cache_size) = clap_utils::parse_optional(cli_args, "proof-cache-size")? {
+        client_config.chain.proof_config.max_cache_size = max_cache_size;
+    }
+    
+    if let Some(cache_ttl_seconds) = clap_utils::parse_optional(cli_args, "proof-cache-ttl")? {
+        client_config.chain.proof_config.cache_ttl_seconds = cache_ttl_seconds;
+    }
+
     if cli_args.get_flag("genesis-backfill") {
         client_config.chain.genesis_backfill = true;
     }

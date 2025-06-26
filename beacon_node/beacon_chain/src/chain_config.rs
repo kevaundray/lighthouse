@@ -1,4 +1,5 @@
 pub use proto_array::{DisallowedReOrgOffsets, ReOrgThreshold};
+use crate::ProofConfig;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use types::{Checkpoint, Epoch};
@@ -86,6 +87,8 @@ pub struct ChainConfig {
     pub epochs_per_migration: u64,
     /// When set to true Light client server computes and caches state proofs for serving updates
     pub enable_light_client_server: bool,
+    /// Configuration for execution proof verification
+    pub proof_config: ProofConfig,
 }
 
 impl Default for ChainConfig {
@@ -118,6 +121,7 @@ impl Default for ChainConfig {
             always_prepare_payload: false,
             epochs_per_migration: crate::migrate::DEFAULT_EPOCHS_PER_MIGRATION,
             enable_light_client_server: false,
+            proof_config: ProofConfig::default(),
         }
     }
 }

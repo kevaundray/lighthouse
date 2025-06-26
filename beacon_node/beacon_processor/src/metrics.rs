@@ -71,6 +71,10 @@ lazy_static::lazy_static! {
         "beacon_processor_bls_to_execution_change_queue_total",
         "Count of address changes from gossip waiting to be verified."
     );
+    pub static ref BEACON_PROCESSOR_EXECUTION_PROOF_QUEUE_TOTAL: Result<IntGauge> = try_create_int_gauge(
+        "beacon_processor_execution_proof_queue_total",
+        "Count of execution proofs from gossip waiting to be verified."
+    );
     // Rpc blocks.
     pub static ref BEACON_PROCESSOR_RPC_BLOCK_QUEUE_TOTAL: Result<IntGauge> = try_create_int_gauge(
         "beacon_processor_rpc_block_queue_total",

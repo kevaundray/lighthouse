@@ -883,6 +883,63 @@ pub fn cli_app() -> Command {
                 .action(ArgAction::Set)
                 .display_order(0)
         )
+        /*
+         * Execution proof configuration
+         */
+        .arg(
+            Arg::new("enable-execution-proofs")
+                .long("enable-execution-proofs")
+                .help("Enable execution proof verification for stateless validation. When enabled, \
+                       the beacon node will verify execution payloads using zkVM proofs or execution \
+                       witnesses received via gossip subnets instead of relying solely on the execution layer.")
+                .action(ArgAction::SetTrue)
+                .display_order(0)
+        )
+        .arg(
+            Arg::new("proof-optimistic-acceptance")
+                .long("proof-optimistic-acceptance")
+                .help("Accept execution payloads optimistically when proofs are not yet available. \
+                       Similar to optimistic sync behavior when the execution layer is syncing.")
+                .action(ArgAction::Set)
+                .default_value("true")
+                .display_order(0)
+        )
+        .arg(
+            Arg::new("proof-fallback-to-execution")
+                .long("proof-fallback-to-execution")
+                .help("Fallback to normal execution layer verification if proof verification fails \
+                       or times out. When disabled, proof verification is required.")
+                .action(ArgAction::Set)
+                .default_value("true")
+                .display_order(0)
+        )
+        .arg(
+            Arg::new("proof-verification-timeout")
+                .long("proof-verification-timeout")
+                .value_name("MILLISECONDS")
+                .help("Timeout for proof verification operations in milliseconds.")
+                .default_value("5000")
+                .action(ArgAction::Set)
+                .display_order(0)
+        )
+        .arg(
+            Arg::new("proof-cache-size")
+                .long("proof-cache-size")
+                .value_name("SIZE")
+                .help("Maximum number of execution proofs to cache.")
+                .default_value("1000")
+                .action(ArgAction::Set)
+                .display_order(0)
+        )
+        .arg(
+            Arg::new("proof-cache-ttl")
+                .long("proof-cache-ttl")
+                .value_name("SECONDS")
+                .help("Time-to-live for cached execution proofs in seconds.")
+                .default_value("300")
+                .action(ArgAction::Set)
+                .display_order(0)
+        )
         /* Deneb settings */
         .arg(
             Arg::new("trusted-setup-file-override")

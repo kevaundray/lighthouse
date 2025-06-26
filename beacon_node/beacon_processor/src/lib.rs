@@ -119,6 +119,7 @@ pub struct BeaconProcessorQueueLengths {
     blbroots_queue: usize,
     blbrange_queue: usize,
     gossip_bls_to_execution_change_queue: usize,
+    gossip_execution_proof_queue: usize,
     lc_bootstrap_queue: usize,
     lc_optimistic_update_queue: usize,
     lc_finality_update_queue: usize,
@@ -171,6 +172,7 @@ impl BeaconProcessorQueueLengths {
             blbroots_queue: 1024,
             blbrange_queue: 1024,
             gossip_bls_to_execution_change_queue: 16384,
+            gossip_execution_proof_queue: 16384,
             lc_bootstrap_queue: 1024,
             lc_optimistic_update_queue: 512,
             lc_finality_update_queue: 512,
@@ -234,6 +236,7 @@ pub const UNKNOWN_BLOCK_ATTESTATION: &str = "unknown_block_attestation";
 pub const UNKNOWN_BLOCK_AGGREGATE: &str = "unknown_block_aggregate";
 pub const UNKNOWN_LIGHT_CLIENT_UPDATE: &str = "unknown_light_client_update";
 pub const GOSSIP_BLS_TO_EXECUTION_CHANGE: &str = "gossip_bls_to_execution_change";
+pub const GOSSIP_EXECUTION_PROOF: &str = "gossip_execution_proof";
 pub const API_REQUEST_P0: &str = "api_request_p0";
 pub const API_REQUEST_P1: &str = "api_request_p1";
 
@@ -606,6 +609,7 @@ pub enum Work<E: EthSpec> {
     BlobsByRangeRequest(BlockingFn),
     BlobsByRootsRequest(BlockingFn),
     GossipBlsToExecutionChange(BlockingFn),
+    GossipExecutionProof(BlockingFn),
     LightClientBootstrapRequest(BlockingFn),
     LightClientOptimisticUpdateRequest(BlockingFn),
     LightClientFinalityUpdateRequest(BlockingFn),
@@ -653,6 +657,7 @@ impl<E: EthSpec> Work<E> {
             Work::UnknownBlockAttestation { .. } => UNKNOWN_BLOCK_ATTESTATION,
             Work::UnknownBlockAggregate { .. } => UNKNOWN_BLOCK_AGGREGATE,
             Work::GossipBlsToExecutionChange(_) => GOSSIP_BLS_TO_EXECUTION_CHANGE,
+            Work::GossipExecutionProof(_) => GOSSIP_EXECUTION_PROOF,
             Work::UnknownLightClientOptimisticUpdate { .. } => UNKNOWN_LIGHT_CLIENT_UPDATE,
             Work::ApiRequestP0 { .. } => API_REQUEST_P0,
             Work::ApiRequestP1 { .. } => API_REQUEST_P1,
@@ -813,6 +818,8 @@ impl<E: EthSpec> BeaconProcessor<E> {
 
         let mut gossip_bls_to_execution_change_queue =
             FifoQueue::new(queue_lengths.gossip_bls_to_execution_change_queue);
+        let mut gossip_execution_proof_queue =
+            FifoQueue::new(queue_lengths.gossip_execution_proof_queue);
 
         let mut lc_bootstrap_queue = FifoQueue::new(queue_lengths.lc_bootstrap_queue);
         let mut lc_optimistic_update_queue =
@@ -1125,6 +1132,8 @@ impl<E: EthSpec> BeaconProcessor<E> {
                             self.spawn_worker(item, idle_tx);
                         } else if let Some(item) = gossip_bls_to_execution_change_queue.pop() {
                             self.spawn_worker(item, idle_tx);
+                        } else if let Some(item) = gossip_execution_proof_queue.pop() {
+                            self.spawn_worker(item, idle_tx);
                         // Check the priority 1 API requests after we've
                         // processed all the interesting things from the network
                         // and things required for us to stay in good repute
@@ -1268,6 +1277,9 @@ impl<E: EthSpec> BeaconProcessor<E> {
                             Work::GossipBlsToExecutionChange { .. } => {
                                 gossip_bls_to_execution_change_queue.push(work, work_id, &self.log)
                             }
+                            Work::GossipExecutionProof { .. } => {
+                                gossip_execution_proof_queue.push(work, work_id, &self.log)
+                            }
                             Work::BlobsByRootsRequest { .. } => {
                                 blbroots_queue.push(work, work_id, &self.log)
                             }
@@ -1343,6 +1355,10 @@ impl<E: EthSpec> BeaconProcessor<E> {
                 metrics::set_gauge(
                     &metrics::BEACON_PROCESSOR_BLS_TO_EXECUTION_CHANGE_QUEUE_TOTAL,
                     gossip_bls_to_execution_change_queue.len() as i64,
+                );
+                metrics::set_gauge(
+                    &metrics::BEACON_PROCESSOR_EXECUTION_PROOF_QUEUE_TOTAL,
+                    gossip_execution_proof_queue.len() as i64,
                 );
                 metrics::set_gauge(
                     &metrics::BEACON_PROCESSOR_API_REQUEST_P0_QUEUE_TOTAL,
@@ -1488,6 +1504,7 @@ impl<E: EthSpec> BeaconProcessor<E> {
             | Work::GossipLightClientOptimisticUpdate(process_fn)
             | Work::Status(process_fn)
             | Work::GossipBlsToExecutionChange(process_fn)
+            | Work::GossipExecutionProof(process_fn)
             | Work::LightClientBootstrapRequest(process_fn)
             | Work::LightClientOptimisticUpdateRequest(process_fn)
             | Work::LightClientFinalityUpdateRequest(process_fn) => {

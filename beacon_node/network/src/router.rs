@@ -426,6 +426,26 @@ impl<T: BeaconChainTypes> Router<T> {
                             bls_to_execution_change,
                         ),
                 ),
+            PubsubMessage::ExecutionProof(execution_proof_data) => {
+                let (subnet_id, execution_proof) = *execution_proof_data;
+                debug!(
+                    self.log,
+                    "Received execution proof";
+                    "peer_id" => %peer_id,
+                    "subnet_id" => ?subnet_id,
+                    "proof_version" => execution_proof.version(),
+                    "proof_size" => execution_proof.data().len()
+                );
+                self.handle_beacon_processor_send_result(
+                    self.network_beacon_processor.send_gossip_execution_proof(
+                        message_id,
+                        peer_id,
+                        execution_proof,
+                        subnet_id,
+                        timestamp_now(),
+                    ),
+                )
+            }
         }
     }
 

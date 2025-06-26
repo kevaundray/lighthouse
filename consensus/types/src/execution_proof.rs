@@ -15,7 +15,7 @@ pub struct ExecutionProof {
 }
 
 /// Types of execution proofs supported by different subnets
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProofType {
     /// SP1 zkVM proofs for state transitions
     SP1Proof = 0,
@@ -40,5 +40,65 @@ impl ExecutionProof {
     /// Get the proof version
     pub fn version(&self) -> u8 {
         self.version
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ssz::{Decode, Encode};
+
+    #[test]
+    fn test_execution_proof_creation() {
+        let data = vec![1, 2, 3, 4, 5];
+        let proof = ExecutionProof::new(1, data.clone());
+        
+        assert_eq!(proof.version(), 1);
+        assert_eq!(proof.data(), &data);
+    }
+
+    #[test]
+    fn test_execution_proof_ssz_encoding() {
+        let proof = ExecutionProof::new(42, vec![0xde, 0xad, 0xbe, 0xef]);
+        
+        // Test encoding and decoding
+        let encoded = proof.as_ssz_bytes();
+        let decoded = ExecutionProof::from_ssz_bytes(&encoded).unwrap();
+        
+        assert_eq!(proof, decoded);
+        assert_eq!(decoded.version(), 42);
+        assert_eq!(decoded.data(), &[0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[test]
+    fn test_execution_proof_empty_data() {
+        let proof = ExecutionProof::new(0, vec![]);
+        assert_eq!(proof.data().len(), 0);
+        
+        // Should still encode/decode correctly
+        let encoded = proof.as_ssz_bytes();
+        let decoded = ExecutionProof::from_ssz_bytes(&encoded).unwrap();
+        assert_eq!(proof, decoded);
+    }
+
+    #[test]
+    fn test_execution_proof_large_data() {
+        let large_data = vec![42u8; 1000000]; // 1MB of data
+        let proof = ExecutionProof::new(255, large_data.clone());
+        
+        assert_eq!(proof.data().len(), 1000000);
+        assert_eq!(proof.version(), 255);
+        
+        // Test SSZ with large data
+        let encoded = proof.as_ssz_bytes();
+        let decoded = ExecutionProof::from_ssz_bytes(&encoded).unwrap();
+        assert_eq!(proof, decoded);
+    }
+
+    #[test]
+    fn test_proof_type_values() {
+        assert_eq!(ProofType::SP1Proof as u8, 0);
+        assert_eq!(ProofType::Risc0Proof as u8, 1);
+        assert_eq!(ProofType::ExecutionWitness as u8, 2);
     }
 }

@@ -27,6 +27,8 @@ pub mod eth1_chain;
 mod eth1_finalization_cache;
 pub mod events;
 pub mod execution_payload;
+pub mod execution_proof_cache;
+pub mod proof_config;
 pub mod fork_choice_signal;
 pub mod fork_revert;
 pub mod graffiti_calculator;
@@ -56,6 +58,8 @@ pub mod state_advance_timer;
 pub mod sync_committee_rewards;
 pub mod sync_committee_verification;
 pub mod test_utils;
+#[cfg(test)]
+mod test_execution_proof_integration;
 mod timeout_rw_lock;
 pub mod validator_monitor;
 pub mod validator_pubkey_cache;
@@ -70,6 +74,7 @@ pub use self::beacon_chain::{
 };
 pub use self::beacon_snapshot::BeaconSnapshot;
 pub use self::chain_config::ChainConfig;
+pub use self::proof_config::ProofConfig;
 pub use self::errors::{BeaconChainError, BlockProductionError};
 pub use self::historical_blocks::HistoricalBlockError;
 pub use attestation_verification::Error as AttestationError;

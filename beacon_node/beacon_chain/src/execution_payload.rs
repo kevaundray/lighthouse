@@ -7,6 +7,7 @@
 //! So, this module contains functions that one might expect to find in other crates, but they live
 //! here for good reason.
 
+use crate::execution_proof_cache::{ProofValidationResult, get_global_proof_cache, get_global_proof_verifier_registry};
 use crate::otb_verification_service::OptimisticTransitionBlock;
 use crate::{
     BeaconChain, BeaconChainError, BeaconChainTypes, BlockError, BlockProductionError,
@@ -218,6 +219,197 @@ async fn notify_new_payload<'a, T: BeaconChainTypes>(
             }
         },
         Err(e) => Err(ExecutionPayloadError::RequestFailed(e).into()),
+    }
+}
+
+/// Verify execution payload using proof-based verification with fallback to EL verification.
+///
+/// This function integrates with the existing optimistic sync infrastructure by:
+/// 1. Checking for cached proofs first
+/// 2. If proof available and valid: return Verified
+/// 3. If no proof available and optimistic enabled: return Optimistic (like EL syncing)
+/// 4. If proof verification fails or disabled: fallback to normal EL verification
+pub async fn verify_execution_payload_with_proof<'a, T: BeaconChainTypes>(
+    chain: &Arc<BeaconChain<T>>,
+    block: BeaconBlockRef<'a, T::EthSpec>,
+    block_root: Hash256,
+) -> Result<PayloadVerificationStatus, BlockError<T::EthSpec>> {
+    let execution_payload = block.execution_payload()?;
+    let payload_hash = execution_payload.block_hash().into_root();
+
+    // Check if proof verification is enabled
+    if !chain.config.proof_config.enabled {
+        // Proof verification disabled - use normal EL verification
+        return notify_new_payload(chain, block).await;
+    }
+
+    // First check: Do we have a cached proof?
+    if let Some(global_cache) = get_global_proof_cache() {
+        if let Some(cached_proof) = global_cache.get_proof(payload_hash).await {
+            debug!(
+                chain.log,
+                "Found cached proof for payload";
+                "payload_hash" => ?payload_hash,
+                "subnet_id" => ?cached_proof.subnet_id,
+                "proof_version" => cached_proof.proof.version(),
+            );
+
+            match verify_cached_proof(chain, &cached_proof, payload_hash).await {
+                Ok(true) => {
+                    debug!(
+                        chain.log,
+                        "Payload verified with cached proof";
+                        "payload_hash" => ?payload_hash,
+                        "subnet_id" => ?cached_proof.subnet_id,
+                    );
+                    return Ok(PayloadVerificationStatus::Verified);
+                }
+                Ok(false) => {
+                    warn!(
+                        chain.log,
+                        "Cached proof verification failed";
+                        "payload_hash" => ?payload_hash,
+                    );
+                    return Err(ExecutionPayloadError::InvalidProof {
+                        payload_hash: payload_hash.into(),
+                        reason: "Proof verification failed".to_string(),
+                    }.into());
+                }
+                Err(e) => {
+                    warn!(
+                        chain.log,
+                        "Proof verification error, falling back to EL verification";
+                        "payload_hash" => ?payload_hash,
+                        "error" => ?e,
+                    );
+                    // Fall through to EL verification or optimistic acceptance
+                }
+            }
+        }
+    }
+
+    // No proof available or proof verification failed
+    if chain.config.proof_config.optimistic_acceptance {
+        // Accept optimistically (like when EL is syncing)
+        debug!(
+            chain.log,
+            "No proof available for payload, accepting optimistically";
+            "payload_hash" => ?payload_hash,
+        );
+
+        // Set up async proof validation for when proof arrives later
+        if let Some(global_cache) = get_global_proof_cache() {
+            let validation_receiver = global_cache
+                .add_pending_validation(payload_hash)
+                .await;
+
+            // Spawn background task to handle proof when it arrives
+            spawn_proof_validation_handler(chain.clone(), block_root, validation_receiver);
+        }
+
+        Ok(PayloadVerificationStatus::Optimistic)
+    } else if chain.config.proof_config.fallback_to_execution {
+        // Fallback to normal EL verification
+        debug!(
+            chain.log,
+            "No proof available, falling back to EL verification";
+            "payload_hash" => ?payload_hash,
+        );
+        notify_new_payload(chain, block).await
+    } else {
+        // Proof required but not available
+        Err(ExecutionPayloadError::ProofRequired {
+            payload_hash: payload_hash.into(),
+        }.into())
+    }
+}
+
+/// Verify a cached proof against a payload
+async fn verify_cached_proof<T: BeaconChainTypes>(
+    chain: &Arc<BeaconChain<T>>,
+    cached_proof: &crate::execution_proof_cache::CachedProof,
+    payload_hash: Hash256,
+) -> Result<bool, String> {
+    // Determine proof type from subnet ID
+    let proof_type = match cached_proof.subnet_id.into() {
+        0 => types::ProofType::SP1Proof,
+        1 => types::ProofType::Risc0Proof,
+        2 => types::ProofType::ExecutionWitness,
+        id => return Err(format!("Unsupported proof subnet ID: {}", id)),
+    };
+
+    // Use the proof verifier registry to verify the proof
+    if let Some(verifier_registry) = get_global_proof_verifier_registry() {
+        verifier_registry
+            .verify_proof(proof_type, &cached_proof.proof, payload_hash)
+            .await
+    } else {
+        Err("No proof verifier registry configured".to_string())
+    }
+}
+
+/// Spawn background task to handle proof validation when proof arrives later
+fn spawn_proof_validation_handler<T: BeaconChainTypes>(
+    chain: Arc<BeaconChain<T>>,
+    block_root: Hash256,
+    mut validation_receiver: tokio::sync::mpsc::UnboundedReceiver<ProofValidationResult>,
+) {
+    tokio::spawn(async move {
+        if let Some(result) = validation_receiver.recv().await {
+            handle_proof_validation_result(&chain, block_root, result).await;
+        }
+    });
+}
+
+/// Handle the result of async proof validation
+async fn handle_proof_validation_result<T: BeaconChainTypes>(
+    chain: &Arc<BeaconChain<T>>,
+    block_root: Hash256,
+    result: ProofValidationResult,
+) {
+    match result {
+        ProofValidationResult::Valid => {
+            debug!(
+                chain.log,
+                "Async proof validation succeeded";
+                "block_root" => ?block_root,
+            );
+
+            // Update fork choice: optimistic → verified
+            // This reuses the existing optimistic sync infrastructure
+            // TODO: Implement when fork choice has set_optimistic_to_valid method
+            debug!(
+                chain.log,
+                "Would update fork choice from optimistic to valid";
+                "block_root" => ?block_root,
+            );
+        }
+        ProofValidationResult::Invalid { reason } => {
+            warn!(
+                chain.log,
+                "Async proof validation failed";
+                "block_root" => ?block_root,
+                "reason" => reason,
+            );
+
+            // Mark block as invalid - this will trigger a re-org
+            // TODO: Implement when fork choice has set_optimistic_to_invalid method
+            debug!(
+                chain.log,
+                "Would update fork choice from optimistic to invalid";
+                "block_root" => ?block_root,
+            );
+        }
+        ProofValidationResult::Error { error } => {
+            warn!(
+                chain.log,
+                "Proof validation error";
+                "block_root" => ?block_root,
+                "error" => error,
+            );
+            // For errors, we might want to retry or fallback to EL verification
+            // For now, we leave the block as optimistic
+        }
     }
 }
 

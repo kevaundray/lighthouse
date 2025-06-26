@@ -107,6 +107,14 @@ lazy_static! {
         "beacon_processor_bls_to_execution_change_imported_total",
         "Total number of address changes imported to the op pool."
     );
+    pub static ref BEACON_PROCESSOR_EXECUTION_PROOF_VERIFIED_TOTAL: Result<IntCounter> = try_create_int_counter(
+        "beacon_processor_execution_proof_verified_total",
+        "Total number of execution proofs verified for propagation."
+    );
+    pub static ref BEACON_PROCESSOR_EXECUTION_PROOF_IMPORTED_TOTAL: Result<IntCounter> = try_create_int_counter(
+        "beacon_processor_execution_proof_imported_total",
+        "Total number of execution proofs imported to the cache."
+    );
 }
 
 // Need to split up this `lazy_static!` due to recursion limits.

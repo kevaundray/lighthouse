@@ -374,6 +374,29 @@ pub enum ExecutionPayloadError {
     ///
     /// The peer is not necessarily invalid.
     UnverifiedNonOptimisticCandidate,
+    /// An execution proof failed verification
+    ///
+    /// ## Peer scoring
+    ///
+    /// The peer sent us an invalid proof, penalize them
+    InvalidProof {
+        payload_hash: Hash256,
+        reason: String,
+    },
+    /// No proof verifier is configured for the required proof type
+    ///
+    /// ## Peer scoring
+    ///
+    /// This is a configuration issue, do not penalize the peer
+    NoProofVerifier,
+    /// Proof verification is required but no proof was provided
+    ///
+    /// ## Peer scoring
+    ///
+    /// The peer should have provided a proof, penalize them
+    ProofRequired {
+        payload_hash: Hash256,
+    },
 }
 
 impl ExecutionPayloadError {
@@ -404,6 +427,12 @@ impl ExecutionPayloadError {
             ExecutionPayloadError::InvalidTerminalBlockHash { .. } => false,
             // Do not penalize the peer since it's not their fault that *we're* optimistic.
             ExecutionPayloadError::UnverifiedNonOptimisticCandidate => false,
+            // The peer sent us an invalid proof, penalize them.
+            ExecutionPayloadError::InvalidProof { .. } => true,
+            // This is a configuration issue on our side, not the peer's fault.
+            ExecutionPayloadError::NoProofVerifier => false,
+            // The peer should have provided a proof but didn't, penalize them.
+            ExecutionPayloadError::ProofRequired { .. } => true,
         }
     }
 }

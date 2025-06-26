@@ -101,3 +101,79 @@ impl AsRef<str> for ProofSubnetId {
         proof_subnet_id_to_string(self.0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution_proof::ProofType;
+
+    #[test]
+    fn test_proof_subnet_id_creation() {
+        let subnet_id = ProofSubnetId::new(5);
+        assert_eq!(*subnet_id, 5);
+        assert_eq!(subnet_id.to_string(), "5");
+    }
+
+    #[test]
+    fn test_proof_type_mapping() {
+        assert_eq!(ProofSubnetId::sp1(), ProofSubnetId::new(0));
+        assert_eq!(ProofSubnetId::risc0(), ProofSubnetId::new(1));
+        assert_eq!(ProofSubnetId::execution_witness(), ProofSubnetId::new(2));
+        
+        assert_eq!(ProofSubnetId::for_proof_type(ProofType::SP1Proof), ProofSubnetId::sp1());
+        assert_eq!(ProofSubnetId::for_proof_type(ProofType::Risc0Proof), ProofSubnetId::risc0());
+        assert_eq!(ProofSubnetId::for_proof_type(ProofType::ExecutionWitness), ProofSubnetId::execution_witness());
+    }
+
+    #[test]
+    fn test_proof_subnet_conversions() {
+        let subnet_id = ProofSubnetId::new(3);
+        
+        // Test From/Into
+        let from_u64: ProofSubnetId = 3u64.into();
+        assert_eq!(subnet_id, from_u64);
+        
+        let into_u64: u64 = subnet_id.into();
+        assert_eq!(into_u64, 3);
+        
+        let ref_into_u64: u64 = (&subnet_id).into();
+        assert_eq!(ref_into_u64, 3);
+    }
+
+    #[test]
+    fn test_proof_subnet_string_conversion() {
+        for i in 0..PROOF_SUBNET_COUNT {
+            let subnet_id = ProofSubnetId::new(i);
+            assert_eq!(subnet_id.as_ref(), i.to_string());
+            assert_eq!(subnet_id.to_string(), i.to_string());
+        }
+        
+        // Test out of range
+        let out_of_range = proof_subnet_id_to_string(PROOF_SUBNET_COUNT + 1);
+        assert_eq!(out_of_range, "proof subnet id out of range");
+    }
+
+    #[test]
+    fn test_proof_subnet_bounds() {
+        // Test edge cases
+        let min = ProofSubnetId::new(0);
+        let max = ProofSubnetId::new(PROOF_SUBNET_COUNT - 1);
+        
+        assert_eq!(*min, 0);
+        assert_eq!(*max, PROOF_SUBNET_COUNT - 1);
+        
+        // Test that we can create subnets up to the limit
+        let _valid = ProofSubnetId::new(PROOF_SUBNET_COUNT - 1);
+    }
+
+    #[test]
+    fn test_proof_subnet_serialization() {
+        let subnet_id = ProofSubnetId::new(42);
+        
+        // Test JSON serialization/deserialization
+        let json = serde_json::to_string(&subnet_id).unwrap();
+        let deserialized: ProofSubnetId = serde_json::from_str(&json).unwrap();
+        
+        assert_eq!(subnet_id, deserialized);
+    }
+}

@@ -166,8 +166,23 @@ impl<E: EthSpec> ProductionBeaconNode<E> {
         let discv5_executor = Discv5Executor(executor);
         client_config.network.discv5_config.executor = Some(Box::new(discv5_executor));
 
+        let builder = builder.build_beacon_chain()?;
+
+        // Initialize global proof cache if execution proof verification is enabled
+        if client_config.chain.proof_config.enabled {
+            beacon_chain::execution_proof_cache::initialize_global_proof_cache(log.clone());
+            beacon_chain::execution_proof_cache::initialize_global_proof_verifier_registry();
+            info!(
+                log,
+                "Execution proof verification enabled";
+                "optimistic_acceptance" => client_config.chain.proof_config.optimistic_acceptance,
+                "fallback_to_execution" => client_config.chain.proof_config.fallback_to_execution,
+                "cache_size" => client_config.chain.proof_config.max_cache_size,
+                "cache_ttl_seconds" => client_config.chain.proof_config.cache_ttl_seconds,
+            );
+        }
+
         builder
-            .build_beacon_chain()?
             .network(&client_config.network)
             .await?
             .notifier()?

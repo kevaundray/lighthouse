@@ -31,11 +31,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use store::hot_cold_store::HotColdDBError;
 use tokio::sync::mpsc;
 use types::{
-    beacon_block::BlockImportSource, Attestation, AttesterSlashing, BlobSidecar, EthSpec, Hash256,
-    IndexedAttestation, LightClientFinalityUpdate, LightClientOptimisticUpdate, ProposerSlashing,
-    SignedAggregateAndProof, SignedBeaconBlock, SignedBlsToExecutionChange,
-    SignedContributionAndProof, SignedVoluntaryExit, Slot, SubnetId, SyncCommitteeMessage,
-    SyncSubnetId,
+    beacon_block::BlockImportSource, Attestation, AttesterSlashing, BlobSidecar, EthSpec, 
+    ExecutionProof, Hash256, IndexedAttestation, LightClientFinalityUpdate, 
+    LightClientOptimisticUpdate, ProofSubnetId, ProposerSlashing, SignedAggregateAndProof, 
+    SignedBeaconBlock, SignedBlsToExecutionChange, SignedContributionAndProof, 
+    SignedVoluntaryExit, Slot, SubnetId, SyncCommitteeMessage, SyncSubnetId,
 };
 
 use beacon_processor::{
@@ -1537,6 +1537,87 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
         );
 
         metrics::inc_counter(&metrics::BEACON_PROCESSOR_BLS_TO_EXECUTION_CHANGE_IMPORTED_TOTAL);
+    }
+
+    /// Process execution proof received from the gossip network and:
+    ///
+    /// - Cache the proof for later payload verification
+    /// - If it passes basic validation, tell the network thread to forward it.
+    /// - Trigger validation of any pending payloads that match this proof.
+    ///
+    /// Raises a log if there are errors.
+    pub fn process_gossip_execution_proof(
+        self: &Arc<Self>,
+        message_id: MessageId,
+        peer_id: PeerId,
+        execution_proof: ExecutionProof,
+        subnet_id: ProofSubnetId,
+        seen_timestamp: Duration,
+    ) {
+        let start_time = Instant::now();
+        let proof_version = execution_proof.version();
+        let proof_size = execution_proof.data().len();
+
+        debug!(
+            self.log,
+            "Processing gossip execution proof";
+            "peer_id" => %peer_id,
+            "subnet_id" => ?subnet_id,
+            "proof_version" => proof_version,
+            "proof_size" => proof_size,
+        );
+
+        // Basic validation - ensure proof is not empty and version is valid
+        if execution_proof.data().is_empty() {
+            debug!(
+                self.log,
+                "Dropping empty execution proof";
+                "peer_id" => %peer_id,
+                "subnet_id" => ?subnet_id,
+            );
+            self.propagate_validation_result(message_id, peer_id, MessageAcceptance::Reject);
+            self.gossip_penalize_peer(
+                peer_id,
+                PeerAction::LowToleranceError,
+                "empty_execution_proof",
+            );
+            return;
+        }
+
+        // Check if proof config is enabled
+        if !self.chain.config.proof_config.enabled {
+            debug!(
+                self.log,
+                "Dropping execution proof - proof verification disabled";
+                "peer_id" => %peer_id,
+                "subnet_id" => ?subnet_id,
+            );
+            self.propagate_validation_result(message_id, peer_id, MessageAcceptance::Ignore);
+            return;
+        }
+
+        // Cache the proof for future payload verification
+        if let Some(global_cache) = beacon_chain::execution_proof_cache::get_global_proof_cache() {
+            let cache = global_cache.clone();
+            let proof = execution_proof.clone();
+            tokio::spawn(async move {
+                cache.cache_proof(proof, subnet_id).await;
+            });
+        }
+
+        debug!(
+            self.log,
+            "Cached execution proof";
+            "peer_id" => %peer_id,
+            "subnet_id" => ?subnet_id,
+            "processing_time_ms" => start_time.elapsed().as_millis(),
+        );
+
+        // Accept the gossip message
+        self.propagate_validation_result(message_id, peer_id, MessageAcceptance::Accept);
+
+        metrics::inc_counter(&metrics::BEACON_PROCESSOR_EXECUTION_PROOF_VERIFIED_TOTAL);
+        metrics::inc_counter(&metrics::BEACON_PROCESSOR_EXECUTION_PROOF_IMPORTED_TOTAL);
     }
 
     /// Process the sync committee signature received from the gossip network and:
