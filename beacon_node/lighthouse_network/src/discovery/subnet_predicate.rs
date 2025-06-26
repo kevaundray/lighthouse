@@ -30,6 +30,11 @@ where
             Subnet::SyncCommittee(s) => sync_committee_bitfield
                 .as_ref()
                 .map_or(false, |b| b.get(*s.deref() as usize).unwrap_or(false)),
+            Subnet::Proof(_s) => {
+                // TODO: Implement proof subnet ENR bitfield support
+                // For now, return false as proof subnets are not yet supported in ENR
+                false
+            }
         });
 
         if !predicate {

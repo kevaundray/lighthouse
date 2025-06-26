@@ -1027,6 +1027,14 @@ impl<E: EthSpec> PeerManager<E> {
                                 .or_default()
                                 .insert(id);
                         }
+                        Subnet::Proof(_) => {
+                            // TODO: Implement proof subnet peer counting
+                            // For now, we add proof subnets to the general subnet peer tracking
+                            subnet_to_peer
+                                .entry(subnet)
+                                .or_default()
+                                .push((*peer_id, info.clone()));
+                        }
                     }
                 }
             }

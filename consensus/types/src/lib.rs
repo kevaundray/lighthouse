@@ -98,6 +98,8 @@ pub mod sync_committee_contribution;
 pub mod sync_committee_message;
 pub mod sync_selection_proof;
 pub mod sync_subnet_id;
+pub mod proof_subnet_id;
+pub mod execution_proof;
 pub mod validator_registration_data;
 pub mod withdrawal;
 
@@ -234,6 +236,8 @@ pub use crate::sync_committee_subscription::SyncCommitteeSubscription;
 pub use crate::sync_duty::SyncDuty;
 pub use crate::sync_selection_proof::SyncSelectionProof;
 pub use crate::sync_subnet_id::SyncSubnetId;
+pub use crate::proof_subnet_id::ProofSubnetId;
+pub use crate::execution_proof::{ExecutionProof, ProofType};
 pub use crate::validator::Validator;
 pub use crate::validator_registration_data::*;
 pub use crate::validator_subscription::ValidatorSubscription;

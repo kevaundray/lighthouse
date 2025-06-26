@@ -548,6 +548,11 @@ impl<E: EthSpec> Discovery<E> {
                     )
                     .map_err(|e| format!("{:?}", e))?;
             }
+            Subnet::Proof(_id) => {
+                // TODO: Implement proof subnet ENR bitfield similar to attestation and sync committee
+                // For now, we don't update the ENR for proof subnets
+                debug!(self.log, "Proof subnet ENR bitfield update not yet implemented");
+            }
         }
 
         // replace the global version
@@ -867,6 +872,7 @@ impl<E: EthSpec> Discovery<E> {
                             let query_str = match query.subnet {
                                 Subnet::Attestation(_) => "attestation",
                                 Subnet::SyncCommittee(_) => "sync_committee",
+                                Subnet::Proof(_) => "proof",
                             };
 
                             if let Some(v) = metrics::get_int_counter(

@@ -94,6 +94,11 @@ impl<E: EthSpec> PeerInfo<E> {
                         .syncnets()
                         .map_or(false, |s| s.get(**id as usize).unwrap_or(false))
                 }
+                Subnet::Proof(_id) => {
+                    // TODO: Implement proofnets metadata field similar to attnets/syncnets
+                    // For now, return false as metadata structure needs to be extended
+                    return false;
+                }
             }
         }
         false

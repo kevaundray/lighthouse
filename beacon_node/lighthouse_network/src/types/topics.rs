@@ -1,7 +1,7 @@
 use gossipsub::{IdentTopic as Topic, TopicHash};
 use serde::{Deserialize, Serialize};
 use strum::AsRefStr;
-use types::{ChainSpec, EthSpec, ForkName, SubnetId, SyncSubnetId, Unsigned};
+use types::{ChainSpec, EthSpec, ForkName, SubnetId, SyncSubnetId, ProofSubnetId, Unsigned};
 
 use crate::Subnet;
 
@@ -19,6 +19,7 @@ pub const PROPOSER_SLASHING_TOPIC: &str = "proposer_slashing";
 pub const ATTESTER_SLASHING_TOPIC: &str = "attester_slashing";
 pub const SIGNED_CONTRIBUTION_AND_PROOF_TOPIC: &str = "sync_committee_contribution_and_proof";
 pub const SYNC_COMMITTEE_PREFIX_TOPIC: &str = "sync_committee_";
+pub const PROOF_PREFIX_TOPIC: &str = "execution_proof_";
 pub const BLS_TO_EXECUTION_CHANGE_TOPIC: &str = "bls_to_execution_change";
 pub const LIGHT_CLIENT_FINALITY_UPDATE: &str = "light_client_finality_update";
 pub const LIGHT_CLIENT_OPTIMISTIC_UPDATE: &str = "light_client_optimistic_update";
@@ -126,6 +127,9 @@ pub enum GossipKind {
     /// Topic for publishing unaggregated sync committee signatures on a particular subnet.
     #[strum(serialize = "sync_committee")]
     SyncCommitteeMessage(SyncSubnetId),
+    /// Topic for publishing execution proofs on a particular subnet.
+    #[strum(serialize = "execution_proof")]
+    ExecutionProof(ProofSubnetId),
     /// Topic for validator messages which change their withdrawal address.
     BlsToExecutionChange,
     /// Topic for publishing finality updates for light clients.
@@ -140,6 +144,9 @@ impl std::fmt::Display for GossipKind {
             GossipKind::Attestation(subnet_id) => write!(f, "beacon_attestation_{}", **subnet_id),
             GossipKind::SyncCommitteeMessage(subnet_id) => {
                 write!(f, "sync_committee_{}", **subnet_id)
+            }
+            GossipKind::ExecutionProof(subnet_id) => {
+                write!(f, "execution_proof_{}", **subnet_id)
             }
             GossipKind::BlobSidecar(blob_index) => {
                 write!(f, "{}{}", BLOB_SIDECAR_PREFIX, blob_index)
@@ -231,6 +238,7 @@ impl GossipTopic {
         match self.kind() {
             GossipKind::Attestation(subnet_id) => Some(Subnet::Attestation(*subnet_id)),
             GossipKind::SyncCommitteeMessage(subnet_id) => Some(Subnet::SyncCommittee(*subnet_id)),
+            GossipKind::ExecutionProof(subnet_id) => Some(Subnet::Proof(*subnet_id)),
             _ => None,
         }
     }
@@ -266,6 +274,9 @@ impl std::fmt::Display for GossipTopic {
             GossipKind::SyncCommitteeMessage(index) => {
                 format!("{}{}", SYNC_COMMITTEE_PREFIX_TOPIC, *index)
             }
+            GossipKind::ExecutionProof(index) => {
+                format!("{}{}", PROOF_PREFIX_TOPIC, *index)
+            }
             GossipKind::BlobSidecar(blob_index) => {
                 format!("{}{}", BLOB_SIDECAR_PREFIX, blob_index)
             }
@@ -289,6 +300,7 @@ impl From<Subnet> for GossipKind {
         match subnet_id {
             Subnet::Attestation(s) => GossipKind::Attestation(s),
             Subnet::SyncCommittee(s) => GossipKind::SyncCommitteeMessage(s),
+            Subnet::Proof(s) => GossipKind::ExecutionProof(s),
         }
     }
 }
@@ -308,6 +320,10 @@ fn subnet_topic_index(topic: &str) -> Option<GossipKind> {
         )));
     } else if let Some(index) = topic.strip_prefix(SYNC_COMMITTEE_PREFIX_TOPIC) {
         return Some(GossipKind::SyncCommitteeMessage(SyncSubnetId::new(
+            index.parse::<u64>().ok()?,
+        )));
+    } else if let Some(index) = topic.strip_prefix(PROOF_PREFIX_TOPIC) {
+        return Some(GossipKind::ExecutionProof(ProofSubnetId::new(
             index.parse::<u64>().ok()?,
         )));
     } else if let Some(index) = topic.strip_prefix(BLOB_SIDECAR_PREFIX) {
@@ -339,6 +355,7 @@ mod tests {
                 SignedContributionAndProof,
                 Attestation(SubnetId::new(42)),
                 SyncCommitteeMessage(SyncSubnetId::new(42)),
+                ExecutionProof(ProofSubnetId::new(42)),
                 VoluntaryExit,
                 ProposerSlashing,
                 AttesterSlashing,
@@ -423,6 +440,12 @@ mod tests {
             subnet_from_topic_hash(&topic_hash),
             Some(Subnet::SyncCommittee(SyncSubnetId::new(42)))
         );
+
+        let topic_hash = TopicHash::from_raw("/eth2/e1925f3b/execution_proof_42/ssz_snappy");
+        assert_eq!(
+            subnet_from_topic_hash(&topic_hash),
+            Some(Subnet::Proof(ProofSubnetId::new(42)))
+        );
     }
 
     #[test]
@@ -440,6 +463,10 @@ mod tests {
         assert_eq!(
             "sync_committee",
             SyncCommitteeMessage(SyncSubnetId::new(42)).as_ref()
+        );
+        assert_eq!(
+            "execution_proof",
+            ExecutionProof(ProofSubnetId::new(42)).as_ref()
         );
         assert_eq!("voluntary_exit", VoluntaryExit.as_ref());
         assert_eq!("proposer_slashing", ProposerSlashing.as_ref());
