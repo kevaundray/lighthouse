@@ -1,9 +1,11 @@
 mod attestation_production;
 mod attestation_verification;
+mod async_proof_generation_tests;
 mod bellatrix;
 mod block_verification;
 mod capella;
 mod events;
+mod execution_proof_tests;
 mod op_verification;
 mod payload_invalidation;
 mod rewards;
