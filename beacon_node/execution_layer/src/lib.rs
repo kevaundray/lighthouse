@@ -422,6 +422,7 @@ type PayloadContentsRefTuple<'a, E> = (ExecutionPayloadRef<'a, E>, Option<&'a Bl
 
 struct Inner<E: EthSpec> {
     engine: Arc<Engine>,
+    execution_engine: Arc<dyn ExecutionEngine<E>>,
     builder: ArcSwapOption<BuilderHttpClient>,
     execution_engine_forkchoice_lock: Mutex<()>,
     suggested_fee_recipient: Option<Address>,
@@ -462,6 +463,10 @@ pub struct Config {
     /// Default directory for the jwt secret if not provided through cli.
     pub default_datadir: PathBuf,
     pub execution_timeout_multiplier: Option<u32>,
+    /// Whether to use stateless validation mode.
+    pub stateless_validation: bool,
+    /// Configuration for stateless execution engine.
+    pub stateless_config: Option<StatelessEngineConfig>,
 }
 
 /// Provides access to one execution engine and provides a neat interface for consumption by the
@@ -486,6 +491,8 @@ impl<E: EthSpec> ExecutionLayer<E> {
             jwt_version,
             default_datadir,
             execution_timeout_multiplier,
+            stateless_validation,
+            stateless_config,
         } = config;
 
         let execution_url = url.ok_or(Error::NoEngine)?;
@@ -530,8 +537,20 @@ impl<E: EthSpec> ExecutionLayer<E> {
             Engine::new(api, executor.clone())
         };
 
+        // Create Arc for the engine first
+        let engine_arc = Arc::new(engine);
+
+        // Create the appropriate execution engine based on configuration
+        let execution_engine: Arc<dyn ExecutionEngine<E>> = if stateless_validation {
+            let config = stateless_config.unwrap_or_default();
+            Arc::new(StatelessExecutionEngine::new(config))
+        } else {
+            Arc::new(StandardExecutionEngine::new(Arc::clone(&engine_arc)))
+        };
+
         let inner = Inner {
-            engine: Arc::new(engine),
+            engine: engine_arc,
+            execution_engine,
             builder: ArcSwapOption::empty(),
             execution_engine_forkchoice_lock: <_>::default(),
             suggested_fee_recipient,
@@ -1366,12 +1385,19 @@ impl<E: EthSpec> ExecutionLayer<E> {
         let parent_hash = new_payload_request.parent_hash();
 
         let result = self
-            .engine()
-            .request(|engine| engine.api.new_payload(new_payload_request))
+            .inner
+            .execution_engine
+            .notify_new_payload(new_payload_request)
             .await;
 
         if let Ok(status) = &result {
-            let status_str = <&'static str>::from(status.status);
+            let status_str = match status {
+                PayloadStatus::Valid => "VALID",
+                PayloadStatus::Invalid { .. } => "INVALID",
+                PayloadStatus::Syncing => "SYNCING",
+                PayloadStatus::Accepted => "ACCEPTED",
+                PayloadStatus::InvalidBlockHash { .. } => "INVALID_BLOCK_HASH",
+            };
             metrics::inc_counter_vec(
                 &metrics::EXECUTION_LAYER_PAYLOAD_STATUS,
                 &["new_payload", status_str],
@@ -1387,9 +1413,7 @@ impl<E: EthSpec> ExecutionLayer<E> {
         }
         *self.inner.last_new_payload_errored.write().await = result.is_err();
 
-        process_payload_status(block_hash, result)
-            .map_err(Box::new)
-            .map_err(Error::EngineError)
+        result.map_err(Box::new).map_err(Error::EngineError)
     }
 
     /// Update engine sync status.
