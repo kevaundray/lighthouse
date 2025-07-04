@@ -4,19 +4,17 @@
 //! allowing for standard execution engines, stateless validation engines, and testing mocks.
 
 use crate::engine_api::{
-    BlockByNumberQuery, EngineCapabilities, ForkchoiceUpdatedResponse,
-    NewPayloadRequest, PayloadAttributes, PayloadId,
+    BlockByNumberQuery, EngineCapabilities, ForkchoiceUpdatedResponse, NewPayloadRequest,
+    PayloadAttributes, PayloadId,
 };
 use crate::engines::EngineError;
 use crate::json_structures::{BlobAndProofV1, BlobAndProofV2};
 use crate::payload_status::PayloadStatus;
+use crate::ForkchoiceState;
 use crate::{ClientVersionV1, ExecutionBlock, ExecutionPayloadBodyV1};
 use async_trait::async_trait;
 use std::time::Duration;
-use types::{
-    EthSpec, ExecutionBlockHash, ForkName, Hash256,
-};
-use crate::ForkchoiceState;
+use types::{EthSpec, ExecutionBlockHash, ForkName, Hash256};
 
 /// A trait that defines the interface for execution engines.
 ///

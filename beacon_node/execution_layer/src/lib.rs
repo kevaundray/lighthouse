@@ -73,7 +73,7 @@ pub mod test_utils;
 pub mod versioned_hashes;
 
 pub use execution_engine::ExecutionEngine;
-pub use mock_engine::{MockExecutionEngine, MockEngineConfig};
+pub use mock_engine::{MockEngineConfig, MockExecutionEngine};
 pub use standard_engine::StandardExecutionEngine;
 
 /// Indicates the default jwt authenticated execution endpoint.
@@ -483,7 +483,7 @@ impl<E: EthSpec> ExecutionLayer<E> {
         // This avoids JWT authentication issues when using mock engines
         let mock_url = "http://127.0.0.1:0".parse().unwrap(); // Use port 0 to avoid conflicts
         let mock_http_client = crate::engine_api::http::HttpJsonRpc::new(mock_url, None).unwrap();
-        
+
         let inner = Inner {
             engine: Arc::new(engines::Engine::new(mock_http_client, executor.clone())),
             execution_engine,
@@ -565,7 +565,7 @@ impl<E: EthSpec> ExecutionLayer<E> {
         let engine_arc = Arc::new(engine);
 
         // Create the execution engine
-        let execution_engine: Arc<dyn ExecutionEngine<E>> = 
+        let execution_engine: Arc<dyn ExecutionEngine<E>> =
             Arc::new(StandardExecutionEngine::new(Arc::clone(&engine_arc)));
 
         let inner = Inner {
@@ -1650,7 +1650,9 @@ impl<E: EthSpec> ExecutionLayer<E> {
             }
         }
 
-        let block = self.get_pow_block_at_total_difficulty_via_execution_engine(spec).await?;
+        let block = self
+            .get_pow_block_at_total_difficulty_via_execution_engine(spec)
+            .await?;
         let hash_opt = if let Some(pow_block) = block {
             // If `terminal_block.timestamp == transition_block.timestamp`,
             // we violate the invariant that a block's timestamp must be
@@ -1765,7 +1767,9 @@ impl<E: EthSpec> ExecutionLayer<E> {
         // Use the execution engine abstraction instead of engine().request()
         let pow_block = self.get_pow_block_via_execution_engine(block_hash).await?;
         if let Some(pow_block) = pow_block {
-            let pow_parent = self.get_pow_block_via_execution_engine(pow_block.parent_hash).await?;
+            let pow_parent = self
+                .get_pow_block_via_execution_engine(pow_block.parent_hash)
+                .await?;
             if let Some(pow_parent) = pow_parent {
                 return Ok(Some(
                     self.is_valid_terminal_pow_block(pow_block, pow_parent, spec),
@@ -1844,17 +1848,24 @@ impl<E: EthSpec> ExecutionLayer<E> {
         spec: &ChainSpec,
     ) -> Result<Option<ExecutionBlock>, Error> {
         use crate::engine_api::LATEST_TAG;
-        
+
         // Get the latest block using execution engine abstraction
-        let mut block = match self.inner.execution_engine.get_block_by_number(
-            BlockByNumberQuery::Tag(LATEST_TAG)
-        ).await {
+        let mut block = match self
+            .inner
+            .execution_engine
+            .get_block_by_number(BlockByNumberQuery::Tag(LATEST_TAG))
+            .await
+        {
             Ok(Some(block)) => block,
-            Ok(None) => return Err(Error::EngineError(Box::new(
-                crate::engines::EngineError::Api { 
-                    error: crate::engine_api::Error::BadResponse("Execution head block not found".to_string()) 
-                }
-            ))),
+            Ok(None) => {
+                return Err(Error::EngineError(Box::new(
+                    crate::engines::EngineError::Api {
+                        error: crate::engine_api::Error::BadResponse(
+                            "Execution head block not found".to_string(),
+                        ),
+                    },
+                )))
+            }
             Err(engine_error) => return Err(Error::EngineError(Box::new(engine_error))),
         };
 
@@ -1867,15 +1878,21 @@ impl<E: EthSpec> ExecutionLayer<E> {
                 if block.parent_hash == ExecutionBlockHash::zero() {
                     return Ok(Some(block));
                 }
-                let parent = match self.get_pow_block_via_execution_engine(block.parent_hash).await? {
+                let parent = match self
+                    .get_pow_block_via_execution_engine(block.parent_hash)
+                    .await?
+                {
                     Some(parent) => parent,
-                    None => return Err(Error::EngineError(Box::new(
-                        crate::engines::EngineError::Api { 
-                            error: crate::engine_api::Error::BadResponse(
-                                format!("Execution block not found: {}", block.parent_hash)
-                            ) 
-                        }
-                    ))),
+                    None => {
+                        return Err(Error::EngineError(Box::new(
+                            crate::engines::EngineError::Api {
+                                error: crate::engine_api::Error::BadResponse(format!(
+                                    "Execution block not found: {}",
+                                    block.parent_hash
+                                )),
+                            },
+                        )))
+                    }
                 };
                 let parent_reached_ttd =
                     parent.terminal_total_difficulty_reached(spec.terminal_total_difficulty);
@@ -2300,42 +2317,43 @@ fn noop<E: EthSpec>(
 mod test {
     #[tokio::test]
     async fn test_refactored_mock_execution_layer() {
-        use crate::test_utils::MockExecutionLayer;
         use crate::payload_status::PayloadStatus;
+        use crate::test_utils::MockExecutionLayer;
         use task_executor::test_utils::TestRuntime;
-        use types::{ExecutionBlockHash, Hash256, MainnetEthSpec, FixedBytesExtended};
-        
+        use types::{ExecutionBlockHash, FixedBytesExtended, Hash256, MainnetEthSpec};
+
         let runtime = TestRuntime::default();
-        let mock_layer = MockExecutionLayer::<MainnetEthSpec>::default_params(runtime.task_executor.clone());
-        
+        let mock_layer =
+            MockExecutionLayer::<MainnetEthSpec>::default_params(runtime.task_executor.clone());
+
         // Test that we can configure the mock engine
         mock_layer.all_payloads_valid();
-        
+
         // Test that we can set specific payload statuses
         let block_hash = ExecutionBlockHash::from_root(Hash256::from_low_u64_be(123));
         mock_layer.set_payload_status(block_hash, PayloadStatus::Syncing);
-        
+
         // Verify the mock engine received our configuration
         assert_eq!(mock_layer.mock_engine().call_count("notify_new_payload"), 0);
     }
-    
+
     #[tokio::test]
     async fn test_execution_layer_with_mock_engine() {
         use crate::{ExecutionLayer, MockExecutionEngine};
         use std::sync::Arc;
         use task_executor::test_utils::TestRuntime;
-        use types::{Address, MainnetEthSpec, FixedBytesExtended};
-        
+        use types::{Address, FixedBytesExtended, MainnetEthSpec};
+
         let runtime = TestRuntime::default();
         let mock_engine = Arc::new(MockExecutionEngine::new());
-        
+
         // Create ExecutionLayer with mock engine
         let execution_layer = ExecutionLayer::<MainnetEthSpec>::with_execution_engine(
             mock_engine.clone(),
             Some(Address::repeat_byte(42)),
             runtime.task_executor.clone(),
         );
-        
+
         // Verify we can access the execution layer
         assert!(execution_layer.inner.execution_engine.is_synced().await);
     }

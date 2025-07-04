@@ -4,21 +4,19 @@
 //! which communicates with real execution clients via JSON-RPC.
 
 use crate::engine_api::{
-    BlockByNumberQuery, EngineCapabilities, ForkchoiceUpdatedResponse,
-    NewPayloadRequest, PayloadAttributes, PayloadId,
+    BlockByNumberQuery, EngineCapabilities, ForkchoiceUpdatedResponse, NewPayloadRequest,
+    PayloadAttributes, PayloadId,
 };
 use crate::engines::{Engine, EngineError};
 use crate::execution_engine::ExecutionEngine;
 use crate::json_structures::{BlobAndProofV1, BlobAndProofV2};
 use crate::payload_status::{process_payload_status, PayloadStatus};
+use crate::ForkchoiceState;
 use crate::{ClientVersionV1, ExecutionBlock, ExecutionPayloadBodyV1};
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
-use types::{
-    EthSpec, ExecutionBlockHash, ForkName, Hash256,
-};
-use crate::ForkchoiceState;
+use types::{EthSpec, ExecutionBlockHash, ForkName, Hash256};
 
 /// Standard execution engine that communicates with execution clients.
 pub struct StandardExecutionEngine {
@@ -86,9 +84,7 @@ impl<E: EthSpec> ExecutionEngine<E> for StandardExecutionEngine {
         payload_id: PayloadId,
     ) -> Result<crate::engine_api::GetPayloadResponse<E>, EngineError> {
         self.engine
-            .request(|engine| async move {
-                engine.api.get_payload(fork_name, payload_id).await
-            })
+            .request(|engine| async move { engine.api.get_payload(fork_name, payload_id).await })
             .await
     }
 

@@ -4,13 +4,14 @@
 //! designed for fast unit testing without HTTP overhead.
 
 use crate::engine_api::{
-    BlockByNumberQuery, EngineCapabilities, ForkchoiceUpdatedResponse,
-    NewPayloadRequest, PayloadAttributes, PayloadId,
+    BlockByNumberQuery, EngineCapabilities, ForkchoiceUpdatedResponse, NewPayloadRequest,
+    PayloadAttributes, PayloadId,
 };
 use crate::engines::EngineError;
 use crate::execution_engine::ExecutionEngine;
 use crate::json_structures::{BlobAndProofV1, BlobAndProofV2};
 use crate::payload_status::PayloadStatus;
+use crate::ForkchoiceState;
 use crate::{ClientVersionV1, ExecutionBlock, ExecutionPayloadBodyV1};
 use async_trait::async_trait;
 use eth2::types::BlobsBundle;
@@ -22,7 +23,6 @@ use types::{
     ExecutionPayloadCapella, ExecutionPayloadDeneb, ExecutionPayloadElectra, ExecutionPayloadFulu,
     ForkName, Hash256, Transactions, Uint256,
 };
-use crate::ForkchoiceState;
 
 /// Configuration for mock execution engine behavior.
 #[derive(Debug, Clone)]
@@ -54,7 +54,7 @@ pub struct MockEngineConfig {
 impl Default for MockEngineConfig {
     fn default() -> Self {
         use crate::test_utils::{DEFAULT_TERMINAL_BLOCK, DEFAULT_TERMINAL_DIFFICULTY};
-        
+
         Self {
             is_synced: true,
             is_offline: false,
@@ -95,19 +95,19 @@ impl Default for MockEngineConfig {
 /// This engine provides configurable responses for all execution engine operations,
 /// allowing for fast unit testing without the overhead of HTTP requests or real
 /// execution client interaction.
-/// 
+///
 /// **Why we can't easily generate blocks like MockServer:**
 /// The original MockServer used ExecutionBlockGenerator to create realistic blocks,
 /// but adding this to MockExecutionEngine faces several challenges:
 /// 1. ExecutionEngine trait doesn't have EthSpec generic parameter
 /// 2. Block generation requires complex state management (chain state, block numbers, etc.)
 /// 3. Adding generics would break the trait object usage in ExecutionLayer
-/// 
+///
 /// **Potential solutions:**
 /// - Make MockExecutionEngine generic and handle trait object complexity
 /// - Add block generation methods outside the trait
 /// - Create a specialized MockExecutionEngineWithBlocks variant
-/// 
+///
 /// For now, this provides a simpler mock focused on response configuration.
 pub struct MockExecutionEngine {
     config: Arc<Mutex<MockEngineConfig>>,
@@ -149,7 +149,10 @@ impl MockExecutionEngine {
 
     /// Set the payload status for a specific block hash.
     pub fn set_payload_status(&self, block_hash: ExecutionBlockHash, status: PayloadStatus) {
-        self.payload_statuses.lock().unwrap().insert(block_hash, status);
+        self.payload_statuses
+            .lock()
+            .unwrap()
+            .insert(block_hash, status);
     }
 
     /// Set all payloads to return valid status.
@@ -174,13 +177,23 @@ impl MockExecutionEngine {
     }
 
     /// Set specific forkchoice response.
-    pub fn set_forkchoice_updated_response(&self, head_hash: ExecutionBlockHash, response: ForkchoiceUpdatedResponse) {
-        self.forkchoice_responses.lock().unwrap().insert(head_hash, response);
+    pub fn set_forkchoice_updated_response(
+        &self,
+        head_hash: ExecutionBlockHash,
+        response: ForkchoiceUpdatedResponse,
+    ) {
+        self.forkchoice_responses
+            .lock()
+            .unwrap()
+            .insert(head_hash, response);
     }
 
     /// Set a specific execution block for hash queries.
     pub fn set_execution_block(&self, block_hash: ExecutionBlockHash, block: ExecutionBlock) {
-        self.execution_blocks.lock().unwrap().insert(block_hash, block);
+        self.execution_blocks
+            .lock()
+            .unwrap()
+            .insert(block_hash, block);
     }
 
     /// Configure chain specification for fork detection.
@@ -190,7 +203,7 @@ impl MockExecutionEngine {
 
     /// Configure fork times for payload generation.
     pub fn set_fork_times(
-        &self, 
+        &self,
         shanghai_time: Option<u64>,
         cancun_time: Option<u64>,
         prague_time: Option<u64>,
@@ -240,31 +253,31 @@ impl MockExecutionEngine {
     /// Get the fork at a given timestamp.
     fn get_fork_at_timestamp(&self, timestamp: u64) -> ForkName {
         let config = self.config.lock().unwrap();
-        
+
         if let Some(osaka_time) = config.osaka_time {
             if timestamp >= osaka_time {
                 return ForkName::Fulu;
             }
         }
-        
+
         if let Some(prague_time) = config.prague_time {
             if timestamp >= prague_time {
                 return ForkName::Electra;
             }
         }
-        
+
         if let Some(cancun_time) = config.cancun_time {
             if timestamp >= cancun_time {
                 return ForkName::Deneb;
             }
         }
-        
+
         if let Some(shanghai_time) = config.shanghai_time {
             if timestamp >= shanghai_time {
                 return ForkName::Capella;
             }
         }
-        
+
         ForkName::Bellatrix
     }
 
@@ -281,13 +294,13 @@ impl MockExecutionEngine {
         payload_attributes: &PayloadAttributes,
     ) -> Result<ExecutionPayload<E>, EngineError> {
         use crate::test_utils::{mock_el_extra_data, DEFAULT_GAS_LIMIT};
-        
+
         let fork = self.get_fork_at_timestamp(payload_attributes.timestamp());
         let block_number = parent_block_number + 1;
-        
+
         // Use mock extra data function
         let extra_data = mock_el_extra_data::<E>();
-        
+
         let execution_payload = match fork {
             ForkName::Bellatrix => ExecutionPayload::Bellatrix(ExecutionPayloadBellatrix {
                 parent_hash,
@@ -381,9 +394,10 @@ impl MockExecutionEngine {
             }),
             _ => {
                 return Err(EngineError::Api {
-                    error: crate::engine_api::Error::BadResponse(
-                        format!("Unsupported fork: {}", fork)
-                    ),
+                    error: crate::engine_api::Error::BadResponse(format!(
+                        "Unsupported fork: {}",
+                        fork
+                    )),
                 });
             }
         };
@@ -414,7 +428,7 @@ impl<E: EthSpec> ExecutionEngine<E> for MockExecutionEngine {
         self.increment_call_count("notify_new_payload");
 
         let block_hash = new_payload_request.block_hash();
-        
+
         // Check for specific payload status override
         if let Some(status) = self.payload_statuses.lock().unwrap().get(&block_hash) {
             return Ok(status.clone());
@@ -449,21 +463,27 @@ impl<E: EthSpec> ExecutionEngine<E> for MockExecutionEngine {
         payload_attributes: Option<PayloadAttributes>,
     ) -> Result<ForkchoiceUpdatedResponse, EngineError> {
         self.increment_call_count("notify_forkchoice_updated");
-        
+
         // Check for specific forkchoice response override
-        if let Some(response) = self.forkchoice_responses.lock().unwrap().get(&forkchoice_state.head_block_hash) {
+        if let Some(response) = self
+            .forkchoice_responses
+            .lock()
+            .unwrap()
+            .get(&forkchoice_state.head_block_hash)
+        {
             return Ok(response.clone());
         }
-        
+
         // Generate payload if attributes are provided
         let payload_id = if let Some(attributes) = payload_attributes {
             // Get the parent block to determine block number
-            let parent_block = self.execution_blocks
+            let parent_block = self
+                .execution_blocks
                 .lock()
                 .unwrap()
                 .get(&forkchoice_state.head_block_hash)
                 .cloned();
-                
+
             if let Some(parent) = parent_block {
                 // Generate a new payload ID
                 let payload_id = {
@@ -472,7 +492,7 @@ impl<E: EthSpec> ExecutionEngine<E> for MockExecutionEngine {
                     *id_counter += 1;
                     id
                 };
-                
+
                 // Build the execution payload based on the fork
                 // Note: We need to store as Any because we can't make MockExecutionEngine generic
                 match self.build_execution_payload::<types::MainnetEthSpec>(
@@ -486,17 +506,18 @@ impl<E: EthSpec> ExecutionEngine<E> for MockExecutionEngine {
                             .lock()
                             .unwrap()
                             .insert(payload_id, Box::new(payload.clone()));
-                        
+
                         // Generate and store blobs bundle for Deneb+ forks
                         let fork = self.get_fork_at_timestamp(attributes.timestamp());
                         if matches!(fork, ForkName::Deneb | ForkName::Electra | ForkName::Fulu) {
-                            let blobs_bundle = self.generate_blobs_bundle::<types::MainnetEthSpec>();
+                            let blobs_bundle =
+                                self.generate_blobs_bundle::<types::MainnetEthSpec>();
                             self.blobs_bundles
                                 .lock()
                                 .unwrap()
                                 .insert(payload_id, Box::new(blobs_bundle));
                         }
-                        
+
                         Some(payload_id)
                     }
                     Err(_) => {
@@ -511,7 +532,7 @@ impl<E: EthSpec> ExecutionEngine<E> for MockExecutionEngine {
         } else {
             None
         };
-        
+
         // Return successful response with optional payload ID
         Ok(ForkchoiceUpdatedResponse {
             payload_status: crate::engine_api::PayloadStatusV1 {
@@ -529,14 +550,14 @@ impl<E: EthSpec> ExecutionEngine<E> for MockExecutionEngine {
         payload_id: PayloadId,
     ) -> Result<crate::engine_api::GetPayloadResponse<E>, EngineError> {
         self.increment_call_count("get_payload");
-        
+
         // Retrieve the stored payload
         let stored_payloads = self.stored_payloads.lock().unwrap();
         if let Some(payload_any) = stored_payloads.get(&payload_id) {
             // Try to downcast to the expected payload type
             if let Some(payload) = payload_any.downcast_ref::<ExecutionPayload<E>>() {
                 use crate::test_utils::DEFAULT_MOCK_EL_PAYLOAD_VALUE_WEI;
-                
+
                 // Build the GetPayloadResponse based on the fork
                 match fork_name {
                     ForkName::Bellatrix => {
@@ -545,12 +566,12 @@ impl<E: EthSpec> ExecutionEngine<E> for MockExecutionEngine {
                                 crate::engine_api::GetPayloadResponseBellatrix {
                                     execution_payload: bellatrix_payload.clone(),
                                     block_value: Uint256::from(DEFAULT_MOCK_EL_PAYLOAD_VALUE_WEI),
-                                }
+                                },
                             ))
                         } else {
                             Err(EngineError::Api {
                                 error: crate::engine_api::Error::BadResponse(
-                                    "Payload type mismatch for Bellatrix fork".to_string()
+                                    "Payload type mismatch for Bellatrix fork".to_string(),
                                 ),
                             })
                         }
@@ -561,12 +582,12 @@ impl<E: EthSpec> ExecutionEngine<E> for MockExecutionEngine {
                                 crate::engine_api::GetPayloadResponseCapella {
                                     execution_payload: capella_payload.clone(),
                                     block_value: Uint256::from(DEFAULT_MOCK_EL_PAYLOAD_VALUE_WEI),
-                                }
+                                },
                             ))
                         } else {
                             Err(EngineError::Api {
                                 error: crate::engine_api::Error::BadResponse(
-                                    "Payload type mismatch for Capella fork".to_string()
+                                    "Payload type mismatch for Capella fork".to_string(),
                                 ),
                             })
                         }
@@ -574,25 +595,26 @@ impl<E: EthSpec> ExecutionEngine<E> for MockExecutionEngine {
                     ForkName::Deneb => {
                         if let ExecutionPayload::Deneb(deneb_payload) = payload {
                             // For Deneb, we need to include blobs bundle
-                            let blobs_bundle = self.blobs_bundles
+                            let blobs_bundle = self
+                                .blobs_bundles
                                 .lock()
                                 .unwrap()
                                 .get(&payload_id)
                                 .and_then(|b| b.downcast_ref::<BlobsBundle<E>>())
                                 .cloned();
-                                
+
                             Ok(crate::engine_api::GetPayloadResponse::Deneb(
                                 crate::engine_api::GetPayloadResponseDeneb {
                                     execution_payload: deneb_payload.clone(),
                                     block_value: Uint256::from(DEFAULT_MOCK_EL_PAYLOAD_VALUE_WEI),
                                     blobs_bundle: blobs_bundle.unwrap_or_default(),
                                     should_override_builder: false,
-                                }
+                                },
                             ))
                         } else {
                             Err(EngineError::Api {
                                 error: crate::engine_api::Error::BadResponse(
-                                    "Payload type mismatch for Deneb fork".to_string()
+                                    "Payload type mismatch for Deneb fork".to_string(),
                                 ),
                             })
                         }
@@ -600,13 +622,14 @@ impl<E: EthSpec> ExecutionEngine<E> for MockExecutionEngine {
                     ForkName::Electra => {
                         if let ExecutionPayload::Electra(electra_payload) = payload {
                             // For Electra, we need to include blobs bundle
-                            let blobs_bundle = self.blobs_bundles
+                            let blobs_bundle = self
+                                .blobs_bundles
                                 .lock()
                                 .unwrap()
                                 .get(&payload_id)
                                 .and_then(|b| b.downcast_ref::<BlobsBundle<E>>())
                                 .cloned();
-                                
+
                             Ok(crate::engine_api::GetPayloadResponse::Electra(
                                 crate::engine_api::GetPayloadResponseElectra {
                                     execution_payload: electra_payload.clone(),
@@ -614,12 +637,12 @@ impl<E: EthSpec> ExecutionEngine<E> for MockExecutionEngine {
                                     blobs_bundle: blobs_bundle.unwrap_or_default(),
                                     should_override_builder: false,
                                     requests: Default::default(),
-                                }
+                                },
                             ))
                         } else {
                             Err(EngineError::Api {
                                 error: crate::engine_api::Error::BadResponse(
-                                    "Payload type mismatch for Electra fork".to_string()
+                                    "Payload type mismatch for Electra fork".to_string(),
                                 ),
                             })
                         }
@@ -627,13 +650,14 @@ impl<E: EthSpec> ExecutionEngine<E> for MockExecutionEngine {
                     ForkName::Fulu => {
                         if let ExecutionPayload::Fulu(fulu_payload) = payload {
                             // For Fulu, similar to Electra
-                            let blobs_bundle = self.blobs_bundles
+                            let blobs_bundle = self
+                                .blobs_bundles
                                 .lock()
                                 .unwrap()
                                 .get(&payload_id)
                                 .and_then(|b| b.downcast_ref::<BlobsBundle<E>>())
                                 .cloned();
-                                
+
                             Ok(crate::engine_api::GetPayloadResponse::Fulu(
                                 crate::engine_api::GetPayloadResponseFulu {
                                     execution_payload: fulu_payload.clone(),
@@ -641,36 +665,36 @@ impl<E: EthSpec> ExecutionEngine<E> for MockExecutionEngine {
                                     blobs_bundle: blobs_bundle.unwrap_or_default(),
                                     should_override_builder: false,
                                     requests: Default::default(),
-                                }
+                                },
                             ))
                         } else {
                             Err(EngineError::Api {
                                 error: crate::engine_api::Error::BadResponse(
-                                    "Payload type mismatch for Fulu fork".to_string()
+                                    "Payload type mismatch for Fulu fork".to_string(),
                                 ),
                             })
                         }
                     }
-                    _ => {
-                        Err(EngineError::Api {
-                            error: crate::engine_api::Error::BadResponse(
-                                format!("Unsupported fork for get_payload: {}", fork_name)
-                            ),
-                        })
-                    }
+                    _ => Err(EngineError::Api {
+                        error: crate::engine_api::Error::BadResponse(format!(
+                            "Unsupported fork for get_payload: {}",
+                            fork_name
+                        )),
+                    }),
                 }
             } else {
                 Err(EngineError::Api {
                     error: crate::engine_api::Error::BadResponse(
-                        "Failed to downcast stored payload".to_string()
+                        "Failed to downcast stored payload".to_string(),
                     ),
                 })
             }
         } else {
             Err(EngineError::Api {
-                error: crate::engine_api::Error::BadResponse(
-                    format!("Payload not found for ID: {:?}", payload_id)
-                ),
+                error: crate::engine_api::Error::BadResponse(format!(
+                    "Payload not found for ID: {:?}",
+                    payload_id
+                )),
             })
         }
     }
@@ -688,7 +712,7 @@ impl<E: EthSpec> ExecutionEngine<E> for MockExecutionEngine {
         _age_limit: Option<Duration>,
     ) -> Result<Vec<ClientVersionV1>, EngineError> {
         self.increment_call_count("get_engine_version");
-        
+
         // Return a mock client version
         Ok(vec![ClientVersionV1 {
             code: crate::engine_api::ClientCode::Unknown("MOCK".to_string()),
@@ -703,7 +727,7 @@ impl<E: EthSpec> ExecutionEngine<E> for MockExecutionEngine {
         _hashes: Vec<ExecutionBlockHash>,
     ) -> Result<Vec<Option<ExecutionPayloadBodyV1<E>>>, EngineError> {
         self.increment_call_count("get_payload_bodies_by_hash");
-        
+
         // Return empty for mocking
         Ok(vec![])
     }
@@ -714,7 +738,7 @@ impl<E: EthSpec> ExecutionEngine<E> for MockExecutionEngine {
         _count: u64,
     ) -> Result<Vec<Option<ExecutionPayloadBodyV1<E>>>, EngineError> {
         self.increment_call_count("get_payload_bodies_by_range");
-        
+
         // Return empty for mocking
         Ok(vec![])
     }
@@ -724,7 +748,7 @@ impl<E: EthSpec> ExecutionEngine<E> for MockExecutionEngine {
         _query: Vec<Hash256>,
     ) -> Result<Vec<Option<BlobAndProofV1<E>>>, EngineError> {
         self.increment_call_count("get_blobs_v1");
-        
+
         // Return empty for mocking
         Ok(vec![])
     }
@@ -734,7 +758,7 @@ impl<E: EthSpec> ExecutionEngine<E> for MockExecutionEngine {
         _query: Vec<Hash256>,
     ) -> Result<Option<Vec<BlobAndProofV2<E>>>, EngineError> {
         self.increment_call_count("get_blobs_v2");
-        
+
         // Return empty for mocking
         Ok(None)
     }
@@ -744,13 +768,14 @@ impl<E: EthSpec> ExecutionEngine<E> for MockExecutionEngine {
         query: BlockByNumberQuery<'_>,
     ) -> Result<Option<ExecutionBlock>, EngineError> {
         self.increment_call_count("get_block_by_number");
-        
+
         // For tag queries (like "latest"), return the latest block from our stored blocks
         match query {
             BlockByNumberQuery::Tag(_tag) => {
                 // Return the latest block (highest block number) from stored blocks
                 let blocks = self.execution_blocks.lock().unwrap();
-                let latest_block = blocks.values()
+                let latest_block = blocks
+                    .values()
                     .max_by_key(|block| block.block_number)
                     .cloned();
                 Ok(latest_block)
@@ -763,9 +788,14 @@ impl<E: EthSpec> ExecutionEngine<E> for MockExecutionEngine {
         block_hash: ExecutionBlockHash,
     ) -> Result<Option<ExecutionBlock>, EngineError> {
         self.increment_call_count("get_block_by_hash");
-        
+
         // Check if we have a stored block for this hash
-        let block = self.execution_blocks.lock().unwrap().get(&block_hash).cloned();
+        let block = self
+            .execution_blocks
+            .lock()
+            .unwrap()
+            .get(&block_hash)
+            .cloned();
         Ok(block)
     }
 
@@ -775,7 +805,7 @@ impl<E: EthSpec> ExecutionEngine<E> for MockExecutionEngine {
         _payload_attributes: &PayloadAttributes,
     ) -> Option<PayloadId> {
         self.increment_call_count("get_payload_id");
-        
+
         // Return None for mocking
         None
     }
@@ -784,18 +814,20 @@ impl<E: EthSpec> ExecutionEngine<E> for MockExecutionEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use types::{MainnetEthSpec, FixedBytesExtended};
     use crate::engine_api::PayloadAttributes;
     use crate::engines::ForkchoiceState;
+    use types::{FixedBytesExtended, MainnetEthSpec};
 
     #[tokio::test]
     async fn test_mock_engine_basic() {
         let engine = MockExecutionEngine::new();
-        
+
         // Test sync status
         assert!(<MockExecutionEngine as ExecutionEngine<MainnetEthSpec>>::is_synced(&engine).await);
-        assert!(!<MockExecutionEngine as ExecutionEngine<MainnetEthSpec>>::is_offline(&engine).await);
-        
+        assert!(
+            !<MockExecutionEngine as ExecutionEngine<MainnetEthSpec>>::is_offline(&engine).await
+        );
+
         // Test call counting
         assert_eq!(engine.call_count("is_synced"), 1);
         assert_eq!(engine.call_count("is_offline"), 1);
@@ -809,20 +841,27 @@ mod tests {
             default_payload_status: PayloadStatus::Syncing,
             ..Default::default()
         };
-        
+
         let engine = MockExecutionEngine::with_config(config);
-        
-        assert!(!<MockExecutionEngine as ExecutionEngine<MainnetEthSpec>>::is_synced(&engine).await);
-        assert!(<MockExecutionEngine as ExecutionEngine<MainnetEthSpec>>::is_offline(&engine).await);
-        
+
+        assert!(
+            !<MockExecutionEngine as ExecutionEngine<MainnetEthSpec>>::is_synced(&engine).await
+        );
+        assert!(
+            <MockExecutionEngine as ExecutionEngine<MainnetEthSpec>>::is_offline(&engine).await
+        );
+
         // Test upcheck with offline engine
-        assert!(matches!(<MockExecutionEngine as ExecutionEngine<MainnetEthSpec>>::upcheck(&engine).await, Err(EngineError::Offline)));
+        assert!(matches!(
+            <MockExecutionEngine as ExecutionEngine<MainnetEthSpec>>::upcheck(&engine).await,
+            Err(EngineError::Offline)
+        ));
     }
 
     #[tokio::test]
     async fn test_mock_engine_payload_generation() {
         let engine = MockExecutionEngine::new();
-        
+
         // Set up a parent block for payload generation
         let parent_hash = ExecutionBlockHash::from_root(Hash256::from_low_u64_be(42));
         let parent_block = crate::ExecutionBlock {
@@ -833,49 +872,60 @@ mod tests {
             timestamp: 1234567890,
         };
         engine.set_execution_block(parent_hash, parent_block);
-        
+
         // Set up forkchoice state and payload attributes
         let forkchoice_state = ForkchoiceState {
             head_block_hash: parent_hash,
             safe_block_hash: parent_hash,
             finalized_block_hash: parent_hash,
         };
-        
+
         let payload_attributes = PayloadAttributes::new(
-            1234567900, // timestamp
+            1234567900,                     // timestamp
             Hash256::from_low_u64_be(999),  // prev_randao
             crate::Address::repeat_byte(1), // fee_recipient
-            None,      // withdrawals
-            None,      // parent_beacon_block_root
+            None,                           // withdrawals
+            None,                           // parent_beacon_block_root
         );
-        
+
         // Test forkchoice_updated with payload generation
-        let response = <MockExecutionEngine as ExecutionEngine<MainnetEthSpec>>::notify_forkchoice_updated(
-            &engine,
-            forkchoice_state,
-            Some(payload_attributes)
-        ).await.unwrap();
-        
+        let response =
+            <MockExecutionEngine as ExecutionEngine<MainnetEthSpec>>::notify_forkchoice_updated(
+                &engine,
+                forkchoice_state,
+                Some(payload_attributes),
+            )
+            .await
+            .unwrap();
+
         // Should return a payload ID
         assert!(response.payload_id.is_some());
         let payload_id = response.payload_id.unwrap();
-        
+
         // Test get_payload
-        let payload_response = <MockExecutionEngine as ExecutionEngine<MainnetEthSpec>>::get_payload(
-            &engine,
-            types::ForkName::Bellatrix,
-            payload_id
-        ).await.unwrap();
-        
+        let payload_response =
+            <MockExecutionEngine as ExecutionEngine<MainnetEthSpec>>::get_payload(
+                &engine,
+                types::ForkName::Bellatrix,
+                payload_id,
+            )
+            .await
+            .unwrap();
+
         // Verify the payload was generated correctly
-        if let crate::engine_api::GetPayloadResponse::Bellatrix(bellatrix_response) = payload_response {
-            assert_eq!(bellatrix_response.execution_payload.parent_hash, parent_hash);
+        if let crate::engine_api::GetPayloadResponse::Bellatrix(bellatrix_response) =
+            payload_response
+        {
+            assert_eq!(
+                bellatrix_response.execution_payload.parent_hash,
+                parent_hash
+            );
             assert_eq!(bellatrix_response.execution_payload.block_number, 101);
             assert_eq!(bellatrix_response.execution_payload.timestamp, 1234567900);
         } else {
             panic!("Expected Bellatrix payload response");
         }
-        
+
         // Test call counting
         assert_eq!(engine.call_count("notify_forkchoice_updated"), 1);
         assert_eq!(engine.call_count("get_payload"), 1);

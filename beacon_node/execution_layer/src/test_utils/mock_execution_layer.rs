@@ -1,11 +1,9 @@
+use crate::test_utils::DEFAULT_JWT_SECRET;
+use crate::MockExecutionEngine;
 use crate::{
-    test_utils::{
-        DEFAULT_TERMINAL_BLOCK, DEFAULT_TERMINAL_DIFFICULTY, ExecutionBlockGenerator,
-    },
+    test_utils::{ExecutionBlockGenerator, DEFAULT_TERMINAL_BLOCK, DEFAULT_TERMINAL_DIFFICULTY},
     *,
 };
-use crate::MockExecutionEngine;
-use crate::test_utils::DEFAULT_JWT_SECRET;
 use alloy_primitives::B256 as H256;
 use kzg::Kzg;
 use parking_lot::Mutex;
@@ -17,18 +15,18 @@ pub struct MockExecutionLayer<E: EthSpec> {
     pub executor: TaskExecutor,
     pub spec: Arc<ChainSpec>,
     /// Keep a direct reference to the MockExecutionEngine for test configuration.
-    /// 
+    ///
     /// While `el` contains the same MockExecutionEngine (as `Arc<dyn ExecutionEngine<E>>`),
     /// we need this typed reference to access MockExecutionEngine-specific methods like:
     /// - `set_payload_status()` - configure responses for specific block hashes
     /// - `all_payloads_valid()` - set global mock behavior
     /// - `call_count()` - verify method invocations in tests
-    /// 
+    ///
     /// Rust trait objects don't allow safe downcasting without additional setup,
     /// so we maintain this reference for test convenience and type safety.
     mock_engine: Arc<MockExecutionEngine>,
     /// Block generator for creating realistic execution blocks and terminal blocks.
-    /// 
+    ///
     /// This provides the same block generation capabilities that the original MockServer had,
     /// allowing tests to work with actual terminal blocks instead of None values.
     block_generator: Arc<Mutex<ExecutionBlockGenerator<E>>>,
@@ -67,15 +65,12 @@ impl<E: EthSpec> MockExecutionLayer<E> {
     ) -> Self {
         // Create mock execution engine with configuration for payload generation
         let mock_engine = Arc::new(MockExecutionEngine::new());
-        
+
         // Configure the mock engine with chain spec and fork times for payload generation
         mock_engine.set_chain_spec(spec.clone());
         mock_engine.set_fork_times(shanghai_time, cancun_time, prague_time, osaka_time);
-        mock_engine.set_terminal_block_settings(
-            spec.terminal_total_difficulty,
-            terminal_block,
-        );
-        
+        mock_engine.set_terminal_block_settings(spec.terminal_total_difficulty, terminal_block);
+
         // Create ExecutionLayer using the mock engine
         let suggested_fee_recipient = Some(Address::repeat_byte(42));
         let el = ExecutionLayer::with_execution_engine(
@@ -111,19 +106,19 @@ impl<E: EthSpec> MockExecutionLayer<E> {
     pub async fn produce_valid_execution_payload_on_head(self) -> Self {
         // TODO: We could enhance MockExecutionEngine to generate actual blocks like MockServer did.
         // The original MockServer used ExecutionBlockGenerator to create realistic blocks with:
-        // - Sequential block numbers and proper parent hash chains  
+        // - Sequential block numbers and proper parent hash chains
         // - Valid block hashes and execution payloads
         // - Terminal difficulty and PoW/PoS transition handling
         //
         // Current limitation: MockExecutionEngine is a simpler stub mock that returns
         // configured responses rather than generating actual block data.
-        // 
+        //
         // For now, we configure mock responses instead of generating real blocks:
 
         let parent_hash = ExecutionBlockHash::from_root(Hash256::from_low_u64_be(1));
         let parent_gas_limit = 30_000_000;
         let block_number = 2;
-        
+
         // Configure mock engine for valid responses
         self.mock_engine.all_payloads_valid();
         let timestamp = block_number;
@@ -350,20 +345,25 @@ impl<E: EthSpec> MockExecutionLayer<E> {
                 let mut generator = self.block_generator.lock();
                 generator.move_to_pow_block(target_block)
             };
-            
+
             if let Err(e) = result {
-                eprintln!("Warning: Failed to move to block prior to terminal block: {}", e);
+                eprintln!(
+                    "Warning: Failed to move to block prior to terminal block: {}",
+                    e
+                );
                 return self;
             }
-            
+
             // Populate the mock engine with blocks from the generator
             {
                 let generator = self.block_generator.lock();
-                
+
                 // Add all blocks from the generator to the mock engine
                 for block_number in 0..=target_block {
-                    if let Some(execution_block) = generator.execution_block_by_number(block_number) {
-                        self.mock_engine.set_execution_block(execution_block.block_hash, execution_block);
+                    if let Some(execution_block) = generator.execution_block_by_number(block_number)
+                    {
+                        self.mock_engine
+                            .set_execution_block(execution_block.block_hash, execution_block);
                     }
                 }
             }
@@ -377,24 +377,25 @@ impl<E: EthSpec> MockExecutionLayer<E> {
             let mut generator = self.block_generator.lock();
             generator.move_to_terminal_block()
         };
-        
+
         if let Err(e) = result {
             eprintln!("Warning: Failed to move to terminal block: {}", e);
             return self;
         }
-        
+
         // Populate the mock engine with blocks from the generator
         {
             let generator = self.block_generator.lock();
-            
+
             // Add all blocks from the generator to the mock engine
             for block_number in 0..=generator.terminal_block_number {
                 if let Some(execution_block) = generator.execution_block_by_number(block_number) {
-                    self.mock_engine.set_execution_block(execution_block.block_hash, execution_block);
+                    self.mock_engine
+                        .set_execution_block(execution_block.block_hash, execution_block);
                 }
             }
         }
-        
+
         self
     }
 
@@ -402,14 +403,14 @@ impl<E: EthSpec> MockExecutionLayer<E> {
         // Create a forked PoW block using the block generator
         let forked_block_hash = {
             let generator = self.block_generator.lock();
-            
+
             // Get the current terminal block
             if let Some(terminal_block) = generator.latest_execution_block() {
                 // Create a forked block at the same height as terminal but with different hash
                 let forked_hash = ExecutionBlockHash::from_root(Hash256::from_low_u64_be(
-                    terminal_block.block_number + 1000 // Ensure different hash
+                    terminal_block.block_number + 1000, // Ensure different hash
                 ));
-                
+
                 // Create a mock execution block for the fork
                 let forked_execution_block = ExecutionBlock {
                     block_hash: forked_hash,
@@ -418,10 +419,11 @@ impl<E: EthSpec> MockExecutionLayer<E> {
                     total_difficulty: terminal_block.total_difficulty,
                     timestamp: terminal_block.timestamp,
                 };
-                
+
                 // Add the forked block to the mock engine
-                self.mock_engine.set_execution_block(forked_hash, forked_execution_block);
-                
+                self.mock_engine
+                    .set_execution_block(forked_hash, forked_execution_block);
+
                 forked_hash
             } else {
                 // Fallback: create a basic forked block
@@ -433,11 +435,12 @@ impl<E: EthSpec> MockExecutionLayer<E> {
                     total_difficulty: Some(Uint256::from(DEFAULT_TERMINAL_DIFFICULTY)),
                     timestamp: DEFAULT_TERMINAL_BLOCK,
                 };
-                self.mock_engine.set_execution_block(block_hash, execution_block);
+                self.mock_engine
+                    .set_execution_block(block_hash, execution_block);
                 block_hash
             }
         };
-        
+
         (self, forked_block_hash)
     }
 
