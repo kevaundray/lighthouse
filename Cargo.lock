@@ -3248,6 +3248,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "arc-swap",
+ "async-trait",
  "builder_client",
  "bytes",
  "eth2",

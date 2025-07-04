@@ -9,6 +9,7 @@ alloy-consensus = { workspace = true }
 alloy-primitives = { workspace = true }
 alloy-rlp = { workspace = true }
 arc-swap = "1.6.0"
+async-trait = "0.1"
 builder_client = { path = "../builder_client" }
 bytes = { workspace = true }
 eth2 = { workspace = true }

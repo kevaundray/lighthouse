@@ -62,12 +62,19 @@ use types::{
 mod block_hash;
 mod engine_api;
 pub mod engines;
+mod execution_engine;
 mod keccak;
 mod metrics;
 pub mod payload_cache;
 mod payload_status;
+mod standard_engine;
+mod stateless_engine;
 pub mod test_utils;
 pub mod versioned_hashes;
+
+pub use execution_engine::ExecutionEngine;
+pub use standard_engine::StandardExecutionEngine;
+pub use stateless_engine::{StatelessEngineConfig, StatelessExecutionEngine};
 
 /// Indicates the default jwt authenticated execution endpoint.
 pub const DEFAULT_EXECUTION_ENDPOINT: &str = "http://localhost:8551/";
