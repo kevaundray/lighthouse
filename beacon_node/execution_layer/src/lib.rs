@@ -65,16 +65,16 @@ pub mod engines;
 mod execution_engine;
 mod keccak;
 mod metrics;
+mod mock_engine;
 pub mod payload_cache;
 mod payload_status;
 mod standard_engine;
-mod stateless_engine;
 pub mod test_utils;
 pub mod versioned_hashes;
 
 pub use execution_engine::ExecutionEngine;
+pub use mock_engine::{MockExecutionEngine, MockEngineConfig};
 pub use standard_engine::StandardExecutionEngine;
-pub use stateless_engine::{StatelessEngineConfig, StatelessExecutionEngine};
 
 /// Indicates the default jwt authenticated execution endpoint.
 pub const DEFAULT_EXECUTION_ENDPOINT: &str = "http://localhost:8551/";
@@ -463,10 +463,6 @@ pub struct Config {
     /// Default directory for the jwt secret if not provided through cli.
     pub default_datadir: PathBuf,
     pub execution_timeout_multiplier: Option<u32>,
-    /// Whether to use stateless validation mode.
-    pub stateless_validation: bool,
-    /// Configuration for stateless execution engine.
-    pub stateless_config: Option<StatelessEngineConfig>,
 }
 
 /// Provides access to one execution engine and provides a neat interface for consumption by the
@@ -491,8 +487,6 @@ impl<E: EthSpec> ExecutionLayer<E> {
             jwt_version,
             default_datadir,
             execution_timeout_multiplier,
-            stateless_validation,
-            stateless_config,
         } = config;
 
         let execution_url = url.ok_or(Error::NoEngine)?;
@@ -540,13 +534,9 @@ impl<E: EthSpec> ExecutionLayer<E> {
         // Create Arc for the engine first
         let engine_arc = Arc::new(engine);
 
-        // Create the appropriate execution engine based on configuration
-        let execution_engine: Arc<dyn ExecutionEngine<E>> = if stateless_validation {
-            let config = stateless_config.unwrap_or_default();
-            Arc::new(StatelessExecutionEngine::new(config))
-        } else {
-            Arc::new(StandardExecutionEngine::new(Arc::clone(&engine_arc)))
-        };
+        // Create the execution engine
+        let execution_engine: Arc<dyn ExecutionEngine<E>> = 
+            Arc::new(StandardExecutionEngine::new(Arc::clone(&engine_arc)));
 
         let inner = Inner {
             engine: engine_arc,
@@ -707,7 +697,7 @@ impl<E: EthSpec> ExecutionLayer<E> {
 
     /// Performs a single execution of the watchdog routine.
     pub async fn watchdog_task(&self) {
-        self.engine().upcheck().await;
+        let _ = self.inner.execution_engine.upcheck().await;
     }
 
     /// Spawns a routine which cleans the cached proposer data periodically.
