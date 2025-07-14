@@ -68,6 +68,7 @@ members = [
     "lcli",
     "lighthouse",
     "lighthouse/environment",
+    "lighthouse_proofs",
     "slasher",
     "slasher/service",
     "testing/ef_tests",

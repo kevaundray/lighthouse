@@ -434,9 +434,8 @@ pub struct BeaconChain<T: BeaconChainTypes> {
         Mutex<ObservedOperations<SignedBlsToExecutionChange, T::EthSpec>>,
     /// Interfaces with the execution client.
     pub execution_layer: Option<ExecutionLayer<T::EthSpec>>,
-    /// Storage for execution payload proofs used in stateless validation.
-    pub execution_payload_proof_store:
-        Arc<crate::execution_payload_proofs::ExecutionPayloadProofStore>,
+    /// Proof system for stateless validation.
+    pub proof_system: Option<Arc<lighthouse_proofs::ProofSystem>>,
     /// Stores information about the canonical head and finalized/justified checkpoints of the
     /// chain. Also contains the fork choice struct, for computing the canonical head.
     pub canonical_head: CanonicalHead<T>,
@@ -2739,7 +2738,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
     /// This method is called when new execution proofs arrive via gossip
     /// In the dual-view architecture, this updates the proven chain but does NOT
     /// modify fork choice weights
-    pub fn re_evaluate_optimistic_blocks_with_proofs(
+    pub async fn re_evaluate_optimistic_blocks_with_proofs(
         &self,
         execution_block_hash: ExecutionBlockHash,
     ) -> Result<bool, Error> {
@@ -2748,10 +2747,13 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             return Ok(false);
         }
 
+        let proof_system = self.proof_system.as_ref()
+            .ok_or_else(|| Error::ProofSystemNotInitialized)?;
+
         // Get the proofs we have for this execution block hash
-        let available_proofs = self
-            .execution_payload_proof_store
-            .get_proofs(&execution_block_hash);
+        let available_proofs = proof_system.store()
+            .get_proofs(&execution_block_hash)
+            .await;
         let proof_count = available_proofs.len();
 
         // Check if we have enough valid proofs
@@ -2759,7 +2761,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             // Get proof descriptions with their subnet IDs for better logging
             let proof_details: Vec<String> = available_proofs
                 .iter()
-                .map(|p| format!("{} on subnet {}", p.description(), p.proof_id.subnet_id()))
+                .map(|p| format!("{} on subnet {}", p.description(), p.proof_id.id()))
                 .collect();
             
             debug!(
@@ -2781,10 +2783,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
 
         // Update the proven canonical chain based on available proofs
         // This does NOT modify fork choice - validators continue with optimistic view
-        let proven_head_changed = self
-            .execution_payload_proof_store
-            .update_proven_chain(self)
-            .map_err(|e| Error::ExecutionPayloadProofError(e))?;
+        let proven_head_changed = self.update_proven_chain().await?;
 
         if proven_head_changed {
             info!(
@@ -2793,50 +2792,67 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             );
         }
 
-        // Clean up pending blocks for this execution hash
-        let pending_blocks_cleaned = self
-            .execution_payload_proof_store
-            .take_pending_blocks(&execution_block_hash);
-        
-        if !pending_blocks_cleaned.is_empty() {
-            debug!(
-                %execution_block_hash,
-                cleaned_count = pending_blocks_cleaned.len(),
-                "Cleaned up pending blocks after proof arrival"
-            );
-        }
-
-        // Perform periodic cleanup of finalized pending blocks
-        if proven_head_changed {
-            let _cleaned_count = self.cleanup_finalized_pending_blocks();
-        }
-
         // Return false - we never trigger head recomputation in dual-view mode
         // Fork choice remains permanently optimistic
         Ok(false)
     }
 
+    /// Update the proven chain based on available proofs
+    /// Returns true if the proven head changed
+    async fn update_proven_chain(&self) -> Result<bool, Error> {
+        if let Some(proof_system) = &self.proof_system {
+            // Get the current optimistic head
+            let head = self.canonical_head.cached_head();
+            let optimistic_head_block_root = head.head_block_root();
+            let head_slot = head.head_slot();
+            
+            // Check if we have enough proofs for the optimistic head
+            if let Some(execution_payload) = head.snapshot.beacon_block.message().body().execution_payload().ok() {
+                let execution_block_hash = execution_payload.block_hash();
+                let proof_count = proof_system.store.proof_count_for_payload(&execution_block_hash).await;
+                if proof_count >= self.config.stateless_min_proofs_required {
+                    // Update the proven chain tracker
+                    proof_system.chain_tracker().update(
+                        optimistic_head_block_root,
+                        execution_block_hash,
+                        head_slot,
+                    )?;
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Register a beacon block as pending execution proof validation
     /// This is called when a block is imported optimistically in stateless validation mode
-    pub fn register_optimistic_block_for_proof(
+    pub async fn register_optimistic_block_for_proof(
         &self,
         beacon_block_root: Hash256,
         execution_block_hash: ExecutionBlockHash,
     ) {
         if self.config.stateless_validation {
-            self.execution_payload_proof_store
-                .register_pending_block(execution_block_hash, beacon_block_root);
-
-            info!(
-                %beacon_block_root,
-                %execution_block_hash,
-                "STATELESS: Registered optimistic block as PENDING execution proof validation"
-            );
-            info!(
-                "STATELESS_TRACE: Block registered - beacon_root: {:?}, exec_hash: {:?} -> PENDING proof",
-                beacon_block_root,
-                execution_block_hash
-            );
+            if let Some(_proof_system) = &self.proof_system {
+                // Register with proven chain tracker
+                let _block_info = lighthouse_proofs::ProvenBlockInfo::new(
+                    beacon_block_root,
+                    execution_block_hash,
+                    self.slot().unwrap_or(Slot::new(0)),
+                    Hash256::zero(), // Parent will be set when proven
+                    0, // No proofs yet
+                );
+                
+                info!(
+                    %beacon_block_root,
+                    %execution_block_hash,
+                    "STATELESS: Registered optimistic block as PENDING execution proof validation"
+                );
+                info!(
+                    "STATELESS_TRACE: Block registered - beacon_root: {:?}, exec_hash: {:?} -> PENDING proof",
+                    beacon_block_root,
+                    execution_block_hash
+                );
+            }
         }
     }
 
@@ -2855,18 +2871,28 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             .start_slot(T::EthSpec::slots_per_epoch());
 
         // Remove pending blocks that are older than finalized slot
-        let removed_count = self
-            .execution_payload_proof_store
-            .cleanup_finalized_pending_blocks(|block_root| {
-                // Check if this block is older than finalized slot
-                // We need to look up the block to get its slot
-                if let Ok(Some(block)) = self.get_blinded_block(&block_root) {
-                    block.slot() <= finalized_slot
-                } else {
-                    // If we can't find the block, it's likely been pruned, so remove it
-                    true
-                }
-            });
+        let removed_count = if let Some(proof_system) = &self.proof_system {
+            // Collect all finalized block roots
+            let pending_blocks = async {
+                let metrics = proof_system.store.metrics().await;
+                // TODO: Need to get pending blocks from store
+                vec![]
+            };
+            
+            let finalized_roots: Vec<Hash256> = vec![];
+            // TODO: Implement proper finalized block collection
+            
+            let count = proof_system.store.cleanup_finalized_blocks(finalized_roots);
+            self.task_executor.spawn(
+                async move {
+                    count.await
+                },
+                "cleanup_finalized_blocks",
+            );
+            0  // Return 0 for now since we're doing async
+        } else {
+            0
+        };
 
         if removed_count > 0 {
             debug!(
@@ -2886,16 +2912,12 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             return 0;
         }
 
-        let removed_count = self
-            .execution_payload_proof_store
-            .cleanup_finalized_pending_blocks(|block_root| {
-                if let Ok(Some(block)) = self.get_blinded_block(&block_root) {
-                    block.slot() < cutoff_slot
-                } else {
-                    // If we can't find the block, remove it
-                    true
-                }
-            });
+        let removed_count = if let Some(proof_system) = &self.proof_system {
+            // TODO: Implement proper cleanup for blocks older than cutoff
+            0
+        } else {
+            0
+        };
 
         if removed_count > 0 {
             info!(

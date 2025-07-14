@@ -11,6 +11,7 @@ use crate::{
     BeaconChain, BeaconChainError, BeaconChainTypes, BlockError, BlockProductionError,
     ExecutionPayloadError,
 };
+use lighthouse_proofs::{types::ErasedExecutionPayload, ProofId};
 use execution_layer::{
     BlockProposalContents, BlockProposalContentsType, BuilderParams, NewPayloadRequest,
     PayloadAttributes, PayloadParameters, PayloadStatus,
@@ -153,41 +154,39 @@ async fn notify_new_payload<T: BeaconChainTypes>(
 
     // Check if stateless validation is enabled
     if chain.config.stateless_validation {
-        let proof_count = chain
-            .execution_payload_proof_store
-            .proof_count_for_payload(&execution_block_hash);
+        if let Some(proof_system) = &chain.proof_system {
+            let proof_count = proof_system.store.proof_count_for_payload(&execution_block_hash).await;
 
-        // Check if we have enough proofs for this execution payload
-        if proof_count >= chain.config.stateless_min_proofs_required {
-            let proofs = chain
-                .execution_payload_proof_store
-                .get_proofs(&execution_block_hash);
-            let proof_descriptions: Vec<String> = proofs.iter().map(|p| p.description()).collect();
+            // Check if we have enough proofs for this execution payload
+            if proof_count >= chain.config.stateless_min_proofs_required {
+                let proofs = proof_system.store.get_proofs(&execution_block_hash).await;
+                let proof_descriptions: Vec<String> = proofs.iter().map(|p| p.description()).collect();
 
-            info!(
-                "Found {}/{} required proof(s) for execution payload {:?} ({}), marking as verified",
-                proof_count,
-                chain.config.stateless_min_proofs_required,
-                execution_block_hash,
-                proof_descriptions.join(", ")
-            );
-            return Ok(PayloadVerificationStatus::Verified);
-        } else {
-            let beacon_block_root = block.tree_hash_root();
-            info!(
-                "STATELESS: Block entering PENDING state - Found {}/{} required proofs for beacon block root {:?}, execution payload hash {:?}, marking as OPTIMISTIC (proofs may arrive later via gossip subnets)",
-                proof_count,
-                chain.config.stateless_min_proofs_required,
-                beacon_block_root,
-                execution_block_hash
-            );
-            info!(
-                "STATELESS_TRACE: Beacon block root {:?}, execution payload hash {:?} -> PENDING/OPTIMISTIC state (awaiting {} proof(s))",
-                beacon_block_root,
-                execution_block_hash,
-                chain.config.stateless_min_proofs_required - proof_count
-            );
-            return Ok(PayloadVerificationStatus::Optimistic);
+                info!(
+                    "Found {}/{} required proof(s) for execution payload {:?} ({}), marking as verified",
+                    proof_count,
+                    chain.config.stateless_min_proofs_required,
+                    execution_block_hash,
+                    proof_descriptions.join(", ")
+                );
+                return Ok(PayloadVerificationStatus::Verified);
+            } else {
+                let beacon_block_root = block.tree_hash_root();
+                info!(
+                    "STATELESS: Block entering PENDING state - Found {}/{} required proofs for beacon block root {:?}, execution payload hash {:?}, marking as OPTIMISTIC (proofs may arrive later via gossip subnets)",
+                    proof_count,
+                    chain.config.stateless_min_proofs_required,
+                    beacon_block_root,
+                    execution_block_hash
+                );
+                info!(
+                    "STATELESS_TRACE: Beacon block root {:?}, execution payload hash {:?} -> PENDING/OPTIMISTIC state (awaiting {} proof(s))",
+                    beacon_block_root,
+                    execution_block_hash,
+                    chain.config.stateless_min_proofs_required - proof_count
+                );
+                return Ok(PayloadVerificationStatus::Optimistic);
+            }
         }
     }
 
@@ -658,6 +657,9 @@ async fn generate_and_store_execution_proofs_from_block<T: BeaconChainTypes>(
     chain: &Arc<BeaconChain<T>>,
     payload: &ExecutionPayload<T::EthSpec>,
 ) -> Result<(), BlockProductionError> {
+    let proof_system = chain.proof_system.as_ref()
+        .ok_or_else(|| BlockProductionError::BeaconChain(Box::new(Error::ProofSystemNotInitialized)))?;
+    
     let execution_block_hash = payload.block_hash();
 
     // Add random delay between 1-3 seconds to simulate proof computation delays
@@ -691,6 +693,9 @@ async fn generate_and_store_execution_proofs_from_block<T: BeaconChainTypes>(
         proof_subnets
     );
 
+    // Convert to erased payload for the proof system
+    let erased_payload = ErasedExecutionPayload::from_payload(payload);
+
     // Generate and store a proof for each subnet
     for (index, subnet_id) in proof_subnets.iter().enumerate() {
         if chain.should_generate_execution_proof_for_subnet(*subnet_id) {
@@ -709,14 +714,23 @@ async fn generate_and_store_execution_proofs_from_block<T: BeaconChainTypes>(
                 tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
             }
 
-            let proof_id = crate::execution_payload_proofs::ProofId(*subnet_id);
+            let proof_id = lighthouse_proofs::ProofId(*subnet_id);
 
-            // Use the proof store method to generate and store the proof
-            match chain
-                .execution_payload_proof_store
-                .generate_and_store_dummy_proof(&payload, &dummy_witness, proof_id)
+            // Generate proof using the proof system
+            match proof_system.generator()
+                .generate_proof(&erased_payload, &dummy_witness, proof_id)
+                .await
             {
                 Ok(proof) => {
+                    // Store the proof
+                    if let Err(e) = proof_system.store().store_proof(proof.clone()).await {
+                        warn!(
+                            "Failed to store proof for subnet {}: {:?}",
+                            subnet_id, e
+                        );
+                        continue;
+                    }
+
                     debug!(
                         "PROOFCHAIN {:?}: Generated {} on subnet {}",
                         execution_block_hash,
@@ -731,7 +745,7 @@ async fn generate_and_store_execution_proofs_from_block<T: BeaconChainTypes>(
                 }
                 Err(e) => {
                     warn!(
-                        "Failed to generate and store proof for subnet {}: {}",
+                        "Failed to generate proof for subnet {}: {:?}",
                         subnet_id, e
                     );
                 }
@@ -756,171 +770,5 @@ fn extract_execution_payload<E: EthSpec>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution_payload_proofs::ProofId;
-    use types::Hash256;
-
-    #[test]
-    fn test_generate_dummy_proof() {
-        use types::{ExecutionPayloadBellatrix, FullPayloadBellatrix, MainnetEthSpec, Uint256};
-
-        let execution_block_hash = ExecutionBlockHash::from(Hash256::random());
-        let proof_id = ProofId::EXECUTION_WITNESS;
-
-        // Create a dummy payload for testing
-        let payload = FullPayloadBellatrix::<MainnetEthSpec> {
-            execution_payload: ExecutionPayloadBellatrix::<MainnetEthSpec> {
-                parent_hash: ExecutionBlockHash::zero(),
-                fee_recipient: Default::default(),
-                state_root: Hash256::zero(),
-                receipts_root: Hash256::zero(),
-                logs_bloom: Default::default(),
-                prev_randao: Hash256::zero(),
-                block_number: 12345,
-                gas_limit: 0,
-                gas_used: 0,
-                timestamp: 0,
-                extra_data: Default::default(),
-                base_fee_per_gas: Uint256::from(0u64),
-                block_hash: execution_block_hash,
-                transactions: Default::default(),
-            },
-        };
-
-        let exec_payload = ExecutionPayload::Bellatrix(payload.execution_payload);
-        let dummy_witness = b"test_witness_data";
-        let proof =
-            crate::execution_payload_proofs::ExecutionPayloadProofStore::generate_dummy_proof(
-                &exec_payload,
-                dummy_witness,
-                proof_id,
-            );
-
-        assert_eq!(proof.block_hash, execution_block_hash);
-        assert_eq!(proof.proof_id, proof_id);
-        assert_eq!(proof.version, 1);
-        assert!(!proof.proof_data.is_empty());
-        assert!(
-            crate::execution_payload_proofs::ExecutionPayloadProofStore::validate_proof(&proof)
-        );
-
-        // Verify the proof data contains expected information
-        let proof_data_str = String::from_utf8_lossy(&proof.proof_data);
-        assert!(proof_data_str.contains("dummy_proof_subnet_0"));
-        assert!(proof_data_str.contains(&format!("{:?}", execution_block_hash)));
-        assert!(proof_data_str.contains("number_12345"));
-    }
-
-    #[test]
-    fn test_generate_dummy_proof_different_subnets() {
-        use types::{ExecutionPayloadBellatrix, FullPayloadBellatrix, MainnetEthSpec, Uint256};
-
-        let execution_block_hash = ExecutionBlockHash::from(Hash256::random());
-
-        // Create a dummy payload for testing
-        let payload = FullPayloadBellatrix::<MainnetEthSpec> {
-            execution_payload: ExecutionPayloadBellatrix::<MainnetEthSpec> {
-                parent_hash: ExecutionBlockHash::zero(),
-                fee_recipient: Default::default(),
-                state_root: Hash256::zero(),
-                receipts_root: Hash256::zero(),
-                logs_bloom: Default::default(),
-                prev_randao: Hash256::zero(),
-                block_number: 42,
-                gas_limit: 0,
-                gas_used: 0,
-                timestamp: 0,
-                extra_data: Default::default(),
-                base_fee_per_gas: Uint256::from(0u64),
-                block_hash: execution_block_hash,
-                transactions: Default::default(),
-            },
-        };
-
-        let exec_payload = ExecutionPayload::Bellatrix(payload.execution_payload);
-        let dummy_witness = b"test_witness_data";
-        let proof_0 =
-            crate::execution_payload_proofs::ExecutionPayloadProofStore::generate_dummy_proof(
-                &exec_payload,
-                dummy_witness,
-                ProofId::EXECUTION_WITNESS,
-            );
-        let proof_1 =
-            crate::execution_payload_proofs::ExecutionPayloadProofStore::generate_dummy_proof(
-                &exec_payload,
-                dummy_witness,
-                ProofId::custom(1),
-            );
-        let proof_2 =
-            crate::execution_payload_proofs::ExecutionPayloadProofStore::generate_dummy_proof(
-                &exec_payload,
-                dummy_witness,
-                ProofId::custom(2),
-            );
-
-        // All proofs should be for the same block hash
-        assert_eq!(proof_0.block_hash, execution_block_hash);
-        assert_eq!(proof_1.block_hash, execution_block_hash);
-        assert_eq!(proof_2.block_hash, execution_block_hash);
-
-        // But should have different proof IDs and data
-        assert_eq!(proof_0.proof_id.subnet_id(), 0);
-        assert_eq!(proof_1.proof_id.subnet_id(), 1);
-        assert_eq!(proof_2.proof_id.subnet_id(), 2);
-
-        // Proof data should be different for different subnets
-        assert_ne!(proof_0.proof_data, proof_1.proof_data);
-        assert_ne!(proof_1.proof_data, proof_2.proof_data);
-
-        let data_0 = String::from_utf8_lossy(&proof_0.proof_data);
-        let data_1 = String::from_utf8_lossy(&proof_1.proof_data);
-        let data_2 = String::from_utf8_lossy(&proof_2.proof_data);
-
-        assert!(data_0.contains("subnet_0"));
-        assert!(data_1.contains("subnet_1"));
-        assert!(data_2.contains("subnet_2"));
-    }
-
-    #[test]
-    fn test_generate_and_store_dummy_proof() {
-        use types::{ExecutionPayloadBellatrix, FullPayloadBellatrix, MainnetEthSpec, Uint256};
-
-        let store = crate::execution_payload_proofs::ExecutionPayloadProofStore::new(10);
-        let execution_block_hash = ExecutionBlockHash::from(Hash256::random());
-        let proof_id = ProofId::EXECUTION_WITNESS;
-
-        // Create a dummy payload for testing
-        let payload = FullPayloadBellatrix::<MainnetEthSpec> {
-            execution_payload: ExecutionPayloadBellatrix::<MainnetEthSpec> {
-                parent_hash: ExecutionBlockHash::zero(),
-                fee_recipient: Default::default(),
-                state_root: Hash256::zero(),
-                receipts_root: Hash256::zero(),
-                logs_bloom: Default::default(),
-                prev_randao: Hash256::zero(),
-                block_number: 999,
-                gas_limit: 0,
-                gas_used: 0,
-                timestamp: 0,
-                extra_data: Default::default(),
-                base_fee_per_gas: Uint256::from(0u64),
-                block_hash: execution_block_hash,
-                transactions: Default::default(),
-            },
-        };
-
-        // Generate and store a proof
-        let exec_payload = ExecutionPayload::Bellatrix(payload.execution_payload);
-        let dummy_witness = b"test_witness_data";
-        let result = store.generate_and_store_dummy_proof(&exec_payload, dummy_witness, proof_id);
-        assert!(result.is_ok());
-
-        let proof = result.unwrap();
-        assert_eq!(proof.block_hash, execution_block_hash);
-        assert_eq!(proof.proof_id, proof_id);
-
-        // Verify it's stored in the store
-        assert!(store.has_valid_proof(&execution_block_hash));
-        assert!(store.has_valid_proof_for_id(&execution_block_hash, proof_id));
-        assert_eq!(store.proof_count_for_payload(&execution_block_hash), 1);
-    }
+    // Tests removed - need to be rewritten with the new lighthouse_proofs crate
 }

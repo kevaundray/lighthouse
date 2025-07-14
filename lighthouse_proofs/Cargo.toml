@@ -1,0 +1,41 @@
+[package]
+name = "lighthouse_proofs"
+version = "0.1.0"
+edition = "2021"
+authors = ["Lighthouse Contributors"]
+description = "Execution proof management for Lighthouse"
+
+[dependencies]
+# Core dependencies
+types = { path = "../consensus/types" }
+ethereum_ssz = { workspace = true }
+ethereum_ssz_derive = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+
+# Async runtime
+tokio = { workspace = true, features = ["time"] }
+futures = { workspace = true }
+async-trait = "0.1"
+
+# Logging
+tracing = { workspace = true }
+
+# Data structures
+parking_lot = { workspace = true }
+lru = "0.12"
+
+# Error handling
+thiserror = "1.0"
+
+# Time handling
+# instant = { workspace = true }
+
+# Randomness (for testing)
+rand = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[features]
+default = []
+persistent-storage = []  # Future feature for persistent proof storage

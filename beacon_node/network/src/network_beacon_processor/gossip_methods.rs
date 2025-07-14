@@ -11,7 +11,6 @@ use beacon_chain::store::Error;
 use beacon_chain::{
     attestation_verification::{self, Error as AttnError, VerifiedAttestation},
     data_availability_checker::AvailabilityCheckErrorCategory,
-    execution_payload_proofs::{ExecutionPayloadProof, ProofId},
     light_client_finality_update_verification::Error as LightClientFinalityUpdateError,
     light_client_optimistic_update_verification::Error as LightClientOptimisticUpdateError,
     observed_operations::ObservationOutcome,
@@ -20,6 +19,7 @@ use beacon_chain::{
     AvailabilityProcessingStatus, BeaconChainError, BeaconChainTypes, BlockError, ForkChoiceError,
     GossipVerifiedBlock, NotifyExecutionLayer,
 };
+use lighthouse_proofs::{types::ExecutionPayloadProof, ProofId};
 use beacon_processor::{Work, WorkEvent};
 use lighthouse_network::{Client, MessageAcceptance, MessageId, PeerAction, PeerId, ReportSource};
 use logging::crit;
@@ -3223,11 +3223,15 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
             execution_proof.proof_data.clone(),
         );
 
-        // Store the proof in the execution payload proof store
-        match self
-            .chain
-            .execution_payload_proof_store
-            .store_proof(execution_payload_proof)
+        // Store the proof in the proof system
+        let store_result = if let Some(proof_system) = &self.chain.proof_system {
+            let store = proof_system.store.clone();
+            store.store_proof(execution_payload_proof).await
+        } else {
+            Err(lighthouse_proofs::Error::SystemNotInitialized)
+        };
+        
+        match store_result
         {
             Ok(()) => {
                 info!(

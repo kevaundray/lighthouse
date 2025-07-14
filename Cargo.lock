@@ -865,6 +865,7 @@ dependencies = [
  "int_to_bytes",
  "itertools 0.10.5",
  "kzg",
+ "lighthouse_proofs",
  "lighthouse_version",
  "logging",
  "lru",
@@ -1536,6 +1537,7 @@ dependencies = [
  "http_metrics",
  "kzg",
  "lighthouse_network",
+ "lighthouse_proofs",
  "logging",
  "metrics",
  "monitoring_api",
@@ -5580,6 +5582,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "lighthouse_proofs"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ethereum_ssz",
+ "ethereum_ssz_derive",
+ "futures",
+ "lru",
+ "parking_lot 0.12.3",
+ "rand 0.8.5",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "types",
+]
+
+[[package]]
 name = "lighthouse_validator_store"
 version = "0.1.0"
 dependencies = [
@@ -6240,6 +6260,7 @@ dependencies = [
  "kzg",
  "libp2p-gossipsub",
  "lighthouse_network",
+ "lighthouse_proofs",
  "logging",
  "lru_cache",
  "matches",

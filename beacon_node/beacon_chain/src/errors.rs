@@ -231,6 +231,7 @@ pub enum BeaconChainError {
     },
     FailedToReconstructBlobs(String),
     ExecutionPayloadProofError(String),
+    ProofSystemNotInitialized,
 }
 
 easy_from_to!(SlotProcessingError, BeaconChainError);

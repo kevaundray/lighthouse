@@ -3,7 +3,6 @@ use crate::beacon_chain::{
 };
 use crate::beacon_proposer_cache::BeaconProposerCache;
 use crate::data_availability_checker::DataAvailabilityChecker;
-use crate::execution_payload_proofs::ExecutionPayloadProofStore;
 use crate::fork_choice_signal::ForkChoiceSignalTx;
 use crate::fork_revert::{reset_fork_choice_to_finalization, revert_to_fork_boundary};
 use crate::graffiti_calculator::{GraffitiCalculator, GraffitiOrigin};
@@ -715,6 +714,32 @@ where
 
     /// Consumes `self`, returning a `BeaconChain` if all required parameters have been supplied.
     ///
+    /// Initialize the proof system if stateless validation is enabled
+    fn initialize_proof_system(
+        &self,
+        config: &ChainConfig,
+    ) -> Result<Option<Arc<lighthouse_proofs::ProofSystem>>, String> {
+        if config.stateless_validation {
+            let proof_config = lighthouse_proofs::ProofSystemConfig {
+                stateless_validation: config.stateless_validation,
+                generate_execution_proofs: config.generate_execution_proofs,
+                max_execution_payload_proofs: config.max_execution_payload_proofs,
+                max_execution_proof_subnets: config.max_execution_proof_subnets,
+                stateless_min_proofs_required: config.stateless_min_proofs_required,
+                ..Default::default()
+            };
+
+            let proof_system = lighthouse_proofs::ProofSystem::builder()
+                .with_config(proof_config)
+                .build()
+                .map_err(|e| format!("Failed to initialize proof system: {:?}", e))?;
+
+            Ok(Some(Arc::new(proof_system)))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// An error will be returned at runtime if all required parameters have not been configured.
     ///
     /// Will also raise ambiguous type errors at compile time if some parameters have not been
@@ -976,8 +1001,7 @@ where
             observed_attester_slashings: <_>::default(),
             observed_bls_to_execution_changes: <_>::default(),
             execution_layer: self.execution_layer.clone(),
-            // TODO: allow for persisting and loading from disk (when a block has been confirmed)
-            execution_payload_proof_store: Arc::new(ExecutionPayloadProofStore::default()),
+            proof_system: self.initialize_proof_system(&self.chain_config)?,
             genesis_validators_root,
             genesis_time,
             canonical_head,
