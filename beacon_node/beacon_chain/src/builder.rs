@@ -876,6 +876,9 @@ where
                     .map_err(|e| format!("Unable to init validator pubkey cache: {:?}", e))
             })?;
 
+        // Initialize proof system before any partial moves
+        let proof_system = self.initialize_proof_system(&self.chain_config)?;
+        
         let migrator_config = self.store_migrator_config.unwrap_or_default();
         let store_migrator = BackgroundMigrator::new(store.clone(), migrator_config);
 
@@ -1001,7 +1004,7 @@ where
             observed_attester_slashings: <_>::default(),
             observed_bls_to_execution_changes: <_>::default(),
             execution_layer: self.execution_layer.clone(),
-            proof_system: self.initialize_proof_system(&self.chain_config)?,
+            proof_system,
             genesis_validators_root,
             genesis_time,
             canonical_head,

@@ -770,5 +770,146 @@ fn extract_execution_payload<E: EthSpec>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Tests removed - need to be rewritten with the new lighthouse_proofs crate
+    use lighthouse_proofs::ProofSystemBuilder;
+    use types::{
+        MainnetEthSpec, ExecutionPayloadBellatrix, FullPayloadBellatrix, Uint256,
+        BeaconBlock, BeaconBlockBellatrix, BeaconBlockBodyBellatrix, Eth1Data,
+        Signature, SyncAggregate, Slot
+    };
+
+    type E = MainnetEthSpec;
+
+    #[test]
+    fn test_extract_execution_payload() {
+        let payload = FullPayloadBellatrix::<E> {
+            execution_payload: ExecutionPayloadBellatrix::<E> {
+                parent_hash: ExecutionBlockHash::zero(),
+                fee_recipient: Default::default(),
+                state_root: Hash256::zero(),
+                receipts_root: Hash256::zero(),
+                logs_bloom: Default::default(),
+                prev_randao: Hash256::zero(),
+                block_number: 12345,
+                gas_limit: 0,
+                gas_used: 0,
+                timestamp: 0,
+                extra_data: Default::default(),
+                base_fee_per_gas: Uint256::from(0u64),
+                block_hash: ExecutionBlockHash::from(Hash256::random()),
+                transactions: Default::default(),
+            },
+        };
+
+        // Create a beacon block with the payload
+        let beacon_block = BeaconBlock::Bellatrix(BeaconBlockBellatrix {
+            slot: Slot::new(1),
+            proposer_index: 0,
+            parent_root: Hash256::zero(),
+            state_root: Hash256::zero(),
+            body: BeaconBlockBodyBellatrix {
+                randao_reveal: Signature::empty(),
+                eth1_data: Eth1Data::default(),
+                graffiti: Default::default(),
+                proposer_slashings: Default::default(),
+                attester_slashings: Default::default(),
+                attestations: Default::default(),
+                deposits: Default::default(),
+                voluntary_exits: Default::default(),
+                sync_aggregate: SyncAggregate::empty(),
+                execution_payload: payload,
+            },
+        });
+
+        let block_ref = beacon_block.to_ref();
+        let extracted = extract_execution_payload(block_ref).unwrap();
+        
+        assert_eq!(extracted.block_number(), 12345);
+    }
+
+    #[tokio::test]
+    async fn test_proof_generation_task() {
+        // Build a simple proof system for testing
+        let proof_system = lighthouse_proofs::ProofSystem::builder()
+            .with_memory_store(100)
+            .with_dummy_generator()
+            .with_basic_validator()
+            .build()
+            .unwrap();
+
+        let proof_system = Arc::new(proof_system);
+
+        // Create a test payload
+        let payload = ExecutionPayloadBellatrix::<E> {
+            parent_hash: ExecutionBlockHash::zero(),
+            fee_recipient: Default::default(),
+            state_root: Hash256::zero(),
+            receipts_root: Hash256::zero(),
+            logs_bloom: Default::default(),
+            prev_randao: Hash256::zero(),
+            block_number: 42,
+            gas_limit: 0,
+            gas_used: 0,
+            timestamp: 0,
+            extra_data: Default::default(),
+            base_fee_per_gas: Uint256::from(0u64),
+            block_hash: ExecutionBlockHash::from(Hash256::random()),
+            transactions: Default::default(),
+        };
+
+        let exec_payload = ExecutionPayload::Bellatrix(payload.clone());
+        let execution_block_hash = exec_payload.block_hash();
+
+        // Generate proof
+        let result = generate_and_store_execution_proofs_from_block_test(
+            &proof_system,
+            &exec_payload,
+            vec![0, 1, 2], // Test subnets
+        ).await;
+
+        assert!(result.is_ok());
+
+        // Verify proofs were stored
+        let proof_count = proof_system.store.proof_count_for_payload(&execution_block_hash).await;
+        assert_eq!(proof_count, 3); // One for each subnet
+
+        // Verify we can retrieve the proofs
+        let proofs = proof_system.store.get_proofs(&execution_block_hash).await;
+        assert_eq!(proofs.len(), 3);
+        
+        // Check proof IDs match subnets
+        let proof_ids: Vec<u64> = proofs.iter().map(|p| p.proof_id.id()).collect();
+        assert!(proof_ids.contains(&0));
+        assert!(proof_ids.contains(&1));
+        assert!(proof_ids.contains(&2));
+    }
+
+    // Helper function for testing proof generation without spawning tasks
+    async fn generate_and_store_execution_proofs_from_block_test(
+        proof_system: &Arc<lighthouse_proofs::ProofSystem>,
+        payload: &ExecutionPayload<E>,
+        proof_subnets: Vec<u64>,
+    ) -> Result<(), String> {
+        let execution_block_hash = payload.block_hash();
+        let dummy_witness = format!("dummy_witness_for_block_{:?}", execution_block_hash).into_bytes();
+        let erased_payload = ErasedExecutionPayload::from_payload(payload);
+
+        for subnet_id in proof_subnets {
+            let proof_id = ProofId(subnet_id);
+            
+            match proof_system.generator()
+                .generate_proof(&erased_payload, &dummy_witness, proof_id)
+                .await
+            {
+                Ok(proof) => {
+                    proof_system.store.store_proof(proof).await
+                        .map_err(|e| format!("Failed to store proof: {}", e))?;
+                }
+                Err(e) => {
+                    return Err(format!("Failed to generate proof: {}", e));
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
