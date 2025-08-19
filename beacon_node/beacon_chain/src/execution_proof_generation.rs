@@ -6,7 +6,7 @@
 
 use tracing::debug;
 use types::{
-    execution_proof_subnet_id::ExecutionProofSubnetId, EthSpec, ExecutionPayload, ExecutionProof,
+    execution_proof_subnet_id::ExecutionProofSubnetId, EthSpec, ExecutionPayload, ExecutionProof, Hash256,
 };
 
 /// Generate a proof for an execution payload
@@ -18,6 +18,7 @@ use types::{
 /// and can be easily serialized for sending to external systems.
 /// The execution_state_witness would be obtained from the EL (e.g., via debug_executionWitness)
 pub async fn generate_proof<T: EthSpec>(
+    block_root: Hash256,
     payload: &ExecutionPayload<T>,
     execution_state_witness: &[u8],
     proof_id: ExecutionProofSubnetId,
@@ -52,7 +53,7 @@ pub async fn generate_proof<T: EthSpec>(
     )
     .into_bytes();
 
-    ExecutionProof::new(execution_block_hash, proof_id, 1, dummy_data)
+    ExecutionProof::new(block_root, execution_block_hash, proof_id, 1, dummy_data)
 }
 
 /// Validate a proof (placeholder implementation)

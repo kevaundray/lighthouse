@@ -3,7 +3,6 @@ use crate::beacon_chain::{
 };
 use crate::beacon_proposer_cache::BeaconProposerCache;
 use crate::data_availability_checker::DataAvailabilityChecker;
-use crate::execution_proof_store::ExecutionPayloadProofStore;
 use crate::fork_choice_signal::ForkChoiceSignalTx;
 use crate::fork_revert::{reset_fork_choice_to_finalization, revert_to_fork_boundary};
 use crate::graffiti_calculator::{GraffitiCalculator, GraffitiOrigin};
@@ -942,6 +941,13 @@ where
         };
         debug!(?custody_context, "Loading persisted custody context");
 
+        // Extract execution proof requirements before moving chain_config
+        let min_execution_proofs_required = if self.chain_config.stateless_validation {
+            Some(self.chain_config.stateless_min_proofs_required)
+        } else {
+            None
+        };
+
         let beacon_chain = BeaconChain {
             spec: self.spec.clone(),
             config: self.chain_config,
@@ -980,10 +986,6 @@ where
             observed_attester_slashings: <_>::default(),
             observed_bls_to_execution_changes: <_>::default(),
             execution_layer: self.execution_layer.clone(),
-            // TODO: allow for persisting and loading from disk (when a block has been confirmed)
-            execution_payload_proof_store: Arc::new(ExecutionPayloadProofStore::new(
-                max_execution_payload_proofs,
-            )),
             genesis_validators_root,
             genesis_time,
             canonical_head,
@@ -1023,6 +1025,7 @@ where
                     store,
                     custody_context,
                     self.spec,
+                    min_execution_proofs_required,
                 )
                 .map_err(|e| format!("Error initializing DataAvailabilityChecker: {:?}", e))?,
             ),

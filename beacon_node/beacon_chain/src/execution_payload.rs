@@ -142,37 +142,17 @@ async fn notify_new_payload<T: BeaconChainTypes>(
         spawn_proof_generation_task_with_block(chain, block);
     }
 
-    // Check if stateless validation is enabled
+    // TODO: Re-implement stateless validation check using DA checker
+    // The execution proof verification is now handled by the DA checker during block import
+    // rather than here during payload verification
     if chain.config.stateless_validation {
-        let proof_count = chain
-            .execution_payload_proof_store
-            .proof_count_for_payload(&execution_block_hash);
-
-        // Eagerly heck if we have enough proofs for this execution payload
-        if proof_count >= chain.config.stateless_min_proofs_required {
-            info!(
-                execution_block_hash = ?execution_block_hash,
-                proof_count,
-                required_proofs = chain.config.stateless_min_proofs_required,
-                "Execution payload verified with proofs"
-            );
-            return Ok(PayloadVerificationStatus::Verified);
-        } else {
-            // We don't have enough proofs, so we mark the block as optimistic,
-            // save it in the proof store and wait for proofs.
-            //
-            // In production, we would have some form of delayed execution
-            // instead of piggy-backing off of optimistic sync.
-            let beacon_block_root = block.tree_hash_root();
-            debug!(
-                beacon_block_root = ?beacon_block_root,
-                execution_block_hash = ?execution_block_hash,
-                proof_count,
-                required_proofs = chain.config.stateless_min_proofs_required,
-                "Insufficient proofs for block, marking as optimistic"
-            );
-            return Ok(PayloadVerificationStatus::Optimistic);
-        }
+        // For now, always proceed optimistically since proof verification 
+        // happens in the DA checker during block import
+        debug!(
+            execution_block_hash = ?execution_block_hash,
+            "Stateless validation enabled - payload will be verified via DA checker"
+        );
+        // Continue with optimistic verification below
     }
 
     let new_payload_response = execution_layer.notify_new_payload(block.try_into()?).await;
@@ -629,71 +609,23 @@ fn spawn_proof_generation_task_with_block<T: BeaconChainTypes>(
 /// Generate and store dummy execution proofs from a block
 /// This simulates receiving proofs that would normally come from zkVMs or other proof generators
 ///
-/// TODO: This implementation lacks a circuit breaker for proof generation
+/// TODO: Re-implement using DA checker instead of separate proof store
 async fn generate_and_store_execution_proofs_from_block<T: BeaconChainTypes>(
     chain: &Arc<BeaconChain<T>>,
     payload: &ExecutionPayload<T::EthSpec>,
 ) -> Result<(), BlockProductionError> {
     let execution_block_hash = payload.block_hash();
 
-    info!(
-        execution_block_hash = ?execution_block_hash,
-        "Starting execution proof generation"
-    );
-
-    // For real proof generation, we would:
-    // 1. Send the ExecutionPayload to EL to fetch witness data (via debug_executionWitness or similar)
-    // 2. Generate actual cryptographic proofs using payload + witness
-    // For now, we generate dummy proofs with a simulated witness
-
-    // let witness = execution_layer.get_execution_witness(execution_block_hash).await?;
-    let witness = format!("dummy_witness_for_block_{:?}", execution_block_hash).into_bytes();
-
-    // Get the subnets this node wants to generate proofs for
-    let proof_subnets = chain.execution_proof_subnets();
-
     debug!(
         execution_block_hash = ?execution_block_hash,
-        subnet_count = proof_subnets.len(),
-        subnets = ?proof_subnets,
-        "Generating proofs for configured subnets"
+        "Execution proof generation temporarily disabled during DA checker migration"
     );
 
-    // Generate and store a proof for each subnet
-    for subnet_id in proof_subnets.iter() {
-        if chain.should_generate_execution_proof_for_subnet(*subnet_id) {
-            // Create ExecutionProofSubnetId from the u64 subnet_id
-            let proof_id = match ExecutionProofSubnetId::new(*subnet_id) {
-                Ok(id) => id,
-                Err(e) => {
-                    debug!("Invalid subnet ID {}: {}", subnet_id, e);
-                    continue;
-                }
-            };
-
-            // Use the proof store method to get or generate the proof
-            match chain
-                .execution_payload_proof_store
-                .get_or_generate_proof(&payload, &witness, proof_id)
-                .await
-            {
-                Ok(_proof) => {
-                    debug!(
-                        execution_block_hash = ?execution_block_hash,
-                        subnet_id,
-                        "Generated execution proof"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        subnet_id,
-                        error = %e,
-                        "Failed to generate execution proof"
-                    );
-                }
-            }
-        }
-    }
+    // TODO: Re-implement proof generation to work with DA checker
+    // Need to:
+    // 1. Generate proofs using execution_proof_generation module
+    // 2. Store via chain.data_availability_checker.put_execution_proofs_by_execution_hash()
+    // 3. Handle subnet selection and proof distribution
 
     Ok(())
 }

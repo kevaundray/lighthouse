@@ -2,7 +2,6 @@ use crate::compute_light_client_updates::{
     compute_light_client_updates, LIGHT_CLIENT_SERVER_CHANNEL_CAPACITY,
 };
 use crate::config::{ClientGenesis, Config as ClientConfig};
-use crate::execution_proof_broadcaster::start_execution_proof_broadcaster_service;
 use crate::notifier::spawn_notifier;
 use crate::Client;
 use beacon_chain::attestation_simulator::start_attestation_simulator_service;
@@ -778,19 +777,6 @@ where
                 beacon_chain.clone(),
             );
 
-            // Start the execution proof broadcaster service if we have network senders
-            // and we're in stateless validation mode
-            if let Some(network_senders) = &self.network_senders {
-                if beacon_chain.config.stateless_validation
-                    || beacon_chain.config.generate_execution_proofs
-                {
-                    start_execution_proof_broadcaster_service(
-                        runtime_context.executor.clone(),
-                        beacon_chain.clone(),
-                        network_senders.network_send(),
-                    );
-                }
-            }
         }
 
         Ok(Client {

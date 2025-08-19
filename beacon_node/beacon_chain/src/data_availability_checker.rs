@@ -17,8 +17,8 @@ use task_executor::TaskExecutor;
 use tracing::{debug, error, info_span, Instrument};
 use types::blob_sidecar::{BlobIdentifier, BlobSidecar, FixedBlobSidecarList};
 use types::{
-    BlobSidecarList, ChainSpec, DataColumnSidecar, DataColumnSidecarList, Epoch, EthSpec, Hash256,
-    RuntimeVariableList, SignedBeaconBlock,
+    BlobSidecarList, ChainSpec, DataColumnSidecar, DataColumnSidecarList, Epoch, EthSpec, 
+    ExecutionProof, Hash256, RuntimeVariableList, SignedBeaconBlock,
 };
 
 mod error;
@@ -89,20 +89,23 @@ pub enum DataColumnReconstructionResult<E: EthSpec> {
 
 /// This type is returned after adding a block / blob to the `DataAvailabilityChecker`.
 ///
-/// Indicates if the block is fully `Available` or if we need blobs or blocks
-///  to "complete" the requirements for an `AvailableBlock`.
-pub enum Availability<E: EthSpec> {
+/// Indicates if the block is ready for import or if we need blobs, columns, or execution proofs
+/// to "complete" the requirements for an importable block.
+pub enum Importability<E: EthSpec> {
     MissingComponents(Hash256),
-    Available(Box<AvailableExecutedBlock<E>>),
+    ReadyForImport(Box<AvailableExecutedBlock<E>>),
 }
 
-impl<E: EthSpec> Debug for Availability<E> {
+/// TODO: Temp alias for backward compatibility during migration
+pub type Availability<E> = Importability<E>;
+
+impl<E: EthSpec> Debug for Importability<E> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::MissingComponents(block_root) => {
                 write!(f, "MissingComponents({})", block_root)
             }
-            Self::Available(block) => write!(f, "Available({:?})", block.import_data.block_root),
+            Self::ReadyForImport(block) => write!(f, "ReadyForImport({:?})", block.import_data.block_root),
         }
     }
 }
@@ -114,12 +117,14 @@ impl<T: BeaconChainTypes> DataAvailabilityChecker<T> {
         store: BeaconStore<T>,
         custody_context: Arc<CustodyContext>,
         spec: Arc<ChainSpec>,
+        min_execution_proofs_required: Option<usize>,
     ) -> Result<Self, AvailabilityCheckError> {
         let inner = DataAvailabilityCheckerInner::new(
             OVERFLOW_LRU_CAPACITY,
             store,
             custody_context.clone(),
             spec.clone(),
+            min_execution_proofs_required,
         )?;
         Ok(Self {
             availability_cache: Arc::new(inner),
@@ -134,7 +139,7 @@ impl<T: BeaconChainTypes> DataAvailabilityChecker<T> {
         self.custody_context.clone()
     }
 
-    /// Checks if the block root is currenlty in the availability cache awaiting import because
+    /// Checks if the block root is currently in the availability cache awaiting import because
     /// of missing components.
     pub fn get_execution_valid_block(
         &self,
@@ -198,6 +203,23 @@ impl<T: BeaconChainTypes> DataAvailabilityChecker<T> {
     ) -> Option<DataColumnSidecarList<T::EthSpec>> {
         self.availability_cache.peek_data_columns(block_root)
     }
+
+    /// Put gossip verified execution proofs into the availability cache.
+    /// 
+    /// This allows stateless validation nodes to collect proofs for execution payloads.
+    pub fn put_gossip_verified_execution_proofs<I, O>(
+        &self,
+        block_root: Hash256,
+        execution_proofs: I,
+    ) -> Result<Availability<T::EthSpec>, AvailabilityCheckError> 
+    where
+        I: IntoIterator<Item = crate::execution_proof_verification::GossipVerifiedExecutionProof<T, O>>,
+        O: crate::observed_data_sidecars::ObservationStrategy,
+    {
+        self.availability_cache
+            .put_execution_proofs(block_root, execution_proofs.into_iter().map(|v| v.into_inner().into_inner()))
+    }
+
 
     /// Put a list of blobs received via RPC into the availability cache. This performs KZG
     /// verification on the blobs in the list.
@@ -331,6 +353,7 @@ impl<T: BeaconChainTypes> DataAvailabilityChecker<T> {
                     block,
                     blob_data: AvailableBlockData::Blobs(blob_list),
                     blobs_available_timestamp: None,
+                    proof_data: None,
                     spec: self.spec.clone(),
                 }))
             } else {
@@ -356,6 +379,7 @@ impl<T: BeaconChainTypes> DataAvailabilityChecker<T> {
                             .collect(),
                     ),
                     blobs_available_timestamp: None,
+                    proof_data: None,
                     spec: self.spec.clone(),
                 }))
             } else {
@@ -368,6 +392,7 @@ impl<T: BeaconChainTypes> DataAvailabilityChecker<T> {
             block,
             blob_data: AvailableBlockData::NoData,
             blobs_available_timestamp: None,
+            proof_data: None,
             spec: self.spec.clone(),
         }))
     }
@@ -425,6 +450,7 @@ impl<T: BeaconChainTypes> DataAvailabilityChecker<T> {
                         block,
                         blob_data: AvailableBlockData::Blobs(blobs),
                         blobs_available_timestamp: None,
+                        proof_data: None,
                         spec: self.spec.clone(),
                     })
                 } else {
@@ -439,6 +465,7 @@ impl<T: BeaconChainTypes> DataAvailabilityChecker<T> {
                             data_columns.into_iter().map(|d| d.into_inner()).collect(),
                         ),
                         blobs_available_timestamp: None,
+                        proof_data: None,
                         spec: self.spec.clone(),
                     })
                 } else {
@@ -450,6 +477,7 @@ impl<T: BeaconChainTypes> DataAvailabilityChecker<T> {
                     block,
                     blob_data: AvailableBlockData::NoData,
                     blobs_available_timestamp: None,
+                    proof_data: None,
                     spec: self.spec.clone(),
                 })
             };
@@ -700,6 +728,16 @@ pub enum AvailableBlockData<E: EthSpec> {
     DataColumns(DataColumnSidecarList<E>),
 }
 
+/// Execution proof data
+/// TODO: Rename to ImportableProofData
+#[derive(Debug, Clone)]
+pub struct AvailableProofData {
+    /// Execution proofs that were used to validate this block.
+    /// The number of proofs is at least `min_proofs_required` because 
+    /// that is needed for the block to be seen as available/importable.
+    pub execution_proofs: Vec<ExecutionProof>,
+}
+
 /// A fully available block that is ready to be imported into fork choice.
 #[derive(Debug)]
 pub struct AvailableBlock<E: EthSpec> {
@@ -708,6 +746,8 @@ pub struct AvailableBlock<E: EthSpec> {
     blob_data: AvailableBlockData<E>,
     /// Timestamp at which this block first became available (UNIX timestamp, time since 1970).
     blobs_available_timestamp: Option<Duration>,
+    /// Execution proof data for this block (if any)
+    pub proof_data: Option<AvailableProofData>,
     pub spec: Arc<ChainSpec>,
 }
 
@@ -723,6 +763,7 @@ impl<E: EthSpec> AvailableBlock<E> {
             block,
             blob_data: data,
             blobs_available_timestamp: None,
+            proof_data: None,
             spec,
         }
     }
@@ -774,6 +815,7 @@ impl<E: EthSpec> AvailableBlock<E> {
                 }
             },
             blobs_available_timestamp: self.blobs_available_timestamp,
+            proof_data: self.proof_data.clone(),
             spec: self.spec.clone(),
         })
     }
