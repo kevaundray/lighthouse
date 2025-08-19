@@ -2558,6 +2558,7 @@ async fn weak_subjectivity_sync_test(
                 block_root,
                 Arc::new(corrupt_block),
                 data,
+                None,
                 Arc::new(spec),
             )
         };

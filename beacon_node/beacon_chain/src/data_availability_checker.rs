@@ -763,6 +763,7 @@ impl<E: EthSpec> AvailableBlock<E> {
         block_root: Hash256,
         block: Arc<SignedBeaconBlock<E>>,
         data: AvailableBlockData<E>,
+        proof_data: Option<AvailableProofData>,
         spec: Arc<ChainSpec>,
     ) -> Self {
         Self {
@@ -770,7 +771,7 @@ impl<E: EthSpec> AvailableBlock<E> {
             block,
             blob_data: data,
             blobs_available_timestamp: None,
-            proof_data: None,
+            proof_data,
             spec,
         }
     }
