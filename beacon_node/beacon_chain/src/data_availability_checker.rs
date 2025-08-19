@@ -729,6 +729,10 @@ pub enum AvailableBlockData<E: EthSpec> {
 }
 
 /// Execution proof data
+/// 
+/// The proofs that were collected that convinced the node that the
+/// Block's execution payload was indeed valid.
+/// 
 /// TODO: Rename to ImportableProofData
 #[derive(Debug, Clone)]
 pub struct AvailableProofData {
@@ -746,7 +750,10 @@ pub struct AvailableBlock<E: EthSpec> {
     blob_data: AvailableBlockData<E>,
     /// Timestamp at which this block first became available (UNIX timestamp, time since 1970).
     blobs_available_timestamp: Option<Duration>,
-    /// Execution proof data for this block (if any)
+    /// Execution proof data for this block
+    /// 
+    /// TODO: This is optional because a node can opt to not receive proofs
+    /// TODO: and instead just rely on an EL.
     pub proof_data: Option<AvailableProofData>,
     pub spec: Arc<ChainSpec>,
 }
