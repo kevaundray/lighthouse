@@ -1049,6 +1049,7 @@ mod test {
                 test_store,
                 custody_context,
                 spec.clone(),
+                None,
             )
             .expect("should create cache"),
         );
