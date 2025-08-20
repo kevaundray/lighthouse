@@ -353,7 +353,7 @@ impl<T: BeaconChainTypes> DataAvailabilityChecker<T> {
                     block,
                     blob_data: AvailableBlockData::Blobs(blob_list),
                     blobs_available_timestamp: None,
-                    proof_data: None,
+                    proof_data: AvailableProofData::NoneRequired,
                     spec: self.spec.clone(),
                 }))
             } else {
@@ -379,7 +379,7 @@ impl<T: BeaconChainTypes> DataAvailabilityChecker<T> {
                             .collect(),
                     ),
                     blobs_available_timestamp: None,
-                    proof_data: None,
+                    proof_data: AvailableProofData::NoneRequired,
                     spec: self.spec.clone(),
                 }))
             } else {
@@ -392,7 +392,7 @@ impl<T: BeaconChainTypes> DataAvailabilityChecker<T> {
             block,
             blob_data: AvailableBlockData::NoData,
             blobs_available_timestamp: None,
-            proof_data: None,
+            proof_data: AvailableProofData::NoneRequired,
             spec: self.spec.clone(),
         }))
     }
@@ -450,7 +450,7 @@ impl<T: BeaconChainTypes> DataAvailabilityChecker<T> {
                         block,
                         blob_data: AvailableBlockData::Blobs(blobs),
                         blobs_available_timestamp: None,
-                        proof_data: None,
+                        proof_data: AvailableProofData::NoneRequired,
                         spec: self.spec.clone(),
                     })
                 } else {
@@ -465,7 +465,7 @@ impl<T: BeaconChainTypes> DataAvailabilityChecker<T> {
                             data_columns.into_iter().map(|d| d.into_inner()).collect(),
                         ),
                         blobs_available_timestamp: None,
-                        proof_data: None,
+                        proof_data: AvailableProofData::NoneRequired,
                         spec: self.spec.clone(),
                     })
                 } else {
@@ -477,7 +477,7 @@ impl<T: BeaconChainTypes> DataAvailabilityChecker<T> {
                     block,
                     blob_data: AvailableBlockData::NoData,
                     blobs_available_timestamp: None,
-                    proof_data: None,
+                    proof_data: AvailableProofData::NoneRequired,
                     spec: self.spec.clone(),
                 })
             };
@@ -735,11 +735,13 @@ pub enum AvailableBlockData<E: EthSpec> {
 /// 
 /// TODO: Rename to ImportableProofData
 #[derive(Debug, Clone)]
-pub struct AvailableProofData {
+pub enum AvailableProofData {
     /// Execution proofs that were used to validate this block.
     /// The number of proofs is at least `min_proofs_required` because 
     /// that is needed for the block to be seen as available/importable.
-    pub execution_proofs: Vec<ExecutionProof>,
+    Proofs(Vec<ExecutionProof>),
+    /// This is the case when the node opts to not receive proofs
+    NoneRequired
 }
 
 /// A fully available block that is ready to be imported into fork choice.
@@ -751,10 +753,7 @@ pub struct AvailableBlock<E: EthSpec> {
     /// Timestamp at which this block first became available (UNIX timestamp, time since 1970).
     blobs_available_timestamp: Option<Duration>,
     /// Execution proof data for this block
-    /// 
-    /// TODO: This is optional because a node can opt to not receive proofs
-    /// TODO: and instead just rely on an EL.
-    pub proof_data: Option<AvailableProofData>,
+    pub proof_data: AvailableProofData,
     pub spec: Arc<ChainSpec>,
 }
 
@@ -763,7 +762,7 @@ impl<E: EthSpec> AvailableBlock<E> {
         block_root: Hash256,
         block: Arc<SignedBeaconBlock<E>>,
         data: AvailableBlockData<E>,
-        proof_data: Option<AvailableProofData>,
+        proof_data: AvailableProofData,
         spec: Arc<ChainSpec>,
     ) -> Self {
         Self {
@@ -848,5 +847,199 @@ impl<E: EthSpec> MaybeAvailableBlock<E> {
             Self::Available(block) => block.block_cloned(),
             Self::AvailabilityPending { block, .. } => block.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod basic_tests_remove {
+    use super::*;
+    use crate::execution_proof_verification::VerifiedExecutionProof;
+    use crate::test_utils::{generate_rand_block_and_blobs, NumBlobs};
+    use std::time::Duration;
+    use types::{
+        ExecutionBlockHash, Hash256, MainnetEthSpec,
+    };
+    use types::execution_proof_subnet_id::ExecutionProofSubnetId;
+
+    type E = MainnetEthSpec;
+
+    fn create_test_execution_proof(block_root: Hash256, subnet_id: u64) -> ExecutionProof {
+        ExecutionProof::new(
+            block_root,
+            ExecutionBlockHash::from(Hash256::random()),
+            ExecutionProofSubnetId::new(subnet_id).unwrap(),
+            1,
+            vec![1, 2, 3, 4], // Mock proof data
+        )
+    }
+
+    fn create_verified_execution_proof(block_root: Hash256, subnet_id: u64) -> VerifiedExecutionProof {
+        let proof = create_test_execution_proof(block_root, subnet_id);
+        VerifiedExecutionProof::new(proof, Duration::from_secs(0))
+    }
+
+    #[test]
+    fn test_available_proof_data_creation() {
+        let block_root = Hash256::random();
+        let proofs = vec![
+            create_test_execution_proof(block_root, 0),
+            create_test_execution_proof(block_root, 1),
+            create_test_execution_proof(block_root, 2),
+        ];
+
+        let proof_data = AvailableProofData::Proofs(proofs.clone());
+
+        match &proof_data {
+            AvailableProofData::Proofs(execution_proofs) => {
+                assert_eq!(execution_proofs.len(), 3);
+                assert_eq!(execution_proofs[0].subnet_id, ExecutionProofSubnetId::new(0).unwrap());
+                assert_eq!(execution_proofs[1].subnet_id, ExecutionProofSubnetId::new(1).unwrap());
+                assert_eq!(execution_proofs[2].subnet_id, ExecutionProofSubnetId::new(2).unwrap());
+            }
+            AvailableProofData::NoneRequired => {
+                panic!("Expected proofs but got NoneRequired");
+            }
+        }
+    }
+
+    #[test]
+    fn test_available_block_with_proof_data() {
+        let block_root = Hash256::random();
+        let mock_block = Arc::new(generate_rand_block_and_blobs::<E>(
+            types::ForkName::Bellatrix, 
+            NumBlobs::None,
+            &mut rand::thread_rng(),
+            &types::ChainSpec::mainnet()
+        ).0);
+
+        let proof_data = AvailableProofData::Proofs(vec![
+            create_test_execution_proof(block_root, 0),
+            create_test_execution_proof(block_root, 1),
+        ]);
+
+        let available_block = AvailableBlock {
+            block_root,
+            block: mock_block,
+            blob_data: AvailableBlockData::NoData,
+            blobs_available_timestamp: None,
+            proof_data,
+            spec: Arc::new(types::ChainSpec::mainnet()),
+        };
+
+        assert_eq!(available_block.block_root, block_root);
+        match &available_block.proof_data {
+            AvailableProofData::Proofs(proofs) => {
+                assert_eq!(proofs.len(), 2);
+            }
+            AvailableProofData::NoneRequired => {
+                panic!("Expected proofs but got NoneRequired");
+            }
+        }
+    }
+
+    #[test]
+    fn test_available_block_testing_constructor_with_proofs() {
+        let block_root = Hash256::random();
+        let mock_block = Arc::new(generate_rand_block_and_blobs::<E>(
+            types::ForkName::Bellatrix,
+            NumBlobs::None,
+            &mut rand::thread_rng(),
+            &types::ChainSpec::mainnet()
+        ).0);
+
+        let proof_data = AvailableProofData::Proofs(
+            vec![create_test_execution_proof(block_root, 0)]
+        );
+
+        let available_block = AvailableBlock::__new_for_testing(
+            block_root,
+            mock_block,
+            AvailableBlockData::NoData,
+            proof_data,
+            Arc::new(types::ChainSpec::mainnet()),
+        );
+
+        match &available_block.proof_data {
+            AvailableProofData::Proofs(proofs) => {
+                assert_eq!(proofs.len(), 1);
+            }
+            AvailableProofData::NoneRequired => {
+                panic!("Expected proofs but got NoneRequired");
+            }
+        }
+    }
+
+    #[test]
+    fn test_available_block_testing_constructor_without_proofs() {
+        let block_root = Hash256::random();
+        let mock_block = Arc::new(generate_rand_block_and_blobs::<E>(
+            types::ForkName::Bellatrix, 
+            NumBlobs::None,
+            &mut rand::thread_rng(),
+            &types::ChainSpec::mainnet()
+        ).0);
+
+        let available_block = AvailableBlock::__new_for_testing(
+            block_root,
+            mock_block,
+            AvailableBlockData::NoData,
+            AvailableProofData::NoneRequired, // No execution proof data
+            Arc::new(types::ChainSpec::mainnet()),
+        );
+
+        match &available_block.proof_data {
+            AvailableProofData::NoneRequired => {
+                // This is expected for this test
+            }
+            AvailableProofData::Proofs(_) => {
+                panic!("Expected NoneRequired but got Proofs");
+            }
+        }
+    }
+
+    #[test]
+    fn test_execution_proof_block_root_consistency() {
+        let block_root = Hash256::random();
+        let different_block_root = Hash256::random();
+        
+        // Proof with correct block root
+        let correct_proof = create_test_execution_proof(block_root, 0);
+        assert_eq!(correct_proof.block_root, block_root);
+        
+        // Proof with different block root  
+        let different_proof = create_test_execution_proof(different_block_root, 0);
+        assert_eq!(different_proof.block_root, different_block_root);
+        assert_ne!(correct_proof.block_root, different_proof.block_root);
+    }
+
+    #[test]
+    fn test_importability_debug_formatting() {
+        let block_root = Hash256::random();
+        
+        // Test MissingComponents variant
+        let missing = Importability::<E>::MissingComponents(block_root);
+        let debug_str = format!("{:?}", missing);
+        assert!(debug_str.contains("MissingComponents"));
+        assert!(debug_str.contains(&format!("{:?}", block_root)));
+
+        // Note: ReadyForImport variant is harder to test without complex setup
+        // since it requires AvailableExecutedBlock which needs full block construction
+    }
+
+    #[test]
+    fn test_verified_execution_proof_wrapper() {
+        let block_root = Hash256::random();
+        let original_proof = create_test_execution_proof(block_root, 1);
+        let seen_time = Duration::from_secs(12345);
+        
+        let verified_proof = VerifiedExecutionProof::new(original_proof.clone(), seen_time);
+        
+        assert_eq!(verified_proof.as_proof().block_root, block_root);
+        assert_eq!(verified_proof.as_proof().subnet_id, original_proof.subnet_id);
+        assert_eq!(verified_proof.seen_timestamp(), seen_time);
+        
+        // Test into_inner
+        let inner_proof = verified_proof.into_inner();
+        assert_eq!(inner_proof.block_root, block_root);
     }
 }

@@ -19,7 +19,7 @@ use tracing::debug;
 use types::blob_sidecar::BlobIdentifier;
 use types::{
     BlobSidecar, ChainSpec, ColumnIndex, DataColumnSidecar, DataColumnSidecarList, Epoch, EthSpec,
-    ExecutionProof, FixedBytesExtended, Hash256, RuntimeFixedVector, 
+    ExecutionProof, Hash256, RuntimeFixedVector, 
     RuntimeVariableList, SignedBeaconBlock,
 };
 use types::execution_proof_subnet_id::ExecutionProofSubnetId;
@@ -27,7 +27,7 @@ use types::execution_proof_subnet_id::ExecutionProofSubnetId;
 /// This represents the components of a partially available block
 ///
 /// The blobs are all gossip and kzg verified.
-/// The block has completed all verifications except the availability check.
+/// The block has completed all verifications except the availability and execution payload check.
 pub struct PendingComponents<E: EthSpec> {
     pub block_root: Hash256,
     pub verified_blobs: RuntimeFixedVector<Option<KzgVerifiedBlob<E>>>,
@@ -122,16 +122,23 @@ impl<E: EthSpec> PendingComponents<E> {
     /// 1. The blob entry at the index is empty and no block exists, or
     /// 2. The block exists and its commitment matches the blob's commitment.
     pub fn merge_single_blob(&mut self, index: usize, blob: KzgVerifiedBlob<E>) {
-        if let Some(cached_block) = self.get_cached_block() {
-            let block_commitment_opt = cached_block.get_commitments().get(index).copied();
-            if let Some(block_commitment) = block_commitment_opt {
-                if block_commitment == *blob.get_commitment() {
-                    self.insert_blob_at_index(index, blob)
-                }
+        // Case 1: No cached block - insert blob if slot is empty
+        let Some(cached_block) = self.get_cached_block() else {
+            if !self.blob_exists(index) {
+                self.insert_blob_at_index(index, blob);
             }
-        } else if !self.blob_exists(index) {
-            self.insert_blob_at_index(index, blob)
+            return;
+        };
+
+        // Case 2: Block exists - check commitment matches
+        let Some(block_commitment) = cached_block.get_commitments().get(index).copied() else {
+            return; // Invalid index for this block
+        };
+
+        if block_commitment == *blob.get_commitment() {
+            self.insert_blob_at_index(index, blob);
         }
+        // Silently drop blob if commitment doesn't match
     }
 
     /// Merges a given set of data columns into the cache.
@@ -198,89 +205,126 @@ impl<E: EthSpec> PendingComponents<E> {
             DietAvailabilityPendingExecutedBlock<E>,
         ) -> Result<AvailabilityPendingExecutedBlock<E>, AvailabilityCheckError>,
     {
+        // Early exit: No block cached yet
         let Some(block) = &self.executed_block else {
-            // Block not available yet
             return Ok(None);
         };
 
-        let num_expected_blobs = block.num_blobs_expected();
-        let num_expected_columns = num_expected_columns as usize;
-        let blob_data = if num_expected_blobs == 0 {
-            Some(AvailableBlockData::NoData)
-        } else if spec.is_peer_das_enabled_for_epoch(block.epoch()) {
-            let num_received_columns = self.verified_data_columns.len();
-            match num_received_columns.cmp(&num_expected_columns) {
-                Ordering::Greater => {
-                    // Should never happen
-                    return Err(AvailabilityCheckError::Unexpected(format!(
-                        "too many columns got {num_received_columns} expected {num_expected_columns}"
-                    )));
-                }
-                Ordering::Equal => {
-                    // Block is post-peerdas, and we got enough columns
-                    let data_columns = self
-                        .verified_data_columns
-                        .iter()
-                        .map(|d| d.clone().into_inner())
-                        .collect::<Vec<_>>();
-                    Some(AvailableBlockData::DataColumns(data_columns))
-                }
-                Ordering::Less => {
-                    // Not enough data columns received yet
-                    None
-                }
-            }
-        } else {
-            // Before PeerDAS, blobs
-            let num_received_blobs = self.verified_blobs.iter().flatten().count();
-            match num_received_blobs.cmp(&num_expected_blobs) {
-                Ordering::Greater => {
-                    // Should never happen
-                    return Err(AvailabilityCheckError::Unexpected(format!(
-                        "too many blobs got {num_received_blobs} expected {num_expected_blobs}"
-                    )));
-                }
-                Ordering::Equal => {
-                    let max_blobs = spec.max_blobs_per_block(block.epoch()) as usize;
-                    let blobs_vec = self
-                        .verified_blobs
-                        .iter()
-                        .flatten()
-                        .map(|blob| blob.clone().to_blob())
-                        .collect::<Vec<_>>();
-                    let blobs_len = blobs_vec.len();
-                    let blobs = RuntimeVariableList::new(blobs_vec, max_blobs).map_err(|_| {
-                        AvailabilityCheckError::Unexpected(format!(
-                            "over max_blobs len {blobs_len} max {max_blobs}"
-                        ))
-                    })?;
-                    Some(AvailableBlockData::Blobs(blobs))
-                }
-                Ordering::Less => {
-                    // Not enough blobs received yet
-                    None
-                }
-            }
-        };
-
-        // Block's data not available yet
+        // Check if all required components are available
+        let blob_data = self.check_blob_data_availability(spec, block, num_expected_columns as usize)?;
         let Some(blob_data) = blob_data else {
-            return Ok(None);
+            return Ok(None); // Missing blobs/columns
         };
 
         // Check execution proof requirements
-        let _current_epoch = block.epoch();
         if let Some(min_proofs_required) = min_execution_proofs_required {
             if !self.has_sufficient_execution_proofs(min_proofs_required) {
-                // Not enough execution proofs yet
-                return Ok(None);
+                return Ok(None); // Missing execution proofs
             }
         }
-        // TODO: Add spec.is_execution_proofs_required_for_epoch(current_epoch) check
 
-        // Block is available, construct `AvailableExecutedBlock`
+        // All components available - recover full block state
+        let recovered_block = recover(block.clone())?;
+        
+        // Construct the final available block
+        Ok(Some(self.create_available_executed_block(
+            spec,
+            blob_data,
+            recovered_block,
+        )))
+    }
 
-        let blobs_available_timestamp = match blob_data {
+    /// Check if blob/column data requirements are satisfied
+    fn check_blob_data_availability(
+        &self,
+        spec: &Arc<ChainSpec>,
+        block: &DietAvailabilityPendingExecutedBlock<E>,
+        num_expected_columns: usize,
+    ) -> Result<Option<AvailableBlockData<E>>, AvailabilityCheckError> {
+        let num_expected_blobs = block.num_blobs_expected();
+
+        // Pre-Deneb: No additional data required
+        if num_expected_blobs == 0 {
+            return Ok(Some(AvailableBlockData::NoData));
+        }
+
+        // Post-PeerDAS: Check data columns
+        if spec.is_peer_das_enabled_for_epoch(block.epoch()) {
+            return self.check_data_column_availability(num_expected_columns);
+        }
+
+        // Deneb era: Check blobs
+        self.check_blob_availability(spec, block, num_expected_blobs)
+    }
+
+    /// Check data column availability (PeerDAS era)
+    fn check_data_column_availability(
+        &self,
+        num_expected_columns: usize,
+    ) -> Result<Option<AvailableBlockData<E>>, AvailabilityCheckError> {
+        let num_received_columns = self.verified_data_columns.len();
+
+        match num_received_columns.cmp(&num_expected_columns) {
+            Ordering::Greater => {
+                Err(AvailabilityCheckError::Unexpected(format!(
+                    "too many columns got {num_received_columns} expected {num_expected_columns}"
+                )))
+            }
+            Ordering::Equal => {
+                let data_columns = self
+                    .verified_data_columns
+                    .iter()
+                    .map(|d| d.clone().into_inner())
+                    .collect::<Vec<_>>();
+                Ok(Some(AvailableBlockData::DataColumns(data_columns)))
+            }
+            Ordering::Less => Ok(None), // Not enough columns yet
+        }
+    }
+
+    /// Check blob availability (Deneb era)
+    fn check_blob_availability(
+        &self,
+        spec: &Arc<ChainSpec>,
+        block: &DietAvailabilityPendingExecutedBlock<E>,
+        num_expected_blobs: usize,
+    ) -> Result<Option<AvailableBlockData<E>>, AvailabilityCheckError> {
+        let num_received_blobs = self.verified_blobs.iter().flatten().count();
+
+        match num_received_blobs.cmp(&num_expected_blobs) {
+            Ordering::Greater => {
+                Err(AvailabilityCheckError::Unexpected(format!(
+                    "too many blobs got {num_received_blobs} expected {num_expected_blobs}"
+                )))
+            }
+            Ordering::Equal => {
+                let max_blobs = spec.max_blobs_per_block(block.epoch()) as usize;
+                let blobs_vec = self
+                    .verified_blobs
+                    .iter()
+                    .flatten()
+                    .map(|blob| blob.clone().to_blob())
+                    .collect::<Vec<_>>();
+                let blobs_len = blobs_vec.len();
+                let blobs = RuntimeVariableList::new(blobs_vec, max_blobs).map_err(|_| {
+                    AvailabilityCheckError::Unexpected(format!(
+                        "over max_blobs len {blobs_len} max {max_blobs}"
+                    ))
+                })?;
+                Ok(Some(AvailableBlockData::Blobs(blobs)))
+            }
+            Ordering::Less => Ok(None), // Not enough blobs yet
+        }
+    }
+
+    /// Create the final AvailableExecutedBlock with all components
+    fn create_available_executed_block(
+        &self,
+        spec: &Arc<ChainSpec>,
+        blob_data: AvailableBlockData<E>,
+        recovered_block: AvailabilityPendingExecutedBlock<E>,
+    ) -> AvailableExecutedBlock<E> {
+        let blobs_available_timestamp = match &blob_data {
             AvailableBlockData::NoData => None,
             AvailableBlockData::Blobs(_) => self
                 .verified_blobs
@@ -288,24 +332,22 @@ impl<E: EthSpec> PendingComponents<E> {
                 .flatten()
                 .map(|blob| blob.seen_timestamp())
                 .max(),
-            // TODO(das): To be fixed with https://github.com/sigp/lighthouse/pull/6850
-            AvailableBlockData::DataColumns(_) => None,
+            AvailableBlockData::DataColumns(_) => None, // TODO: Track column timestamps
+        };
+
+        let proof_data = if !self.verified_execution_proofs.is_empty() {
+            AvailableProofData::Proofs(
+                self.verified_execution_proofs.values().cloned().collect(),
+            )
+        } else {
+            AvailableProofData::NoneRequired
         };
 
         let AvailabilityPendingExecutedBlock {
             block,
             import_data,
             payload_verification_outcome,
-        } = recover(block.clone())?;
-
-        // Create proof data if execution proofs were required and collected
-        let proof_data = if !self.verified_execution_proofs.is_empty() {
-            Some(AvailableProofData {
-                execution_proofs: self.verified_execution_proofs.values().cloned().collect(),
-            })
-        } else {
-            None
-        };
+        } = recovered_block;
 
         let available_block = AvailableBlock {
             block_root: self.block_root,
@@ -315,11 +357,8 @@ impl<E: EthSpec> PendingComponents<E> {
             proof_data,
             spec: spec.clone(),
         };
-        Ok(Some(AvailableExecutedBlock::new(
-            available_block,
-            import_data,
-            payload_verification_outcome,
-        )))
+
+        AvailableExecutedBlock::new(available_block, import_data, payload_verification_outcome)
     }
 
     /// Returns an empty `PendingComponents` object with the given block root.
@@ -336,28 +375,25 @@ impl<E: EthSpec> PendingComponents<E> {
 
     /// Returns the epoch of the block if it is cached, otherwise returns the epoch of the first blob.
     pub fn epoch(&self) -> Option<Epoch> {
-        self.executed_block
-            .as_ref()
-            .map(|pending_block| pending_block.as_block().epoch())
-            .or_else(|| {
-                for maybe_blob in self.verified_blobs.iter() {
-                    if maybe_blob.is_some() {
-                        return maybe_blob.as_ref().map(|kzg_verified_blob| {
-                            kzg_verified_blob
-                                .as_blob()
-                                .slot()
-                                .epoch(E::slots_per_epoch())
-                        });
-                    }
-                }
+        // Primary source: Get epoch from cached executed block
+        if let Some(executed_block) = &self.executed_block {
+            return Some(executed_block.as_block().epoch());
+        }
 
-                if let Some(kzg_verified_data_column) = self.verified_data_columns.first() {
-                    let epoch = kzg_verified_data_column.as_data_column().epoch();
-                    return Some(epoch);
-                }
+        // Fallback 1: Get epoch from first available blob
+        for maybe_blob in &self.verified_blobs {
+            if let Some(blob) = maybe_blob {
+                return Some(blob.as_blob().slot().epoch(E::slots_per_epoch()));
+            }
+        }
 
-                None
-            })
+        // Fallback 2: Get epoch from first available data column
+        if let Some(data_column) = self.verified_data_columns.first() {
+            return Some(data_column.as_data_column().epoch());
+        }
+
+        // No components available - cannot determine epoch
+        None
     }
 
     pub fn status_str(
