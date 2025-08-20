@@ -142,17 +142,12 @@ async fn notify_new_payload<T: BeaconChainTypes>(
         spawn_proof_generation_task_with_block(chain, block);
     }
 
-    // TODO: Re-implement stateless validation check using DA checker
-    // The execution proof verification is now handled by the DA checker during block import
-    // rather than here during payload verification
     if chain.config.stateless_validation {
-        // For now, always proceed optimistically since proof verification 
-        // happens in the DA checker during block import
         debug!(
             execution_block_hash = ?execution_block_hash,
-            "Stateless validation enabled - payload will be verified via DA checker"
+            "Stateless validation enabled - marking payload as optimistic DA checker will check for proofs"
         );
-        // Continue with optimistic verification below
+        return Ok(PayloadVerificationStatus::Optimistic);
     }
 
     let new_payload_response = execution_layer.notify_new_payload(block.try_into()?).await;
