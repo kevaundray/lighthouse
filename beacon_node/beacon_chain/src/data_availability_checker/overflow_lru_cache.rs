@@ -217,7 +217,7 @@ impl<E: EthSpec> PendingComponents<E> {
         };
 
         // Check execution proof requirements
-        let proof_data = self.check_proof_availability(min_execution_proofs_required);
+        let proof_data = self.check_proof_availability(min_execution_proofs_required)?;
         let Some(proof_data) = proof_data else {
             return Ok(None); // Missing execution proofs
         };
@@ -259,21 +259,36 @@ impl<E: EthSpec> PendingComponents<E> {
 
     /// Check execution proof availability
     /// 
-    /// Returns `None` if execution proofs are required and we do not have enough
-    fn check_proof_availability(&self, min_execution_proofs_required: Option<usize>) -> Option<AvailableProofData> {
-        let Some(min_proofs_required) = min_execution_proofs_required else {
+    /// TODO: availability here might be confusing because it uses the literal meaning "available"
+    /// TODO: whereas its not the same data availability
+    fn check_proof_availability(
+        &self,
+        min_execution_proofs_required: Option<usize>,
+    ) -> Result<Option<AvailableProofData>, AvailabilityCheckError> {
+        let Some(num_expected_proofs) = min_execution_proofs_required else {
             // No execution proofs required
-            return Some(AvailableProofData::NoneRequired);
+            return Ok(Some(AvailableProofData::NoneRequired));
         };
 
-        if self.has_sufficient_execution_proofs(min_proofs_required) {
-            // Sufficient proofs available
-            Some(AvailableProofData::Proofs(
-                self.verified_execution_proofs.values().cloned().collect()
-            ))
-        } else {
-            // Not enough proofs yet
-            None
+        let num_received_proofs = self.verified_execution_proofs.len();
+
+        match num_received_proofs.cmp(&num_expected_proofs) {
+            Ordering::Greater => {
+                // This is okay - we have more proofs than required
+                Ok(Some(AvailableProofData::Proofs(
+                    self.verified_execution_proofs.values().cloned().collect()
+                )))
+            }
+            Ordering::Equal => {
+                // Exact number of proofs required
+                Ok(Some(AvailableProofData::Proofs(
+                    self.verified_execution_proofs.values().cloned().collect()
+                )))
+            }
+            Ordering::Less => {
+                // Not enough execution proofs yet
+                Ok(None)
+            }
         }
     }
 
