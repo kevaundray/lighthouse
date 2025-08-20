@@ -174,11 +174,6 @@ impl<E: EthSpec> PendingComponents<E> {
         self.verified_execution_proofs.len()
     }
 
-    /// Checks if sufficient execution proofs are available
-    pub fn has_sufficient_execution_proofs(&self, min_required: usize) -> bool {
-        self.execution_proof_count() >= min_required
-    }
-
     /// Inserts a new block and revalidates the existing blobs against it.
     ///
     /// Blobs that don't match the new block's commitments are evicted.
