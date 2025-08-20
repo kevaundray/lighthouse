@@ -217,11 +217,10 @@ impl<E: EthSpec> PendingComponents<E> {
         };
 
         // Check execution proof requirements
-        if let Some(min_proofs_required) = min_execution_proofs_required {
-            if !self.has_sufficient_execution_proofs(min_proofs_required) {
-                return Ok(None); // Missing execution proofs
-            }
-        }
+        let proof_data = self.check_proof_availability(min_execution_proofs_required);
+        let Some(proof_data) = proof_data else {
+            return Ok(None); // Missing execution proofs
+        };
 
         // All components available - recover full block state
         let recovered_block = recover(block.clone())?;
@@ -230,6 +229,7 @@ impl<E: EthSpec> PendingComponents<E> {
         Ok(Some(self.create_available_executed_block(
             spec,
             blob_data,
+            proof_data,
             recovered_block,
         )))
     }
@@ -255,6 +255,26 @@ impl<E: EthSpec> PendingComponents<E> {
 
         // Deneb era: Check blobs
         self.check_blob_availability(spec, block, num_expected_blobs)
+    }
+
+    /// Check execution proof availability
+    /// 
+    /// Returns `None` if execution proofs are required and we do not have enough
+    fn check_proof_availability(&self, min_execution_proofs_required: Option<usize>) -> Option<AvailableProofData> {
+        let Some(min_proofs_required) = min_execution_proofs_required else {
+            // No execution proofs required
+            return Some(AvailableProofData::NoneRequired);
+        };
+
+        if self.has_sufficient_execution_proofs(min_proofs_required) {
+            // Sufficient proofs available
+            Some(AvailableProofData::Proofs(
+                self.verified_execution_proofs.values().cloned().collect()
+            ))
+        } else {
+            // Not enough proofs yet
+            None
+        }
     }
 
     /// Check data column availability (PeerDAS era)
@@ -322,6 +342,7 @@ impl<E: EthSpec> PendingComponents<E> {
         &self,
         spec: &Arc<ChainSpec>,
         blob_data: AvailableBlockData<E>,
+        proof_data: AvailableProofData,
         recovered_block: AvailabilityPendingExecutedBlock<E>,
     ) -> AvailableExecutedBlock<E> {
         let blobs_available_timestamp = match &blob_data {
@@ -332,15 +353,7 @@ impl<E: EthSpec> PendingComponents<E> {
                 .flatten()
                 .map(|blob| blob.seen_timestamp())
                 .max(),
-            AvailableBlockData::DataColumns(_) => None, // TODO: Track column timestamps
-        };
-
-        let proof_data = if !self.verified_execution_proofs.is_empty() {
-            AvailableProofData::Proofs(
-                self.verified_execution_proofs.values().cloned().collect(),
-            )
-        } else {
-            AvailableProofData::NoneRequired
+            AvailableBlockData::DataColumns(_) => None,
         };
 
         let AvailabilityPendingExecutedBlock {
