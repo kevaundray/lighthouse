@@ -3254,7 +3254,7 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
             }
         };
 
-        // Store the verified proof in the data availability checker (now works like blobs!)
+        // Store the verified proof in the data availability checker
         let block_root = verified_proof.block_root();
         
         // Extract proof data for re-broadcasting before moving verified_proof
