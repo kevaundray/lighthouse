@@ -501,6 +501,19 @@ impl<T: BeaconChainTypes> DataAvailabilityChecker<T> {
         self.da_check_required_for_epoch(epoch) && self.spec.is_peer_das_enabled_for_epoch(epoch)
     }
 
+    /// Determines the execution proof requirements for an epoch.
+    /// - If the epoch is from prior to the data availability boundary, no execution proofs are required.
+    /// - This allows historical blocks to sync without waiting for execution proofs.
+    pub fn execution_proofs_required_for_epoch(&self, epoch: Epoch) -> bool {
+        self.da_check_required_for_epoch(epoch) // Only for recent blocks within DA boundary
+    }
+
+    /// Get execution proofs that are ready for broadcasting
+    /// Returns proofs that have been stored but not yet broadcast to the network
+    pub fn take_unbroadcast_execution_proofs(&self) -> Vec<(Hash256, types::ExecutionProof)> {
+        self.availability_cache.take_unbroadcast_execution_proofs()
+    }
+
     /// See `Self::blobs_required_for_epoch`
     fn blobs_required_for_block(&self, block: &SignedBeaconBlock<T::EthSpec>) -> bool {
         block.num_expected_blobs() > 0 && self.blobs_required_for_epoch(block.epoch())

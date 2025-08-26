@@ -11,7 +11,7 @@ use crate::BeaconChainTypes;
 use crate::CustodyContext;
 use lru::LruCache;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::cmp::Ordering;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -156,23 +156,30 @@ impl<E: EthSpec> PendingComponents<E> {
 
     /// Merges execution proofs into the cache.
     /// Only inserts proofs that are structurally valid and not already present.
+    /// Returns the newly added proofs for queueing. (TODO: This will be removed in the future for proper proof broadcasting)
     pub fn merge_execution_proofs<I: IntoIterator<Item = ExecutionProof>>(
         &mut self,
         execution_proofs: I,
-    ) -> Result<(), AvailabilityCheckError> {
+    ) -> Result<Vec<ExecutionProof>, AvailabilityCheckError> {
+        let mut newly_added_proofs = Vec::new();
+        
         for proof in execution_proofs {
+            // TODO: Check the proof, not just structure
             if proof.is_structurally_valid() 
                 && !self.verified_execution_proofs.contains_key(&proof.subnet_id) {
-                self.verified_execution_proofs.insert(proof.subnet_id, proof);
+                self.verified_execution_proofs.insert(proof.subnet_id, proof.clone());
+                newly_added_proofs.push(proof);
             }
         }
-        Ok(())
+        
+        Ok(newly_added_proofs)
     }
 
     /// Returns the number of execution proofs for this block
     pub fn execution_proof_count(&self) -> usize {
         self.verified_execution_proofs.len()
     }
+
 
     /// Inserts a new block and revalidates the existing blobs against it.
     ///
@@ -212,7 +219,11 @@ impl<E: EthSpec> PendingComponents<E> {
         };
 
         // Check execution proof requirements
-        let proof_data = self.check_proof_availability(min_execution_proofs_required)?;
+        let proof_data = self.check_proof_availability(
+            spec,
+            block,
+            min_execution_proofs_required
+        )?;
         let Some(proof_data) = proof_data else {
             return Ok(None); // Missing execution proofs
         };
@@ -252,16 +263,30 @@ impl<E: EthSpec> PendingComponents<E> {
         self.check_blob_availability(spec, block, num_expected_blobs)
     }
 
+
     /// Check execution proof availability
     /// 
+    /// TODO: Currently uses DA epoch to determine if proofs should be allowed
     /// TODO: availability here might be confusing because it uses the literal meaning "available"
     /// TODO: whereas its not the same data availability
     fn check_proof_availability(
         &self,
+        spec: &Arc<ChainSpec>,
+        block: &DietAvailabilityPendingExecutedBlock<E>,
         min_execution_proofs_required: Option<usize>,
     ) -> Result<Option<AvailableProofData>, AvailabilityCheckError> {
+        // Check DA boundary like blobs/columns do
+        let current_epoch = block.epoch();
+        let da_boundary = spec.min_epoch_data_availability_boundary(current_epoch);
+        let within_da_boundary = da_boundary.is_some_and(|da_epoch| block.epoch() >= da_epoch);
+        
+        if !within_da_boundary {
+            // Historical block outside DA boundary - no execution proofs required (allows sync)
+            return Ok(Some(AvailableProofData::NoneRequired));
+        }
+
         let Some(num_expected_proofs) = min_execution_proofs_required else {
-            // No execution proofs required
+            // Node not configured for execution proof requirements
             return Ok(Some(AvailableProofData::NoneRequired));
         };
 
@@ -269,7 +294,7 @@ impl<E: EthSpec> PendingComponents<E> {
 
         match num_received_proofs.cmp(&num_expected_proofs) {
             Ordering::Greater => {
-                // This is okay - we have more proofs than required
+                // More proofs than required (fine)
                 Ok(Some(AvailableProofData::Proofs(
                     self.verified_execution_proofs.values().cloned().collect()
                 )))
@@ -465,6 +490,9 @@ pub struct DataAvailabilityCheckerInner<T: BeaconChainTypes> {
     spec: Arc<ChainSpec>,
     /// Minimum execution proofs required for blocks to become available (None = no requirement)
     min_execution_proofs_required: Option<usize>,
+    /// Queue of execution proofs ready for broadcasting
+    /// TODO: Broadcast tracking shouldn't be here
+    unbroadcast_proof_queue: RwLock<VecDeque<(Hash256, ExecutionProof)>>,
 }
 
 // This enum is only used internally within the crate in the reconstruction function to improve
@@ -490,6 +518,7 @@ impl<T: BeaconChainTypes> DataAvailabilityCheckerInner<T> {
             custody_context,
             spec,
             min_execution_proofs_required,
+            unbroadcast_proof_queue: RwLock::new(VecDeque::new()),
         })
     }
 
@@ -698,7 +727,15 @@ impl<T: BeaconChainTypes> DataAvailabilityCheckerInner<T> {
                 .map(|(_, v)| v)
                 .unwrap_or_else(|| PendingComponents::empty(block_root, default_max_len));
 
-            pending_components.merge_execution_proofs(execution_proofs)?;
+            let newly_added_proofs = pending_components.merge_execution_proofs(execution_proofs)?;
+            
+            // Queue newly added proofs for broadcasting
+            if !newly_added_proofs.is_empty() {
+                let mut queue = self.unbroadcast_proof_queue.write();
+                for proof in newly_added_proofs {
+                    queue.push_back((block_root, proof));
+                }
+            }
 
             debug!(
                 component = "execution_proofs",
@@ -720,7 +757,15 @@ impl<T: BeaconChainTypes> DataAvailabilityCheckerInner<T> {
                 PendingComponents::empty(block_root, self.spec.max_blobs_per_block(epoch) as usize)
             });
 
-        pending_components.merge_execution_proofs(execution_proofs)?;
+        let newly_added_proofs = pending_components.merge_execution_proofs(execution_proofs)?;
+        
+        // Queue newly added proofs for broadcasting
+        if !newly_added_proofs.is_empty() {
+            let mut queue = self.unbroadcast_proof_queue.write();
+            for proof in newly_added_proofs {
+                queue.push_back((block_root, proof));
+            }
+        }
 
         let num_expected_columns = self
             .custody_context
@@ -896,6 +941,20 @@ impl<T: BeaconChainTypes> DataAvailabilityCheckerInner<T> {
     /// Number of pending component entries in memory in the cache.
     pub fn block_cache_size(&self) -> usize {
         self.critical.read().len()
+    }
+
+    /// Get execution proofs that are ready for broadcasting
+    /// Returns (block_root, proof) pairs from the broadcast queue
+    pub fn take_unbroadcast_execution_proofs(&self) -> Vec<(Hash256, types::ExecutionProof)> {
+        let mut queue = self.unbroadcast_proof_queue.write();
+        let unbroadcast_proofs: Vec<_> = queue.drain(..).collect();
+
+        debug!(
+            proof_count = unbroadcast_proofs.len(),
+            "DA checker found un-broadcast execution proofs"
+        );
+
+        unbroadcast_proofs
     }
 }
 

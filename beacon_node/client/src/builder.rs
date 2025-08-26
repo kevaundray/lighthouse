@@ -777,6 +777,19 @@ where
                 beacon_chain.clone(),
             );
 
+            // Start the execution proof broadcaster service if we have network senders
+            // and we're in stateless validation mode or generating execution proofs
+            if let Some(network_senders) = &self.network_senders {
+                if beacon_chain.config.stateless_validation
+                    || beacon_chain.config.generate_execution_proofs
+                {
+                    start_execution_proof_broadcasting_service(
+                        runtime_context.executor.clone(),
+                        beacon_chain.clone(),
+                        network_senders.network_send(),
+                    );
+                }
+            }
         }
 
         Ok(Client {
@@ -912,4 +925,76 @@ async fn genesis_state<E: EthSpec>(
         )
         .await?
         .ok_or_else(|| "Genesis state is unknown".to_string())
+}
+
+/// Start a background service that broadcasts locally generated execution proofs to the network.
+/// This service monitors for execution proofs being stored in the DA checker and publishes them.
+fn start_execution_proof_broadcasting_service<T: BeaconChainTypes>(
+    executor: task_executor::TaskExecutor,
+    beacon_chain: Arc<BeaconChain<T>>,
+    network_sender: tokio::sync::mpsc::UnboundedSender<network::NetworkMessage<T::EthSpec>>,
+) {
+    info!("Starting execution proof broadcasting service");
+    
+    executor.spawn(
+        async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            
+            loop {
+                interval.tick().await;
+                
+                // Check if proof generation is enabled
+                if !beacon_chain.config.generate_execution_proofs {
+                    continue;
+                }
+                
+                // Get unbroadcast proofs from DA checker (original polling pattern)
+                debug!(" Polling DA checker for unbroadcast proofs");
+                let unbroadcast_proofs = beacon_chain.data_availability_checker.take_unbroadcast_execution_proofs();
+                
+                if !unbroadcast_proofs.is_empty() {
+                    info!(
+                        proof_count = unbroadcast_proofs.len(),
+                        " Broadcasting unbroadcast execution proofs via gradual publishing"
+                    );
+                    
+                    // Broadcast each proof individually (like original)
+                    for (block_root, proof) in unbroadcast_proofs {
+                        let pubsub_message = lighthouse_network::PubsubMessage::ExecutionProofMessage(
+                            Box::new((proof.subnet_id, Arc::new(proof.clone())))
+                        );
+                        
+                        debug!(
+                            execution_block_hash = ?proof.block_hash,
+                            ?block_root,
+                            subnet_id = *proof.subnet_id,
+                            " Sending NetworkMessage::Publish for execution proof"
+                        );
+                        
+                        if let Err(e) = network_sender.send(network::NetworkMessage::Publish {
+                            messages: vec![pubsub_message],
+                        }) {
+                            warn!(
+                                execution_block_hash = ?proof.block_hash,
+                                ?block_root,
+                                subnet_id = *proof.subnet_id,
+                                error = %e,
+                                "Failed to broadcast execution proof"
+                            );
+                        } else {
+                            debug!(
+                                execution_block_hash = ?proof.block_hash,
+                                ?block_root,
+                                subnet_id = *proof.subnet_id,
+                                " Broadcast execution proof to network - NetworkMessage sent"
+                            );
+                        }
+                    }
+                } else {
+                    debug!(" Execution proof broadcaster running (no unbroadcast proofs)");
+                }
+            }
+        },
+        "execution_proof_broadcaster",
+    );
 }

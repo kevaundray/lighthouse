@@ -139,6 +139,10 @@ async fn notify_new_payload<T: BeaconChainTypes>(
 
     // Generate proof for this payload (even though it may not be your proposed block)
     if chain.config.generate_execution_proofs {
+        info!(
+            execution_block_hash = ?block.execution_payload().map(|p| p.block_hash()),
+            "spawn_proof_generation_task_with_block called"
+        );
         spawn_proof_generation_task_with_block(chain, block);
     }
 
@@ -609,7 +613,7 @@ fn spawn_proof_generation_task_with_block<T: BeaconChainTypes>(
 /// Proofs are stored using the DA checker
 /// 
 /// TODO: This simulates receiving proofs that would normally come from zkVMs or other proof generators
-async fn generate_and_store_execution_proofs_from_block<T: BeaconChainTypes>(
+pub async fn generate_and_store_execution_proofs_from_block<T: BeaconChainTypes>(
     chain: &Arc<BeaconChain<T>>,
     block_root: Hash256,
     payload: &ExecutionPayload<T::EthSpec>,
@@ -674,6 +678,7 @@ async fn generate_and_store_execution_proofs_from_block<T: BeaconChainTypes>(
             }
         };
 
+        // Store in local DA checker
         match chain
             .data_availability_checker
             .put_gossip_verified_execution_proofs(block_root, std::iter::once(verified_proof)) {
@@ -681,7 +686,7 @@ async fn generate_and_store_execution_proofs_from_block<T: BeaconChainTypes>(
                 debug!(
                     execution_block_hash = ?execution_block_hash,
                     subnet_id,
-                    "Generated and stored execution proof"
+                    "Generated and stored execution proof locally"
                 );
             }
             Err(e) => {
