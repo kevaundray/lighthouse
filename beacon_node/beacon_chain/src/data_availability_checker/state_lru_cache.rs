@@ -17,11 +17,12 @@ use types::{BeaconState, BlindedPayload, ChainSpec, Epoch, EthSpec, Hash256, Sig
 /// a full `BeaconState`.
 #[derive(Clone)]
 pub struct DietAvailabilityPendingExecutedBlock<E: EthSpec> {
-    block: Arc<SignedBeaconBlock<E>>,
-    state_root: Hash256,
-    parent_block: SignedBeaconBlock<E, BlindedPayload<E>>,
-    consensus_context: OnDiskConsensusContext<E>,
-    payload_verification_outcome: PayloadVerificationOutcome,
+    // TODO: Put these back to internal visibility
+    pub(crate) block: Arc<SignedBeaconBlock<E>>,
+    pub(crate) state_root: Hash256,
+    pub(crate) parent_block: SignedBeaconBlock<E, BlindedPayload<E>>,
+    pub(crate) consensus_context: OnDiskConsensusContext<E>,
+    pub(crate) payload_verification_outcome: PayloadVerificationOutcome,
 }
 
 /// just implementing the same methods as `AvailabilityPendingExecutedBlock`
@@ -90,7 +91,7 @@ impl<T: BeaconChainTypes> StateLRUCache<T> {
         let state = executed_block.import_data.state;
         let state_root = executed_block.block.state_root();
         self.states.write().put(state_root, state);
-
+        // TODO: Check that parent_block against BeaconStore
         DietAvailabilityPendingExecutedBlock {
             block: executed_block.block,
             state_root,

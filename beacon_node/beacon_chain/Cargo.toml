@@ -8,6 +8,9 @@ autotests = false # using a single test binary compiles faster
 
 [features]
 default = ["participation_metrics"]
+## Use the new state-machine based data availability checker implementation.
+## When enabled, it aliases `data_availability_checker_new` to `data_availability_checker`.
+da_state_machine = []
 write_ssz_files = []  # Writes debugging .ssz files to /tmp during block processing.
 participation_metrics = []  # Exposes validator participation metrics to Prometheus.
 fork_from_env = [] # Initialise the harness chain spec from the FORK_NAME env variable

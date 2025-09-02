@@ -18,7 +18,17 @@ pub mod builder;
 pub mod canonical_head;
 pub mod capella_readiness;
 pub mod chain_config;
+// Default to the existing implementation. When the `da_state_machine` feature is
+// enabled, alias the new implementation under the same module path used by the rest
+// of the codebase to avoid widespread import changes.
+#[cfg(not(feature = "da_state_machine"))]
 pub mod data_availability_checker;
+
+#[cfg(any(test, feature = "da_state_machine"))]
+pub mod data_availability_checker_new;
+
+#[cfg(feature = "da_state_machine")]
+pub use data_availability_checker_new as data_availability_checker;
 pub mod data_column_verification;
 pub mod deneb_readiness;
 mod early_attester_cache;

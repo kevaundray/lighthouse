@@ -2,11 +2,8 @@ use crate::blob_verification::{verify_kzg_for_blob_list, GossipVerifiedBlob, Kzg
 use crate::block_verification_types::{
     AvailabilityPendingExecutedBlock, AvailableExecutedBlock, RpcBlock,
 };
-use crate::data_availability_checker::overflow_lru_cache::{
+use crate::data_availability_checker_new::state_machine_cache::{
     DataAvailabilityCheckerInner, ReconstructColumnsDecision,
-};
-pub use crate::data_availability_checker::state_lru_cache::{
-    StateLRUCache, DietAvailabilityPendingExecutedBlock,
 };
 use crate::{metrics, BeaconChain, BeaconChainTypes, BeaconStore, CustodyContext};
 use kzg::Kzg;
@@ -25,8 +22,9 @@ use types::{
 };
 
 mod error;
-mod overflow_lru_cache;
-mod state_lru_cache;
+mod state_machine;
+mod collections;
+mod state_machine_cache;
 
 use crate::data_column_verification::{
     verify_kzg_for_data_column_list_with_scoring, CustodyDataColumn, GossipVerifiedDataColumn,
@@ -612,18 +610,26 @@ pub fn start_availability_cache_maintenance_service<T: BeaconChainTypes>(
 ) {
     // this cache only needs to be maintained if deneb is configured
     if chain.spec.deneb_fork_epoch.is_some() {
-        let overflow_cache = chain.data_availability_checker.availability_cache.clone();
-        executor.spawn(
-            async move {
-                availability_cache_maintenance_service(chain, overflow_cache)
-                    .instrument(info_span!(
-                        "DataAvailabilityChecker",
-                        service = "data_availability_checker"
-                    ))
-                    .await
-            },
-            "availability_cache_service",
-        );
+        #[cfg(feature = "da_state_machine")]
+        {
+            let overflow_cache = chain.data_availability_checker.availability_cache.clone();
+            executor.spawn(
+                async move {
+                    availability_cache_maintenance_service(chain, overflow_cache)
+                        .instrument(info_span!(
+                            "DataAvailabilityChecker",
+                            service = "data_availability_checker"
+                        ))
+                        .await
+                },
+                "availability_cache_service",
+            );
+        }
+        #[cfg(not(feature = "da_state_machine"))]
+        {
+            // Compiled for tests without the feature; skip spawning
+            debug!("Maintenance service available only with da_state_machine feature");
+        }
     } else {
         debug!("Deneb fork not configured, not starting availability cache maintenance service");
     }
