@@ -64,7 +64,7 @@ impl<T: BeaconChainTypes> DataAvailabilityCheckerInner<T> {
             .peek(block_root)
             .and_then(|pending_components| {
                 pending_components
-                    .executed_block
+                    .get_cached_block()
                     .as_ref()
                     .map(|block| block.block_cloned())
             })
@@ -77,7 +77,7 @@ impl<T: BeaconChainTypes> DataAvailabilityCheckerInner<T> {
     ) -> Result<Option<Arc<BlobSidecar<T::EthSpec>>>, AvailabilityCheckError> {
         if let Some(pending_components) = self.critical.read().peek(&blob_id.block_root) {
             Ok(pending_components
-                .verified_blobs
+                .get_cached_blobs()
                 .get(blob_id.index as usize)
                 .ok_or(AvailabilityCheckError::BlobIndexInvalid(blob_id.index))?
                 .as_ref()
@@ -97,9 +97,9 @@ impl<T: BeaconChainTypes> DataAvailabilityCheckerInner<T> {
             .peek(&block_root)
             .map(|pending_components| {
                 pending_components
-                    .verified_data_columns
-                    .iter()
-                    .map(|col| col.clone_arc())
+                    .get_cached_data_columns_indices()
+                    .into_iter()
+                    .filter_map(|index| pending_components.get_cached_data_column(index))
                     .collect()
             })
     }
@@ -142,7 +142,7 @@ impl<T: BeaconChainTypes> DataAvailabilityCheckerInner<T> {
                 Ok(())
             })?;
 
-        pending_components.span.in_scope(|| {
+        pending_components.span().in_scope(|| {
             debug!(
                 component = "blobs",
                 status = pending_components.status_str(None),
@@ -182,7 +182,7 @@ impl<T: BeaconChainTypes> DataAvailabilityCheckerInner<T> {
             .custody_context
             .num_of_data_columns_to_sample(epoch, &self.spec);
 
-        pending_components.span.in_scope(|| {
+        pending_components.span().in_scope(|| {
             debug!(
                 component = "data_columns",
                 status = pending_components.status_str(Some(num_expected_columns)),
@@ -212,7 +212,7 @@ impl<T: BeaconChainTypes> DataAvailabilityCheckerInner<T> {
             drop(pending_components);
             if let Some(components) = self.critical.write().get_mut(&block_root) {
                 // Clean up span now that block is available
-                components.span = Span::none();
+                components.set_span(Span::none());
             }
 
             // We never remove the pending components manually to avoid race conditions.
@@ -245,7 +245,7 @@ impl<T: BeaconChainTypes> DataAvailabilityCheckerInner<T> {
 
         {
             let pending_components = write_lock.get_or_insert_mut(block_root, || {
-                PendingComponents::empty(block_root, self.spec.max_blobs_per_block(epoch) as usize)
+                PendingComponents::empty_for_epoch(block_root, epoch, &self.spec)
             });
             update_fn(pending_components)?
         }
@@ -279,9 +279,9 @@ impl<T: BeaconChainTypes> DataAvailabilityCheckerInner<T> {
 
         // If we're sampling all columns, it means we must be custodying all columns.
         let total_column_count = T::EthSpec::number_of_columns();
-        let received_column_count = pending_components.verified_data_columns.len();
+        let received_column_count = pending_components.get_cached_data_columns_indices().len();
 
-        if pending_components.reconstruction_started {
+        if pending_components.reconstruction_started() {
             return ReconstructColumnsDecision::No("already started");
         }
         if received_column_count >= total_column_count {
@@ -291,8 +291,8 @@ impl<T: BeaconChainTypes> DataAvailabilityCheckerInner<T> {
             return ReconstructColumnsDecision::No("not enough columns");
         }
 
-        pending_components.reconstruction_started = true;
-        ReconstructColumnsDecision::Yes(pending_components.verified_data_columns.clone())
+        pending_components.set_reconstruction_started(true);
+        ReconstructColumnsDecision::Yes(pending_components.get_verified_data_columns())
     }
 
     /// This could mean some invalid data columns made it through to the `DataAvailabilityChecker`.
@@ -300,8 +300,7 @@ impl<T: BeaconChainTypes> DataAvailabilityCheckerInner<T> {
     /// status so that we can attempt to retrieve columns from peers again.
     pub fn handle_reconstruction_failure(&self, block_root: &Hash256) {
         if let Some(pending_components_mut) = self.critical.write().get_mut(block_root) {
-            pending_components_mut.verified_data_columns = vec![];
-            pending_components_mut.reconstruction_started = false;
+            pending_components_mut.clear_data_columns_and_reset_reconstruction();
         }
     }
 
@@ -759,7 +758,7 @@ mod test {
                 .peek(&block_root)
                 .map(|pending_components| {
                     pending_components
-                        .executed_block
+                        .get_cached_block()
                         .clone()
                         .expect("should exist")
                 })
