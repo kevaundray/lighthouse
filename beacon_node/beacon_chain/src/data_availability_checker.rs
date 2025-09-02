@@ -25,6 +25,7 @@ use types::{
 
 mod error;
 mod overflow_lru_cache;
+mod pending_components;
 mod state_lru_cache;
 
 use crate::data_column_verification::{
