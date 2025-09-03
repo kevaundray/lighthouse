@@ -118,6 +118,8 @@ use std::collections::HashSet;
 use std::io::prelude::*;
 use std::marker::PhantomData;
 use std::sync::Arc;
+use tokio::sync::mpsc::UnboundedSender;
+use types::{ExecutionProof, ExecutionProofSubnetId};
 use std::time::Duration;
 use store::iter::{BlockRootsIterator, ParentRootBlockIterator, StateRootsIterator};
 use store::{
@@ -490,6 +492,8 @@ pub struct BeaconChain<T: BeaconChainTypes> {
     pub kzg: Arc<Kzg>,
     /// RNG instance used by the chain. Currently used for shuffling column sidecars in block publishing.
     pub rng: Arc<Mutex<Box<dyn RngCore + Send>>>,
+    /// Channel for locally generated execution proofs to be published by the network task.
+    pub execution_proof_publish_tx: Option<UnboundedSender<(ExecutionProofSubnetId, ExecutionProof)>>,
 }
 
 pub enum BeaconBlockResponseWrapper<E: EthSpec> {

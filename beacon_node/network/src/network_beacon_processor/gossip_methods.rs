@@ -3306,9 +3306,6 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
                     }
                 }
 
-                // Proof stored successfully - re-broadcast to help network propagation
-                self.rebroadcast_execution_proof(proof_to_rebroadcast, subnet_for_rebroadcast);
-
                 debug!(
                     %block_root,
                     execution_block_hash = %block_hash,
@@ -3316,44 +3313,6 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
                     "Execution proof received via gossip"
                 );
                 self.propagate_validation_result(message_id, peer_id, MessageAcceptance::Accept);
-            }
-        }
-    }
-
-    /// Re-broadcast a verified execution proof to help network propagation.
-    /// This helps disseminate proofs more quickly through the network.
-    fn rebroadcast_execution_proof(
-        &self,
-        proof: ExecutionProof,
-        subnet_id: ExecutionProofSubnetId,
-    ) {
-        // Extract values before moving proof into Arc
-        let execution_block_hash = proof.block_hash;
-        let block_root = proof.block_root;
-        
-        let pubsub_message = PubsubMessage::ExecutionProofMessage(
-            Box::new((subnet_id, Arc::new(proof)))
-        );
-
-        match self.network_tx.send(NetworkMessage::Publish {
-            messages: vec![pubsub_message],
-        }) {
-            Ok(()) => {
-                debug!(
-                    execution_block_hash = %execution_block_hash,
-                    block_root = %block_root,
-                    subnet_id = *subnet_id,
-                    "Re-broadcast execution proof to help network propagation"
-                );
-            }
-            Err(e) => {
-                debug!(
-                    execution_block_hash = %execution_block_hash,
-                    block_root = %block_root,
-                    subnet_id = *subnet_id,
-                    error = %e,
-                    "Failed to re-broadcast execution proof"
-                );
             }
         }
     }

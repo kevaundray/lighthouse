@@ -490,9 +490,6 @@ pub struct DataAvailabilityCheckerInner<T: BeaconChainTypes> {
     spec: Arc<ChainSpec>,
     /// Minimum execution proofs required for blocks to become available (None = no requirement)
     min_execution_proofs_required: Option<usize>,
-    /// Queue of execution proofs ready for broadcasting
-    /// TODO: Broadcast tracking shouldn't be here
-    unbroadcast_proof_queue: RwLock<VecDeque<(Hash256, ExecutionProof)>>,
 }
 
 // This enum is only used internally within the crate in the reconstruction function to improve
@@ -518,7 +515,6 @@ impl<T: BeaconChainTypes> DataAvailabilityCheckerInner<T> {
             custody_context,
             spec,
             min_execution_proofs_required,
-            unbroadcast_proof_queue: RwLock::new(VecDeque::new()),
         })
     }
 
@@ -727,15 +723,7 @@ impl<T: BeaconChainTypes> DataAvailabilityCheckerInner<T> {
                 .map(|(_, v)| v)
                 .unwrap_or_else(|| PendingComponents::empty(block_root, default_max_len));
 
-            let newly_added_proofs = pending_components.merge_execution_proofs(execution_proofs)?;
-            
-            // Queue newly added proofs for broadcasting
-            if !newly_added_proofs.is_empty() {
-                let mut queue = self.unbroadcast_proof_queue.write();
-                for proof in newly_added_proofs {
-                    queue.push_back((block_root, proof));
-                }
-            }
+            let _newly_added_proofs = pending_components.merge_execution_proofs(execution_proofs)?;
 
             debug!(
                 component = "execution_proofs",
@@ -757,15 +745,7 @@ impl<T: BeaconChainTypes> DataAvailabilityCheckerInner<T> {
                 PendingComponents::empty(block_root, self.spec.max_blobs_per_block(epoch) as usize)
             });
 
-        let newly_added_proofs = pending_components.merge_execution_proofs(execution_proofs)?;
-        
-        // Queue newly added proofs for broadcasting
-        if !newly_added_proofs.is_empty() {
-            let mut queue = self.unbroadcast_proof_queue.write();
-            for proof in newly_added_proofs {
-                queue.push_back((block_root, proof));
-            }
-        }
+        let _newly_added_proofs = pending_components.merge_execution_proofs(execution_proofs)?;
 
         let num_expected_columns = self
             .custody_context
@@ -941,20 +921,6 @@ impl<T: BeaconChainTypes> DataAvailabilityCheckerInner<T> {
     /// Number of pending component entries in memory in the cache.
     pub fn block_cache_size(&self) -> usize {
         self.critical.read().len()
-    }
-
-    /// Get execution proofs that are ready for broadcasting
-    /// Returns (block_root, proof) pairs from the broadcast queue
-    pub fn take_unbroadcast_execution_proofs(&self) -> Vec<(Hash256, types::ExecutionProof)> {
-        let mut queue = self.unbroadcast_proof_queue.write();
-        let unbroadcast_proofs: Vec<_> = queue.drain(..).collect();
-
-        debug!(
-            proof_count = unbroadcast_proofs.len(),
-            "DA checker found un-broadcast execution proofs"
-        );
-
-        unbroadcast_proofs
     }
 }
 

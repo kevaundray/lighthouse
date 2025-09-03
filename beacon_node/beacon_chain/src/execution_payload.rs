@@ -678,7 +678,7 @@ pub async fn generate_and_store_execution_proofs_from_block<T: BeaconChainTypes>
             }
         };
 
-        // Store in local DA checker
+        // Store in local DA checker and enqueue for broadcast (locally generated)
         match chain
             .data_availability_checker
             .put_gossip_verified_execution_proofs(block_root, std::iter::once(verified_proof)) {
@@ -688,6 +688,10 @@ pub async fn generate_and_store_execution_proofs_from_block<T: BeaconChainTypes>
                     subnet_id,
                     "Generated and stored execution proof locally"
                 );
+                // Publish locally generated proof to the network via the publisher channel
+                if let Some(tx) = &chain.execution_proof_publish_tx {
+                    let _ = tx.send((proof_id, proof.clone()));
+                }
             }
             Err(e) => {
                 warn!(
