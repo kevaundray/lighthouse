@@ -5,10 +5,7 @@
 //! actual proof generation from zkVMs or other proof systems.
 
 use tracing::debug;
-use types::{
-    EthSpec, ExecutionPayload, ExecutionProof, Hash256,
-    execution_proof_subnet_id::ExecutionProofSubnetId,
-};
+use types::{EthSpec, ExecutionPayload, ExecutionProof, Hash256};
 
 /// Generate a proof for an execution payload
 ///
@@ -22,7 +19,7 @@ pub async fn generate_proof<T: EthSpec>(
     block_root: Hash256,
     payload: &ExecutionPayload<T>,
     execution_state_witness: &[u8],
-    proof_id: ExecutionProofSubnetId,
+    execution_proof_id: u64,
 ) -> ExecutionProof {
     let execution_block_hash = payload.block_hash();
     let block_number = payload.block_number();
@@ -35,26 +32,26 @@ pub async fn generate_proof<T: EthSpec>(
 
     debug!(
         execution_block_hash = ?execution_block_hash,
-        subnet_id = *proof_id,
+        execution_proof_id,
         delay_ms,
         "Simulating proof generation delay"
     );
 
     tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
 
-    // Create dummy proof data that includes the subnet information and payload details
+    // Create dummy proof data that includes the proof system and payload details
     // In a real implementation, this would use the execution_state_witness to generate
     // a cryptographic proof of the payload's validity
     let dummy_data = format!(
-        "dummy_proof_subnet_{}_block_{:?}_number_{}_witness_len_{}",
-        *proof_id,
+        "dummy_proof_system_{}_block_{:?}_number_{}_witness_len_{}",
+        execution_proof_id,
         execution_block_hash,
         block_number,
         execution_state_witness.len()
     )
     .into_bytes();
 
-    ExecutionProof::new(block_root, execution_block_hash, proof_id, 1, dummy_data)
+    ExecutionProof::new(block_root, execution_block_hash, execution_proof_id, 1, dummy_data)
 }
 
 /// Validate a proof (placeholder implementation)
@@ -86,7 +83,7 @@ mod tests {
     #[tokio::test]
     async fn test_generate_proof() {
         let execution_block_hash = ExecutionBlockHash::from(Hash256::random());
-        let proof_id = ExecutionProofSubnetId::new(5).unwrap();
+        let execution_proof_id = types::EXECUTION_PROOF_0;
 
         // Create a dummy payload for testing
         let payload = FullPayloadBellatrix::<MainnetEthSpec> {
@@ -110,17 +107,17 @@ mod tests {
 
         let exec_payload = ExecutionPayload::Bellatrix(payload.execution_payload);
         let dummy_witness = b"test_witness_data";
-        let proof = generate_proof(Hash256::random(), &exec_payload, dummy_witness, proof_id).await;
+        let proof = generate_proof(Hash256::random(), &exec_payload, dummy_witness, execution_proof_id).await;
 
         assert_eq!(proof.block_hash, execution_block_hash);
-        assert_eq!(proof.subnet_id, proof_id);
+        assert_eq!(proof.execution_proof_id, execution_proof_id);
         assert_eq!(proof.version, 1);
         assert!(!proof.proof_data.is_empty());
         assert!(validate_proof(&proof));
 
         // Verify the proof data contains expected information
         let proof_data_str = String::from_utf8_lossy(&proof.proof_data);
-        assert!(proof_data_str.contains("subnet_5"));
+        assert!(proof_data_str.contains("system_0"));
         assert!(proof_data_str.contains("number_12345"));
         assert!(proof_data_str.contains("witness_len_17")); // 17 is the length of "test_witness_data"
     }
@@ -133,7 +130,7 @@ mod tests {
         let v1_proof = ExecutionProof::new(
             Hash256::random(),
             hash,
-            ExecutionProofSubnetId::new(0).unwrap(),
+            types::EXECUTION_PROOF_0,
             1,
             vec![1, 2, 3],
         );
@@ -143,7 +140,7 @@ mod tests {
         let v2_proof = ExecutionProof::new(
             Hash256::random(),
             hash,
-            ExecutionProofSubnetId::new(0).unwrap(),
+            types::EXECUTION_PROOF_0,
             2,
             vec![7, 8, 9],
         );
@@ -153,7 +150,7 @@ mod tests {
         let empty_v1 = ExecutionProof::new(
             Hash256::random(),
             hash,
-            ExecutionProofSubnetId::new(0).unwrap(),
+            types::EXECUTION_PROOF_0,
             1,
             vec![],
         );
@@ -161,7 +158,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_generate_proof_different_subnets() {
+    async fn test_generate_proof_for_same_block() {
+        // All execution proofs are sent on a single subnet (subnet 0).
+        // Different proof systems for the same block are distinguished by execution_proof_id and version.
+        // This test verifies that proofs from different systems have different IDs.
         let execution_block_hash = ExecutionBlockHash::from(Hash256::random());
 
         // Create a dummy payload for testing
@@ -187,56 +187,45 @@ mod tests {
         let exec_payload = ExecutionPayload::Bellatrix(payload.execution_payload);
         let dummy_witness = b"test_witness_data";
 
+        // Generate proofs from different proof systems for the same block
         let proof_0 = generate_proof(
             Hash256::random(),
             &exec_payload,
             dummy_witness,
-            ExecutionProofSubnetId::new(0).unwrap(),
+            types::EXECUTION_PROOF_0,
         )
         .await;
         let proof_1 = generate_proof(
             Hash256::random(),
             &exec_payload,
             dummy_witness,
-            ExecutionProofSubnetId::new(1).unwrap(),
-        )
-        .await;
-        let proof_2 = generate_proof(
-            Hash256::random(),
-            &exec_payload,
-            dummy_witness,
-            ExecutionProofSubnetId::new(2).unwrap(),
+            types::EXECUTION_PROOF_1,
         )
         .await;
 
         // All proofs should be for the same block hash
         assert_eq!(proof_0.block_hash, execution_block_hash);
         assert_eq!(proof_1.block_hash, execution_block_hash);
-        assert_eq!(proof_2.block_hash, execution_block_hash);
 
-        // But should have different proof IDs and data
-        assert_eq!(*proof_0.subnet_id, 0);
-        assert_eq!(*proof_1.subnet_id, 1);
-        assert_eq!(*proof_2.subnet_id, 2);
+        // But should have different proof system IDs
+        assert_eq!(proof_0.execution_proof_id, types::EXECUTION_PROOF_0);
+        assert_eq!(proof_1.execution_proof_id, types::EXECUTION_PROOF_1);
 
-        // Proof data should be different for different subnets
-        assert_ne!(proof_0.proof_data, proof_1.proof_data);
-        assert_ne!(proof_1.proof_data, proof_2.proof_data);
-
+        // Proof data should be different for different proof systems
         let data_0 = String::from_utf8_lossy(&proof_0.proof_data);
         let data_1 = String::from_utf8_lossy(&proof_1.proof_data);
-        let data_2 = String::from_utf8_lossy(&proof_2.proof_data);
 
-        assert!(data_0.contains("subnet_0"));
-        assert!(data_1.contains("subnet_1"));
-        assert!(data_2.contains("subnet_2"));
+        assert!(data_0.contains("system_0"));
+        assert!(data_1.contains("system_1"));
+        assert!(data_0.contains("number_42"));
+        assert!(data_1.contains("number_42"));
     }
 
     #[tokio::test]
     async fn test_generate_proof_deterministic() {
         // Test that proof generation is deterministic - same input always produces same output
         let execution_block_hash = ExecutionBlockHash::from(Hash256::from_low_u64_be(12345));
-        let proof_id = ExecutionProofSubnetId::new(3).unwrap();
+        let execution_proof_id = types::EXECUTION_PROOF_0;
 
         // Create a specific payload with fixed values
         let payload = FullPayloadBellatrix::<MainnetEthSpec> {
@@ -263,16 +252,16 @@ mod tests {
 
         // Generate proof multiple times with same input
         let block_root = Hash256::random();
-        let proof1 = generate_proof(block_root, &exec_payload, witness_data, proof_id).await;
-        let proof2 = generate_proof(block_root, &exec_payload, witness_data, proof_id).await;
-        let proof3 = generate_proof(block_root, &exec_payload, witness_data, proof_id).await;
+        let proof1 = generate_proof(block_root, &exec_payload, witness_data, execution_proof_id).await;
+        let proof2 = generate_proof(block_root, &exec_payload, witness_data, execution_proof_id).await;
+        let proof3 = generate_proof(block_root, &exec_payload, witness_data, execution_proof_id).await;
 
         // All proofs should be identical
         assert_eq!(proof1.block_hash, proof2.block_hash);
         assert_eq!(proof1.block_hash, proof3.block_hash);
 
-        assert_eq!(proof1.subnet_id, proof2.subnet_id);
-        assert_eq!(proof1.subnet_id, proof3.subnet_id);
+        assert_eq!(proof1.execution_proof_id, proof2.execution_proof_id);
+        assert_eq!(proof1.execution_proof_id, proof3.execution_proof_id);
 
         assert_eq!(proof1.version, proof2.version);
         assert_eq!(proof1.version, proof3.version);
@@ -283,18 +272,18 @@ mod tests {
 
         // Verify the content is as expected
         let proof_str = String::from_utf8_lossy(&proof1.proof_data);
-        assert!(proof_str.contains("subnet_3"));
+        assert!(proof_str.contains("system_0"));
         assert!(proof_str.contains("number_555"));
         assert!(proof_str.contains("witness_len_26"));
 
         // Now test that different inputs produce different proofs
         let different_witness = b"different_witness_data";
         let proof_different =
-            generate_proof(block_root, &exec_payload, different_witness, proof_id).await;
+            generate_proof(block_root, &exec_payload, different_witness, execution_proof_id).await;
 
-        // Same block hash and subnet, but different proof data
+        // Same block hash and proof system, but different proof data
         assert_eq!(proof_different.block_hash, proof1.block_hash);
-        assert_eq!(proof_different.subnet_id, proof1.subnet_id);
+        assert_eq!(proof_different.execution_proof_id, proof1.execution_proof_id);
         assert_ne!(proof_different.proof_data, proof1.proof_data);
     }
 }
