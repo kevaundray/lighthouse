@@ -83,7 +83,7 @@ mod tests {
     #[tokio::test]
     async fn test_generate_proof() {
         let execution_block_hash = ExecutionBlockHash::from(Hash256::random());
-        let execution_proof_id = types::EXECUTION_PROOF_0;
+        let execution_proof_id = types::ProofSystemId::ZKVM0.as_u64();
 
         // Create a dummy payload for testing
         let payload = FullPayloadBellatrix::<MainnetEthSpec> {
@@ -130,7 +130,7 @@ mod tests {
         let v1_proof = ExecutionProof::new(
             Hash256::random(),
             hash,
-            types::EXECUTION_PROOF_0,
+            types::ProofSystemId::ZKVM0.as_u64(),
             1,
             vec![1, 2, 3],
         );
@@ -140,7 +140,7 @@ mod tests {
         let v2_proof = ExecutionProof::new(
             Hash256::random(),
             hash,
-            types::EXECUTION_PROOF_0,
+            types::ProofSystemId::ZKVM0.as_u64(),
             2,
             vec![7, 8, 9],
         );
@@ -150,7 +150,7 @@ mod tests {
         let empty_v1 = ExecutionProof::new(
             Hash256::random(),
             hash,
-            types::EXECUTION_PROOF_0,
+            types::ProofSystemId::ZKVM0.as_u64(),
             1,
             vec![],
         );
@@ -192,14 +192,14 @@ mod tests {
             Hash256::random(),
             &exec_payload,
             dummy_witness,
-            types::EXECUTION_PROOF_0,
+            types::ProofSystemId::ZKVM0.as_u64(),
         )
         .await;
         let proof_1 = generate_proof(
             Hash256::random(),
             &exec_payload,
             dummy_witness,
-            types::EXECUTION_PROOF_1,
+            types::ProofSystemId::ZKVM1.as_u64(),
         )
         .await;
 
@@ -208,8 +208,8 @@ mod tests {
         assert_eq!(proof_1.block_hash, execution_block_hash);
 
         // But should have different proof system IDs
-        assert_eq!(proof_0.execution_proof_id, types::EXECUTION_PROOF_0);
-        assert_eq!(proof_1.execution_proof_id, types::EXECUTION_PROOF_1);
+        assert_eq!(proof_0.execution_proof_id, types::ProofSystemId::ZKVM0.as_u64());
+        assert_eq!(proof_1.execution_proof_id, types::ProofSystemId::ZKVM1.as_u64());
 
         // Proof data should be different for different proof systems
         let data_0 = String::from_utf8_lossy(&proof_0.proof_data);
@@ -225,7 +225,7 @@ mod tests {
     async fn test_generate_proof_deterministic() {
         // Test that proof generation is deterministic - same input always produces same output
         let execution_block_hash = ExecutionBlockHash::from(Hash256::from_low_u64_be(12345));
-        let execution_proof_id = types::EXECUTION_PROOF_0;
+        let execution_proof_id = types::ProofSystemId::ZKVM0.as_u64();
 
         // Create a specific payload with fixed values
         let payload = FullPayloadBellatrix::<MainnetEthSpec> {

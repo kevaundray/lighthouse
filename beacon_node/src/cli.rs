@@ -1500,9 +1500,10 @@ pub fn cli_app() -> Command {
             Arg::new("stateless-min-proofs-required")
                 .long("stateless-min-proofs-required")
                 .value_name("COUNT")
-                .help("Minimum number of execution proofs required to consider a block valid in \
-                       stateless validation mode. Only applies when --stateless-validation is enabled. \
-                       Must be between 1 and max_execution_proof_subnets.")
+                .help("Minimum number of execution proofs from different proof systems required to \
+                       consider a block valid in stateless validation mode. Only applies when \
+                       --stateless-validation is enabled. Must be between 1 and MAX_PROOF_SYSTEMS. \
+                       Different proof systems provide redundancy through diversity of zkVM implementations.")
                 .action(ArgAction::Set)
                 .display_order(0)
         )

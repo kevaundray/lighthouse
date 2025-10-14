@@ -178,9 +178,7 @@ pub use crate::execution_payload_header::{
     ExecutionPayloadHeaderDeneb, ExecutionPayloadHeaderElectra, ExecutionPayloadHeaderFulu,
     ExecutionPayloadHeaderGloas, ExecutionPayloadHeaderRef, ExecutionPayloadHeaderRefMut,
 };
-pub use crate::execution_proof::{
-    ExecutionProof, EXECUTION_PROOF_0, EXECUTION_PROOF_1, EXECUTION_PROOF_2,
-};
+pub use crate::execution_proof::{ExecutionProof, ProofSystemId, MAX_PROOF_SYSTEMS};
 pub use crate::execution_requests::{ExecutionRequests, RequestType};
 pub use crate::fork::Fork;
 pub use crate::fork_context::ForkContext;

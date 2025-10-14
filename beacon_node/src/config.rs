@@ -805,10 +805,10 @@ pub fn get_config<E: EthSpec>(
         if min_proofs == 0 {
             return Err("--stateless-min-proofs-required must be at least 1".to_string());
         }
-        if min_proofs as u64 > client_config.chain.max_execution_proof_subnets {
+        if min_proofs > types::MAX_PROOF_SYSTEMS {
             return Err(format!(
-                "--stateless-min-proofs-required ({}) cannot exceed max_execution_proof_subnets ({})",
-                min_proofs, client_config.chain.max_execution_proof_subnets
+                "--stateless-min-proofs-required ({}) cannot exceed MAX_PROOF_SYSTEMS ({})",
+                min_proofs, types::MAX_PROOF_SYSTEMS
             ));
         }
         client_config.chain.stateless_min_proofs_required = min_proofs;

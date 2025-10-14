@@ -88,26 +88,13 @@ pub struct ChainConfig {
     pub stateless_validation: bool,
     /// Generate execution proofs for all blocks received.
     ///
-    /// Nodes that have this enabled will be used to bootstrap proofs into the subnets,
-    /// whether they are a proposer or not.
+    /// Nodes that have this enabled will be used to bootstrap proofs whether they are a proposer or not.
     pub generate_execution_proofs: bool,
-    /// Maximum number of execution proof subnets this node will participate in.
+    /// Minimum number of proofs from different proof systems required to consider a block valid in stateless mode.
     ///
-    /// This is a per-node configuration that must not exceed the protocol maximum
-    /// (MAX_EXECUTION_PROOF_SUBNETS). Nodes may choose to participate in fewer
-    /// subnets to reduce resource usage, but this limits the number of proofs they
-    /// can generate or validate.
-    ///
-    /// TODO: We can remove the sequential allocations with a random allocation, so that lower numbered
-    /// TODO: subnets are not important. Current strategy is mostly POC.
-    ///
-    /// Note: stateless_min_proofs_required must not exceed this value, as a node
-    /// cannot require more proofs than the number of subnets it participates in.
-    pub max_execution_proof_subnets: u64,
-    /// Minimum number of proofs required to consider a block valid in stateless mode.
-    ///
-    /// Must be between 1 and max_execution_proof_subnets. Higher values provide
-    /// more security but may increase block validation latency.
+    /// Must be between 1 and MAX_PROOF_SYSTEMS. Higher values provide more security
+    /// but may increase block validation latency. Different proof systems (zkVMs) provide
+    /// redundancy through diversity of implementations.
     pub stateless_min_proofs_required: usize,
     /// The size of the shuffling cache,
     pub shuffling_cache_size: usize,
@@ -174,7 +161,6 @@ impl Default for ChainConfig {
             optimistic_finalized_sync: true,
             stateless_validation: false,
             generate_execution_proofs: false,
-            max_execution_proof_subnets: 8,
             stateless_min_proofs_required: 1,
             shuffling_cache_size: crate::shuffling_cache::DEFAULT_CACHE_SIZE,
             genesis_backfill: false,

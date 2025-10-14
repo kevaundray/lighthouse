@@ -120,12 +120,10 @@ pub fn get_configured_proof_systems<T: BeaconChainTypes>(chain: &Arc<BeaconChain
     // TODO(zkproofs): Check if there are any assumptions on the proof being deterministic ie
     // whether its okay that two nodes generate two valid proofs for the same payload.
     if chain.config.generate_execution_proofs {
-        // TODO(zkproofs): We can make some nodes choose what zkVMs they generate proofs for
-        vec![
-            types::EXECUTION_PROOF_0,
-            types::EXECUTION_PROOF_1,
-            types::EXECUTION_PROOF_2,
-        ]
+        // Generate proofs for all known proof systems
+        types::ProofSystemId::all()
+            .map(|ps| ps.as_u64())
+            .collect()
     } else {
         vec![]
     }
