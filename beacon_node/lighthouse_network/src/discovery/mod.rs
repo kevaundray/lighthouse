@@ -560,8 +560,6 @@ impl<E: EthSpec> Discovery<E> {
             }
             // Data column subnets are computed from node ID. No subnet bitfield in the ENR.
             Subnet::DataColumn(_) => return Ok(()),
-            // Execution proof subnets don't use ENR bitfields
-            Subnet::ExecutionProof(_) => return Ok(()),
         }
 
         // replace the global version
@@ -906,7 +904,6 @@ impl<E: EthSpec> Discovery<E> {
                                 Subnet::Attestation(_) => "attestation",
                                 Subnet::SyncCommittee(_) => "sync_committee",
                                 Subnet::DataColumn(_) => "data_column",
-                                Subnet::ExecutionProof(_) => "execution_proof",
                             };
 
                             if let Some(v) = metrics::get_int_counter(

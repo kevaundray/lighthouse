@@ -1056,7 +1056,7 @@ pub struct SseExecutionProof {
     pub block_root: Hash256,
     pub block_hash: ExecutionBlockHash,
     #[serde(with = "serde_utils::quoted_u64")]
-    pub subnet_id: u64,
+    pub execution_proof_id: u64,
     #[serde(with = "serde_utils::quoted_u64")]
     pub version: u64,
 }
@@ -1066,7 +1066,7 @@ impl SseExecutionProof {
         SseExecutionProof {
             block_root: execution_proof.block_root,
             block_hash: execution_proof.block_hash,
-            subnet_id: *execution_proof.subnet_id,
+            execution_proof_id: execution_proof.execution_proof_id,
             version: execution_proof.version,
         }
     }

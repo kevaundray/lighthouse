@@ -290,15 +290,14 @@ pub fn build_enr<E: EthSpec>(
     );
 
     // set the "exproofs" field on our ENR
-    // Default to 0 (no subnets)
+    // This is a simple boolean (expressed as u8): do we listen for execution proofs?
+    // All execution proofs are sent on a single subnet (subnet 0).
+    // Nodes receive all proofs for each execution payload (from different proof systems/zkVMs)
+    // and choose k-out-of-n validation at the application layer.
     let execution_proof_subnets: u8 = if config.stateless_validation {
-        // If stateless validation is enabled, advertise all subnets
-        // as a default.
-        // TODO(zkproofs): In the future, we can allow nodes to choose
-        // certain subnets based on their k-out-of-n appetite
-        0xFF
+        0x01  // Subscribe to execution proof subnet
     } else {
-        0
+        0x00  // Don't subscribe
     };
     builder.add_value(EXECUTION_PROOF_SUBNETS_ENR_KEY, &execution_proof_subnets);
 

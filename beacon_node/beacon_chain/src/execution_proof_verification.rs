@@ -13,7 +13,6 @@ use crate::beacon_chain::{BeaconChain, BeaconChainTypes};
 use crate::execution_proof_generation;
 use crate::observed_data_sidecars::{ObservationStrategy, Observe};
 use slot_clock::SlotClock;
-use types::execution_proof_subnet_id::ExecutionProofSubnetId;
 use types::{ExecutionProof, Hash256, Slot};
 
 /// An error occurred while validating a gossip execution proof.
@@ -29,8 +28,6 @@ pub enum GossipExecutionProofError {
         message_slot: Slot,
         earliest_permissible_slot: Slot,
     },
-    /// The subnet ID does not match the proof's subnet ID.
-    InvalidSubnetId { expected: u64, received: u64 },
     /// The execution proof failed cryptographic verification.
     InvalidProof { reason: String },
     /// The execution proof is structurally invalid.
@@ -90,7 +87,6 @@ impl<T: BeaconChainTypes, O: ObservationStrategy> GossipVerifiedExecutionProof<T
     /// Create a new `GossipVerifiedExecutionProof` after performing gossip verification.
     pub fn new(
         proof: Arc<ExecutionProof>,
-        subnet_id: ExecutionProofSubnetId,
         chain: &BeaconChain<T>,
     ) -> Result<Self, GossipExecutionProofError> {
         let seen_timestamp = chain
@@ -98,7 +94,7 @@ impl<T: BeaconChainTypes, O: ObservationStrategy> GossipVerifiedExecutionProof<T
             .now_duration()
             .ok_or(BeaconChainError::UnableToReadSlot)?;
 
-        validate_execution_proof_for_gossip::<T, O>(proof.clone(), subnet_id, chain)?;
+        validate_execution_proof_for_gossip::<T, O>(proof.clone(), chain)?;
 
         // Perform cryptographic verification
         if !execution_proof_generation::validate_proof(&proof) {
@@ -138,11 +134,6 @@ impl<T: BeaconChainTypes, O: ObservationStrategy> GossipVerifiedExecutionProof<T
         self.proof.as_proof()
     }
 
-    /// Get the subnet ID.
-    pub fn subnet_id(&self) -> ExecutionProofSubnetId {
-        self.proof.proof.subnet_id
-    }
-
     /// Get the slot of the proof (derived from block).
     pub fn slot(&self) -> Slot {
         // TODO: This would need to be derived from the block the proof references
@@ -159,18 +150,10 @@ impl<T: BeaconChainTypes, O: ObservationStrategy> GossipVerifiedExecutionProof<T
 /// Validate an execution proof for gossip according to the rules defined in the consensus specs.
 fn validate_execution_proof_for_gossip<T: BeaconChainTypes, O: ObservationStrategy>(
     proof: Arc<ExecutionProof>,
-    subnet_id: ExecutionProofSubnetId,
     _chain: &BeaconChain<T>,
 ) -> Result<(), GossipExecutionProofError> {
-    // Check subnet ID matches
-    if proof.subnet_id != subnet_id {
-        return Err(GossipExecutionProofError::InvalidSubnetId {
-            expected: *subnet_id,
-            received: *proof.subnet_id,
-        });
-    }
-
     // Check structural validity
+    // TODO(zkproofs): Do proper validation here
     if !proof.is_structurally_valid() {
         return Err(GossipExecutionProofError::InvalidStructure {
             reason: "Proof is structurally invalid".to_string(),
@@ -205,8 +188,8 @@ impl VerifiedExecutionProofList {
                 verified_proofs.push(VerifiedExecutionProof::new(proof, seen_timestamp));
             } else {
                 return Err(format!(
-                    "Invalid execution proof for subnet {}",
-                    *proof.subnet_id
+                    "Invalid execution proof for proof system {} v{}",
+                    proof.execution_proof_id, proof.version
                 ));
             }
         }

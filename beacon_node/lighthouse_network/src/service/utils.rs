@@ -17,8 +17,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
 use types::{
-    ChainSpec, DataColumnSubnetId, EnrForkId, EthSpec, ExecutionProofSubnetId, ForkContext,
-    SubnetId, SyncSubnetId, execution_proof_subnet_id::MAX_EXECUTION_PROOF_SUBNETS,
+    ChainSpec, DataColumnSubnetId, EnrForkId, EthSpec, ForkContext,
+    SubnetId, SyncSubnetId,
 };
 
 pub const NETWORK_KEY_FILENAME: &str = "key";
@@ -289,13 +289,9 @@ pub(crate) fn create_whitelist_filter(
         for id in 0..spec.data_column_sidecar_subnet_count {
             add(DataColumnSidecar(DataColumnSubnetId::new(id)));
         }
-        // Add execution proof subnets
-        for id in 0..MAX_EXECUTION_PROOF_SUBNETS {
-            add(ExecutionProof(
-                ExecutionProofSubnetId::new(id)
-                    .expect("id is less than MAX_EXECUTION_PROOF_SUBNETS"),
-            ));
-        }
+        // TODO(zkproofs): Check stateless-validation flag before adding this
+        // Add execution proof topic (single topic, not subnet-based)
+        add(ExecutionProof);
     }
     gossipsub::WhitelistSubscriptionFilter(possible_hashes)
 }

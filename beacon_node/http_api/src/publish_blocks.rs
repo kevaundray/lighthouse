@@ -119,13 +119,11 @@ pub async fn publish_block<T: BeaconChainTypes, B: IntoGossipVerifiedBlock<T>>(
         );
 
         let network_tx_clone = network_tx.clone();
-        let publish_fn = move |proof_id: types::ExecutionProofSubnetId,
-                               proof: types::ExecutionProof| {
+        let publish_fn = move |proof: types::ExecutionProof| {
             let pubsub_message =
-                PubsubMessage::ExecutionProofMessage(Box::new((proof_id, Arc::new(proof))));
+                PubsubMessage::ExecutionProofMessage(Box::new(Arc::new(proof)));
             if let Err(e) = crate::publish_pubsub_message(&network_tx_clone, pubsub_message) {
                 warn!(
-                    subnet_id = *proof_id,
                     error = ?e,
                     "Failed to publish execution proof to gossip network"
                 );

@@ -43,7 +43,7 @@ use store::hot_cold_store::HotColdDBError;
 use tracing::{Instrument, Span, debug, error, info, instrument, trace, warn};
 use types::{
     Attestation, AttestationData, AttestationRef, AttesterSlashing, BlobSidecar, DataColumnSidecar,
-    DataColumnSubnetId, EthSpec, ExecPayload, ExecutionProof, ExecutionProofSubnetId, Hash256,
+    DataColumnSubnetId, EthSpec, ExecPayload, ExecutionProof, Hash256,
     IndexedAttestation, LightClientFinalityUpdate, LightClientOptimisticUpdate, ProposerSlashing,
     SignedAggregateAndProof, SignedBeaconBlock, SignedBlsToExecutionChange,
     SignedContributionAndProof, SignedVoluntaryExit, SingleAttestation, Slot, SubnetId,
@@ -1476,24 +1476,21 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
                         );
 
                         let network_tx_clone = self.network_tx.clone();
-                        let publish_fn =
-                            move |proof_id: types::ExecutionProofSubnetId,
-                                  proof: types::ExecutionProof| {
-                                let pubsub_message = PubsubMessage::ExecutionProofMessage(
-                                    Box::new((proof_id, Arc::new(proof))),
+                        let publish_fn = move |proof: types::ExecutionProof| {
+                            let pubsub_message = PubsubMessage::ExecutionProofMessage(
+                                Box::new(Arc::new(proof)),
+                            );
+                            if let Err(e) =
+                                network_tx_clone.send(crate::service::NetworkMessage::Publish {
+                                    messages: vec![pubsub_message],
+                                })
+                            {
+                                warn!(
+                                    error = ?e,
+                                    "Failed to publish execution proof to gossip network (Phase 2)"
                                 );
-                                if let Err(e) =
-                                    network_tx_clone.send(crate::service::NetworkMessage::Publish {
-                                        messages: vec![pubsub_message],
-                                    })
-                                {
-                                    warn!(
-                                        subnet_id = *proof_id,
-                                        error = ?e,
-                                        "Failed to publish execution proof to gossip network (Phase 2)"
-                                    );
-                                }
-                            };
+                            }
+                        };
 
                         execution_proof_network::spawn_proof_generation_task_with_publishing(
                             &self.chain,
@@ -3261,17 +3258,14 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
         message_id: MessageId,
         peer_id: PeerId,
         _peer_client: Client,
-        subnet_id: ExecutionProofSubnetId,
         execution_proof: Arc<ExecutionProof>,
         _seen_duration: Duration,
     ) {
         let block_hash = execution_proof.block_hash;
         let proof_description = execution_proof.description();
-        let subnet_id_u64 = *subnet_id;
 
         debug!(
             %block_hash,
-            subnet_id = %subnet_id_u64,
             description = %proof_description,
             "Processing gossip execution proof"
         );
@@ -3279,14 +3273,12 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
         // Create gossip verified execution proof (includes full verification)
         let verified_proof = match GossipVerifiedExecutionProof::<T>::new(
             execution_proof.clone(),
-            subnet_id,
             &self.chain,
         ) {
             Ok(verified) => verified,
             Err(GossipExecutionProofError::InvalidProof { reason }) => {
                 warn!(
                     %block_hash,
-                    subnet_id = %subnet_id_u64,
                     %reason,
                     "Rejecting execution proof with invalid cryptographic proof"
                 );
@@ -3298,25 +3290,9 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
                 );
                 return;
             }
-            Err(GossipExecutionProofError::InvalidSubnetId { expected, received }) => {
-                warn!(
-                    %block_hash,
-                    expected,
-                    received,
-                    "Rejecting execution proof with mismatched subnet ID"
-                );
-                self.propagate_validation_result(message_id, peer_id, MessageAcceptance::Reject);
-                self.gossip_penalize_peer(
-                    peer_id,
-                    PeerAction::LowToleranceError,
-                    "execution_proof_subnet_mismatch",
-                );
-                return;
-            }
             Err(GossipExecutionProofError::InvalidStructure { reason }) => {
                 warn!(
                     %block_hash,
-                    subnet_id = %subnet_id_u64,
                     %reason,
                     "Rejecting structurally invalid execution proof"
                 );
@@ -3331,7 +3307,6 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
             Err(e) => {
                 warn!(
                     %block_hash,
-                    subnet_id = %subnet_id_u64,
                     error = ?e,
                     "Failed to verify execution proof"
                 );
@@ -3354,7 +3329,6 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
             Err(e) => {
                 warn!(
                     %block_hash,
-                    subnet_id = %subnet_id_u64,
                     error = ?e,
                     "Failed to store execution proof in data availability checker"
                 );
@@ -3390,7 +3364,6 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
                         debug!(
                             %block_root,
                             execution_block_hash = %block_hash,
-                            subnet_id = subnet_id_u64,
                             "Execution proof stored, but block still missing other components"
                         );
                         self.propagate_validation_result(
@@ -3404,7 +3377,6 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
                 debug!(
                     %block_root,
                     execution_block_hash = %block_hash,
-                    subnet_id = subnet_id_u64,
                     "Execution proof received via gossip"
                 );
 

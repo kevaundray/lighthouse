@@ -254,7 +254,6 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
         message_id: MessageId,
         peer_id: PeerId,
         peer_client: Client,
-        subnet_id: ExecutionProofSubnetId,
         execution_proof: Arc<ExecutionProof>,
         seen_timestamp: Duration,
     ) -> Result<(), Error<T::EthSpec>> {
@@ -265,7 +264,6 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
                     message_id,
                     peer_id,
                     peer_client,
-                    subnet_id,
                     execution_proof,
                     seen_timestamp,
                 )

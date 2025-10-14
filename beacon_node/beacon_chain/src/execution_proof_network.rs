@@ -2,12 +2,13 @@ use crate::{BeaconChain, BeaconChainTypes};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 use types::{
-    BeaconBlockRef, BeaconStateError, ExecutionPayload, ExecutionProofSubnetId, FullPayload,
-    FullPayloadRef, Hash256,
+    BeaconBlockRef, BeaconStateError, ExecutionPayload, FullPayload, FullPayloadRef, Hash256,
 };
 
 /// Spawn a background task to generate and store execution proofs with publishing via callback
 /// This provides a clean interface for both HTTP API (publish_blocks) and gossip processing (process_block)
+///
+/// Different proof systems are identified by the execution_proof_id field in ExecutionProof.
 pub fn spawn_proof_generation_task_with_publishing<T, F>(
     chain: &Arc<BeaconChain<T>>,
     block: BeaconBlockRef<'_, T::EthSpec, FullPayload<T::EthSpec>>,
@@ -16,7 +17,7 @@ pub fn spawn_proof_generation_task_with_publishing<T, F>(
     task_name: &'static str,
 ) where
     T: BeaconChainTypes,
-    F: Fn(ExecutionProofSubnetId, types::ExecutionProof) + Send + 'static,
+    F: Fn(types::ExecutionProof) + Send + 'static,
 {
     let chain_clone = chain.clone();
 
@@ -46,45 +47,37 @@ pub fn spawn_proof_generation_task_with_publishing<T, F>(
             // Simulate execution witness data (in production, this would come from EL)
             let witness = format!("dummy_witness_for_block_{:?}", execution_block_hash).into_bytes();
 
-            // Get configured subnets for proof generation
-            let proof_subnets = get_configured_proof_subnets(&chain_clone);
+            // Get configured proof systems for proof generation
+            let proof_systems = get_configured_proof_systems(&chain_clone);
 
             debug!(
                 execution_block_hash = ?execution_block_hash,
-                subnet_count = proof_subnets.len(),
-                subnets = ?proof_subnets,
-                "Generating proofs for configured subnets"
+                proof_system_count = proof_systems.len(),
+                proof_systems = ?proof_systems,
+                "Generating proofs for configured proof systems"
             );
 
-            // Generate and store a proof for each subnet
-            for subnet_id in proof_subnets {
-                let proof_id = match ExecutionProofSubnetId::new(subnet_id) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        debug!(subnet_id, error = %e, "Invalid subnet ID, skipping");
-                        continue;
-                    }
-                };
-
+            // Generate and store a proof for each proof system
+            for execution_proof_id in proof_systems {
                 // Generate proof using the execution_proof_generation module
                 let proof = crate::execution_proof_generation::generate_proof(
-                    block_root, &payload, &witness, proof_id,
+                    block_root, &payload, &witness, execution_proof_id,
                 )
                 .await;
 
                 let verified_proof = match crate::execution_proof_verification::GossipVerifiedExecutionProof::<
                     T,
-                >::new(Arc::new(proof.clone()), proof_id, &chain_clone)
+                >::new(Arc::new(proof.clone()), &chain_clone)
                 {
                     Ok(verified) => verified,
                     Err(e) => {
                         warn!(
                             execution_block_hash = ?execution_block_hash,
-                            subnet_id,
+                            execution_proof_id,
                             error = ?e,
                             "Failed to verify locally generated execution proof"
                         );
-                        continue; // Skip this proof and continue with next subnet
+                        continue; // Skip this proof and continue with next execution proof
                     }
                 };
 
@@ -96,16 +89,16 @@ pub fn spawn_proof_generation_task_with_publishing<T, F>(
                     Ok(_) => {
                         debug!(
                             execution_block_hash = ?execution_block_hash,
-                            subnet_id,
+                            execution_proof_id,
                             "Generated and stored execution proof locally"
                         );
                         // Let the caller handle publishing via their specific network interface
-                        publish_fn(proof_id, proof);
+                        publish_fn(proof);
                     }
                     Err(e) => {
                         warn!(
                             execution_block_hash = ?execution_block_hash,
-                            subnet_id,
+                            execution_proof_id,
                             error = ?e,
                             "Failed to store generated execution proof"
                         );
@@ -117,16 +110,22 @@ pub fn spawn_proof_generation_task_with_publishing<T, F>(
     );
 }
 
-/// Get configured proof subnets for this node
-pub fn get_configured_proof_subnets<T: BeaconChainTypes>(chain: &Arc<BeaconChain<T>>) -> Vec<u64> {
-    // TODO(zkproofs): For now, the node will generate proofs for all available subnets. In the
-    // future, they should be able to configure this for proofs they can generate for. Mainly for
-    // altruistic nodes that want to seed the network.
+/// Get configured proof systems for this node to generate proofs for
+pub fn get_configured_proof_systems<T: BeaconChainTypes>(chain: &Arc<BeaconChain<T>>) -> Vec<u64> {
+    // TODO(zkproofs): For now, the node will generate proofs for all known proof systems.
+    // In the future, nodes should be able to configure which specific proof systems they can
+    // generate proofs for. This would be useful for altruistic nodes that want to seed the
+    // network with specific proof types they can efficiently generate.
     //
     // TODO(zkproofs): Check if there are any assumptions on the proof being deterministic ie
     // whether its okay that two nodes generate two valid proofs for the same payload.
     if chain.config.generate_execution_proofs {
-        (0..types::execution_proof_subnet_id::MAX_EXECUTION_PROOF_SUBNETS).collect()
+        // TODO(zkproofs): We can make some nodes choose what zkVMs they generate proofs for
+        vec![
+            types::EXECUTION_PROOF_0,
+            types::EXECUTION_PROOF_1,
+            types::EXECUTION_PROOF_2,
+        ]
     } else {
         vec![]
     }

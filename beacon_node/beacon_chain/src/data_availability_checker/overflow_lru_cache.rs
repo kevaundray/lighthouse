@@ -20,7 +20,6 @@ use std::sync::Arc;
 use tracing::{Span, debug, debug_span};
 use types::beacon_block_body::KzgCommitments;
 use types::blob_sidecar::BlobIdentifier;
-use types::execution_proof_subnet_id::ExecutionProofSubnetId;
 use types::{
     BlobSidecar, BlockImportSource, ChainSpec, ColumnIndex, DataColumnSidecar,
     DataColumnSidecarList, Epoch, EthSpec, Hash256, RuntimeFixedVector, RuntimeVariableList,
@@ -79,8 +78,9 @@ pub struct PendingComponents<E: EthSpec> {
     pub verified_data_columns: Vec<KzgVerifiedCustodyDataColumn<E>>,
     pub block: Option<CachedBlock<E>>,
     pub reconstruction_started: bool,
-    /// Verified execution proofs indexed by subnet ID
-    pub verified_execution_proofs: HashMap<ExecutionProofSubnetId, VerifiedExecutionProof>,
+    /// Verified execution proofs indexed by proof system ID
+    /// Multiple proof systems can provide proofs for the same block, each identified by their execution_proof_id
+    pub verified_execution_proofs: HashMap<u64, VerifiedExecutionProof>,
     span: Span,
 }
 
@@ -211,9 +211,9 @@ impl<E: EthSpec> PendingComponents<E> {
         execution_proofs: I,
     ) {
         for execution_proof in execution_proofs {
-            let subnet_id = execution_proof.as_proof().subnet_id;
+            let execution_proof_id = execution_proof.as_proof().execution_proof_id;
             self.verified_execution_proofs
-                .entry(subnet_id)
+                .entry(execution_proof_id)
                 .or_insert(execution_proof);
         }
     }
