@@ -66,7 +66,7 @@ pub struct ExecutionProof {
     /// The execution block hash this proof attests to
     pub block_hash: ExecutionBlockHash,
     /// Identifies which proof system/zkVM generated this proof
-    /// See EXECUTION_PROOF_* constants for known values.
+    /// See `ProofSystemId` constants for known values.
     pub execution_proof_id: u64,
     /// Version of the proof format within the specific proof system
     /// Each proof system can independently upgrade their version number.
