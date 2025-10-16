@@ -19,8 +19,11 @@ pub use verifier_registry::VerifierRegistry;
 use slog::{debug, error, info, warn, Logger};
 use std::collections::HashSet;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 use types::{ExecutionBlockHash, ExecutionProof, ExecutionProofSubnetId, Hash256};
+
+/// Type for the callback function when proofs become available
+pub type ProofReadyCallback = Arc<dyn Fn(ExecutionBlockHash) + Send + Sync>;
 
 /// Result type for StatelessExecutionLayer operations
 pub type Result<T> = std::result::Result<T, StatelessExecutionLayerError>;
@@ -84,6 +87,9 @@ pub struct StatelessExecutionLayer {
     /// Format: (subnet_id, proof)
     network_tx: Option<mpsc::UnboundedSender<(ExecutionProofSubnetId, Arc<ExecutionProof>)>>,
 
+    /// Callback to notify when required proofs become available for a block
+    proof_ready_callback: Arc<RwLock<Option<ProofReadyCallback>>>,
+
     /// Logger
     log: Logger,
 }
@@ -125,6 +131,7 @@ impl StatelessExecutionLayer {
             verifiers,
             generators,
             network_tx: None,
+            proof_ready_callback: Arc::new(RwLock::new(None)),
             log,
         })
     }
@@ -135,6 +142,12 @@ impl StatelessExecutionLayer {
         tx: mpsc::UnboundedSender<(ExecutionProofSubnetId, Arc<ExecutionProof>)>,
     ) {
         self.network_tx = Some(tx);
+    }
+
+    /// Register a callback to be notified when required proofs become available for a block
+    pub async fn register_proof_ready_callback(&self, callback: ProofReadyCallback) {
+        let mut cb = self.proof_ready_callback.write().await;
+        *cb = Some(callback);
     }
 
     /// Main Engine API method: validate execution payload
@@ -239,8 +252,24 @@ impl StatelessExecutionLayer {
             "block_hash" => ?proof.block_hash,
         );
 
+        let block_hash = proof.block_hash;
+
         // Store in cache
         self.proof_cache.insert((*proof).clone()).await;
+
+        // Check if we now have enough proofs for this block
+        if self.has_required_proofs(&block_hash).await {
+            debug!(
+                self.log,
+                "Required proofs threshold reached";
+                "block_hash" => ?block_hash,
+            );
+
+            // Trigger callback if available
+            if let Some(callback) = self.proof_ready_callback.read().await.as_ref() {
+                callback(block_hash);
+            }
+        }
 
         Ok(())
     }
