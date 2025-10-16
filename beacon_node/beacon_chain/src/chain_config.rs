@@ -2,7 +2,7 @@ pub use proto_array::{DisallowedReOrgOffsets, ReOrgThreshold};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::{collections::HashSet, sync::LazyLock, time::Duration};
-use types::{Checkpoint, Epoch, Hash256};
+use types::{Checkpoint, Epoch, ExecutionProofSubnetId, Hash256};
 
 pub const DEFAULT_RE_ORG_HEAD_THRESHOLD: ReOrgThreshold = ReOrgThreshold(20);
 pub const DEFAULT_RE_ORG_PARENT_THRESHOLD: ReOrgThreshold = ReOrgThreshold(160);
@@ -118,6 +118,14 @@ pub struct ChainConfig {
     pub invalid_block_roots: HashSet<Hash256>,
     /// Disable the getBlobs optimisation to fetch blobs from the EL mempool.
     pub disable_get_blobs: bool,
+    /// Enable stateless execution layer instead of full EL
+    pub stateless_execution_layer: bool,
+    /// Execution proof subnets to subscribe to (for verification)
+    pub verify_execution_proof_subnets: HashSet<ExecutionProofSubnetId>,
+    /// Minimum proofs required from different subnets before accepting payload
+    pub min_proofs_required: usize,
+    /// Execution proof subnets to generate proofs for (for proposing)
+    pub generate_execution_proof_subnets: HashSet<ExecutionProofSubnetId>,
 }
 
 impl Default for ChainConfig {
@@ -158,6 +166,10 @@ impl Default for ChainConfig {
             data_column_publishing_delay: None,
             invalid_block_roots: HashSet::new(),
             disable_get_blobs: false,
+            stateless_execution_layer: false,
+            verify_execution_proof_subnets: HashSet::new(),
+            min_proofs_required: 1, // Default: require at least 1 proof
+            generate_execution_proof_subnets: HashSet::new(),
         }
     }
 }

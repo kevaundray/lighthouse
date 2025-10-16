@@ -323,6 +323,87 @@ pub fn get_config<E: EthSpec>(
     // Store the EL config in the client config.
     client_config.execution_layer = Some(el_config);
 
+    /*
+     * Stateless Execution Layer
+     */
+    if cli_args.get_flag("stateless-execution-layer") {
+        use stateless_execution_layer::StatelessExecutionLayerConfigBuilder;
+        use types::ExecutionProofSubnetId;
+
+        let mut config_builder = StatelessExecutionLayerConfigBuilder::default();
+
+        // Parse subscription subnets (required)
+        let verify_subnets: Vec<String> = cli_args
+            .get_many::<String>("verify-execution-proof-subnets")
+            .map(|vals| vals.map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+
+        if verify_subnets.is_empty() {
+            return Err(
+                "--stateless-execution-layer requires --verify-execution-proof-subnets".to_string()
+            );
+        }
+
+        for subnet_str in &verify_subnets {
+            let subnet_id = subnet_str
+                .parse::<u8>()
+                .map_err(|_| format!("Invalid subnet ID: {}", subnet_str))
+                .and_then(|id| {
+                    ExecutionProofSubnetId::new(id)
+                        .map_err(|e| format!("Invalid subnet ID {}: {:?}", id, e))
+                })?;
+            config_builder = config_builder.add_subscribed_subnet(subnet_id);
+        }
+
+        // Parse generation subnets (optional)
+        if let Some(generate_subnets) = cli_args.get_many::<String>("generate-execution-proof-subnets") {
+            for subnet_str in generate_subnets {
+                let subnet_id = subnet_str
+                    .parse::<u8>()
+                    .map_err(|_| format!("Invalid subnet ID: {}", subnet_str))
+                    .and_then(|id| {
+                        ExecutionProofSubnetId::new(id)
+                            .map_err(|e| format!("Invalid subnet ID {}: {:?}", id, e))
+                    })?;
+                config_builder = config_builder.add_generation_subnet(subnet_id);
+            }
+        }
+
+        // Parse min proofs
+        if let Some(min_proofs_str) = cli_args.get_one::<String>("stateless-el-min-proofs") {
+            let min_proofs = min_proofs_str
+                .parse::<usize>()
+                .map_err(|_| "Invalid value for --stateless-el-min-proofs")?;
+
+            if min_proofs == 0 {
+                return Err("--stateless-el-min-proofs must be at least 1".to_string());
+            }
+
+            config_builder = config_builder.min_proofs_required(min_proofs);
+        }
+
+        let stateless_el_config = config_builder
+            .build()
+            .map_err(|e| format!("Invalid stateless-EL configuration: {}", e))?;
+
+        info!(
+            verify_subnets = ?stateless_el_config.subscribed_subnets,
+            generate_subnets = ?stateless_el_config.generation_subnets,
+            min_proofs = stateless_el_config.min_proofs_required,
+            "Stateless execution layer enabled"
+        );
+
+        client_config.stateless_execution_layer = Some(stateless_el_config.clone());
+
+        // Configure execution proof subnet subscriptions in NetworkConfig
+        client_config.network.execution_proof_subnets = stateless_el_config.subscribed_subnets.clone();
+
+        info!(
+            subnets = ?stateless_el_config.subscribed_subnets,
+            "Configured execution proof gossip subscriptions"
+        );
+    }
+
     // Override default trusted setup file if required
     if let Some(trusted_setup_file_path) = cli_args.get_one::<String>("trusted-setup-file-override")
     {

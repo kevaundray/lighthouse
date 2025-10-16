@@ -7,6 +7,7 @@ use kzg::trusted_setup::get_trusted_setup;
 use network::NetworkConfig;
 use sensitive_url::SensitiveUrl;
 use serde::{Deserialize, Serialize};
+use stateless_execution_layer;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -79,6 +80,8 @@ pub struct Config {
     pub genesis_state_url: Option<String>,
     pub genesis_state_url_timeout: Duration,
     pub allow_insecure_genesis_sync: bool,
+    /// Stateless execution layer configuration (if enabled)
+    pub stateless_execution_layer: Option<stateless_execution_layer::StatelessExecutionLayerConfig>,
 }
 
 impl Default for Config {
@@ -107,6 +110,7 @@ impl Default for Config {
             // This default value should always be overwritten by the CLI default value.
             genesis_state_url_timeout: Duration::from_secs(60),
             allow_insecure_genesis_sync: false,
+            stateless_execution_layer: None,
         }
     }
 }

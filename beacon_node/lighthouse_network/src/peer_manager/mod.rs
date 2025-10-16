@@ -1081,6 +1081,8 @@ impl<E: EthSpec> PeerManager<E> {
                     Subnet::DataColumn(id) => {
                         peer_info.custody_subnets.insert(id);
                     }
+                    // TODO: Track execution proof subnets in peer_info
+                    Subnet::ExecutionProof(_) => {}
                 }
             }
 

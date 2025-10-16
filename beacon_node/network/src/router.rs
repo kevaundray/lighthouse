@@ -40,6 +40,10 @@ pub struct Router<T: BeaconChainTypes> {
     network_beacon_processor: Arc<NetworkBeaconProcessor<T>>,
     /// Provides de-bounce functionality for logging.
     logger_debounce: TimeLatch,
+    /// Channel to send execution proofs to stateless-EL (if configured).
+    /// TODO: Wire this up when stateless-EL is implemented (Phase 3)
+    /// https://github.com/sigp/lighthouse/issues/XXXX
+    stateless_el_proof_tx: Option<mpsc::UnboundedSender<Arc<types::ExecutionProof>>>,
 }
 
 /// Types of messages the router can receive.
@@ -86,6 +90,7 @@ impl<T: BeaconChainTypes> Router<T> {
         invalid_block_storage: InvalidBlockStorage,
         beacon_processor_send: BeaconProcessorSend<T::EthSpec>,
         fork_context: Arc<ForkContext>,
+        stateless_el_proof_tx: Option<mpsc::UnboundedSender<Arc<types::ExecutionProof>>>,
     ) -> Result<mpsc::UnboundedSender<RouterMessage<T::EthSpec>>, String> {
         trace!("Service starting");
 
@@ -124,6 +129,7 @@ impl<T: BeaconChainTypes> Router<T> {
             network: HandlerNetworkContext::new(network_send),
             network_beacon_processor,
             logger_debounce: TimeLatch::default(),
+            stateless_el_proof_tx,
         };
 
         // spawn handler task and move the message handler instance into the spawned thread
@@ -486,6 +492,26 @@ impl<T: BeaconChainTypes> Router<T> {
                             bls_to_execution_change,
                         ),
                 ),
+            PubsubMessage::ExecutionProofMessage(data) => {
+                let (subnet_id, proof) = *data;
+
+                // TODO: Forward to stateless-EL when implemented
+                // https://github.com/sigp/lighthouse/issues/XXXX
+                // For now, just log that we received it
+                debug!(
+                    %peer_id,
+                    subnet_id = subnet_id.as_u8(),
+                    block_hash = ?proof.block_hash,
+                    "Received execution proof (not yet forwarded to stateless-EL)"
+                );
+
+                // Future implementation:
+                // if let Some(tx) = &self.stateless_el_proof_tx {
+                //     if let Err(e) = tx.send(proof) {
+                //         warn!("Failed to send execution proof to stateless-EL: {:?}", e);
+                //     }
+                // }
+            }
         }
     }
 

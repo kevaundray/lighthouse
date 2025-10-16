@@ -1,0 +1,36 @@
+[package]
+name = "stateless_execution_layer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Consensus types for ExecutionProof and related structures
+types = { path = "../consensus/types" }
+
+# Execution layer types
+execution_layer = { path = "../beacon_node/execution_layer" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Async trait support
+async-trait = "0.1"
+
+# Caching
+lru = "0.12"
+
+# Logging
+slog = "2"
+
+# Error handling
+thiserror = "2"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+
+# Collections
+hashbrown = "0.15"
+
+[dev-dependencies]
+# Testing
+tokio-test = "0.4"

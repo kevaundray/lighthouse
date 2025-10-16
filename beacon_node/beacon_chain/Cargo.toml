@@ -53,6 +53,7 @@ serde_json = { workspace = true }
 slasher = { workspace = true }
 slot_clock = { workspace = true }
 smallvec = { workspace = true }
+stateless_execution_layer = { path = "../../stateless_execution_layer" }
 ssz_types = { workspace = true }
 state_processing = { workspace = true }
 store = { workspace = true }

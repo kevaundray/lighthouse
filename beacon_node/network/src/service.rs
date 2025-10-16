@@ -316,6 +316,7 @@ impl<T: BeaconChainTypes> NetworkService<T> {
             invalid_block_storage,
             beacon_processor_send,
             fork_context.clone(),
+            None, // TODO: Wire up stateless-EL proof channel in task 7
         )?;
 
         // attestation and sync committee subnet service

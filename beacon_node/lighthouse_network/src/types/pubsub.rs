@@ -8,14 +8,14 @@ use std::io::{Error, ErrorKind};
 use std::sync::Arc;
 use types::{
     AttesterSlashing, AttesterSlashingBase, AttesterSlashingElectra, BlobSidecar,
-    DataColumnSidecar, DataColumnSubnetId, EthSpec, ForkContext, ForkName,
-    LightClientFinalityUpdate, LightClientOptimisticUpdate, ProposerSlashing,
-    SignedAggregateAndProof, SignedAggregateAndProofBase, SignedAggregateAndProofElectra,
-    SignedBeaconBlock, SignedBeaconBlockAltair, SignedBeaconBlockBase, SignedBeaconBlockBellatrix,
-    SignedBeaconBlockCapella, SignedBeaconBlockDeneb, SignedBeaconBlockElectra,
-    SignedBeaconBlockFulu, SignedBeaconBlockGloas, SignedBlsToExecutionChange,
-    SignedContributionAndProof, SignedVoluntaryExit, SingleAttestation, SubnetId,
-    SyncCommitteeMessage, SyncSubnetId,
+    DataColumnSidecar, DataColumnSubnetId, EthSpec, ExecutionProof, ExecutionProofSubnetId,
+    ForkContext, ForkName, LightClientFinalityUpdate, LightClientOptimisticUpdate,
+    ProposerSlashing, SignedAggregateAndProof, SignedAggregateAndProofBase,
+    SignedAggregateAndProofElectra, SignedBeaconBlock, SignedBeaconBlockAltair,
+    SignedBeaconBlockBase, SignedBeaconBlockBellatrix, SignedBeaconBlockCapella,
+    SignedBeaconBlockDeneb, SignedBeaconBlockElectra, SignedBeaconBlockFulu, SignedBeaconBlockGloas,
+    SignedBlsToExecutionChange, SignedContributionAndProof, SignedVoluntaryExit, SingleAttestation,
+    SubnetId, SyncCommitteeMessage, SyncSubnetId,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -46,6 +46,8 @@ pub enum PubsubMessage<E: EthSpec> {
     LightClientFinalityUpdate(Box<LightClientFinalityUpdate<E>>),
     /// Gossipsub message providing notification of a light client optimistic update.
     LightClientOptimisticUpdate(Box<LightClientOptimisticUpdate<E>>),
+    /// ExecutionProof message with subnet_id and proof data
+    ExecutionProofMessage(Box<(ExecutionProofSubnetId, Arc<ExecutionProof>)>),
 }
 
 // Implements the `DataTransform` trait of gossipsub to employ snappy compression
@@ -149,6 +151,7 @@ impl<E: EthSpec> PubsubMessage<E> {
             PubsubMessage::LightClientOptimisticUpdate(_) => {
                 GossipKind::LightClientOptimisticUpdate
             }
+            PubsubMessage::ExecutionProofMessage(data) => GossipKind::ExecutionProof(data.0),
         }
     }
 
@@ -387,6 +390,35 @@ impl<E: EthSpec> PubsubMessage<E> {
                             light_client_optimistic_update,
                         )))
                     }
+                    GossipKind::ExecutionProof(subnet_id) => {
+                        // Decode ExecutionProof from SSZ bytes
+                        let execution_proof = ExecutionProof::from_ssz_bytes(data)
+                            .map_err(|e| {
+                                format!(
+                                    "Failed to decode ExecutionProof from SSZ: {:?}",
+                                    e
+                                )
+                            })?;
+
+                        // Verify subnet_id in proof matches gossip topic subnet_id
+                        if execution_proof.subnet_id != *subnet_id {
+                            return Err(format!(
+                                "ExecutionProof subnet_id mismatch: gossip_topic={:?}, proof.subnet_id={:?}",
+                                subnet_id,
+                                execution_proof.subnet_id
+                            ));
+                        }
+
+                        // Verify proof has content
+                        if execution_proof.proof_data_size() == 0 {
+                            return Err("ExecutionProof has empty proof_data".to_string());
+                        }
+
+                        Ok(PubsubMessage::ExecutionProofMessage(Box::new((
+                            *subnet_id,
+                            Arc::new(execution_proof),
+                        ))))
+                    }
                 }
             }
         }
@@ -413,6 +445,7 @@ impl<E: EthSpec> PubsubMessage<E> {
             PubsubMessage::BlsToExecutionChange(data) => data.as_ssz_bytes(),
             PubsubMessage::LightClientFinalityUpdate(data) => data.as_ssz_bytes(),
             PubsubMessage::LightClientOptimisticUpdate(data) => data.as_ssz_bytes(),
+            PubsubMessage::ExecutionProofMessage(data) => data.1.as_ssz_bytes(),
         }
     }
 }
@@ -471,6 +504,14 @@ impl<E: EthSpec> std::fmt::Display for PubsubMessage<E> {
             }
             PubsubMessage::LightClientOptimisticUpdate(_data) => {
                 write!(f, "Light CLient Optimistic Update")
+            }
+            PubsubMessage::ExecutionProofMessage(data) => {
+                write!(
+                    f,
+                    "ExecutionProof: subnet_id: {}, proof_size: {}",
+                    data.0.as_u8(),
+                    data.1.proof_data_size()
+                )
             }
         }
     }

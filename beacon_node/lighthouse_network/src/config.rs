@@ -104,6 +104,9 @@ pub struct Config {
     /// runtime.
     pub import_all_attestations: bool,
 
+    /// Execution proof subnets to subscribe to for stateless execution layer.
+    pub execution_proof_subnets: std::collections::HashSet<types::ExecutionProofSubnetId>,
+
     /// A setting specifying a range of values that tune the network parameters of lighthouse. The
     /// lower the value the less bandwidth used, but the slower messages will be received.
     pub network_load: u8,
@@ -358,6 +361,7 @@ impl Default for Config {
             subscribe_all_data_column_subnets: false,
             subscribe_all_subnets: false,
             import_all_attestations: false,
+            execution_proof_subnets: std::collections::HashSet::new(),
             shutdown_after_sync: false,
             topics: Vec::new(),
             proposer_only: false,

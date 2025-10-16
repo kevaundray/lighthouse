@@ -428,6 +428,8 @@ pub struct BeaconChain<T: BeaconChainTypes> {
         Mutex<ObservedOperations<SignedBlsToExecutionChange, T::EthSpec>>,
     /// Interfaces with the execution client.
     pub execution_layer: Option<ExecutionLayer<T::EthSpec>>,
+    /// Stateless execution layer for proof-based validation (if configured).
+    pub stateless_execution_layer: Option<Arc<stateless_execution_layer::StatelessExecutionLayer>>,
     /// Stores information about the canonical head and finalized/justified checkpoints of the
     /// chain. Also contains the fork choice struct, for computing the canonical head.
     pub canonical_head: CanonicalHead<T>,

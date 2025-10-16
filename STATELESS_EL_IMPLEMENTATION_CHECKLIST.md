@@ -2,28 +2,31 @@
 
 This checklist tracks the implementation of the Stateless Execution Layer architecture as described in `STATELESS_EXECUTION_LAYER_DESIGN.md`.
 
-## Phase 1: Core Stateless-EL Crate (Foundation)
+## Phase 1: Core Stateless-EL Crate (Foundation) ✅ COMPLETE
 
 **Goal:** Create the stateless-EL crate with basic structure and dummy implementations.
 
-- [ ] Create `stateless_execution_layer/` crate with Cargo.toml
-- [ ] Implement `StatelessExecutionLayer` struct with core fields
-- [ ] Implement `ProofVerifier` and `ProofGenerator` traits
-- [ ] Create `DummyVerifier` implementation (simulate delay, return success)
-- [ ] Create `DummyGenerator` implementation (simulate delay, create dummy proof)
-- [ ] Implement `VerifierRegistry` and `GeneratorRegistry`
-- [ ] Implement proof cache with LRU eviction (`ProofCache`)
-- [ ] Implement basic `new_payload()` method with proof checking logic
-- [ ] Implement `forkchoice_updated()` method (minimal for stateless)
-- [ ] Create `StatelessExecutionLayerConfig` struct
-- [ ] Add configuration parsing and validation
-- [ ] Write unit tests for:
-  - [ ] Proof cache operations
-  - [ ] Config validation
-  - [ ] Dummy verifier/generator
-  - [ ] has_required_proofs() logic
+- [x] Create `stateless_execution_layer/` crate with Cargo.toml
+- [x] Implement `StatelessExecutionLayer` struct with core fields
+- [x] Implement `ProofVerifier` and `ProofGenerator` traits
+- [x] Create `DummyVerifier` implementation (simulate delay, return success)
+- [x] Create `DummyGenerator` implementation (simulate delay, create dummy proof)
+- [x] Implement `VerifierRegistry` and `GeneratorRegistry`
+- [x] Implement proof cache with LRU eviction (`ProofCache`)
+- [x] Implement basic `new_payload()` method with proof checking logic
+- [x] Implement `forkchoice_updated()` method (minimal for stateless)
+- [x] Create `StatelessExecutionLayerConfig` struct
+- [x] Add configuration parsing and validation
+- [x] Write unit tests for:
+  - [x] Proof cache operations
+  - [x] Config validation
+  - [x] Dummy verifier/generator
+  - [x] has_required_proofs() logic
 
-**Exit Criteria:** Stateless-EL crate compiles and unit tests pass.
+**Exit Criteria:** Stateless-EL crate compiles and unit tests pass. ✅
+
+**Completion Date:** 2025-10-15
+**Test Results:** 38 tests passed, 0 failed
 
 ---
 
@@ -317,6 +320,36 @@ Keep these files (they're reused):
 
 ## Current Status
 
-**Phase:** Not started
-**Branch:** (to be created)
-**Last Updated:** 2025-10-14
+**Phase:** Phase 1 Complete ✅
+**Branch:** kw/exec-proofs-stateless-el
+**Last Updated:** 2025-10-15
+
+### Phase 1 Summary
+
+Phase 1 is complete with all components implemented and tested:
+
+#### Files Created:
+- `consensus/types/src/execution_proof.rs` - Core ExecutionProof type with SSZ/TreeHash
+- `consensus/types/src/execution_proof_subnet_id.rs` - Type-safe subnet ID (0-7)
+- `stateless_execution_layer/Cargo.toml` - Crate dependencies
+- `stateless_execution_layer/src/config.rs` - Configuration with builder pattern
+- `stateless_execution_layer/src/proof_verification.rs` - ProofVerifier trait
+- `stateless_execution_layer/src/proof_generation.rs` - ProofGenerator trait
+- `stateless_execution_layer/src/dummy_verifier.rs` - Dummy verifier for testing
+- `stateless_execution_layer/src/dummy_generator.rs` - Dummy generator for testing
+- `stateless_execution_layer/src/verifier_registry.rs` - Registry for verifiers
+- `stateless_execution_layer/src/generator_registry.rs` - Registry for generators
+- `stateless_execution_layer/src/proof_cache.rs` - LRU cache for proofs
+- `stateless_execution_layer/src/lib.rs` - Main StatelessExecutionLayer implementation
+
+#### Test Coverage:
+All 38 unit tests passing:
+- Config validation (5 tests)
+- Dummy verifier/generator (8 tests)
+- Verifier/Generator registries (8 tests)
+- Proof cache operations (9 tests)
+- Error handling (2 tests)
+- Main StatelessExecutionLayer (3 tests)
+- Integration tests (3 tests)
+
+Ready to proceed to Phase 2: Network Integration

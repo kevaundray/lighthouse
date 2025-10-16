@@ -980,6 +980,7 @@ where
             observed_attester_slashings: <_>::default(),
             observed_bls_to_execution_changes: <_>::default(),
             execution_layer: self.execution_layer.clone(),
+            stateless_execution_layer: None, // TODO: Initialize in task 6
             genesis_validators_root,
             genesis_time,
             canonical_head,

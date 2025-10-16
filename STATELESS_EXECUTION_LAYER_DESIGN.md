@@ -42,7 +42,7 @@ The goal is to enable **stateless validation** where nodes can validate executio
 │  │  - Peer tracking (exec-proof-capable)       │  │
 │  └──────────────┬───────────────────────────────┘  │
 │                 │ Proof messages (channels)         │
-│                 ▼                                   │
+│                ▼                                   │
 │  ┌──────────────────────────────────────────────┐  │
 │  │ Lighthouse Network (lighthouse_network)      │  │
 │  │                                              │  │

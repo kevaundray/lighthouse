@@ -31,6 +31,7 @@ serde_json = { workspace = true }
 slasher = { workspace = true }
 slasher_service = { path = "../../slasher/service" }
 slot_clock = { workspace = true }
+stateless_execution_layer = { path = "../../stateless_execution_layer" }
 store = { workspace = true }
 task_executor = { workspace = true }
 time = "0.3.5"

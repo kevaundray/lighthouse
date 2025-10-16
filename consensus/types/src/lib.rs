@@ -107,6 +107,8 @@ pub mod blob_sidecar;
 pub mod data_column_custody_group;
 pub mod data_column_sidecar;
 pub mod data_column_subnet_id;
+pub mod execution_proof;
+pub mod execution_proof_subnet_id;
 pub mod light_client_header;
 pub mod non_zero_usize;
 pub mod runtime_fixed_vector;
@@ -177,6 +179,8 @@ pub use crate::execution_payload_header::{
     ExecutionPayloadHeaderDeneb, ExecutionPayloadHeaderElectra, ExecutionPayloadHeaderFulu,
     ExecutionPayloadHeaderGloas, ExecutionPayloadHeaderRef, ExecutionPayloadHeaderRefMut,
 };
+pub use crate::execution_proof::{ExecutionProof, MAX_PROOF_DATA_BYTES};
+pub use crate::execution_proof_subnet_id::{EXECUTION_PROOF_SUBNET_COUNT, ExecutionProofSubnetId};
 pub use crate::execution_requests::{ExecutionRequests, RequestType};
 pub use crate::fork::Fork;
 pub use crate::fork_context::ForkContext;

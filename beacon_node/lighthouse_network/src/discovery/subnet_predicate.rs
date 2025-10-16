@@ -41,6 +41,10 @@ where
                     false
                 }
             }
+            Subnet::ExecutionProof(_) => {
+                // TODO: Add ENR metadata support for execution proof subnets
+                false
+            }
         });
 
         if !predicate {

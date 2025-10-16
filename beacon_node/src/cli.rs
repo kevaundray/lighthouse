@@ -933,6 +933,52 @@ pub fn cli_app() -> Command {
                 .display_order(0)
         )
         /*
+         * Stateless Execution Layer
+         */
+        .arg(
+            Arg::new("stateless-execution-layer")
+                .long("stateless-execution-layer")
+                .help("Enable stateless execution layer for proof-based payload verification. \
+                       Requires subscription to execution proof subnets via \
+                       --verify-execution-proof-subnets.")
+                .action(ArgAction::SetTrue)
+                .help_heading(FLAG_HEADER)
+                .display_order(0)
+        )
+        .arg(
+            Arg::new("verify-execution-proof-subnets")
+                .long("verify-execution-proof-subnets")
+                .value_name("SUBNETS")
+                .help("Comma-separated list of execution proof subnet IDs to subscribe to for \
+                       verification (0-7). Example: --verify-execution-proof-subnets 0,1,2")
+                .value_delimiter(',')
+                .requires("stateless-execution-layer")
+                .action(ArgAction::Set)
+                .display_order(0)
+        )
+        .arg(
+            Arg::new("generate-execution-proof-subnets")
+                .long("generate-execution-proof-subnets")
+                .value_name("SUBNETS")
+                .help("Comma-separated list of execution proof subnet IDs to generate proofs for \
+                       (0-7). Example: --generate-execution-proof-subnets 3,4")
+                .value_delimiter(',')
+                .requires("stateless-execution-layer")
+                .action(ArgAction::Set)
+                .display_order(0)
+        )
+        .arg(
+            Arg::new("stateless-el-min-proofs")
+                .long("stateless-el-min-proofs")
+                .value_name("COUNT")
+                .help("Minimum number of valid proofs from different subnets required to accept \
+                       a payload (default: 1)")
+                .default_value("1")
+                .requires("stateless-execution-layer")
+                .action(ArgAction::Set)
+                .display_order(0)
+        )
+        /*
          * Database purging and compaction.
          */
         .arg(
