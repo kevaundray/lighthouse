@@ -38,6 +38,7 @@ sha2 = { workspace = true }
 slot_clock = { workspace = true }
 ssz_types = { workspace = true }
 state_processing = { workspace = true }
+stateless_execution_layer = { path = "../../stateless_execution_layer" }
 strum = { workspace = true }
 superstruct = { workspace = true }
 task_executor = { workspace = true }

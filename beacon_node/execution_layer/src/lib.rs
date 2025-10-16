@@ -425,8 +425,29 @@ pub enum SubmitBlindedBlockResponse<E: EthSpec> {
 
 type PayloadContentsRefTuple<'a, E> = (ExecutionPayloadRef<'a, E>, Option<&'a BlobsBundle<E>>);
 
+/// Execution backend type - either a full execution engine or stateless execution layer
+pub enum ExecutionBackend {
+    /// External execution engine (geth, nethermind, etc.) via Engine API
+    Full(Arc<Engine>),
+
+    /// In-process stateless execution layer using execution proofs
+    Stateless(Arc<stateless_execution_layer::StatelessExecutionLayer>),
+}
+
+impl ExecutionBackend {
+    /// Returns true if this is a full execution engine backend
+    pub fn is_full(&self) -> bool {
+        matches!(self, ExecutionBackend::Full(_))
+    }
+
+    /// Returns true if this is a stateless execution layer backend
+    pub fn is_stateless(&self) -> bool {
+        matches!(self, ExecutionBackend::Stateless(_))
+    }
+}
+
 struct Inner<E: EthSpec> {
-    engine: Arc<Engine>,
+    backend: ExecutionBackend,
     builder: ArcSwapOption<BuilderHttpClient>,
     execution_engine_forkchoice_lock: Mutex<()>,
     suggested_fee_recipient: Option<Address>,
@@ -536,7 +557,7 @@ impl<E: EthSpec> ExecutionLayer<E> {
         };
 
         let inner = Inner {
-            engine: Arc::new(engine),
+            backend: ExecutionBackend::Full(Arc::new(engine)),
             builder: ArcSwapOption::empty(),
             execution_engine_forkchoice_lock: <_>::default(),
             suggested_fee_recipient,
@@ -564,8 +585,47 @@ impl<E: EthSpec> ExecutionLayer<E> {
         Ok(el)
     }
 
+    /// Instantiate `Self` with a stateless execution layer backend
+    pub fn from_stateless(
+        stateless_el: Arc<stateless_execution_layer::StatelessExecutionLayer>,
+        suggested_fee_recipient: Option<Address>,
+        executor: TaskExecutor,
+    ) -> Result<Self, Error> {
+        let inner = Inner {
+            backend: ExecutionBackend::Stateless(stateless_el),
+            builder: ArcSwapOption::empty(),
+            execution_engine_forkchoice_lock: <_>::default(),
+            suggested_fee_recipient,
+            proposer_preparation_data: Mutex::new(HashMap::new()),
+            proposers: RwLock::new(HashMap::new()),
+            execution_blocks: Mutex::new(LruCache::new(EXECUTION_BLOCKS_LRU_CACHE_SIZE)),
+            executor,
+            payload_cache: PayloadCache::default(),
+            last_new_payload_errored: RwLock::new(false),
+        };
+
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
+    }
+
+    /// Get the engine reference. Panics if using stateless backend.
+    /// This is for internal use only where we know we have a full backend.
     fn engine(&self) -> &Arc<Engine> {
-        &self.inner.engine
+        match &self.inner.backend {
+            ExecutionBackend::Full(engine) => engine,
+            ExecutionBackend::Stateless(_) => {
+                panic!("Attempted to access engine() on stateless execution layer")
+            }
+        }
+    }
+
+    fn backend(&self) -> &ExecutionBackend {
+        &self.inner.backend
+    }
+
+    pub fn is_stateless(&self) -> bool {
+        matches!(&self.inner.backend, ExecutionBackend::Stateless(_))
     }
 
     pub fn builder(&self) -> Option<Arc<BuilderHttpClient>> {
@@ -1375,10 +1435,50 @@ impl<E: EthSpec> ExecutionLayer<E> {
         let block_hash = new_payload_request.block_hash();
         let parent_hash = new_payload_request.parent_hash();
 
-        let result = self
-            .engine()
-            .request(|engine| engine.api.new_payload(new_payload_request))
-            .await;
+        // Dispatch to appropriate backend
+        let result = match &self.inner.backend {
+            ExecutionBackend::Full(engine) => {
+                engine
+                    .request(|engine| engine.api.new_payload(new_payload_request))
+                    .await
+            }
+            ExecutionBackend::Stateless(stateless_el) => {
+                // For stateless EL, we need the block root from the beacon block.
+                // TODO(Phase 2): This needs to be passed through properly from the caller.
+                // For now, we use a placeholder. This will be fixed when wiring up the
+                // beacon chain integration.
+                let block_root = Hash256::repeat_byte(0);
+
+                // Call stateless EL's new_payload
+                match stateless_el.new_payload(block_hash, block_root).await {
+                    Ok(status) => {
+                        // Convert stateless PayloadStatus to execution_layer PayloadStatusV1
+                        Ok(match status {
+                            stateless_execution_layer::PayloadStatus::Valid => PayloadStatusV1 {
+                                status: PayloadStatusV1Status::Valid,
+                                latest_valid_hash: None,
+                                validation_error: None,
+                            },
+                            stateless_execution_layer::PayloadStatus::Syncing => PayloadStatusV1 {
+                                status: PayloadStatusV1Status::Syncing,
+                                latest_valid_hash: None,
+                                validation_error: None,
+                            },
+                            stateless_execution_layer::PayloadStatus::Invalid { error } => {
+                                PayloadStatusV1 {
+                                    status: PayloadStatusV1Status::Invalid,
+                                    latest_valid_hash: None,
+                                    validation_error: Some(error),
+                                }
+                            }
+                        })
+                    }
+                    Err(e) => Err(EngineError::Api {
+                        error: ApiError::BadResponse(format!("Stateless EL error: {}", e)),
+                    }),
+                }
+            }
+        };
 
         if let Ok(status) = &result {
             let status_str = <&'static str>::from(status.status);
@@ -1511,32 +1611,65 @@ impl<E: EthSpec> ExecutionLayer<E> {
             finalized_block_hash,
         };
 
-        self.engine()
-            .set_latest_forkchoice_state(forkchoice_state)
-            .await;
-
-        let result = self
-            .engine()
-            .request(|engine| async move {
+        // Dispatch to appropriate backend
+        let result = match &self.inner.backend {
+            ExecutionBackend::Full(engine) => {
                 engine
-                    .notify_forkchoice_updated(forkchoice_state, payload_attributes)
+                    .set_latest_forkchoice_state(forkchoice_state)
+                    .await;
+
+                engine
+                    .request(|engine| async move {
+                        engine
+                            .notify_forkchoice_updated(forkchoice_state, payload_attributes)
+                            .await
+                    })
                     .await
-            })
-            .await;
+                    .map(|response| response.payload_status)
+            }
+            ExecutionBackend::Stateless(stateless_el) => {
+                // For stateless EL, forkchoice_updated is minimal (no payload building)
+                stateless_el
+                    .forkchoice_updated(head_block_hash)
+                    .await
+                    .map(|response| {
+                        // Convert stateless ForkchoiceUpdatedResponse to PayloadStatusV1
+                        match response.payload_status {
+                            stateless_execution_layer::PayloadStatus::Valid => PayloadStatusV1 {
+                                status: PayloadStatusV1Status::Valid,
+                                latest_valid_hash: None,
+                                validation_error: None,
+                            },
+                            stateless_execution_layer::PayloadStatus::Syncing => PayloadStatusV1 {
+                                status: PayloadStatusV1Status::Syncing,
+                                latest_valid_hash: None,
+                                validation_error: None,
+                            },
+                            stateless_execution_layer::PayloadStatus::Invalid { error } => {
+                                PayloadStatusV1 {
+                                    status: PayloadStatusV1Status::Invalid,
+                                    latest_valid_hash: None,
+                                    validation_error: Some(error),
+                                }
+                            }
+                        }
+                    })
+                    .map_err(|e| EngineError::Api {
+                        error: ApiError::BadResponse(format!("Stateless EL error: {}", e)),
+                    })
+            }
+        };
 
         if let Ok(status) = &result {
             metrics::inc_counter_vec(
                 &metrics::EXECUTION_LAYER_PAYLOAD_STATUS,
-                &["forkchoice_updated", status.payload_status.status.into()],
+                &["forkchoice_updated", status.status.into()],
             );
         }
 
-        process_payload_status(
-            head_block_hash,
-            result.map(|response| response.payload_status),
-        )
-        .map_err(Box::new)
-        .map_err(Error::EngineError)
+        process_payload_status(head_block_hash, result)
+            .map_err(Box::new)
+            .map_err(Error::EngineError)
     }
 
     /// Returns the execution engine capabilities resulting from a call to

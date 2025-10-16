@@ -7,9 +7,6 @@ edition = "2021"
 # Consensus types for ExecutionProof and related structures
 types = { path = "../consensus/types" }
 
-# Execution layer types
-execution_layer = { path = "../beacon_node/execution_layer" }
-
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
