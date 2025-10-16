@@ -46,6 +46,8 @@ pub struct PeerInfo<E: EthSpec> {
     /// Note: Another reason to keep this separate to `self.subnets` is an upcoming change to
     /// decouple custody requirements from the actual subnets, i.e. changing this to `custody_groups`.
     custody_subnets: HashSet<DataColumnSubnetId>,
+    /// The execution proof subnets this peer advertises in its ENR.
+    execution_proof_subnets: HashSet<types::ExecutionProofSubnetId>,
     /// The time we would like to retain this peer. After this time, the peer is no longer
     /// necessary.
     #[serde(skip)]
@@ -69,6 +71,7 @@ impl<E: EthSpec> Default for PeerInfo<E> {
             seen_multiaddrs: HashSet::new(),
             subnets: HashSet::new(),
             custody_subnets: HashSet::new(),
+            execution_proof_subnets: HashSet::new(),
             sync_status: SyncStatus::Unknown,
             meta_data: None,
             min_ttl: None,
@@ -241,6 +244,21 @@ impl<E: EthSpec> PeerInfo<E> {
     /// Returns the number of custody subnets this peer is assigned to.
     pub fn custody_subnet_count(&self) -> usize {
         self.custody_subnets.len()
+    }
+
+    /// Returns if the peer is subscribed to a given `ExecutionProofSubnetId` from the ENR.
+    pub fn on_execution_proof_subnet(&self, subnet_id: &types::ExecutionProofSubnetId) -> bool {
+        self.execution_proof_subnets.contains(subnet_id)
+    }
+
+    /// Returns an iterator on this peer's execution proof subnets
+    pub fn execution_proof_subnets_iter(&self) -> impl Iterator<Item = &types::ExecutionProofSubnetId> {
+        self.execution_proof_subnets.iter()
+    }
+
+    /// Returns the number of execution proof subnets this peer advertises.
+    pub fn execution_proof_subnet_count(&self) -> usize {
+        self.execution_proof_subnets.len()
     }
 
     /// Returns true if the peer is connected to a long-lived subnet.
@@ -423,6 +441,13 @@ impl<E: EthSpec> PeerInfo<E> {
 
     /// Sets the ENR of the peer if one is known.
     pub(super) fn set_enr(&mut self, enr: Enr) {
+        // Extract execution proof subnets from ENR
+        if let Ok(proof_subnets) = enr.execution_proof_subnets() {
+            self.execution_proof_subnets = (0..proof_subnets.len())
+                .filter(|i| proof_subnets.get(*i).unwrap_or(false))
+                .filter_map(|i| types::ExecutionProofSubnetId::new(i as u8).ok())
+                .collect();
+        }
         self.enr = Some(enr)
     }
 
