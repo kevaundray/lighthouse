@@ -455,4 +455,60 @@ mod tests {
         let response = el.forkchoice_updated(head).await.unwrap();
         assert_eq!(response.payload_status, PayloadStatus::Valid);
     }
+
+    #[tokio::test]
+    async fn test_proof_generation_and_publishing() {
+        let subnet_0 = ExecutionProofSubnetId::new(0).unwrap();
+        let subnet_1 = ExecutionProofSubnetId::new(1).unwrap();
+
+        // Configure to generate proofs for two subnets
+        let config = StatelessExecutionLayerConfig::builder()
+            .add_subscribed_subnet(subnet_0)
+            .add_subscribed_subnet(subnet_1)
+            .add_generation_subnet(subnet_0)
+            .add_generation_subnet(subnet_1)
+            .min_proofs_required(2)
+            .build()
+            .unwrap();
+
+        let mut el = StatelessExecutionLayer::new(config, test_logger()).unwrap();
+
+        // Set up network channel to receive published proofs
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        el.set_network_tx(tx);
+
+        let payload_hash = ExecutionBlockHash::repeat_byte(1);
+        let block_root = Hash256::repeat_byte(2);
+
+        // Call new_payload which should trigger proof generation
+        let status = el.new_payload(payload_hash, block_root).await.unwrap();
+        // Should return SYNCING since we don't have proofs yet
+        assert_eq!(status, PayloadStatus::Syncing);
+
+        // Wait for generated proofs to be published via channel
+        // Dummy generator is instant, so proofs should arrive quickly
+        let mut received_proofs = Vec::new();
+        for _ in 0..2 {
+            if let Ok(Some((subnet_id, proof))) = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                rx.recv()
+            ).await {
+                received_proofs.push((subnet_id, proof));
+            }
+        }
+
+        // Should have received 2 proofs (one for each generation subnet)
+        assert_eq!(received_proofs.len(), 2);
+
+        // Verify proof metadata
+        for (subnet_id, proof) in received_proofs {
+            assert_eq!(proof.block_hash, payload_hash);
+            assert_eq!(proof.block_root, block_root);
+            assert!(subnet_id == subnet_0 || subnet_id == subnet_1);
+        }
+
+        // Now that proofs have been generated and cached, new_payload should return Valid
+        let status = el.new_payload(payload_hash, block_root).await.unwrap();
+        assert_eq!(status, PayloadStatus::Valid);
+    }
 }
