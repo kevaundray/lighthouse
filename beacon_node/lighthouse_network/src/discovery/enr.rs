@@ -4,7 +4,7 @@ pub use discv5::enr::CombinedKey;
 
 use super::ENR_FILENAME;
 use crate::NetworkConfig;
-use crate::types::{Enr, EnrAttestationBitfield, EnrSyncCommitteeBitfield};
+use crate::types::{Enr, EnrAttestationBitfield, EnrExecutionProofBitfield, EnrSyncCommitteeBitfield};
 use alloy_rlp::bytes::Bytes;
 use libp2p::identity::Keypair;
 use lighthouse_version::{client_name, version};
@@ -29,6 +29,8 @@ pub const ATTESTATION_BITFIELD_ENR_KEY: &str = "attnets";
 pub const SYNC_COMMITTEE_BITFIELD_ENR_KEY: &str = "syncnets";
 /// The ENR field specifying the peerdas custody group count.
 pub const PEERDAS_CUSTODY_GROUP_COUNT_ENR_KEY: &str = "cgc";
+/// The ENR field specifying the execution proof subnet bitfield.
+pub const EXECUTION_PROOF_SUBNETS_ENR_KEY: &str = "execnets";
 
 /// Extension trait for ENR's within Eth2.
 pub trait Eth2Enr {
@@ -45,6 +47,9 @@ pub trait Eth2Enr {
 
     /// The next fork digest associated with the ENR.
     fn next_fork_digest(&self) -> Result<[u8; 4], &'static str>;
+
+    /// The execution proof subnet bitfield associated with the ENR.
+    fn execution_proof_subnets(&self) -> Result<EnrExecutionProofBitfield, &'static str>;
 
     fn eth2(&self) -> Result<EnrForkId, &'static str>;
 }
@@ -89,6 +94,16 @@ impl Eth2Enr for Enr {
         self.get_decodable::<[u8; 4]>(NEXT_FORK_DIGEST_ENR_KEY)
             .ok_or("ENR next fork digest non-existent")?
             .map_err(|_| "Could not decode the ENR next fork digest")
+    }
+
+    fn execution_proof_subnets(&self) -> Result<EnrExecutionProofBitfield, &'static str> {
+        let bitfield_bytes: Bytes = self
+            .get_decodable(EXECUTION_PROOF_SUBNETS_ENR_KEY)
+            .ok_or("ENR execution proof subnets non-existent")?
+            .map_err(|_| "Invalid RLP Encoding")?;
+
+        EnrExecutionProofBitfield::from_ssz_bytes(&bitfield_bytes)
+            .map_err(|_| "Could not decode the ENR execnets bitfield")
     }
 
     fn eth2(&self) -> Result<EnrForkId, &'static str> {
@@ -278,6 +293,14 @@ pub fn build_enr<E: EthSpec>(
         &bitfield.as_ssz_bytes().into(),
     );
 
+    // set the "execnets" field on our ENR
+    let bitfield = EnrExecutionProofBitfield::new();
+
+    builder.add_value::<Bytes>(
+        EXECUTION_PROOF_SUBNETS_ENR_KEY,
+        &bitfield.as_ssz_bytes().into(),
+    );
+
     // only set `cgc` and `nfd` if PeerDAS fork (Fulu) epoch has been scheduled
     if spec.is_peer_das_scheduled() {
         let custody_group_count = if let Some(cgc) = custody_group_count {
@@ -317,11 +340,12 @@ fn compare_enr(local_enr: &Enr, disk_enr: &Enr) -> bool {
         && (local_enr.udp4().is_none() || local_enr.udp4() == disk_enr.udp4())
         && (local_enr.udp6().is_none() || local_enr.udp6() == disk_enr.udp6())
         // we need the ATTESTATION_BITFIELD_ENR_KEY and SYNC_COMMITTEE_BITFIELD_ENR_KEY and
-        // PEERDAS_CUSTODY_GROUP_COUNT_ENR_KEY key to match, otherwise we use a new ENR. This will
-        // likely only be true for non-validating nodes.
+        // PEERDAS_CUSTODY_GROUP_COUNT_ENR_KEY and EXECUTION_PROOF_SUBNETS_ENR_KEY to match,
+        // otherwise we use a new ENR. This will likely only be true for non-validating nodes.
         && local_enr.get_decodable::<Bytes>(ATTESTATION_BITFIELD_ENR_KEY) == disk_enr.get_decodable(ATTESTATION_BITFIELD_ENR_KEY)
         && local_enr.get_decodable::<Bytes>(SYNC_COMMITTEE_BITFIELD_ENR_KEY) == disk_enr.get_decodable(SYNC_COMMITTEE_BITFIELD_ENR_KEY)
         && local_enr.get_decodable::<Bytes>(PEERDAS_CUSTODY_GROUP_COUNT_ENR_KEY) == disk_enr.get_decodable(PEERDAS_CUSTODY_GROUP_COUNT_ENR_KEY)
+        && local_enr.get_decodable::<Bytes>(EXECUTION_PROOF_SUBNETS_ENR_KEY) == disk_enr.get_decodable(EXECUTION_PROOF_SUBNETS_ENR_KEY)
 }
 
 /// Loads enr from the given directory

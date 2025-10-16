@@ -3,10 +3,11 @@ mod pubsub;
 mod subnet;
 mod topics;
 
-use types::{BitVector, EthSpec};
+use types::{BitVector, EthSpec, typenum};
 
 pub type EnrAttestationBitfield<E> = BitVector<<E as EthSpec>::SubnetBitfieldLength>;
 pub type EnrSyncCommitteeBitfield<E> = BitVector<<E as EthSpec>::SyncCommitteeSubnetCount>;
+pub type EnrExecutionProofBitfield = BitVector<typenum::U8>;
 
 pub type Enr = discv5::enr::Enr<discv5::enr::CombinedKey>;
 

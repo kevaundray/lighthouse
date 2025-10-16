@@ -495,22 +495,29 @@ impl<T: BeaconChainTypes> Router<T> {
             PubsubMessage::ExecutionProofMessage(data) => {
                 let (subnet_id, proof) = *data;
 
-                // TODO: Forward to stateless-EL when implemented
-                // https://github.com/sigp/lighthouse/issues/XXXX
-                // For now, just log that we received it
                 debug!(
                     %peer_id,
                     subnet_id = subnet_id.as_u8(),
                     block_hash = ?proof.block_hash,
-                    "Received execution proof (not yet forwarded to stateless-EL)"
+                    "Received execution proof via gossip"
                 );
 
-                // Future implementation:
-                // if let Some(tx) = &self.stateless_el_proof_tx {
-                //     if let Err(e) = tx.send(proof) {
-                //         warn!("Failed to send execution proof to stateless-EL: {:?}", e);
-                //     }
-                // }
+                // Forward to stateless-EL if configured
+                if let Some(tx) = &self.stateless_el_proof_tx {
+                    if let Err(e) = tx.send(proof) {
+                        warn!(
+                            error = ?e,
+                            subnet_id = subnet_id.as_u8(),
+                            "Failed to send execution proof to stateless-EL"
+                        );
+                    }
+                } else {
+                    // No stateless-EL configured, proof is ignored
+                    trace!(
+                        subnet_id = subnet_id.as_u8(),
+                        "Execution proof received but no stateless-EL configured"
+                    );
+                }
             }
         }
     }
