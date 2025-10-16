@@ -511,4 +511,109 @@ mod tests {
         let status = el.new_payload(payload_hash, block_root).await.unwrap();
         assert_eq!(status, PayloadStatus::Valid);
     }
+
+    #[tokio::test]
+    async fn test_gossip_proof_reception() {
+        let subnet_0 = ExecutionProofSubnetId::new(0).unwrap();
+        let subnet_1 = ExecutionProofSubnetId::new(1).unwrap();
+
+        let config = StatelessExecutionLayerConfig::builder()
+            .add_subscribed_subnet(subnet_0)
+            .add_subscribed_subnet(subnet_1)
+            .min_proofs_required(2)
+            .build()
+            .unwrap();
+
+        let el = StatelessExecutionLayer::new(config, test_logger()).unwrap();
+        let payload_hash = ExecutionBlockHash::repeat_byte(1);
+        let block_root = Hash256::repeat_byte(2);
+
+        // Initially should return SYNCING (no proofs)
+        let status = el.new_payload(payload_hash, block_root).await.unwrap();
+        assert_eq!(status, PayloadStatus::Syncing);
+
+        // Simulate receiving first proof via gossip
+        let proof_0 = ExecutionProof::new(subnet_0, payload_hash, block_root, vec![1, 2, 3]).unwrap();
+        el.on_gossip_proof_received(subnet_0, Arc::new(proof_0))
+            .await
+            .unwrap();
+
+        // Still should return SYNCING (need 2 proofs from different subnets)
+        let status = el.new_payload(payload_hash, block_root).await.unwrap();
+        assert_eq!(status, PayloadStatus::Syncing);
+
+        // Simulate receiving second proof from different subnet
+        let proof_1 = ExecutionProof::new(subnet_1, payload_hash, block_root, vec![4, 5, 6]).unwrap();
+        el.on_gossip_proof_received(subnet_1, Arc::new(proof_1))
+            .await
+            .unwrap();
+
+        // Now should return VALID (have 2 proofs from different subnets)
+        let status = el.new_payload(payload_hash, block_root).await.unwrap();
+        assert_eq!(status, PayloadStatus::Valid);
+    }
+
+    #[tokio::test]
+    async fn test_proof_ready_callback() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let subnet_0 = ExecutionProofSubnetId::new(0).unwrap();
+        let config = StatelessExecutionLayerConfig::builder()
+            .add_subscribed_subnet(subnet_0)
+            .min_proofs_required(1)
+            .build()
+            .unwrap();
+
+        let el = StatelessExecutionLayer::new(config, test_logger()).unwrap();
+        let payload_hash = ExecutionBlockHash::repeat_byte(1);
+        let block_root = Hash256::repeat_byte(2);
+
+        // Register callback
+        let callback_triggered = Arc::new(AtomicBool::new(false));
+        let callback_triggered_clone = callback_triggered.clone();
+        let callback = Arc::new(move |_hash: ExecutionBlockHash| {
+            callback_triggered_clone.store(true, Ordering::SeqCst);
+        });
+        el.register_proof_ready_callback(callback).await;
+
+        // Initially callback not triggered
+        assert!(!callback_triggered.load(Ordering::SeqCst));
+
+        // Receive proof via gossip
+        let proof = ExecutionProof::new(subnet_0, payload_hash, block_root, vec![1, 2, 3]).unwrap();
+        el.on_gossip_proof_received(subnet_0, Arc::new(proof))
+            .await
+            .unwrap();
+
+        // Callback should have been triggered
+        assert!(callback_triggered.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_gossip_proof_validation() {
+        let subnet_0 = ExecutionProofSubnetId::new(0).unwrap();
+        let subnet_1 = ExecutionProofSubnetId::new(1).unwrap();
+
+        // Only subscribe to subnet_0
+        let config = StatelessExecutionLayerConfig::builder()
+            .add_subscribed_subnet(subnet_0)
+            .min_proofs_required(1)
+            .build()
+            .unwrap();
+
+        let el = StatelessExecutionLayer::new(config, test_logger()).unwrap();
+        let payload_hash = ExecutionBlockHash::repeat_byte(1);
+        let block_root = Hash256::repeat_byte(2);
+
+        // Should reject proof from unsubscribed subnet
+        let proof_1 = ExecutionProof::new(subnet_1, payload_hash, block_root, vec![1, 2, 3]).unwrap();
+        let result = el.on_gossip_proof_received(subnet_1, Arc::new(proof_1)).await;
+        assert!(result.is_err());
+
+        // Should reject proof with mismatched subnet_id
+        let mut proof_0 = ExecutionProof::new(subnet_0, payload_hash, block_root, vec![4, 5, 6]).unwrap();
+        proof_0.subnet_id = subnet_1; // Mismatch: claim subnet_0 but actually subnet_1
+        let result = el.on_gossip_proof_received(subnet_0, Arc::new(proof_0)).await;
+        assert!(result.is_err());
+    }
 }

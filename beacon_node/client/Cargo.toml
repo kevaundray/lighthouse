@@ -30,6 +30,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 slasher = { workspace = true }
 slasher_service = { path = "../../slasher/service" }
+slog = "2"
 slot_clock = { workspace = true }
 stateless_execution_layer = { path = "../../stateless_execution_layer" }
 store = { workspace = true }

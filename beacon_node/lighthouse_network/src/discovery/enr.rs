@@ -475,4 +475,19 @@ mod test {
         enr.attestation_bitfield::<MainnetEthSpec>().unwrap();
         enr.sync_committee_bitfield::<MainnetEthSpec>().unwrap();
     }
+
+    #[test]
+    fn test_execution_proof_subnet_bitfield() {
+        // Build an ENR and verify execution proof subnet bitfield is present and empty
+        let (enr, _key) = build_enr_with_config(NetworkConfig::default(), None, &E::default_spec());
+
+        // Should be able to decode execution proof subnet bitfield
+        let bitfield = enr.execution_proof_subnets().unwrap();
+
+        // Bitfield should be empty initially (all zeros)
+        assert_eq!(bitfield.len(), 8); // EnrExecutionProofBitfield has typenum::U8
+        for i in 0..8 {
+            assert!(!bitfield.get(i).unwrap());
+        }
+    }
 }

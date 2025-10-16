@@ -35,6 +35,8 @@ use rand::SeedableRng;
 use rand::rngs::{OsRng, StdRng};
 use slasher::Slasher;
 use slasher_service::SlasherService;
+use slog;
+use stateless_execution_layer;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -175,7 +177,29 @@ where
             None
         };
 
-        let execution_layer = if let Some(config) = config.execution_layer.clone() {
+        let execution_layer = if let Some(stateless_config) = config.stateless_execution_layer.clone() {
+            // Create stateless execution layer
+            let context = runtime_context.service_context("stateless_exec".into());
+            info!("Initializing stateless execution layer");
+
+            // Create a logger for the stateless execution layer
+            let log = slog::Logger::root(slog::Discard, slog::o!());
+
+            let stateless_el = stateless_execution_layer::StatelessExecutionLayer::new(
+                stateless_config,
+                log,
+            )
+            .map_err(|e| format!("unable to create stateless execution layer: {:?}", e))?;
+
+            let execution_layer = ExecutionLayer::from_stateless(
+                Arc::new(stateless_el),
+                None, // suggested_fee_recipient - not used for stateless
+                context.executor.clone(),
+            )
+            .map_err(|e| format!("unable to start stateless execution layer: {:?}", e))?;
+            Some(execution_layer)
+        } else if let Some(config) = config.execution_layer.clone() {
+            // Create traditional full execution layer
             let context = runtime_context.service_context("exec".into());
             let execution_layer = ExecutionLayer::from_config(config, context.executor.clone())
                 .map_err(|e| format!("unable to start execution layer endpoints: {:?}", e))?;

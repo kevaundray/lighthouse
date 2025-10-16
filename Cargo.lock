@@ -1563,6 +1563,7 @@ dependencies = [
  "serde_yaml",
  "slasher",
  "slasher_service",
+ "slog",
  "slot_clock",
  "state_processing",
  "stateless_execution_layer",
