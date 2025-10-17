@@ -597,6 +597,36 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         })
     }
 
+    /// Called when execution proofs become available for a payload.
+    ///
+    /// This is invoked via callback when the stateless execution layer receives
+    /// sufficient proofs (M-of-N) for a block's execution payload.
+    ///
+    /// Currently logs the event for observability. In the future, this could
+    /// trigger proactive re-verification of optimistic blocks to reduce latency.
+    ///
+    /// ## Note
+    ///
+    /// Fork choice already re-verifies optimistic blocks naturally during periodic
+    /// updates, so this callback is primarily a UX optimization rather than a
+    /// security requirement.
+    pub fn on_execution_proofs_ready(&self, payload_hash: ExecutionBlockHash) {
+        info!(
+            payload_hash = ?payload_hash,
+            "Execution proofs became available"
+        );
+
+        // TODO (Phase 3.3 enhancement): Implement proactive re-verification
+        //
+        // Future enhancement could:
+        // 1. Query fork choice for blocks with this payload_hash in optimistic state
+        // 2. Re-call notify_new_payload() with the same payload
+        // 3. Update fork choice with new verification status
+        // 4. Potentially trigger head recomputation
+        //
+        // For now, fork choice will naturally re-verify on next update.
+    }
+
     /// Return a database operation for writing the `PersistedBeaconChain` to disk.
     ///
     /// These days the `PersistedBeaconChain` is only used to store the genesis block root, so it

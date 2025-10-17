@@ -177,7 +177,8 @@ where
             None
         };
 
-        let execution_layer = if let Some(stateless_config) = config.stateless_execution_layer.clone() {
+        // Create execution layer and optionally store reference to stateless-EL for callback wiring
+        let (execution_layer, stateless_el) = if let Some(stateless_config) = config.stateless_execution_layer.clone() {
             // Create stateless execution layer
             let context = runtime_context.service_context("stateless_exec".into());
             info!("Initializing stateless execution layer");
@@ -191,21 +192,24 @@ where
             )
             .map_err(|e| format!("unable to create stateless execution layer: {:?}", e))?;
 
+            // Store Arc for later use (callback registration)
+            let stateless_el_arc = Arc::new(stateless_el);
+
             let execution_layer = ExecutionLayer::from_stateless(
-                Arc::new(stateless_el),
+                stateless_el_arc.clone(),
                 None, // suggested_fee_recipient - not used for stateless
                 context.executor.clone(),
             )
             .map_err(|e| format!("unable to start stateless execution layer: {:?}", e))?;
-            Some(execution_layer)
+            (Some(execution_layer), Some(stateless_el_arc))
         } else if let Some(config) = config.execution_layer.clone() {
             // Create traditional full execution layer
             let context = runtime_context.service_context("exec".into());
             let execution_layer = ExecutionLayer::from_config(config, context.executor.clone())
                 .map_err(|e| format!("unable to start execution layer endpoints: {:?}", e))?;
-            Some(execution_layer)
+            (Some(execution_layer), None)
         } else {
-            None
+            (None, None)
         };
 
         let kzg_err_msg = |e| format!("Failed to load trusted setup: {:?}", e);
@@ -226,6 +230,7 @@ where
             .beacon_graffiti(beacon_graffiti)
             .event_handler(event_handler)
             .execution_layer(execution_layer)
+            .stateless_execution_layer(stateless_el)
             .import_all_data_columns(config.network.subscribe_all_data_column_subnets)
             .validator_monitor_config(config.validator_monitor.clone())
             .rng(Box::new(
@@ -857,6 +862,26 @@ where
 
         self.beacon_chain = Some(Arc::new(chain));
         self.beacon_chain_builder = None;
+
+        // Register proof-ready callback if using stateless execution layer
+        if let Some(beacon_chain) = &self.beacon_chain {
+            if let Some(execution_layer) = &beacon_chain.execution_layer {
+                if execution_layer.is_stateless() {
+                    let chain = beacon_chain.clone();
+                    let callback = Arc::new(move |payload_hash: ExecutionBlockHash| {
+                        chain.on_execution_proofs_ready(payload_hash);
+                    });
+
+                    let el = execution_layer.clone();
+                    context.executor.spawn(
+                        async move {
+                            el.register_proof_ready_callback(callback).await;
+                        },
+                        "register_proof_callback",
+                    );
+                }
+            }
+        }
 
         // a beacon chain requires a timer
         self.timer()

@@ -628,6 +628,17 @@ impl<E: EthSpec> ExecutionLayer<E> {
         matches!(&self.inner.backend, ExecutionBackend::Stateless(_))
     }
 
+    /// Register a callback to be invoked when execution proofs become available for a block.
+    /// Only works with stateless execution layer backend.
+    pub async fn register_proof_ready_callback(
+        &self,
+        callback: Arc<dyn Fn(ExecutionBlockHash) + Send + Sync>,
+    ) {
+        if let ExecutionBackend::Stateless(stateless_el) = &self.inner.backend {
+            stateless_el.register_proof_ready_callback(callback).await;
+        }
+    }
+
     pub fn builder(&self) -> Option<Arc<BuilderHttpClient>> {
         self.inner.builder.load_full()
     }

@@ -85,6 +85,7 @@ pub struct BeaconChainBuilder<T: BeaconChainTypes> {
     >,
     op_pool: Option<OperationPool<T::EthSpec>>,
     execution_layer: Option<ExecutionLayer<T::EthSpec>>,
+    stateless_execution_layer: Option<Arc<stateless_execution_layer::StatelessExecutionLayer>>,
     event_handler: Option<ServerSentEventHandler<T::EthSpec>>,
     slot_clock: Option<T::SlotClock>,
     shutdown_sender: Option<Sender<ShutdownReason>>,
@@ -126,6 +127,7 @@ where
             fork_choice: None,
             op_pool: None,
             execution_layer: None,
+            stateless_execution_layer: None,
             event_handler: None,
             slot_clock: None,
             shutdown_sender: None,
@@ -640,6 +642,15 @@ where
         self
     }
 
+    /// Sets the `BeaconChain` stateless execution layer.
+    pub fn stateless_execution_layer(
+        mut self,
+        stateless_execution_layer: Option<Arc<stateless_execution_layer::StatelessExecutionLayer>>,
+    ) -> Self {
+        self.stateless_execution_layer = stateless_execution_layer;
+        self
+    }
+
     /// Sets whether to require and import all data columns when importing block.
     pub fn import_all_data_columns(mut self, import_all_data_columns: bool) -> Self {
         self.import_all_data_columns = import_all_data_columns;
@@ -980,7 +991,7 @@ where
             observed_attester_slashings: <_>::default(),
             observed_bls_to_execution_changes: <_>::default(),
             execution_layer: self.execution_layer.clone(),
-            stateless_execution_layer: None, // TODO: Initialize in task 6
+            stateless_execution_layer: self.stateless_execution_layer.clone(),
             genesis_validators_root,
             genesis_time,
             canonical_head,
