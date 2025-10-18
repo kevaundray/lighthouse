@@ -178,7 +178,9 @@ where
         };
 
         // Create execution layer and optionally store reference to stateless-EL for callback wiring
-        let (execution_layer, stateless_el) = if let Some(stateless_config) = config.stateless_execution_layer.clone() {
+        let (execution_layer, stateless_el) = if let Some(stateless_config) =
+            config.stateless_execution_layer.clone()
+        {
             // Create stateless execution layer
             let context = runtime_context.service_context("stateless_exec".into());
             info!("Initializing stateless execution layer");
@@ -186,11 +188,9 @@ where
             // Create a logger for the stateless execution layer
             let log = slog::Logger::root(slog::Discard, slog::o!());
 
-            let stateless_el = stateless_execution_layer::StatelessExecutionLayer::new(
-                stateless_config,
-                log,
-            )
-            .map_err(|e| format!("unable to create stateless execution layer: {:?}", e))?;
+            let stateless_el =
+                stateless_execution_layer::StatelessExecutionLayer::new(stateless_config, log)
+                    .map_err(|e| format!("unable to create stateless execution layer: {:?}", e))?;
 
             // Store Arc for later use (callback registration and RPC wiring)
             let stateless_el_arc = Arc::new(stateless_el);

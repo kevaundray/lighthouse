@@ -165,7 +165,8 @@ mod tests {
         block_hash: ExecutionBlockHash,
     ) -> ExecutionProof {
         use types::FixedBytesExtended;
-        ExecutionProof::new_for_testing(subnet_id, block_hash, Hash256::zero(), vec![1, 2, 3]).unwrap()
+        ExecutionProof::new_for_testing(subnet_id, block_hash, Hash256::zero(), vec![1, 2, 3])
+            .unwrap()
     }
 
     #[tokio::test]

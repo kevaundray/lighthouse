@@ -8,14 +8,10 @@
 // 2. Payload status transitions from SYNCING to VALID as proofs arrive
 // 3. M-of-N security model enforced (need M proofs from different subnets)
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use stateless_execution_layer::{StatelessExecutionLayer, StatelessExecutionLayerConfig};
 use std::sync::Arc;
-use stateless_execution_layer::{
-    StatelessExecutionLayer, StatelessExecutionLayerConfig,
-};
-use types::{
-    ExecutionBlockHash, ExecutionProof, ExecutionProofSubnetId, Hash256,
-};
+use std::sync::atomic::{AtomicBool, Ordering};
+use types::{ExecutionBlockHash, ExecutionProof, ExecutionProofSubnetId, Hash256};
 
 /// Create a test logger (discards output)
 fn test_logger() -> slog::Logger {
@@ -25,8 +21,8 @@ fn test_logger() -> slog::Logger {
 
 /// Creates a stateless execution layer for testing.
 fn build_stateless_el(min_proofs_required: usize) -> Arc<StatelessExecutionLayer> {
-    let mut builder = StatelessExecutionLayerConfig::builder()
-        .min_proofs_required(min_proofs_required);
+    let mut builder =
+        StatelessExecutionLayerConfig::builder().min_proofs_required(min_proofs_required);
 
     // Add subnets to meet minimum requirement
     for subnet_id in 0..min_proofs_required.max(2) {
@@ -38,7 +34,7 @@ fn build_stateless_el(min_proofs_required: usize) -> Arc<StatelessExecutionLayer
 
     Arc::new(
         StatelessExecutionLayer::new(config, test_logger())
-            .expect("should create stateless execution layer")
+            .expect("should create stateless execution layer"),
     )
 }
 
@@ -120,7 +116,9 @@ async fn test_proof_availability_status_transitions() {
     let block_root = Hash256::repeat_byte(0x01);
 
     // Initially, no proofs available - should return SYNCING
-    let status = stateless_el.new_payload(payload_hash, block_root).await
+    let status = stateless_el
+        .new_payload(payload_hash, block_root)
+        .await
         .expect("new_payload should not error");
 
     assert!(
@@ -136,7 +134,9 @@ async fn test_proof_availability_status_transitions() {
         .expect("should accept proof");
 
     // Still not enough proofs - should still return SYNCING
-    let status = stateless_el.new_payload(payload_hash, block_root).await
+    let status = stateless_el
+        .new_payload(payload_hash, block_root)
+        .await
         .expect("new_payload should not error");
 
     assert!(
@@ -152,7 +152,9 @@ async fn test_proof_availability_status_transitions() {
         .expect("should accept proof");
 
     // Now we have enough proofs - should return VALID
-    let status = stateless_el.new_payload(payload_hash, block_root).await
+    let status = stateless_el
+        .new_payload(payload_hash, block_root)
+        .await
         .expect("new_payload should not error");
 
     assert!(
@@ -189,7 +191,9 @@ async fn test_multiple_proofs_same_subnet_only_counts_once() {
         .expect("should accept proof");
 
     // Should still return SYNCING (both proofs from same subnet)
-    let status = stateless_el.new_payload(payload_hash, block_root).await
+    let status = stateless_el
+        .new_payload(payload_hash, block_root)
+        .await
         .expect("new_payload should not error");
 
     assert!(
@@ -205,7 +209,9 @@ async fn test_multiple_proofs_same_subnet_only_counts_once() {
         .expect("should accept proof");
 
     // Now should return VALID (2 different subnets)
-    let status = stateless_el.new_payload(payload_hash, block_root).await
+    let status = stateless_el
+        .new_payload(payload_hash, block_root)
+        .await
         .expect("new_payload should not error");
 
     assert!(

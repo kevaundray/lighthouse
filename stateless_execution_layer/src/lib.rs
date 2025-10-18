@@ -362,7 +362,9 @@ impl StatelessExecutionLayer {
         // but RPC requests use beacon block_root. We need to search through all cached proofs.
         // This is inefficient but works for Phase 4. A production implementation should add
         // a secondary index.
-        self.proof_cache.find_by_block_root(block_root, subnet_id).await
+        self.proof_cache
+            .find_by_block_root(block_root, subnet_id)
+            .await
     }
 
     /// Request missing proofs from peers via RPC fallback
@@ -370,11 +372,7 @@ impl StatelessExecutionLayer {
     /// This method is called when we have insufficient proofs for a payload.
     /// It determines which subnets we're missing proofs from and sends a request
     /// to the network layer to fetch them from peers.
-    async fn request_missing_proofs(
-        &self,
-        payload_hash: ExecutionBlockHash,
-        block_root: Hash256,
-    ) {
+    async fn request_missing_proofs(&self, payload_hash: ExecutionBlockHash, block_root: Hash256) {
         // Only request if we have a proof request channel configured
         let request_tx_guard = self.proof_request_tx.read().await;
         let request_tx = match request_tx_guard.as_ref() {
@@ -390,7 +388,11 @@ impl StatelessExecutionLayer {
         };
 
         // Get currently cached proofs for this block
-        let cached_proofs = self.proof_cache.get(&payload_hash).await.unwrap_or_default();
+        let cached_proofs = self
+            .proof_cache
+            .get(&payload_hash)
+            .await
+            .unwrap_or_default();
         let cached_subnet_ids: HashSet<ExecutionProofSubnetId> =
             cached_proofs.iter().map(|p| p.subnet_id).collect();
 
@@ -606,7 +608,9 @@ mod tests {
         let block_root = Hash256::repeat_byte(2);
 
         // Insert a proof
-        let proof = ExecutionProof::new_for_testing(subnet_0, payload_hash, block_root, vec![1, 2, 3]).unwrap();
+        let proof =
+            ExecutionProof::new_for_testing(subnet_0, payload_hash, block_root, vec![1, 2, 3])
+                .unwrap();
         el.proof_cache.insert(proof).await;
 
         let status = el.new_payload(payload_hash, block_root).await.unwrap();
@@ -661,10 +665,9 @@ mod tests {
         // Dummy generator is instant, so proofs should arrive quickly
         let mut received_proofs = Vec::new();
         for _ in 0..2 {
-            if let Ok(Some((subnet_id, proof))) = tokio::time::timeout(
-                std::time::Duration::from_secs(1),
-                rx.recv()
-            ).await {
+            if let Ok(Some((subnet_id, proof))) =
+                tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await
+            {
                 received_proofs.push((subnet_id, proof));
             }
         }
@@ -706,7 +709,9 @@ mod tests {
         assert_eq!(status, PayloadStatus::Syncing);
 
         // Simulate receiving first proof via gossip
-        let proof_0 = ExecutionProof::new_for_testing(subnet_0, payload_hash, block_root, vec![1, 2, 3]).unwrap();
+        let proof_0 =
+            ExecutionProof::new_for_testing(subnet_0, payload_hash, block_root, vec![1, 2, 3])
+                .unwrap();
         el.on_gossip_proof_received(subnet_0, Arc::new(proof_0))
             .await
             .unwrap();
@@ -716,7 +721,9 @@ mod tests {
         assert_eq!(status, PayloadStatus::Syncing);
 
         // Simulate receiving second proof from different subnet
-        let proof_1 = ExecutionProof::new_for_testing(subnet_1, payload_hash, block_root, vec![4, 5, 6]).unwrap();
+        let proof_1 =
+            ExecutionProof::new_for_testing(subnet_1, payload_hash, block_root, vec![4, 5, 6])
+                .unwrap();
         el.on_gossip_proof_received(subnet_1, Arc::new(proof_1))
             .await
             .unwrap();
@@ -753,7 +760,9 @@ mod tests {
         assert!(!callback_triggered.load(Ordering::SeqCst));
 
         // Receive proof via gossip
-        let proof = ExecutionProof::new_for_testing(subnet_0, payload_hash, block_root, vec![1, 2, 3]).unwrap();
+        let proof =
+            ExecutionProof::new_for_testing(subnet_0, payload_hash, block_root, vec![1, 2, 3])
+                .unwrap();
         el.on_gossip_proof_received(subnet_0, Arc::new(proof))
             .await
             .unwrap();
@@ -779,14 +788,22 @@ mod tests {
         let block_root = Hash256::repeat_byte(2);
 
         // Should reject proof from unsubscribed subnet
-        let proof_1 = ExecutionProof::new_for_testing(subnet_1, payload_hash, block_root, vec![1, 2, 3]).unwrap();
-        let result = el.on_gossip_proof_received(subnet_1, Arc::new(proof_1)).await;
+        let proof_1 =
+            ExecutionProof::new_for_testing(subnet_1, payload_hash, block_root, vec![1, 2, 3])
+                .unwrap();
+        let result = el
+            .on_gossip_proof_received(subnet_1, Arc::new(proof_1))
+            .await;
         assert!(result.is_err());
 
         // Should reject proof with mismatched subnet_id
-        let mut proof_0 = ExecutionProof::new_for_testing(subnet_0, payload_hash, block_root, vec![4, 5, 6]).unwrap();
+        let mut proof_0 =
+            ExecutionProof::new_for_testing(subnet_0, payload_hash, block_root, vec![4, 5, 6])
+                .unwrap();
         proof_0.subnet_id = subnet_1; // Mismatch: claim subnet_0 but actually subnet_1
-        let result = el.on_gossip_proof_received(subnet_0, Arc::new(proof_0)).await;
+        let result = el
+            .on_gossip_proof_received(subnet_0, Arc::new(proof_0))
+            .await;
         assert!(result.is_err());
     }
 
@@ -815,7 +832,9 @@ mod tests {
         let block_root = Hash256::repeat_byte(2);
 
         // Insert one proof from subnet_0
-        let proof_0 = ExecutionProof::new_for_testing(subnet_0, payload_hash, block_root, vec![1, 2, 3]).unwrap();
+        let proof_0 =
+            ExecutionProof::new_for_testing(subnet_0, payload_hash, block_root, vec![1, 2, 3])
+                .unwrap();
         el.proof_cache.insert(proof_0).await;
 
         // Call new_payload - should return SYNCING and request missing proofs
@@ -832,9 +851,7 @@ mod tests {
 
         // Should request either subnet_1 or subnet_2 (not subnet_0 which we already have)
         assert!(!request.subnet_ids.contains(&subnet_0));
-        assert!(
-            request.subnet_ids.contains(&subnet_1) || request.subnet_ids.contains(&subnet_2)
-        );
+        assert!(request.subnet_ids.contains(&subnet_1) || request.subnet_ids.contains(&subnet_2));
     }
 
     #[tokio::test]
@@ -859,8 +876,12 @@ mod tests {
         let block_root = Hash256::repeat_byte(2);
 
         // Insert two proofs (sufficient)
-        let proof_0 = ExecutionProof::new_for_testing(subnet_0, payload_hash, block_root, vec![1, 2, 3]).unwrap();
-        let proof_1 = ExecutionProof::new_for_testing(subnet_1, payload_hash, block_root, vec![4, 5, 6]).unwrap();
+        let proof_0 =
+            ExecutionProof::new_for_testing(subnet_0, payload_hash, block_root, vec![1, 2, 3])
+                .unwrap();
+        let proof_1 =
+            ExecutionProof::new_for_testing(subnet_1, payload_hash, block_root, vec![4, 5, 6])
+                .unwrap();
         el.proof_cache.insert(proof_0).await;
         el.proof_cache.insert(proof_1).await;
 
@@ -869,7 +890,10 @@ mod tests {
         assert_eq!(status, PayloadStatus::Valid);
 
         // Should NOT have received any proof request
-        assert!(rx.try_recv().is_err(), "Should not request proofs when we have enough");
+        assert!(
+            rx.try_recv().is_err(),
+            "Should not request proofs when we have enough"
+        );
     }
 
     #[tokio::test]

@@ -18,10 +18,10 @@ use tokio_util::codec::{Decoder, Encoder};
 use types::{
     BlobSidecar, ChainSpec, DataColumnSidecar, DataColumnsByRootIdentifier, EthSpec,
     ExecutionProof, ForkContext, ForkName, Hash256, LightClientBootstrap,
-    LightClientFinalityUpdate, LightClientOptimisticUpdate, LightClientUpdate,
-    RuntimeVariableList, SignedBeaconBlock, SignedBeaconBlockAltair, SignedBeaconBlockBase,
-    SignedBeaconBlockBellatrix, SignedBeaconBlockCapella, SignedBeaconBlockDeneb,
-    SignedBeaconBlockElectra, SignedBeaconBlockFulu, SignedBeaconBlockGloas,
+    LightClientFinalityUpdate, LightClientOptimisticUpdate, LightClientUpdate, RuntimeVariableList,
+    SignedBeaconBlock, SignedBeaconBlockAltair, SignedBeaconBlockBase, SignedBeaconBlockBellatrix,
+    SignedBeaconBlockCapella, SignedBeaconBlockDeneb, SignedBeaconBlockElectra,
+    SignedBeaconBlockFulu, SignedBeaconBlockGloas,
 };
 use unsigned_varint::codec::Uvi;
 

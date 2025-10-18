@@ -388,10 +388,15 @@ impl<T: BeaconChainTypes> Router<T> {
                 self.network_beacon_processor
                     .send_data_columns_by_range_request(peer_id, inbound_request_id, request),
             ),
-            RequestType::ExecutionProofsByRoot(request) => self.handle_beacon_processor_send_result(
-                self.network_beacon_processor
-                    .send_execution_proofs_by_roots_request(peer_id, inbound_request_id, request),
-            ),
+            RequestType::ExecutionProofsByRoot(request) => self
+                .handle_beacon_processor_send_result(
+                    self.network_beacon_processor
+                        .send_execution_proofs_by_roots_request(
+                            peer_id,
+                            inbound_request_id,
+                            request,
+                        ),
+                ),
             RequestType::LightClientBootstrap(request) => self.handle_beacon_processor_send_result(
                 self.network_beacon_processor
                     .send_light_client_bootstrap_request(peer_id, inbound_request_id, request),

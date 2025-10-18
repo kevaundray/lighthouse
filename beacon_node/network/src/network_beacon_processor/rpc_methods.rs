@@ -1320,7 +1320,12 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
         self.terminate_response_stream(
             peer_id,
             inbound_request_id,
-            self.handle_execution_proofs_by_root_request_inner(peer_id, inbound_request_id, request).await,
+            self.handle_execution_proofs_by_root_request_inner(
+                peer_id,
+                inbound_request_id,
+                request,
+            )
+            .await,
             Response::ExecutionProofsByRoot,
         );
     }

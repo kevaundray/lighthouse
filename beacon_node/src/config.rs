@@ -340,7 +340,7 @@ pub fn get_config<E: EthSpec>(
 
         if verify_subnets.is_empty() {
             return Err(
-                "--stateless-execution-layer requires --verify-execution-proof-subnets".to_string()
+                "--stateless-execution-layer requires --verify-execution-proof-subnets".to_string(),
             );
         }
 
@@ -356,7 +356,9 @@ pub fn get_config<E: EthSpec>(
         }
 
         // Parse generation subnets (optional)
-        if let Some(generate_subnets) = cli_args.get_many::<String>("generate-execution-proof-subnets") {
+        if let Some(generate_subnets) =
+            cli_args.get_many::<String>("generate-execution-proof-subnets")
+        {
             for subnet_str in generate_subnets {
                 let subnet_id = subnet_str
                     .parse::<u8>()
@@ -396,7 +398,8 @@ pub fn get_config<E: EthSpec>(
         client_config.stateless_execution_layer = Some(stateless_el_config.clone());
 
         // Configure execution proof subnet subscriptions in NetworkConfig
-        client_config.network.execution_proof_subnets = stateless_el_config.subscribed_subnets.clone();
+        client_config.network.execution_proof_subnets =
+            stateless_el_config.subscribed_subnets.clone();
 
         info!(
             subnets = ?stateless_el_config.subscribed_subnets,

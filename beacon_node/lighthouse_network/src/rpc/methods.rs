@@ -797,7 +797,10 @@ impl<E: EthSpec> RpcSuccessResponse<E> {
             Self::LightClientFinalityUpdate(r) => Some(r.get_attested_header_slot()),
             Self::LightClientOptimisticUpdate(r) => Some(r.get_slot()),
             Self::LightClientUpdatesByRange(r) => Some(r.attested_header_slot()),
-            Self::ExecutionProofsByRoot(_) | Self::MetaData(_) | Self::Status(_) | Self::Pong(_) => None,
+            Self::ExecutionProofsByRoot(_)
+            | Self::MetaData(_)
+            | Self::Status(_)
+            | Self::Pong(_) => None,
         }
     }
 }
@@ -861,7 +864,8 @@ impl<E: EthSpec> std::fmt::Display for RpcSuccessResponse<E> {
                 write!(
                     f,
                     "ExecutionProofsByRoot: block_root: {}, subnet_id: {}",
-                    proof.block_root(), proof.subnet_id
+                    proof.block_root(),
+                    proof.subnet_id
                 )
             }
             RpcSuccessResponse::Pong(ping) => write!(f, "Pong: {}", ping.data),

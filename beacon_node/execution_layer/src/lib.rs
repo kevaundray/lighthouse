@@ -1623,9 +1623,7 @@ impl<E: EthSpec> ExecutionLayer<E> {
         // Dispatch to appropriate backend
         let result = match &self.inner.backend {
             ExecutionBackend::Full(engine) => {
-                engine
-                    .set_latest_forkchoice_state(forkchoice_state)
-                    .await;
+                engine.set_latest_forkchoice_state(forkchoice_state).await;
 
                 engine
                     .request(|engine| async move {

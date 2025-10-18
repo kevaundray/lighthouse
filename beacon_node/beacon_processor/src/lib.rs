@@ -1615,9 +1615,7 @@ impl<E: EthSpec> BeaconProcessor<E> {
             }
             Work::BlocksByRangeRequest(work)
             | Work::BlocksByRootsRequest(work)
-            | Work::ExecutionProofsByRootsRequest(work) => {
-                task_spawner.spawn_async(work)
-            }
+            | Work::ExecutionProofsByRootsRequest(work) => task_spawner.spawn_async(work),
             Work::ChainSegmentBackfill(process_fn) => {
                 if self.config.enable_backfill_rate_limiting {
                     task_spawner.spawn_blocking_with_rayon(RayonPoolType::LowPriority, process_fn)

@@ -278,8 +278,8 @@ mod tests {
         let signed_header = create_test_header(123);
         let proof_data = vec![1, 2, 3];
 
-        let proof = ExecutionProof::new(subnet_id, block_hash, signed_header.clone(), proof_data)
-            .unwrap();
+        let proof =
+            ExecutionProof::new(subnet_id, block_hash, signed_header.clone(), proof_data).unwrap();
 
         assert_eq!(proof.slot(), Slot::new(123));
         assert_eq!(proof.block_root(), signed_header.message.tree_hash_root());

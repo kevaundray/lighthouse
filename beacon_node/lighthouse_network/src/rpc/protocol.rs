@@ -524,7 +524,9 @@ impl ProtocolId {
                 DataColumnsByRangeRequest::ssz_min_len(),
                 DataColumnsByRangeRequest::ssz_max_len::<E>(),
             ),
-            Protocol::ExecutionProofsByRoot => RpcLimits::new(0, spec.max_execution_proofs_by_root_request),
+            Protocol::ExecutionProofsByRoot => {
+                RpcLimits::new(0, spec.max_execution_proofs_by_root_request)
+            }
             Protocol::Ping => RpcLimits::new(
                 <Ping as Encode>::ssz_fixed_len(),
                 <Ping as Encode>::ssz_fixed_len(),

@@ -252,7 +252,9 @@ impl<E: EthSpec> PeerInfo<E> {
     }
 
     /// Returns an iterator on this peer's execution proof subnets
-    pub fn execution_proof_subnets_iter(&self) -> impl Iterator<Item = &types::ExecutionProofSubnetId> {
+    pub fn execution_proof_subnets_iter(
+        &self,
+    ) -> impl Iterator<Item = &types::ExecutionProofSubnetId> {
         self.execution_proof_subnets.iter()
     }
 

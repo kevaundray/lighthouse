@@ -335,7 +335,10 @@ impl RPCRateLimiter {
             .set_quota(Protocol::BlocksByRoot, blocks_by_root_quota)
             .set_quota(Protocol::BlobsByRange, blobs_by_range_quota)
             .set_quota(Protocol::BlobsByRoot, blobs_by_root_quota)
-            .set_quota(Protocol::ExecutionProofsByRoot, execution_proofs_by_root_quota)
+            .set_quota(
+                Protocol::ExecutionProofsByRoot,
+                execution_proofs_by_root_quota,
+            )
             .set_quota(Protocol::DataColumnsByRoot, data_columns_by_root_quota)
             .set_quota(Protocol::DataColumnsByRange, data_columns_by_range_quota)
             .set_quota(Protocol::LightClientBootstrap, light_client_bootstrap_quota)

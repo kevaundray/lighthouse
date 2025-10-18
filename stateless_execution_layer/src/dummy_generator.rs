@@ -32,7 +32,6 @@ impl DummyGenerator {
             generation_delay: delay,
         }
     }
-
 }
 
 #[async_trait]

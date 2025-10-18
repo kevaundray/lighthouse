@@ -4,7 +4,9 @@ pub use discv5::enr::CombinedKey;
 
 use super::ENR_FILENAME;
 use crate::NetworkConfig;
-use crate::types::{Enr, EnrAttestationBitfield, EnrExecutionProofBitfield, EnrSyncCommitteeBitfield};
+use crate::types::{
+    Enr, EnrAttestationBitfield, EnrExecutionProofBitfield, EnrSyncCommitteeBitfield,
+};
 use alloy_rlp::bytes::Bytes;
 use libp2p::identity::Keypair;
 use lighthouse_version::{client_name, version};

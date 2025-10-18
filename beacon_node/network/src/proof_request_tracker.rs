@@ -201,9 +201,8 @@ impl ProofRequestTracker {
         let now = Instant::now();
         const MAX_REQUEST_AGE: Duration = Duration::from_secs(300); // 5 minutes
 
-        self.requests.retain(|_, request| {
-            now.duration_since(request.first_requested) < MAX_REQUEST_AGE
-        });
+        self.requests
+            .retain(|_, request| now.duration_since(request.first_requested) < MAX_REQUEST_AGE);
     }
 }
 
@@ -294,7 +293,10 @@ mod tests {
 
         // Immediately check for retries (should be empty since request is active)
         let retry_subnets = tracker.get_retry_subnets(&block_root);
-        assert!(retry_subnets.is_empty(), "Should not retry while request is active");
+        assert!(
+            retry_subnets.is_empty(),
+            "Should not retry while request is active"
+        );
 
         // Wait for timeout (in real scenario, would wait PROOF_REQUEST_TIMEOUT)
         // For testing, we rely on the fact that active_requests() will be 0 after timeout

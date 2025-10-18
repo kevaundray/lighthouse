@@ -13,9 +13,9 @@ use types::{
     ProposerSlashing, SignedAggregateAndProof, SignedAggregateAndProofBase,
     SignedAggregateAndProofElectra, SignedBeaconBlock, SignedBeaconBlockAltair,
     SignedBeaconBlockBase, SignedBeaconBlockBellatrix, SignedBeaconBlockCapella,
-    SignedBeaconBlockDeneb, SignedBeaconBlockElectra, SignedBeaconBlockFulu, SignedBeaconBlockGloas,
-    SignedBlsToExecutionChange, SignedContributionAndProof, SignedVoluntaryExit, SingleAttestation,
-    SubnetId, SyncCommitteeMessage, SyncSubnetId,
+    SignedBeaconBlockDeneb, SignedBeaconBlockElectra, SignedBeaconBlockFulu,
+    SignedBeaconBlockGloas, SignedBlsToExecutionChange, SignedContributionAndProof,
+    SignedVoluntaryExit, SingleAttestation, SubnetId, SyncCommitteeMessage, SyncSubnetId,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -392,20 +392,16 @@ impl<E: EthSpec> PubsubMessage<E> {
                     }
                     GossipKind::ExecutionProof(subnet_id) => {
                         // Decode ExecutionProof from SSZ bytes
-                        let execution_proof = ExecutionProof::from_ssz_bytes(data)
-                            .map_err(|e| {
-                                format!(
-                                    "Failed to decode ExecutionProof from SSZ: {:?}",
-                                    e
-                                )
+                        let execution_proof =
+                            ExecutionProof::from_ssz_bytes(data).map_err(|e| {
+                                format!("Failed to decode ExecutionProof from SSZ: {:?}", e)
                             })?;
 
                         // Verify subnet_id in proof matches gossip topic subnet_id
                         if execution_proof.subnet_id != *subnet_id {
                             return Err(format!(
                                 "ExecutionProof subnet_id mismatch: gossip_topic={:?}, proof.subnet_id={:?}",
-                                subnet_id,
-                                execution_proof.subnet_id
+                                subnet_id, execution_proof.subnet_id
                             ));
                         }
 
