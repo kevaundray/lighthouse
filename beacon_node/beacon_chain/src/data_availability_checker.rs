@@ -700,7 +700,7 @@ async fn availability_cache_maintenance_service<T: BeaconChainTypes>(
             .duration_to_next_epoch(T::EthSpec::slots_per_epoch())
         {
             Some(duration) => {
-                // this service should run 3/4 of the way through the epoch
+                // this service should run 3/4 of the way through the next epoch
                 let additional_delay = (epoch_duration * 3) / 4;
                 tokio::time::sleep(duration + additional_delay).await;
 
