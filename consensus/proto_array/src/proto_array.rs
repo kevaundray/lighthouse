@@ -372,7 +372,7 @@ impl ProtoArray {
     /// Returns an error if:
     ///
     /// - The `block-root` is unknown.
-    /// - Any of the to-be-validated payloads are already invalid.
+    /// - Any of the to-be-validated payloads are already invalid.    
     pub fn propagate_execution_payload_validation(
         &mut self,
         block_root: Hash256,
@@ -1052,6 +1052,528 @@ impl ProtoArray {
                     && self.is_finalized_checkpoint_or_descendant::<E>(node.root)
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use types::Epoch;
+
+    fn get_hash(value: u64) -> Hash256 {
+        Hash256::from_low_u64_be(value)
+    }
+
+    fn get_execution_hash(value: u64) -> ExecutionBlockHash {
+        ExecutionBlockHash::from_root(get_hash(value))
+    }
+
+    fn get_checkpoint(epoch: u64, root: u64) -> Checkpoint {
+        Checkpoint {
+            epoch: Epoch::new(epoch),
+            root: get_hash(root),
+        }
+    }
+
+    fn get_shuffling_id(epoch: u64, root: u64) -> AttestationShufflingId {
+        AttestationShufflingId::from_components(Epoch::new(epoch), get_hash(root))
+    }
+
+    /// Helper to create a ProtoArray with a genesis block
+    fn get_proto_array_with_genesis() -> ProtoArray {
+        let mut proto_array = ProtoArray {
+            prune_threshold: 0,
+            justified_checkpoint: get_checkpoint(0, 0),
+            finalized_checkpoint: get_checkpoint(0, 0),
+            nodes: vec![],
+            indices: HashMap::new(),
+            previous_proposer_boost: ProposerBoost::default(),
+        };
+
+        // Add genesis block with Valid status
+        let genesis_node = ProtoNode {
+            slot: Slot::new(0),
+            state_root: Hash256::zero(),
+            target_root: Hash256::zero(),
+            current_epoch_shuffling_id: get_shuffling_id(0, 0),
+            next_epoch_shuffling_id: get_shuffling_id(0, 0),
+            root: get_hash(0),
+            parent: None,
+            justified_checkpoint: get_checkpoint(0, 0),
+            finalized_checkpoint: get_checkpoint(0, 0),
+            weight: 0,
+            best_child: None,
+            best_descendant: None,
+            execution_status: ExecutionStatus::Valid(get_execution_hash(0)),
+            unrealized_justified_checkpoint: None,
+            unrealized_finalized_checkpoint: None,
+        };
+
+        proto_array.indices.insert(genesis_node.root, 0);
+        proto_array.nodes.push(genesis_node);
+
+        proto_array
+    }
+
+    /// Helper to add a node with a given execution status
+    fn add_node(
+        proto_array: &mut ProtoArray,
+        slot: u64,
+        root: u64,
+        parent: Option<usize>,
+        execution_status: ExecutionStatus,
+    ) -> usize {
+        let node = ProtoNode {
+            slot: Slot::new(slot),
+            state_root: Hash256::zero(),
+            target_root: Hash256::zero(),
+            current_epoch_shuffling_id: get_shuffling_id(0, 0),
+            next_epoch_shuffling_id: get_shuffling_id(0, 0),
+            root: get_hash(root),
+            parent,
+            justified_checkpoint: get_checkpoint(0, 0),
+            finalized_checkpoint: get_checkpoint(0, 0),
+            weight: 0,
+            best_child: None,
+            best_descendant: None,
+            execution_status,
+            unrealized_justified_checkpoint: None,
+            unrealized_finalized_checkpoint: None,
+        };
+
+        let index = proto_array.nodes.len();
+        proto_array.indices.insert(node.root, index);
+        proto_array.nodes.push(node);
+
+        index
+    }
+
+    #[test]
+    fn propagate_validation_through_optimistic_chain() {
+        let mut proto_array = get_proto_array_with_genesis();
+
+        // Build chain: 0 (Valid) <- 1 (Optimistic) <- 2 (Optimistic) <- 3 (Optimistic)
+        add_node(
+            &mut proto_array,
+            1,
+            1,
+            Some(0),
+            ExecutionStatus::Optimistic(get_execution_hash(1)),
+        );
+        add_node(
+            &mut proto_array,
+            2,
+            2,
+            Some(1),
+            ExecutionStatus::Optimistic(get_execution_hash(2)),
+        );
+        add_node(
+            &mut proto_array,
+            3,
+            3,
+            Some(2),
+            ExecutionStatus::Optimistic(get_execution_hash(3)),
+        );
+
+        // Verify initial state
+        assert!(matches!(
+            proto_array.nodes[0].execution_status,
+            ExecutionStatus::Valid(_)
+        ));
+        assert!(matches!(
+            proto_array.nodes[1].execution_status,
+            ExecutionStatus::Optimistic(_)
+        ));
+        assert!(matches!(
+            proto_array.nodes[2].execution_status,
+            ExecutionStatus::Optimistic(_)
+        ));
+        assert!(matches!(
+            proto_array.nodes[3].execution_status,
+            ExecutionStatus::Optimistic(_)
+        ));
+
+        // Propagate validation from node 3
+        proto_array
+            .propagate_execution_payload_validation_by_index(3)
+            .expect("should propagate validation");
+
+        // All nodes should now be valid
+        assert!(matches!(
+            proto_array.nodes[0].execution_status,
+            ExecutionStatus::Valid(_)
+        ));
+        assert!(matches!(
+            proto_array.nodes[1].execution_status,
+            ExecutionStatus::Valid(_)
+        ));
+        assert!(matches!(
+            proto_array.nodes[2].execution_status,
+            ExecutionStatus::Valid(_)
+        ));
+        assert!(matches!(
+            proto_array.nodes[3].execution_status,
+            ExecutionStatus::Valid(_)
+        ));
+    }
+    #[test]
+    fn propagate_validation_through_optimistic_chain_iterative_change() {
+        let mut proto_array = get_proto_array_with_genesis();
+
+        // Build chain: 0 (Valid) <- 1 (Optimistic) <- 2 (Optimistic) <- 3 (Optimistic)
+        // We will now iteratively change each node from Optimistic to Valid
+        // instead of changing `3` since that will propagate to the ancestors
+        add_node(
+            &mut proto_array,
+            1,
+            1,
+            Some(0),
+            ExecutionStatus::Optimistic(get_execution_hash(1)),
+        );
+        add_node(
+            &mut proto_array,
+            2,
+            2,
+            Some(1),
+            ExecutionStatus::Optimistic(get_execution_hash(2)),
+        );
+        add_node(
+            &mut proto_array,
+            3,
+            3,
+            Some(2),
+            ExecutionStatus::Optimistic(get_execution_hash(3)),
+        );
+
+        // Verify initial state
+        assert!(matches!(
+            proto_array.nodes[0].execution_status,
+            ExecutionStatus::Valid(_)
+        ));
+        assert!(matches!(
+            proto_array.nodes[1].execution_status,
+            ExecutionStatus::Optimistic(_)
+        ));
+        assert!(matches!(
+            proto_array.nodes[2].execution_status,
+            ExecutionStatus::Optimistic(_)
+        ));
+        assert!(matches!(
+            proto_array.nodes[3].execution_status,
+            ExecutionStatus::Optimistic(_)
+        ));
+
+        // Propagate validation from node 1
+        proto_array
+            .propagate_execution_payload_validation_by_index(1)
+            .expect("should propagate validation");
+
+        assert!(matches!(
+            proto_array.nodes[1].execution_status,
+            ExecutionStatus::Valid(_)
+        ));
+        assert!(matches!(
+            proto_array.nodes[2].execution_status,
+            ExecutionStatus::Optimistic(_)
+        ));
+        assert!(matches!(
+            proto_array.nodes[3].execution_status,
+            ExecutionStatus::Optimistic(_)
+        ));
+        proto_array
+            .propagate_execution_payload_validation_by_index(2)
+            .expect("should propagate validation");
+        assert!(matches!(
+            proto_array.nodes[1].execution_status,
+            ExecutionStatus::Valid(_)
+        ));
+        assert!(matches!(
+            proto_array.nodes[2].execution_status,
+            ExecutionStatus::Valid(_)
+        ));
+        assert!(matches!(
+            proto_array.nodes[3].execution_status,
+            ExecutionStatus::Optimistic(_)
+        ));
+        proto_array
+            .propagate_execution_payload_validation_by_index(3)
+            .expect("should propagate validation");
+        assert!(matches!(
+            proto_array.nodes[1].execution_status,
+            ExecutionStatus::Valid(_)
+        ));
+        assert!(matches!(
+            proto_array.nodes[2].execution_status,
+            ExecutionStatus::Valid(_)
+        ));
+        assert!(matches!(
+            proto_array.nodes[3].execution_status,
+            ExecutionStatus::Valid(_)
+        ));
+    }
+
+    #[test]
+    fn propagate_validation_stops_at_valid() {
+        let mut proto_array = get_proto_array_with_genesis();
+
+        // Build chain: 0 (Valid) <- 1 (Valid) <- 2 (Optimistic) <- 3 (Optimistic)
+        add_node(
+            &mut proto_array,
+            1,
+            1,
+            Some(0),
+            ExecutionStatus::Valid(get_execution_hash(1)),
+        );
+        add_node(
+            &mut proto_array,
+            2,
+            2,
+            Some(1),
+            ExecutionStatus::Optimistic(get_execution_hash(2)),
+        );
+        add_node(
+            &mut proto_array,
+            3,
+            3,
+            Some(2),
+            ExecutionStatus::Optimistic(get_execution_hash(3)),
+        );
+
+        // Propagate validation from node 3
+        proto_array
+            .propagate_execution_payload_validation_by_index(3)
+            .expect("should propagate validation");
+
+        // Nodes 2 and 3 should be valid, but the function should have stopped at node 1
+        assert!(matches!(
+            proto_array.nodes[1].execution_status,
+            ExecutionStatus::Valid(_)
+        ));
+        assert!(matches!(
+            proto_array.nodes[2].execution_status,
+            ExecutionStatus::Valid(_)
+        ));
+        assert!(matches!(
+            proto_array.nodes[3].execution_status,
+            ExecutionStatus::Valid(_)
+        ));
+    }
+
+    #[test]
+    fn propagate_validation_stops_at_irrelevant() {
+        let mut proto_array = ProtoArray {
+            prune_threshold: 0,
+            justified_checkpoint: get_checkpoint(0, 0),
+            finalized_checkpoint: get_checkpoint(0, 0),
+            nodes: vec![],
+            indices: HashMap::new(),
+            previous_proposer_boost: ProposerBoost::default(),
+        };
+
+        // Build chain with irrelevant genesis: 0 (Irrelevant) <- 1 (Optimistic) <- 2 (Optimistic)
+        add_node(
+            &mut proto_array,
+            0,
+            0,
+            None,
+            ExecutionStatus::Irrelevant(false),
+        );
+        add_node(
+            &mut proto_array,
+            1,
+            1,
+            Some(0),
+            ExecutionStatus::Optimistic(get_execution_hash(1)),
+        );
+        add_node(
+            &mut proto_array,
+            2,
+            2,
+            Some(1),
+            ExecutionStatus::Optimistic(get_execution_hash(2)),
+        );
+
+        // Propagate validation from node 2
+        proto_array
+            .propagate_execution_payload_validation_by_index(2)
+            .expect("should propagate validation");
+
+        // Nodes 1 and 2 should be valid, node 0 should still be irrelevant
+        assert!(matches!(
+            proto_array.nodes[0].execution_status,
+            ExecutionStatus::Irrelevant(_)
+        ));
+        assert!(matches!(
+            proto_array.nodes[1].execution_status,
+            ExecutionStatus::Valid(_)
+        ));
+        assert!(matches!(
+            proto_array.nodes[2].execution_status,
+            ExecutionStatus::Valid(_)
+        ));
+    }
+
+    #[test]
+    fn propagate_validation_errors_on_invalid_ancestor() {
+        let mut proto_array = get_proto_array_with_genesis();
+
+        // Build chain: 0 (Valid) <- 1 (Invalid) <- 2 (Optimistic)
+        add_node(
+            &mut proto_array,
+            1,
+            1,
+            Some(0),
+            ExecutionStatus::Invalid(get_execution_hash(1)),
+        );
+        add_node(
+            &mut proto_array,
+            2,
+            2,
+            Some(1),
+            ExecutionStatus::Optimistic(get_execution_hash(2)),
+        );
+
+        // Attempting to propagate validation from node 2 should error
+        let result = proto_array.propagate_execution_payload_validation_by_index(2);
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            Error::InvalidAncestorOfValidPayload { .. }
+        ));
+    }
+
+    #[test]
+    fn propagate_validation_single_optimistic_node() {
+        let mut proto_array = get_proto_array_with_genesis();
+
+        // Add single optimistic node
+        add_node(
+            &mut proto_array,
+            1,
+            1,
+            Some(0),
+            ExecutionStatus::Optimistic(get_execution_hash(1)),
+        );
+
+        // Propagate validation
+        proto_array
+            .propagate_execution_payload_validation_by_index(1)
+            .expect("should propagate validation");
+
+        // Both nodes should be valid
+        assert!(matches!(
+            proto_array.nodes[0].execution_status,
+            ExecutionStatus::Valid(_)
+        ));
+        assert!(matches!(
+            proto_array.nodes[1].execution_status,
+            ExecutionStatus::Valid(_)
+        ));
+    }
+
+    #[test]
+    fn propagate_validation_already_valid_node() {
+        let mut proto_array = get_proto_array_with_genesis();
+
+        // Add valid node
+        add_node(
+            &mut proto_array,
+            1,
+            1,
+            Some(0),
+            ExecutionStatus::Valid(get_execution_hash(1)),
+        );
+
+        // Propagate validation on already-valid node should be no-op
+        proto_array
+            .propagate_execution_payload_validation_by_index(1)
+            .expect("should handle already-valid node");
+
+        // Both should still be valid
+        assert!(matches!(
+            proto_array.nodes[0].execution_status,
+            ExecutionStatus::Valid(_)
+        ));
+        assert!(matches!(
+            proto_array.nodes[1].execution_status,
+            ExecutionStatus::Valid(_)
+        ));
+    }
+
+    #[test]
+    fn propagate_validation_preserves_execution_hash() {
+        let mut proto_array = get_proto_array_with_genesis();
+
+        // Add optimistic nodes with specific execution hashes
+        let exec_hash_1 = get_execution_hash(100);
+        let exec_hash_2 = get_execution_hash(200);
+
+        add_node(
+            &mut proto_array,
+            1,
+            1,
+            Some(0),
+            ExecutionStatus::Optimistic(exec_hash_1),
+        );
+        add_node(
+            &mut proto_array,
+            2,
+            2,
+            Some(1),
+            ExecutionStatus::Optimistic(exec_hash_2),
+        );
+
+        // Propagate validation
+        proto_array
+            .propagate_execution_payload_validation_by_index(2)
+            .expect("should propagate validation");
+
+        // Verify execution hashes are preserved
+        assert_eq!(
+            proto_array.nodes[1].execution_status,
+            ExecutionStatus::Valid(exec_hash_1)
+        );
+        assert_eq!(
+            proto_array.nodes[2].execution_status,
+            ExecutionStatus::Valid(exec_hash_2)
+        );
+    }
+
+    #[test]
+    fn propagate_validation_public_api() {
+        let mut proto_array = get_proto_array_with_genesis();
+
+        // Add optimistic node
+        add_node(
+            &mut proto_array,
+            1,
+            1,
+            Some(0),
+            ExecutionStatus::Optimistic(get_execution_hash(1)),
+        );
+
+        // Test public API
+        proto_array
+            .propagate_execution_payload_validation(get_hash(1))
+            .expect("should propagate via public API");
+
+        // Verify validation propagated
+        assert!(matches!(
+            proto_array.nodes[1].execution_status,
+            ExecutionStatus::Valid(_)
+        ));
+    }
+
+    #[test]
+    fn propagate_validation_public_api_unknown_root() {
+        let mut proto_array = get_proto_array_with_genesis();
+
+        // Try to propagate validation for unknown root
+        let result = proto_array.propagate_execution_payload_validation(get_hash(999));
+
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), Error::NodeUnknown(_)));
     }
 }
 
