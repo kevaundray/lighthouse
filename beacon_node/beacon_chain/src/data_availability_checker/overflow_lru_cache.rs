@@ -725,9 +725,17 @@ impl<T: BeaconChainTypes> DataAvailabilityCheckerInner<T> {
     /// Removes a pre-execution block from the cache.
     /// This does NOT remove an existing executed block.
     pub fn remove_pre_execution_block(&self, block_root: &Hash256) {
-        // The read lock is immediately dropped so we can safely remove the block from the cache.
-        if let Some(BlockProcessStatus::NotValidated(_, _)) = self.get_cached_block(block_root) {
-            self.critical.write().pop(block_root);
+        // Conservatively, hold a write lock ensuring that the pre-executed
+        // block cannot be upgraded to  
+        let mut write_lock = self.critical.write();
+
+        let should_remove = write_lock
+            .peek(block_root)
+            .and_then(|components| components.block.as_ref())
+            .is_some_and(|cached_block| matches!(cached_block, CachedBlock::PreExecution(..)));
+
+        if should_remove {
+            write_lock.pop(block_root);
         }
     }
 
