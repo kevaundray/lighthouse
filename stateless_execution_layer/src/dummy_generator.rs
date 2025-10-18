@@ -32,6 +32,7 @@ impl DummyGenerator {
             generation_delay: delay,
         }
     }
+
 }
 
 #[async_trait]
@@ -57,7 +58,8 @@ impl ProofGenerator for DummyGenerator {
             payload_hash.0[3],
         ];
 
-        ExecutionProof::new(self.subnet_id, *payload_hash, *block_root, proof_data)
+        // Use testing helper to create proof with minimal header
+        ExecutionProof::new_for_testing(self.subnet_id, *payload_hash, *block_root, proof_data)
             .map_err(GenerationError::GenerationFailed)
     }
 
@@ -73,6 +75,7 @@ impl ProofGenerator for DummyGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use types::Slot;
 
     #[tokio::test]
     async fn test_dummy_generator_success() {
@@ -87,7 +90,7 @@ mod tests {
         let proof = result.unwrap();
         assert_eq!(proof.subnet_id, subnet);
         assert_eq!(proof.block_hash, block_hash);
-        assert_eq!(proof.block_root, block_root);
+        assert_eq!(proof.slot(), Slot::new(0)); // Dummy header has slot 0
         assert!(proof.proof_data_size() > 0);
     }
 

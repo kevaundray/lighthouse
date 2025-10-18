@@ -192,7 +192,7 @@ where
             )
             .map_err(|e| format!("unable to create stateless execution layer: {:?}", e))?;
 
-            // Store Arc for later use (callback registration)
+            // Store Arc for later use (callback registration and RPC wiring)
             let stateless_el_arc = Arc::new(stateless_el);
 
             let execution_layer = ExecutionLayer::from_stateless(

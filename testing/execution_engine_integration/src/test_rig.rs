@@ -413,7 +413,10 @@ impl<Engine: GenericExecutionEngine> TestRig<Engine> {
         let status = self
             .ee_a
             .execution_layer
-            .notify_new_payload(valid_payload.to_ref().try_into().unwrap())
+            .notify_new_payload(
+                valid_payload.to_ref().try_into().unwrap(),
+                Hash256::zero(), // placeholder for test
+            )
             .await
             .unwrap();
         assert_eq!(status, PayloadStatus::Valid);
@@ -467,7 +470,10 @@ impl<Engine: GenericExecutionEngine> TestRig<Engine> {
         let status = self
             .ee_a
             .execution_layer
-            .notify_new_payload(invalid_payload.to_ref().try_into().unwrap())
+            .notify_new_payload(
+                invalid_payload.to_ref().try_into().unwrap(),
+                Hash256::zero(), // placeholder for test
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -546,7 +552,10 @@ impl<Engine: GenericExecutionEngine> TestRig<Engine> {
         let status = self
             .ee_a
             .execution_layer
-            .notify_new_payload(second_payload.to_ref().try_into().unwrap())
+            .notify_new_payload(
+                second_payload.to_ref().try_into().unwrap(),
+                Hash256::zero(), // placeholder for test
+            )
             .await
             .unwrap();
         assert_eq!(status, PayloadStatus::Valid);
@@ -598,7 +607,10 @@ impl<Engine: GenericExecutionEngine> TestRig<Engine> {
         let status = self
             .ee_b
             .execution_layer
-            .notify_new_payload(second_payload.to_ref().try_into().unwrap())
+            .notify_new_payload(
+                second_payload.to_ref().try_into().unwrap(),
+                Hash256::zero(), // placeholder for test
+            )
             .await
             .unwrap();
         assert!(matches!(status, PayloadStatus::Syncing));
@@ -636,7 +648,10 @@ impl<Engine: GenericExecutionEngine> TestRig<Engine> {
         let status = self
             .ee_b
             .execution_layer
-            .notify_new_payload(valid_payload.to_ref().try_into().unwrap())
+            .notify_new_payload(
+                valid_payload.to_ref().try_into().unwrap(),
+                Hash256::zero(), // placeholder for test
+            )
             .await
             .unwrap();
         assert_eq!(status, PayloadStatus::Valid);
@@ -650,7 +665,10 @@ impl<Engine: GenericExecutionEngine> TestRig<Engine> {
         let status = self
             .ee_b
             .execution_layer
-            .notify_new_payload(second_payload.to_ref().try_into().unwrap())
+            .notify_new_payload(
+                second_payload.to_ref().try_into().unwrap(),
+                Hash256::zero(), // placeholder for test
+            )
             .await
             .unwrap();
         assert_eq!(status, PayloadStatus::Valid);

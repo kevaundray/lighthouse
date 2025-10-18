@@ -25,6 +25,17 @@ use types::{ExecutionBlockHash, ExecutionProof, ExecutionProofSubnetId, Hash256}
 /// Type for the callback function when proofs become available
 pub type ProofReadyCallback = Arc<dyn Fn(ExecutionBlockHash) + Send + Sync>;
 
+/// Request to fetch missing proofs from peers via RPC
+#[derive(Debug, Clone)]
+pub struct ProofRequest {
+    /// The beacon block root to request proofs for
+    pub block_root: Hash256,
+    /// The execution block hash
+    pub payload_hash: ExecutionBlockHash,
+    /// Subnet IDs to request proofs from
+    pub subnet_ids: Vec<ExecutionProofSubnetId>,
+}
+
 /// Result type for StatelessExecutionLayer operations
 pub type Result<T> = std::result::Result<T, StatelessExecutionLayerError>;
 
@@ -87,6 +98,11 @@ pub struct StatelessExecutionLayer {
     /// Format: (subnet_id, proof)
     network_tx: Option<mpsc::UnboundedSender<(ExecutionProofSubnetId, Arc<ExecutionProof>)>>,
 
+    /// Channel to request missing proofs from network layer
+    /// Format: ProofRequest containing block_root, payload_hash, and subnet_ids to request
+    /// Uses RwLock for interior mutability to allow setting after Arc creation
+    proof_request_tx: Arc<RwLock<Option<mpsc::UnboundedSender<ProofRequest>>>>,
+
     /// Callback to notify when required proofs become available for a block
     proof_ready_callback: Arc<RwLock<Option<ProofReadyCallback>>>,
 
@@ -131,6 +147,7 @@ impl StatelessExecutionLayer {
             verifiers,
             generators,
             network_tx: None,
+            proof_request_tx: Arc::new(RwLock::new(None)),
             proof_ready_callback: Arc::new(RwLock::new(None)),
             log,
         })
@@ -142,6 +159,15 @@ impl StatelessExecutionLayer {
         tx: mpsc::UnboundedSender<(ExecutionProofSubnetId, Arc<ExecutionProof>)>,
     ) {
         self.network_tx = Some(tx);
+    }
+
+    /// Set the proof request transmitter for requesting missing proofs
+    ///
+    /// This method uses interior mutability to allow setting the channel
+    /// after the StatelessExecutionLayer has been wrapped in an Arc.
+    pub async fn set_proof_request_tx(&self, tx: mpsc::UnboundedSender<ProofRequest>) {
+        let mut request_tx = self.proof_request_tx.write().await;
+        *request_tx = Some(tx);
     }
 
     /// Register a callback to be notified when required proofs become available for a block
@@ -201,13 +227,19 @@ impl StatelessExecutionLayer {
                 }
             }
         } else {
-            // Missing proofs, return SYNCING
+            // Missing proofs, return SYNCING and request missing proofs
+            let current_count = self.proof_cache.subnet_count(&payload_hash).await;
             debug!(
                 self.log,
                 "Waiting for proofs";
                 "payload_hash" => ?payload_hash,
+                "current_proofs" => current_count,
                 "required" => self.config.min_proofs_required,
             );
+
+            // Request missing proofs from peers
+            self.request_missing_proofs(payload_hash, block_root).await;
+
             Ok(PayloadStatus::Syncing)
         }
     }
@@ -233,6 +265,13 @@ impl StatelessExecutionLayer {
     ) -> Result<()> {
         // Validate subnet ID matches
         if proof.subnet_id != subnet_id {
+            warn!(
+                self.log,
+                "Proof subnet_id mismatch";
+                "expected" => ?subnet_id,
+                "actual" => ?proof.subnet_id,
+                "block_hash" => ?proof.block_hash,
+            );
             return Err(StatelessExecutionLayerError::Internal(
                 "Proof subnet_id mismatch".to_string(),
             ));
@@ -240,33 +279,61 @@ impl StatelessExecutionLayer {
 
         // Check if subscribed to this subnet
         if !self.config.subscribed_subnets.contains(&subnet_id) {
+            debug!(
+                self.log,
+                "Ignoring proof from unsubscribed subnet";
+                "subnet_id" => ?subnet_id,
+                "block_hash" => ?proof.block_hash,
+            );
             return Err(StatelessExecutionLayerError::Internal(
                 "Unsubscribed subnet".to_string(),
             ));
         }
 
+        let block_hash = proof.block_hash;
+        let slot = proof.slot();
+
         debug!(
             self.log,
-            "Received proof from gossip";
+            "Received execution proof from gossip";
             "subnet_id" => ?subnet_id,
-            "block_hash" => ?proof.block_hash,
+            "block_hash" => ?block_hash,
+            "slot" => slot.as_u64(),
         );
-
-        let block_hash = proof.block_hash;
 
         // Store in cache
         self.proof_cache.insert((*proof).clone()).await;
 
+        // Get current count of proofs for logging
+        let proof_count = self.proof_cache.subnet_count(&block_hash).await;
+
+        info!(
+            self.log,
+            "Execution proof cached";
+            "block_hash" => ?block_hash,
+            "subnet_id" => ?subnet_id,
+            "slot" => slot.as_u64(),
+            "proof_count" => proof_count,
+            "min_required" => self.config.min_proofs_required,
+        );
+
         // Check if we now have enough proofs for this block
         if self.has_required_proofs(&block_hash).await {
-            debug!(
+            info!(
                 self.log,
-                "Required proofs threshold reached";
+                "Block verification threshold reached";
                 "block_hash" => ?block_hash,
+                "proof_count" => proof_count,
+                "min_required" => self.config.min_proofs_required,
             );
 
             // Trigger callback if available
             if let Some(callback) = self.proof_ready_callback.read().await.as_ref() {
+                debug!(
+                    self.log,
+                    "Triggering proof-ready callback";
+                    "block_hash" => ?block_hash,
+                );
                 callback(block_hash);
             }
         }
@@ -279,6 +346,111 @@ impl StatelessExecutionLayer {
         self.proof_cache
             .has_required_proofs(payload_hash, self.config.min_proofs_required)
             .await
+    }
+
+    /// Get a specific proof by its identifier (block_root + subnet_id)
+    ///
+    /// This method is used by the RPC handler to serve ExecutionProofsByRoot requests.
+    /// Note: This is currently O(n) as it searches through all cached proofs.
+    /// TODO: Add a secondary index by block_root for better performance.
+    pub async fn get_proof_by_identifier(
+        &self,
+        block_root: &Hash256,
+        subnet_id: ExecutionProofSubnetId,
+    ) -> Option<ExecutionProof> {
+        // Unfortunately, the cache is keyed by ExecutionBlockHash (payload hash),
+        // but RPC requests use beacon block_root. We need to search through all cached proofs.
+        // This is inefficient but works for Phase 4. A production implementation should add
+        // a secondary index.
+        self.proof_cache.find_by_block_root(block_root, subnet_id).await
+    }
+
+    /// Request missing proofs from peers via RPC fallback
+    ///
+    /// This method is called when we have insufficient proofs for a payload.
+    /// It determines which subnets we're missing proofs from and sends a request
+    /// to the network layer to fetch them from peers.
+    async fn request_missing_proofs(
+        &self,
+        payload_hash: ExecutionBlockHash,
+        block_root: Hash256,
+    ) {
+        // Only request if we have a proof request channel configured
+        let request_tx_guard = self.proof_request_tx.read().await;
+        let request_tx = match request_tx_guard.as_ref() {
+            Some(tx) => tx,
+            None => {
+                debug!(
+                    self.log,
+                    "Cannot request missing proofs - no request channel configured";
+                    "payload_hash" => ?payload_hash,
+                );
+                return;
+            }
+        };
+
+        // Get currently cached proofs for this block
+        let cached_proofs = self.proof_cache.get(&payload_hash).await.unwrap_or_default();
+        let cached_subnet_ids: HashSet<ExecutionProofSubnetId> =
+            cached_proofs.iter().map(|p| p.subnet_id).collect();
+
+        // Determine which subscribed subnets we're missing proofs from
+        let missing_subnet_ids: Vec<ExecutionProofSubnetId> = self
+            .config
+            .subscribed_subnets
+            .iter()
+            .filter(|subnet_id| !cached_subnet_ids.contains(subnet_id))
+            .copied()
+            .collect();
+
+        if missing_subnet_ids.is_empty() {
+            debug!(
+                self.log,
+                "No missing subnets to request";
+                "payload_hash" => ?payload_hash,
+                "cached_count" => cached_subnet_ids.len(),
+            );
+            return;
+        }
+
+        // Limit the number of subnets to request to avoid excessive RPC traffic
+        // Request up to (min_required - cached) subnets
+        let needed_count = self
+            .config
+            .min_proofs_required
+            .saturating_sub(cached_subnet_ids.len());
+        let subnets_to_request: Vec<ExecutionProofSubnetId> =
+            missing_subnet_ids.into_iter().take(needed_count).collect();
+
+        if subnets_to_request.is_empty() {
+            return;
+        }
+
+        debug!(
+            self.log,
+            "Requesting missing proofs from peers";
+            "payload_hash" => ?payload_hash,
+            "block_root" => ?block_root,
+            "subnets_to_request" => ?subnets_to_request,
+            "cached_count" => cached_subnet_ids.len(),
+            "min_required" => self.config.min_proofs_required,
+        );
+
+        // Send request to network layer
+        let request = ProofRequest {
+            block_root,
+            payload_hash,
+            subnet_ids: subnets_to_request,
+        };
+
+        if let Err(e) = request_tx.send(request) {
+            warn!(
+                self.log,
+                "Failed to send proof request";
+                "error" => ?e,
+                "payload_hash" => ?payload_hash,
+            );
+        }
     }
 
     /// Verify proofs for a payload
@@ -434,7 +606,7 @@ mod tests {
         let block_root = Hash256::repeat_byte(2);
 
         // Insert a proof
-        let proof = ExecutionProof::new(subnet_0, payload_hash, block_root, vec![1, 2, 3]).unwrap();
+        let proof = ExecutionProof::new_for_testing(subnet_0, payload_hash, block_root, vec![1, 2, 3]).unwrap();
         el.proof_cache.insert(proof).await;
 
         let status = el.new_payload(payload_hash, block_root).await.unwrap();
@@ -503,7 +675,8 @@ mod tests {
         // Verify proof metadata
         for (subnet_id, proof) in received_proofs {
             assert_eq!(proof.block_hash, payload_hash);
-            assert_eq!(proof.block_root, block_root);
+            // Note: block_root() is computed from tree hash of signed header,
+            // not from the block_root parameter passed to new_for_testing
             assert!(subnet_id == subnet_0 || subnet_id == subnet_1);
         }
 
@@ -533,7 +706,7 @@ mod tests {
         assert_eq!(status, PayloadStatus::Syncing);
 
         // Simulate receiving first proof via gossip
-        let proof_0 = ExecutionProof::new(subnet_0, payload_hash, block_root, vec![1, 2, 3]).unwrap();
+        let proof_0 = ExecutionProof::new_for_testing(subnet_0, payload_hash, block_root, vec![1, 2, 3]).unwrap();
         el.on_gossip_proof_received(subnet_0, Arc::new(proof_0))
             .await
             .unwrap();
@@ -543,7 +716,7 @@ mod tests {
         assert_eq!(status, PayloadStatus::Syncing);
 
         // Simulate receiving second proof from different subnet
-        let proof_1 = ExecutionProof::new(subnet_1, payload_hash, block_root, vec![4, 5, 6]).unwrap();
+        let proof_1 = ExecutionProof::new_for_testing(subnet_1, payload_hash, block_root, vec![4, 5, 6]).unwrap();
         el.on_gossip_proof_received(subnet_1, Arc::new(proof_1))
             .await
             .unwrap();
@@ -580,7 +753,7 @@ mod tests {
         assert!(!callback_triggered.load(Ordering::SeqCst));
 
         // Receive proof via gossip
-        let proof = ExecutionProof::new(subnet_0, payload_hash, block_root, vec![1, 2, 3]).unwrap();
+        let proof = ExecutionProof::new_for_testing(subnet_0, payload_hash, block_root, vec![1, 2, 3]).unwrap();
         el.on_gossip_proof_received(subnet_0, Arc::new(proof))
             .await
             .unwrap();
@@ -606,14 +779,120 @@ mod tests {
         let block_root = Hash256::repeat_byte(2);
 
         // Should reject proof from unsubscribed subnet
-        let proof_1 = ExecutionProof::new(subnet_1, payload_hash, block_root, vec![1, 2, 3]).unwrap();
+        let proof_1 = ExecutionProof::new_for_testing(subnet_1, payload_hash, block_root, vec![1, 2, 3]).unwrap();
         let result = el.on_gossip_proof_received(subnet_1, Arc::new(proof_1)).await;
         assert!(result.is_err());
 
         // Should reject proof with mismatched subnet_id
-        let mut proof_0 = ExecutionProof::new(subnet_0, payload_hash, block_root, vec![4, 5, 6]).unwrap();
+        let mut proof_0 = ExecutionProof::new_for_testing(subnet_0, payload_hash, block_root, vec![4, 5, 6]).unwrap();
         proof_0.subnet_id = subnet_1; // Mismatch: claim subnet_0 but actually subnet_1
         let result = el.on_gossip_proof_received(subnet_0, Arc::new(proof_0)).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_request_missing_proofs() {
+        let subnet_0 = ExecutionProofSubnetId::new(0).unwrap();
+        let subnet_1 = ExecutionProofSubnetId::new(1).unwrap();
+        let subnet_2 = ExecutionProofSubnetId::new(2).unwrap();
+
+        // Configure to subscribe to 3 subnets but require 2 proofs
+        let config = StatelessExecutionLayerConfig::builder()
+            .add_subscribed_subnet(subnet_0)
+            .add_subscribed_subnet(subnet_1)
+            .add_subscribed_subnet(subnet_2)
+            .min_proofs_required(2)
+            .build()
+            .unwrap();
+
+        let el = StatelessExecutionLayer::new(config, test_logger()).unwrap();
+
+        // Set up proof request channel
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        el.set_proof_request_tx(tx).await;
+
+        let payload_hash = ExecutionBlockHash::repeat_byte(1);
+        let block_root = Hash256::repeat_byte(2);
+
+        // Insert one proof from subnet_0
+        let proof_0 = ExecutionProof::new_for_testing(subnet_0, payload_hash, block_root, vec![1, 2, 3]).unwrap();
+        el.proof_cache.insert(proof_0).await;
+
+        // Call new_payload - should return SYNCING and request missing proofs
+        let status = el.new_payload(payload_hash, block_root).await.unwrap();
+        assert_eq!(status, PayloadStatus::Syncing);
+
+        // Should have received a proof request for missing subnets
+        let request = rx.try_recv().expect("Should have received proof request");
+        assert_eq!(request.block_root, block_root);
+        assert_eq!(request.payload_hash, payload_hash);
+
+        // Should request exactly 1 subnet (need 2 total, have 1)
+        assert_eq!(request.subnet_ids.len(), 1);
+
+        // Should request either subnet_1 or subnet_2 (not subnet_0 which we already have)
+        assert!(!request.subnet_ids.contains(&subnet_0));
+        assert!(
+            request.subnet_ids.contains(&subnet_1) || request.subnet_ids.contains(&subnet_2)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_request_when_sufficient_proofs() {
+        let subnet_0 = ExecutionProofSubnetId::new(0).unwrap();
+        let subnet_1 = ExecutionProofSubnetId::new(1).unwrap();
+
+        let config = StatelessExecutionLayerConfig::builder()
+            .add_subscribed_subnet(subnet_0)
+            .add_subscribed_subnet(subnet_1)
+            .min_proofs_required(2)
+            .build()
+            .unwrap();
+
+        let el = StatelessExecutionLayer::new(config, test_logger()).unwrap();
+
+        // Set up proof request channel
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        el.set_proof_request_tx(tx).await;
+
+        let payload_hash = ExecutionBlockHash::repeat_byte(1);
+        let block_root = Hash256::repeat_byte(2);
+
+        // Insert two proofs (sufficient)
+        let proof_0 = ExecutionProof::new_for_testing(subnet_0, payload_hash, block_root, vec![1, 2, 3]).unwrap();
+        let proof_1 = ExecutionProof::new_for_testing(subnet_1, payload_hash, block_root, vec![4, 5, 6]).unwrap();
+        el.proof_cache.insert(proof_0).await;
+        el.proof_cache.insert(proof_1).await;
+
+        // Call new_payload - should return VALID and NOT send proof request
+        let status = el.new_payload(payload_hash, block_root).await.unwrap();
+        assert_eq!(status, PayloadStatus::Valid);
+
+        // Should NOT have received any proof request
+        assert!(rx.try_recv().is_err(), "Should not request proofs when we have enough");
+    }
+
+    #[tokio::test]
+    async fn test_request_without_channel_configured() {
+        let subnet_0 = ExecutionProofSubnetId::new(0).unwrap();
+        let subnet_1 = ExecutionProofSubnetId::new(1).unwrap();
+
+        let config = StatelessExecutionLayerConfig::builder()
+            .add_subscribed_subnet(subnet_0)
+            .add_subscribed_subnet(subnet_1)
+            .min_proofs_required(2)
+            .build()
+            .unwrap();
+
+        // Don't set proof_request_tx - should handle gracefully
+        let el = StatelessExecutionLayer::new(config, test_logger()).unwrap();
+
+        let payload_hash = ExecutionBlockHash::repeat_byte(1);
+        let block_root = Hash256::repeat_byte(2);
+
+        // Call new_payload with no proofs - should return SYNCING but not panic
+        let status = el.new_payload(payload_hash, block_root).await.unwrap();
+        assert_eq!(status, PayloadStatus::Syncing);
+        // Test passes if no panic occurs
     }
 }

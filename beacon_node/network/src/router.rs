@@ -6,6 +6,8 @@
 #![allow(clippy::unit_arg)]
 
 use crate::network_beacon_processor::{InvalidBlockStorage, NetworkBeaconProcessor};
+use crate::proof_peer_selector::select_proof_peer;
+use crate::proof_request_tracker::ProofRequestTracker;
 use crate::service::NetworkMessage;
 use crate::status::status_message;
 use crate::sync::SyncMessage;
@@ -19,6 +21,7 @@ use lighthouse_network::{
 };
 use logging::TimeLatch;
 use logging::crit;
+use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -110,6 +113,134 @@ impl<T: BeaconChainTypes> Router<T> {
             executor: executor.clone(),
         };
         let network_beacon_processor = Arc::new(network_beacon_processor);
+
+        // Wire up proof request channel for RPC fallback if stateless-EL is configured
+        if let Some(stateless_el) = beacon_chain.stateless_execution_layer.as_ref() {
+            let (proof_request_tx, mut proof_request_rx) =
+                mpsc::unbounded_channel::<stateless_execution_layer::ProofRequest>();
+
+            // Set the channel on the stateless-EL using interior mutability
+            let stateless_el_clone = stateless_el.clone();
+            let proof_request_tx_clone = proof_request_tx.clone();
+            executor.spawn(
+                async move {
+                    stateless_el_clone
+                        .set_proof_request_tx(proof_request_tx_clone)
+                        .await;
+                },
+                "stateless_el_proof_request_setup",
+            );
+
+            // Spawn task to listen for proof requests and initiate RPC calls
+            // This task implements smart peer selection and request tracking with retries
+            let network_globals_clone = network_globals.clone();
+            let network_send_clone = network_send.clone();
+
+            // Shared state for tracking proof requests
+            let proof_tracker = Arc::new(Mutex::new(ProofRequestTracker::new()));
+            let proof_tracker_clone = proof_tracker.clone();
+
+            // Spawn periodic cleanup task
+            let executor_clone = executor.clone();
+            executor_clone.spawn(
+                async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(60));
+                    loop {
+                        interval.tick().await;
+                        proof_tracker_clone.lock().prune_old_requests();
+                    }
+                },
+                "proof_request_tracker_cleanup",
+            );
+
+            executor.spawn(
+                async move {
+                    while let Some(request) = proof_request_rx.recv().await {
+                        debug!(
+                            block_root = ?request.block_root,
+                            payload_hash = ?request.payload_hash,
+                            subnet_ids = ?request.subnet_ids,
+                            "Received proof request from stateless-EL"
+                        );
+
+                        // Get list of peers we've already asked
+                        let excluded_peers = request
+                            .subnet_ids
+                            .iter()
+                            .flat_map(|&subnet_id| {
+                                proof_tracker
+                                    .lock()
+                                    .get_asked_peers(&request.block_root, subnet_id)
+                            })
+                            .collect();
+
+                        // Select best peer using intelligent selection
+                        let peer_id = select_proof_peer(
+                            &network_globals_clone,
+                            &request.subnet_ids,
+                            &excluded_peers,
+                        );
+
+                        if let Some(peer_id) = peer_id {
+                            // Track this request
+                            proof_tracker.lock().insert_request(
+                                request.block_root,
+                                &request.subnet_ids,
+                                peer_id,
+                            );
+
+                            // Create RPC request identifiers for this block
+                            let identifiers: Vec<_> = request
+                                .subnet_ids
+                                .iter()
+                                .map(|subnet_id| types::ExecutionProofIdentifier {
+                                    block_root: request.block_root,
+                                    subnet_id: *subnet_id,
+                                })
+                                .collect();
+
+                            debug!(
+                                peer_id = %peer_id,
+                                identifiers = identifiers.len(),
+                                excluded_peers = excluded_peers.len(),
+                                "Sending ExecutionProofsByRoot RPC request"
+                            );
+
+                            // Send RPC request
+                            const MAX_REQUEST_EXECUTION_PROOFS: usize = 128;
+                            let rpc_request = match methods::ExecutionProofsByRootRequest::new(
+                                identifiers,
+                                MAX_REQUEST_EXECUTION_PROOFS,
+                            ) {
+                                Ok(req) => req,
+                                Err(e) => {
+                                    warn!(error = e, "Failed to create ExecutionProofsByRootRequest");
+                                    continue;
+                                }
+                            };
+
+                            if let Err(e) = network_send_clone.send(NetworkMessage::SendRequest {
+                                peer_id,
+                                app_request_id: AppRequestId::Router,
+                                request: RequestType::ExecutionProofsByRoot(rpc_request),
+                            }) {
+                                warn!(
+                                    error = ?e,
+                                    "Failed to send proof request to network"
+                                );
+                            }
+                        } else {
+                            warn!(
+                                block_root = ?request.block_root,
+                                excluded_peers = excluded_peers.len(),
+                                "No suitable peers available to request proofs (all peers excluded or disconnected)"
+                            );
+                        }
+                    }
+                },
+                "proof_request_handler",
+            );
+        }
 
         // spawn the sync thread
         crate::sync::manager::spawn(
@@ -257,6 +388,10 @@ impl<T: BeaconChainTypes> Router<T> {
                 self.network_beacon_processor
                     .send_data_columns_by_range_request(peer_id, inbound_request_id, request),
             ),
+            RequestType::ExecutionProofsByRoot(request) => self.handle_beacon_processor_send_result(
+                self.network_beacon_processor
+                    .send_execution_proofs_by_roots_request(peer_id, inbound_request_id, request),
+            ),
             RequestType::LightClientBootstrap(request) => self.handle_beacon_processor_send_result(
                 self.network_beacon_processor
                     .send_light_client_bootstrap_request(peer_id, inbound_request_id, request),
@@ -314,6 +449,9 @@ impl<T: BeaconChainTypes> Router<T> {
             }
             Response::DataColumnsByRange(data_column) => {
                 self.on_data_columns_by_range_response(peer_id, app_request_id, data_column);
+            }
+            Response::ExecutionProofsByRoot(proof) => {
+                self.on_execution_proofs_by_root_response(peer_id, app_request_id, proof);
             }
             // Light client responses should not be received
             Response::LightClientBootstrap(_)
@@ -757,6 +895,59 @@ impl<T: BeaconChainTypes> Router<T> {
             });
         } else {
             crit!("All data columns by range responses should belong to sync");
+        }
+    }
+
+    /// Handle an `ExecutionProofsByRoot` response from the peer.
+    ///
+    /// ExecutionProofsByRoot is used for RPC fallback when gossip delivery fails.
+    /// Proofs are forwarded to the stateless-EL if configured.
+    pub fn on_execution_proofs_by_root_response(
+        &mut self,
+        peer_id: PeerId,
+        app_request_id: AppRequestId,
+        proof: Option<Arc<types::ExecutionProof>>,
+    ) {
+        trace!(
+            %peer_id,
+            "Received ExecutionProofsByRoot Response"
+        );
+
+        // ExecutionProofsByRoot responses are initiated by the router for RPC fallback,
+        // not by the sync manager
+        match app_request_id {
+            AppRequestId::Router => {
+                if let Some(proof) = proof {
+                    debug!(
+                        %peer_id,
+                        subnet_id = proof.subnet_id.as_u8(),
+                        block_hash = ?proof.block_hash,
+                        "Received execution proof via RPC"
+                    );
+
+                    // Forward to stateless-EL if configured
+                    if let Some(tx) = &self.stateless_el_proof_tx {
+                        if let Err(e) = tx.send(proof) {
+                            warn!(
+                                error = ?e,
+                                %peer_id,
+                                "Failed to send RPC execution proof to stateless-EL"
+                            );
+                        }
+                    } else {
+                        // No stateless-EL configured, proof is ignored
+                        trace!(
+                            %peer_id,
+                            "Execution proof received via RPC but no stateless-EL configured"
+                        );
+                    }
+                }
+                // None response indicates end of stream, nothing to do
+            }
+            AppRequestId::Sync(_) => {
+                crit!(%peer_id, "ExecutionProofsByRoot requests should not belong to sync");
+            }
+            AppRequestId::Internal => unreachable!("Handled internally"),
         }
     }
 

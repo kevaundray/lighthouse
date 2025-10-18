@@ -81,7 +81,8 @@ mod tests {
         subnet_id: ExecutionProofSubnetId,
         block_hash: ExecutionBlockHash,
     ) -> ExecutionProof {
-        ExecutionProof::new(subnet_id, block_hash, Hash256::zero(), vec![1, 2, 3, 4]).unwrap()
+        ExecutionProof::new_for_testing(subnet_id, block_hash, Hash256::zero(), vec![1, 2, 3, 4])
+            .unwrap()
     }
 
     #[tokio::test]

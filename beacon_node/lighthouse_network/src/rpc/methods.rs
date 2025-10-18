@@ -540,6 +540,28 @@ impl<E: EthSpec> DataColumnsByRootRequest<E> {
     }
 }
 
+/// Request execution proofs by their identifiers (block_root + subnet_id)
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExecutionProofsByRootRequest {
+    /// The list of execution proof identifiers being requested.
+    pub proof_ids: RuntimeVariableList<types::ExecutionProofIdentifier>,
+}
+
+impl ExecutionProofsByRootRequest {
+    pub fn new(
+        proof_ids: Vec<types::ExecutionProofIdentifier>,
+        max_request_proofs: usize,
+    ) -> Result<Self, &'static str> {
+        let proof_ids = RuntimeVariableList::new(proof_ids, max_request_proofs)
+            .map_err(|_| "ExecutionProofsByRootRequest too many proof IDs")?;
+        Ok(Self { proof_ids })
+    }
+
+    pub fn max_requested(&self) -> usize {
+        self.proof_ids.len()
+    }
+}
+
 /// Request a number of beacon data columns from a peer.
 #[derive(Encode, Decode, Clone, Debug, PartialEq)]
 pub struct LightClientUpdatesByRangeRequest {
@@ -607,6 +629,9 @@ pub enum RpcSuccessResponse<E: EthSpec> {
     /// A response to a get DATA_COLUMN_SIDECARS_BY_RANGE request.
     DataColumnsByRange(Arc<DataColumnSidecar<E>>),
 
+    /// A response to a get EXECUTION_PROOFS_BY_ROOT request.
+    ExecutionProofsByRoot(Arc<types::ExecutionProof>),
+
     /// A PONG response to a PING request.
     Pong(Ping),
 
@@ -635,6 +660,9 @@ pub enum ResponseTermination {
     /// Data column sidecars by range stream termination.
     DataColumnsByRange,
 
+    /// Execution proofs by root stream termination.
+    ExecutionProofsByRoot,
+
     /// Light client updates by range stream termination.
     LightClientUpdatesByRange,
 }
@@ -648,6 +676,7 @@ impl ResponseTermination {
             ResponseTermination::BlobsByRoot => Protocol::BlobsByRoot,
             ResponseTermination::DataColumnsByRoot => Protocol::DataColumnsByRoot,
             ResponseTermination::DataColumnsByRange => Protocol::DataColumnsByRange,
+            ResponseTermination::ExecutionProofsByRoot => Protocol::ExecutionProofsByRoot,
             ResponseTermination::LightClientUpdatesByRange => Protocol::LightClientUpdatesByRange,
         }
     }
@@ -743,6 +772,7 @@ impl<E: EthSpec> RpcSuccessResponse<E> {
             RpcSuccessResponse::BlobsByRoot(_) => Protocol::BlobsByRoot,
             RpcSuccessResponse::DataColumnsByRoot(_) => Protocol::DataColumnsByRoot,
             RpcSuccessResponse::DataColumnsByRange(_) => Protocol::DataColumnsByRange,
+            RpcSuccessResponse::ExecutionProofsByRoot(_) => Protocol::ExecutionProofsByRoot,
             RpcSuccessResponse::Pong(_) => Protocol::Ping,
             RpcSuccessResponse::MetaData(_) => Protocol::MetaData,
             RpcSuccessResponse::LightClientBootstrap(_) => Protocol::LightClientBootstrap,
@@ -767,7 +797,7 @@ impl<E: EthSpec> RpcSuccessResponse<E> {
             Self::LightClientFinalityUpdate(r) => Some(r.get_attested_header_slot()),
             Self::LightClientOptimisticUpdate(r) => Some(r.get_slot()),
             Self::LightClientUpdatesByRange(r) => Some(r.attested_header_slot()),
-            Self::MetaData(_) | Self::Status(_) | Self::Pong(_) => None,
+            Self::ExecutionProofsByRoot(_) | Self::MetaData(_) | Self::Status(_) | Self::Pong(_) => None,
         }
     }
 }
@@ -825,6 +855,13 @@ impl<E: EthSpec> std::fmt::Display for RpcSuccessResponse<E> {
                     f,
                     "DataColumnsByRange: Data column slot: {}",
                     sidecar.slot()
+                )
+            }
+            RpcSuccessResponse::ExecutionProofsByRoot(proof) => {
+                write!(
+                    f,
+                    "ExecutionProofsByRoot: block_root: {}, subnet_id: {}",
+                    proof.block_root(), proof.subnet_id
                 )
             }
             RpcSuccessResponse::Pong(ping) => write!(f, "Pong: {}", ping.data),
@@ -934,6 +971,16 @@ impl<E: EthSpec> std::fmt::Display for DataColumnsByRootRequest<E> {
             f,
             "Request: DataColumnsByRoot: Number of Requested Data Column Ids: {}",
             self.data_column_ids.len()
+        )
+    }
+}
+
+impl std::fmt::Display for ExecutionProofsByRootRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Request: ExecutionProofsByRoot: Number of Requested Proof IDs: {}",
+            self.proof_ids.len()
         )
     }
 }

@@ -16,12 +16,12 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use tokio_util::codec::{Decoder, Encoder};
 use types::{
-    BlobSidecar, ChainSpec, DataColumnSidecar, DataColumnsByRootIdentifier, EthSpec, ForkContext,
-    ForkName, Hash256, LightClientBootstrap, LightClientFinalityUpdate,
-    LightClientOptimisticUpdate, LightClientUpdate, RuntimeVariableList, SignedBeaconBlock,
-    SignedBeaconBlockAltair, SignedBeaconBlockBase, SignedBeaconBlockBellatrix,
-    SignedBeaconBlockCapella, SignedBeaconBlockDeneb, SignedBeaconBlockElectra,
-    SignedBeaconBlockFulu, SignedBeaconBlockGloas,
+    BlobSidecar, ChainSpec, DataColumnSidecar, DataColumnsByRootIdentifier, EthSpec,
+    ExecutionProof, ForkContext, ForkName, Hash256, LightClientBootstrap,
+    LightClientFinalityUpdate, LightClientOptimisticUpdate, LightClientUpdate,
+    RuntimeVariableList, SignedBeaconBlock, SignedBeaconBlockAltair, SignedBeaconBlockBase,
+    SignedBeaconBlockBellatrix, SignedBeaconBlockCapella, SignedBeaconBlockDeneb,
+    SignedBeaconBlockElectra, SignedBeaconBlockFulu, SignedBeaconBlockGloas,
 };
 use unsigned_varint::codec::Uvi;
 
@@ -78,6 +78,7 @@ impl<E: EthSpec> SSZSnappyInboundCodec<E> {
                 RpcSuccessResponse::BlocksByRoot(res) => res.as_ssz_bytes(),
                 RpcSuccessResponse::BlobsByRange(res) => res.as_ssz_bytes(),
                 RpcSuccessResponse::BlobsByRoot(res) => res.as_ssz_bytes(),
+                RpcSuccessResponse::ExecutionProofsByRoot(res) => res.as_ssz_bytes(),
                 RpcSuccessResponse::DataColumnsByRoot(res) => res.as_ssz_bytes(),
                 RpcSuccessResponse::DataColumnsByRange(res) => res.as_ssz_bytes(),
                 RpcSuccessResponse::LightClientBootstrap(res) => res.as_ssz_bytes(),
@@ -358,6 +359,7 @@ impl<E: EthSpec> Encoder<RequestType<E>> for SSZSnappyOutboundCodec<E> {
             },
             RequestType::BlobsByRange(req) => req.as_ssz_bytes(),
             RequestType::BlobsByRoot(req) => req.blob_ids.as_ssz_bytes(),
+            RequestType::ExecutionProofsByRoot(req) => req.proof_ids.as_ssz_bytes(),
             RequestType::DataColumnsByRange(req) => req.as_ssz_bytes(),
             RequestType::DataColumnsByRoot(req) => req.data_column_ids.as_ssz_bytes(),
             RequestType::Ping(req) => req.as_ssz_bytes(),
@@ -556,6 +558,18 @@ fn handle_rpc_request<E: EthSpec>(
                 )?,
             })))
         }
+        SupportedProtocol::ExecutionProofsByRootV1 => {
+            // Max 128 execution proofs per request (16 blocks * 8 subnets)
+            const MAX_REQUEST_EXECUTION_PROOFS: usize = 128;
+            Ok(Some(RequestType::ExecutionProofsByRoot(
+                ExecutionProofsByRootRequest {
+                    proof_ids: RuntimeVariableList::from_ssz_bytes(
+                        decoded_buffer,
+                        MAX_REQUEST_EXECUTION_PROOFS,
+                    )?,
+                },
+            )))
+        }
         SupportedProtocol::DataColumnsByRangeV1 => Ok(Some(RequestType::DataColumnsByRange(
             DataColumnsByRangeRequest::from_ssz_bytes(decoded_buffer)?,
         ))),
@@ -678,6 +692,28 @@ fn handle_rpc_response<E: EthSpec>(
                     Err(RPCError::ErrorResponse(
                         RpcErrorResponse::InvalidRequest,
                         "Invalid fork name for blobs by root".to_string(),
+                    ))
+                }
+            }
+            None => Err(RPCError::ErrorResponse(
+                RpcErrorResponse::InvalidRequest,
+                format!(
+                    "No context bytes provided for {:?} response",
+                    versioned_protocol
+                ),
+            )),
+        },
+        SupportedProtocol::ExecutionProofsByRootV1 => match fork_name {
+            Some(fork_name) => {
+                // Execution proofs are available starting from Fulu fork (Phase 3)
+                if fork_name.fulu_enabled() {
+                    Ok(Some(RpcSuccessResponse::ExecutionProofsByRoot(Arc::new(
+                        ExecutionProof::from_ssz_bytes(decoded_buffer)?,
+                    ))))
+                } else {
+                    Err(RPCError::ErrorResponse(
+                        RpcErrorResponse::InvalidRequest,
+                        "Invalid fork name for execution proofs by root".to_string(),
                     ))
                 }
             }
@@ -1278,6 +1314,12 @@ mod tests {
                 assert_eq!(
                     decoded,
                     RequestType::LightClientUpdatesByRange(light_client_updates_by_range)
+                )
+            }
+            RequestType::ExecutionProofsByRoot(execution_proofs_by_root) => {
+                assert_eq!(
+                    decoded,
+                    RequestType::ExecutionProofsByRoot(execution_proofs_by_root)
                 )
             }
         }

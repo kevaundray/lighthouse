@@ -136,7 +136,10 @@ async fn notify_new_payload<T: BeaconChainTypes>(
         .ok_or(ExecutionPayloadError::NoExecutionConnection)?;
 
     let execution_block_hash = block.execution_payload()?.block_hash();
-    let new_payload_response = execution_layer.notify_new_payload(block.try_into()?).await;
+    let beacon_block_root = block.tree_hash_root();
+    let new_payload_response = execution_layer
+        .notify_new_payload(block.try_into()?, beacon_block_root)
+        .await;
 
     match new_payload_response {
         Ok(status) => match status {

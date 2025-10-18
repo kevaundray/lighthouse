@@ -61,7 +61,7 @@ mod tests {
     // Helper to create a test proof
     #[allow(dead_code)]
     fn create_test_proof(subnet_id: ExecutionProofSubnetId) -> ExecutionProof {
-        ExecutionProof::new(
+        ExecutionProof::new_for_testing(
             subnet_id,
             types::ExecutionBlockHash::zero(),
             types::Hash256::zero(),

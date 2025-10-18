@@ -123,6 +123,28 @@ impl ProofCache {
         let cache = self.cache.read().await;
         cache.is_empty()
     }
+
+    /// Find a proof by block_root and subnet_id
+    ///
+    /// This iterates through all cached proofs to find one matching the given
+    /// block_root and subnet_id. This is O(n) in cache size.
+    pub async fn find_by_block_root(
+        &self,
+        block_root: &types::Hash256,
+        subnet_id: ExecutionProofSubnetId,
+    ) -> Option<ExecutionProof> {
+        let cache = self.cache.read().await;
+
+        for (_payload_hash, proofs) in cache.iter() {
+            for proof in proofs {
+                if proof.block_root() == *block_root && proof.subnet_id == subnet_id {
+                    return Some(proof.clone());
+                }
+            }
+        }
+
+        None
+    }
 }
 
 impl Clone for ProofCache {
@@ -143,7 +165,7 @@ mod tests {
         block_hash: ExecutionBlockHash,
     ) -> ExecutionProof {
         use types::FixedBytesExtended;
-        ExecutionProof::new(subnet_id, block_hash, Hash256::zero(), vec![1, 2, 3]).unwrap()
+        ExecutionProof::new_for_testing(subnet_id, block_hash, Hash256::zero(), vec![1, 2, 3]).unwrap()
     }
 
     #[tokio::test]

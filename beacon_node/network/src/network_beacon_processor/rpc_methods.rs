@@ -6,7 +6,8 @@ use crate::sync::SyncMessage;
 use beacon_chain::{BeaconChainError, BeaconChainTypes, WhenSlotSkipped};
 use itertools::{Itertools, process_results};
 use lighthouse_network::rpc::methods::{
-    BlobsByRangeRequest, BlobsByRootRequest, DataColumnsByRangeRequest, DataColumnsByRootRequest,
+    self, BlobsByRangeRequest, BlobsByRootRequest, DataColumnsByRangeRequest,
+    DataColumnsByRootRequest,
 };
 use lighthouse_network::rpc::*;
 use lighthouse_network::{PeerId, ReportSource, Response, SyncInfo};
@@ -1303,6 +1304,80 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
                 self.send_error_response(peer_id, error_code, reason.into(), inbound_request_id);
             }
         }
+    }
+
+    /// Handle an `ExecutionProofsByRoot` request from the peer.
+    ///
+    /// This handler serves execution proofs from the stateless-EL cache.
+    /// Following the BlobsByRoot pattern, this is an async request that
+    /// iterates through requested proof identifiers and sends matching proofs.
+    pub async fn handle_execution_proofs_by_root_request(
+        self: Arc<Self>,
+        peer_id: PeerId,
+        inbound_request_id: InboundRequestId,
+        request: methods::ExecutionProofsByRootRequest,
+    ) {
+        self.terminate_response_stream(
+            peer_id,
+            inbound_request_id,
+            self.handle_execution_proofs_by_root_request_inner(peer_id, inbound_request_id, request).await,
+            Response::ExecutionProofsByRoot,
+        );
+    }
+
+    /// Handle an `ExecutionProofsByRoot` request from the peer.
+    async fn handle_execution_proofs_by_root_request_inner(
+        &self,
+        peer_id: PeerId,
+        inbound_request_id: InboundRequestId,
+        request: methods::ExecutionProofsByRootRequest,
+    ) -> Result<(), (RpcErrorResponse, &'static str)> {
+        let requested_count = request.proof_ids.len();
+        let mut proofs_sent = 0;
+
+        // Access stateless-EL to serve proofs from cache (if configured)
+        let stateless_el = match &self.chain.stateless_execution_layer {
+            Some(sel) => sel,
+            None => {
+                debug!(
+                    %peer_id,
+                    "ExecutionProofsByRoot request received but stateless-EL not configured"
+                );
+                // Return empty stream - no error, just no proofs available
+                return Ok(());
+            }
+        };
+
+        // Iterate through requested proof identifiers and serve matching proofs
+        for proof_id in request.proof_ids.as_slice() {
+            if let Some(proof) = stateless_el
+                .get_proof_by_identifier(&proof_id.block_root, proof_id.subnet_id)
+                .await
+            {
+                self.send_response(
+                    peer_id,
+                    inbound_request_id,
+                    Response::ExecutionProofsByRoot(Some(Arc::new(proof))),
+                );
+                proofs_sent += 1;
+            } else {
+                debug!(
+                    %peer_id,
+                    block_root = ?proof_id.block_root,
+                    subnet_id = proof_id.subnet_id.as_u8(),
+                    "Requested proof not found in cache"
+                );
+            }
+        }
+
+        debug!(
+            %peer_id,
+            requested = requested_count,
+            returned = proofs_sent,
+            "ExecutionProofsByRoot request processed"
+        );
+
+        Ok(())
     }
 
     fn record_data_column_request_in_span(

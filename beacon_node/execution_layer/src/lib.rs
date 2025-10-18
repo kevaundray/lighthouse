@@ -1435,6 +1435,7 @@ impl<E: EthSpec> ExecutionLayer<E> {
     pub async fn notify_new_payload(
         &self,
         new_payload_request: NewPayloadRequest<'_, E>,
+        beacon_block_root: Hash256,
     ) -> Result<PayloadStatus, Error> {
         let _timer = metrics::start_timer_vec(
             &metrics::EXECUTION_LAYER_REQUEST_TIMES,
@@ -1454,14 +1455,11 @@ impl<E: EthSpec> ExecutionLayer<E> {
                     .await
             }
             ExecutionBackend::Stateless(stateless_el) => {
-                // For stateless EL, we need the block root from the beacon block.
-                // TODO(Phase 2): This needs to be passed through properly from the caller.
-                // For now, we use a placeholder. This will be fixed when wiring up the
-                // beacon chain integration.
-                let block_root = Hash256::repeat_byte(0);
-
-                // Call stateless EL's new_payload
-                match stateless_el.new_payload(block_hash, block_root).await {
+                // Call stateless EL's new_payload with the beacon block root
+                match stateless_el
+                    .new_payload(block_hash, beacon_block_root)
+                    .await
+                {
                     Ok(status) => {
                         // Convert stateless PayloadStatus to execution_layer PayloadStatusV1
                         Ok(match status {

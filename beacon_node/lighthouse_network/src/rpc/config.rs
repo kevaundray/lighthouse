@@ -91,6 +91,7 @@ pub struct RateLimiterConfig {
     pub(super) blocks_by_root_quota: Quota,
     pub(super) blobs_by_range_quota: Quota,
     pub(super) blobs_by_root_quota: Quota,
+    pub(super) execution_proofs_by_root_quota: Quota,
     pub(super) data_columns_by_root_quota: Quota,
     pub(super) data_columns_by_range_quota: Quota,
     pub(super) light_client_bootstrap_quota: Quota,
@@ -116,6 +117,8 @@ impl RateLimiterConfig {
         Quota::n_every(NonZeroU64::new(896).unwrap(), 10);
     pub const DEFAULT_BLOBS_BY_ROOT_QUOTA: Quota =
         Quota::n_every(NonZeroU64::new(896).unwrap(), 10);
+    pub const DEFAULT_EXECUTION_PROOFS_BY_ROOT_QUOTA: Quota =
+        Quota::n_every(NonZeroU64::new(128).unwrap(), 10);
     // Allow up to `MAX_REQUEST_DATA_COLUMN_SIDECARS` (16384), the maximum number of data
     // column sidecars in a single request from the spec.
     pub const DEFAULT_DATA_COLUMNS_BY_RANGE_QUOTA: Quota =
@@ -139,6 +142,7 @@ impl Default for RateLimiterConfig {
             blocks_by_root_quota: Self::DEFAULT_BLOCKS_BY_ROOT_QUOTA,
             blobs_by_range_quota: Self::DEFAULT_BLOBS_BY_RANGE_QUOTA,
             blobs_by_root_quota: Self::DEFAULT_BLOBS_BY_ROOT_QUOTA,
+            execution_proofs_by_root_quota: Self::DEFAULT_EXECUTION_PROOFS_BY_ROOT_QUOTA,
             data_columns_by_root_quota: Self::DEFAULT_DATA_COLUMNS_BY_ROOT_QUOTA,
             data_columns_by_range_quota: Self::DEFAULT_DATA_COLUMNS_BY_RANGE_QUOTA,
             light_client_bootstrap_quota: Self::DEFAULT_LIGHT_CLIENT_BOOTSTRAP_QUOTA,
@@ -172,6 +176,10 @@ impl Debug for RateLimiterConfig {
             .field("blobs_by_range", fmt_q!(&self.blobs_by_range_quota))
             .field("blobs_by_root", fmt_q!(&self.blobs_by_root_quota))
             .field(
+                "execution_proofs_by_root",
+                fmt_q!(&self.execution_proofs_by_root_quota),
+            )
+            .field(
                 "data_columns_by_range",
                 fmt_q!(&self.data_columns_by_range_quota),
             )
@@ -199,6 +207,7 @@ impl FromStr for RateLimiterConfig {
         let mut blocks_by_root_quota = None;
         let mut blobs_by_range_quota = None;
         let mut blobs_by_root_quota = None;
+        let mut execution_proofs_by_root_quota = None;
         let mut data_columns_by_root_quota = None;
         let mut data_columns_by_range_quota = None;
         let mut light_client_bootstrap_quota = None;
@@ -216,6 +225,9 @@ impl FromStr for RateLimiterConfig {
                 Protocol::BlocksByRoot => blocks_by_root_quota = blocks_by_root_quota.or(quota),
                 Protocol::BlobsByRange => blobs_by_range_quota = blobs_by_range_quota.or(quota),
                 Protocol::BlobsByRoot => blobs_by_root_quota = blobs_by_root_quota.or(quota),
+                Protocol::ExecutionProofsByRoot => {
+                    execution_proofs_by_root_quota = execution_proofs_by_root_quota.or(quota)
+                }
                 Protocol::DataColumnsByRoot => {
                     data_columns_by_root_quota = data_columns_by_root_quota.or(quota)
                 }
@@ -253,6 +265,8 @@ impl FromStr for RateLimiterConfig {
             blobs_by_range_quota: blobs_by_range_quota
                 .unwrap_or(Self::DEFAULT_BLOBS_BY_RANGE_QUOTA),
             blobs_by_root_quota: blobs_by_root_quota.unwrap_or(Self::DEFAULT_BLOBS_BY_ROOT_QUOTA),
+            execution_proofs_by_root_quota: execution_proofs_by_root_quota
+                .unwrap_or(Self::DEFAULT_EXECUTION_PROOFS_BY_ROOT_QUOTA),
             data_columns_by_root_quota: data_columns_by_root_quota
                 .unwrap_or(Self::DEFAULT_DATA_COLUMNS_BY_ROOT_QUOTA),
             data_columns_by_range_quota: data_columns_by_range_quota

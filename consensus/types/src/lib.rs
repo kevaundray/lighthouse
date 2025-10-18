@@ -179,7 +179,7 @@ pub use crate::execution_payload_header::{
     ExecutionPayloadHeaderDeneb, ExecutionPayloadHeaderElectra, ExecutionPayloadHeaderFulu,
     ExecutionPayloadHeaderGloas, ExecutionPayloadHeaderRef, ExecutionPayloadHeaderRefMut,
 };
-pub use crate::execution_proof::{ExecutionProof, MAX_PROOF_DATA_BYTES};
+pub use crate::execution_proof::{ExecutionProof, ExecutionProofIdentifier, MAX_PROOF_DATA_BYTES};
 pub use crate::execution_proof_subnet_id::{EXECUTION_PROOF_SUBNET_COUNT, ExecutionProofSubnetId};
 pub use crate::execution_requests::{ExecutionRequests, RequestType};
 pub use crate::fork::Fork;

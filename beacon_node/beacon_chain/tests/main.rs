@@ -8,6 +8,7 @@ mod op_verification;
 mod payload_invalidation;
 mod rewards;
 mod schema_stability;
+mod stateless_execution_layer_integration;
 mod store_tests;
 mod sync_committee_verification;
 mod tests;

@@ -101,6 +101,8 @@ pub struct RPCRateLimiter {
     blbrange_rl: Limiter<PeerId>,
     /// BlobsByRoot rate limiter.
     blbroot_rl: Limiter<PeerId>,
+    /// ExecutionProofsByRoot rate limiter.
+    exec_proof_root_rl: Limiter<PeerId>,
     /// DataColumnssByRoot rate limiter.
     dcbroot_rl: Limiter<PeerId>,
     /// DataColumnsByRange rate limiter.
@@ -144,6 +146,8 @@ pub struct RPCRateLimiterBuilder {
     blbrange_quota: Option<Quota>,
     /// Quota for the BlobsByRoot protocol.
     blbroot_quota: Option<Quota>,
+    /// Quota for the ExecutionProofsByRoot protocol.
+    exec_proof_root_quota: Option<Quota>,
     /// Quota for the DataColumnsByRoot protocol.
     dcbroot_quota: Option<Quota>,
     /// Quota for the DataColumnsByRange protocol.
@@ -171,6 +175,7 @@ impl RPCRateLimiterBuilder {
             Protocol::BlocksByRoot => self.bbroots_quota = q,
             Protocol::BlobsByRange => self.blbrange_quota = q,
             Protocol::BlobsByRoot => self.blbroot_quota = q,
+            Protocol::ExecutionProofsByRoot => self.exec_proof_root_quota = q,
             Protocol::DataColumnsByRoot => self.dcbroot_quota = q,
             Protocol::DataColumnsByRange => self.dcbrange_quota = q,
             Protocol::LightClientBootstrap => self.lcbootstrap_quota = q,
@@ -213,6 +218,10 @@ impl RPCRateLimiterBuilder {
             .blbroot_quota
             .ok_or("BlobsByRoot quota not specified")?;
 
+        let exec_proof_root_quota = self
+            .exec_proof_root_quota
+            .ok_or("ExecutionProofsByRoot quota not specified")?;
+
         let dcbroot_quota = self
             .dcbroot_quota
             .ok_or("DataColumnsByRoot quota not specified")?;
@@ -230,6 +239,7 @@ impl RPCRateLimiterBuilder {
         let bbrange_rl = Limiter::from_quota(bbrange_quota)?;
         let blbrange_rl = Limiter::from_quota(blbrange_quota)?;
         let blbroot_rl = Limiter::from_quota(blbroots_quota)?;
+        let exec_proof_root_rl = Limiter::from_quota(exec_proof_root_quota)?;
         let dcbroot_rl = Limiter::from_quota(dcbroot_quota)?;
         let dcbrange_rl = Limiter::from_quota(dcbrange_quota)?;
         let lc_bootstrap_rl = Limiter::from_quota(lc_bootstrap_quota)?;
@@ -253,6 +263,7 @@ impl RPCRateLimiterBuilder {
             bbrange_rl,
             blbrange_rl,
             blbroot_rl,
+            exec_proof_root_rl,
             dcbroot_rl,
             dcbrange_rl,
             lc_bootstrap_rl,
@@ -306,6 +317,7 @@ impl RPCRateLimiter {
             blocks_by_root_quota,
             blobs_by_range_quota,
             blobs_by_root_quota,
+            execution_proofs_by_root_quota,
             data_columns_by_root_quota,
             data_columns_by_range_quota,
             light_client_bootstrap_quota,
@@ -323,6 +335,7 @@ impl RPCRateLimiter {
             .set_quota(Protocol::BlocksByRoot, blocks_by_root_quota)
             .set_quota(Protocol::BlobsByRange, blobs_by_range_quota)
             .set_quota(Protocol::BlobsByRoot, blobs_by_root_quota)
+            .set_quota(Protocol::ExecutionProofsByRoot, execution_proofs_by_root_quota)
             .set_quota(Protocol::DataColumnsByRoot, data_columns_by_root_quota)
             .set_quota(Protocol::DataColumnsByRange, data_columns_by_range_quota)
             .set_quota(Protocol::LightClientBootstrap, light_client_bootstrap_quota)
@@ -370,6 +383,7 @@ impl RPCRateLimiter {
             Protocol::BlocksByRoot => &mut self.bbroots_rl,
             Protocol::BlobsByRange => &mut self.blbrange_rl,
             Protocol::BlobsByRoot => &mut self.blbroot_rl,
+            Protocol::ExecutionProofsByRoot => &mut self.exec_proof_root_rl,
             Protocol::DataColumnsByRoot => &mut self.dcbroot_rl,
             Protocol::DataColumnsByRange => &mut self.dcbrange_rl,
             Protocol::LightClientBootstrap => &mut self.lc_bootstrap_rl,
@@ -394,6 +408,7 @@ impl RPCRateLimiter {
             bbroots_rl,
             blbrange_rl,
             blbroot_rl,
+            exec_proof_root_rl,
             dcbroot_rl,
             dcbrange_rl,
             lc_bootstrap_rl,
@@ -411,6 +426,7 @@ impl RPCRateLimiter {
         bbroots_rl.prune(time_since_start);
         blbrange_rl.prune(time_since_start);
         blbroot_rl.prune(time_since_start);
+        exec_proof_root_rl.prune(time_since_start);
         dcbrange_rl.prune(time_since_start);
         dcbroot_rl.prune(time_since_start);
         lc_bootstrap_rl.prune(time_since_start);

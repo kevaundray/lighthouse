@@ -129,6 +129,7 @@ pub struct BeaconProcessorQueueLengths {
     blbrange_queue: usize,
     dcbroots_queue: usize,
     dcbrange_queue: usize,
+    exec_proofs_by_roots_queue: usize,
     gossip_bls_to_execution_change_queue: usize,
     lc_gossip_finality_update_queue: usize,
     lc_gossip_optimistic_update_queue: usize,
@@ -195,6 +196,7 @@ impl BeaconProcessorQueueLengths {
             blbrange_queue: 1024,
             dcbroots_queue: 1024,
             dcbrange_queue: 1024,
+            exec_proofs_by_roots_queue: 1024,
             gossip_bls_to_execution_change_queue: 16384,
             lc_gossip_finality_update_queue: 1024,
             lc_gossip_optimistic_update_queue: 1024,
@@ -611,6 +613,7 @@ pub enum Work<E: EthSpec> {
     BlobsByRootsRequest(BlockingFn),
     DataColumnsByRootsRequest(BlockingFn),
     DataColumnsByRangeRequest(BlockingFn),
+    ExecutionProofsByRootsRequest(AsyncFn),
     GossipBlsToExecutionChange(BlockingFn),
     LightClientBootstrapRequest(BlockingFn),
     LightClientOptimisticUpdateRequest(BlockingFn),
@@ -663,6 +666,7 @@ pub enum WorkType {
     BlobsByRootsRequest,
     DataColumnsByRootsRequest,
     DataColumnsByRangeRequest,
+    ExecutionProofsByRootsRequest,
     GossipBlsToExecutionChange,
     LightClientBootstrapRequest,
     LightClientOptimisticUpdateRequest,
@@ -713,6 +717,7 @@ impl<E: EthSpec> Work<E> {
             Work::BlobsByRootsRequest(_) => WorkType::BlobsByRootsRequest,
             Work::DataColumnsByRootsRequest(_) => WorkType::DataColumnsByRootsRequest,
             Work::DataColumnsByRangeRequest(_) => WorkType::DataColumnsByRangeRequest,
+            Work::ExecutionProofsByRootsRequest(_) => WorkType::ExecutionProofsByRootsRequest,
             Work::LightClientBootstrapRequest(_) => WorkType::LightClientBootstrapRequest,
             Work::LightClientOptimisticUpdateRequest(_) => {
                 WorkType::LightClientOptimisticUpdateRequest
@@ -882,6 +887,8 @@ impl<E: EthSpec> BeaconProcessor<E> {
         let mut blbrange_queue = FifoQueue::new(queue_lengths.blbrange_queue);
         let mut dcbroots_queue = FifoQueue::new(queue_lengths.dcbroots_queue);
         let mut dcbrange_queue = FifoQueue::new(queue_lengths.dcbrange_queue);
+        let mut exec_proofs_by_roots_queue =
+            FifoQueue::new(queue_lengths.exec_proofs_by_roots_queue);
 
         let mut gossip_bls_to_execution_change_queue =
             FifoQueue::new(queue_lengths.gossip_bls_to_execution_change_queue);
@@ -1202,6 +1209,8 @@ impl<E: EthSpec> BeaconProcessor<E> {
                                 Some(item)
                             } else if let Some(item) = dcbrange_queue.pop() {
                                 Some(item)
+                            } else if let Some(item) = exec_proofs_by_roots_queue.pop() {
+                                Some(item)
                             // Check slashings after all other consensus messages so we prioritize
                             // following head.
                             //
@@ -1391,6 +1400,9 @@ impl<E: EthSpec> BeaconProcessor<E> {
                             Work::DataColumnsByRangeRequest { .. } => {
                                 dcbrange_queue.push(work, work_id)
                             }
+                            Work::ExecutionProofsByRootsRequest { .. } => {
+                                exec_proofs_by_roots_queue.push(work, work_id)
+                            }
                             Work::UnknownLightClientOptimisticUpdate { .. } => {
                                 unknown_light_client_update_queue.push(work, work_id)
                             }
@@ -1441,6 +1453,7 @@ impl<E: EthSpec> BeaconProcessor<E> {
                         WorkType::BlobsByRootsRequest => bbroots_queue.len(),
                         WorkType::DataColumnsByRootsRequest => dcbroots_queue.len(),
                         WorkType::DataColumnsByRangeRequest => dcbrange_queue.len(),
+                        WorkType::ExecutionProofsByRootsRequest => exec_proofs_by_roots_queue.len(),
                         WorkType::GossipBlsToExecutionChange => {
                             gossip_bls_to_execution_change_queue.len()
                         }
@@ -1600,7 +1613,9 @@ impl<E: EthSpec> BeaconProcessor<E> {
             | Work::DataColumnsByRangeRequest(process_fn) => {
                 task_spawner.spawn_blocking(process_fn)
             }
-            Work::BlocksByRangeRequest(work) | Work::BlocksByRootsRequest(work) => {
+            Work::BlocksByRangeRequest(work)
+            | Work::BlocksByRootsRequest(work)
+            | Work::ExecutionProofsByRootsRequest(work) => {
                 task_spawner.spawn_async(work)
             }
             Work::ChainSegmentBackfill(process_fn) => {

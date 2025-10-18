@@ -13,8 +13,8 @@ use beacon_processor::{
 };
 use lighthouse_network::rpc::InboundRequestId;
 use lighthouse_network::rpc::methods::{
-    BlobsByRangeRequest, BlobsByRootRequest, DataColumnsByRangeRequest, DataColumnsByRootRequest,
-    LightClientUpdatesByRangeRequest,
+    self, BlobsByRangeRequest, BlobsByRootRequest, DataColumnsByRangeRequest,
+    DataColumnsByRootRequest, LightClientUpdatesByRangeRequest,
 };
 use lighthouse_network::{
     Client, MessageId, NetworkGlobals, PeerId, PubsubMessage,
@@ -609,6 +609,26 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
         self.try_send(BeaconWorkEvent {
             drop_during_sync: false,
             work: Work::BlobsByRootsRequest(Box::new(process_fn)),
+        })
+    }
+
+    /// Create a new work event to process `ExecutionProofsByRootRequest`s from the RPC network.
+    pub fn send_execution_proofs_by_roots_request(
+        self: &Arc<Self>,
+        peer_id: PeerId,
+        inbound_request_id: InboundRequestId,
+        request: methods::ExecutionProofsByRootRequest,
+    ) -> Result<(), Error<T::EthSpec>> {
+        let processor = self.clone();
+        let process_fn = async move {
+            processor
+                .handle_execution_proofs_by_root_request(peer_id, inbound_request_id, request)
+                .await;
+        };
+
+        self.try_send(BeaconWorkEvent {
+            drop_during_sync: false,
+            work: Work::ExecutionProofsByRootsRequest(Box::pin(process_fn)),
         })
     }
 

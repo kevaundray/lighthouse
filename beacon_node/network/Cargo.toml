@@ -38,6 +38,7 @@ rand = { workspace = true }
 slot_clock = { workspace = true }
 smallvec = { workspace = true }
 ssz_types = { workspace = true }
+stateless_execution_layer = { workspace = true }
 store = { workspace = true }
 strum = { workspace = true }
 task_executor = { workspace = true }

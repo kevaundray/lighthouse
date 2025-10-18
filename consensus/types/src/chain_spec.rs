@@ -270,6 +270,7 @@ pub struct ChainSpec {
     pub max_blocks_by_root_request_deneb: usize,
     pub max_blobs_by_root_request: usize,
     pub max_data_columns_by_root_request: usize,
+    pub max_execution_proofs_by_root_request: usize,
 
     /*
      * Application params
@@ -1139,6 +1140,8 @@ impl ChainSpec {
             max_blocks_by_root_request: default_max_blocks_by_root_request(),
             max_blocks_by_root_request_deneb: default_max_blocks_by_root_request_deneb(),
             max_blobs_by_root_request: default_max_blobs_by_root_request(),
+            max_data_columns_by_root_request: default_data_columns_by_root_request(),
+            max_execution_proofs_by_root_request: default_max_execution_proofs_by_root_request(),
 
             /*
              * Networking Electra specific
@@ -1153,7 +1156,6 @@ impl ChainSpec {
             blob_schedule: BlobSchedule::default(),
             min_epochs_for_data_column_sidecars_requests:
                 default_min_epochs_for_data_column_sidecars_requests(),
-            max_data_columns_by_root_request: default_data_columns_by_root_request(),
 
             /*
              * Application specific
@@ -1485,6 +1487,8 @@ impl ChainSpec {
             max_blocks_by_root_request: default_max_blocks_by_root_request(),
             max_blocks_by_root_request_deneb: default_max_blocks_by_root_request_deneb(),
             max_blobs_by_root_request: default_max_blobs_by_root_request(),
+            max_data_columns_by_root_request: default_data_columns_by_root_request(),
+            max_execution_proofs_by_root_request: default_max_execution_proofs_by_root_request(),
 
             /*
              * Networking Electra specific
@@ -1499,7 +1503,6 @@ impl ChainSpec {
             blob_schedule: BlobSchedule::default(),
             min_epochs_for_data_column_sidecars_requests:
                 default_min_epochs_for_data_column_sidecars_requests(),
-            max_data_columns_by_root_request: default_data_columns_by_root_request(),
 
             /*
              * Application specific
@@ -2087,6 +2090,11 @@ fn default_data_columns_by_root_request() -> usize {
     max_data_columns_by_root_request_common::<MainnetEthSpec>(default_max_request_blocks_deneb())
 }
 
+fn default_max_execution_proofs_by_root_request() -> usize {
+    // Similar to blocks by root - allow 128 proofs per request
+    128
+}
+
 impl Default for Config {
     fn default() -> Self {
         let chain_spec = MainnetEthSpec::default_spec();
@@ -2401,6 +2409,7 @@ impl Config {
             max_data_columns_by_root_request: max_data_columns_by_root_request_common::<E>(
                 max_request_blocks_deneb,
             ),
+            max_execution_proofs_by_root_request: default_max_execution_proofs_by_root_request(),
 
             number_of_custody_groups,
             data_column_sidecar_subnet_count,
