@@ -45,6 +45,7 @@ pub enum LookupRequestError {
     Failed(/* reason: */ String),
     /// Received MissingComponents when all components have been processed. This should never
     /// happen, and indicates some internal bug
+    /// TODO: This could happen if we add Proofs, but only check that blobs/columns are processed
     MissingComponentsAfterAllProcessed,
     /// Attempted to retrieve a not known lookup id
     UnknownLookup,
