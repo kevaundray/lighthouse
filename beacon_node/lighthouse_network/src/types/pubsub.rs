@@ -295,9 +295,10 @@ impl<E: EthSpec> PubsubMessage<E> {
                     }
                     GossipKind::ExecutionProof => {
                         match fork_context.get_fork_from_context_bytes(gossip_topic.fork_digest) {
+                            // TODO(ethproofs): Changed to Electra fork for demo.
                             // TODO(zkproofs): we don't have the ChainSpec here, so if we change this to
                             // be for gloas, then we should change it here too
-                            Some(fork) if fork.fulu_enabled() => {
+                            Some(fork) if fork.electra_enabled() => {
                                 let execution_proof = Arc::new(
                                     ExecutionProof::from_ssz_bytes(data)
                                         .map_err(|e| format!("{:?}", e))?,

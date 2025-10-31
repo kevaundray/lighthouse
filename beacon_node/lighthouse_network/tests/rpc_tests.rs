@@ -1749,7 +1749,8 @@ fn test_tcp_execution_proofs_by_root_single() {
     let _subscriber = build_tracing_subscriber(log_level, enable_logging);
 
     let spec = Arc::new(spec_with_all_forks_enabled());
-    let current_fork_name = ForkName::Fulu;
+    // TODO(ethproofs): Changed to Electra fork for demo.
+    let current_fork_name = ForkName::Electra;
 
     let rt = Arc::new(Runtime::new().unwrap());
     rt.block_on(async {
@@ -2013,7 +2014,8 @@ fn test_tcp_execution_proofs_by_root_empty_response() {
     let _subscriber = build_tracing_subscriber(log_level, enable_logging);
 
     let spec = Arc::new(spec_with_all_forks_enabled());
-    let current_fork_name = ForkName::Fulu;
+    // TODO(ethproofs): Changed to Electra fork for demo.
+    let current_fork_name = ForkName::Electra;
 
     let rt = Arc::new(Runtime::new().unwrap());
     rt.block_on(async {
