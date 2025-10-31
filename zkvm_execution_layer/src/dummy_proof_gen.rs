@@ -1,9 +1,15 @@
+use crate::ethproofs_demo::{
+    download_proof_binary, fetch_proofs_list, validate_proof, VERIFIER_STORE,
+};
 use crate::proof_generation::{ProofGenerationError, ProofGenerationResult, ProofGenerator};
 use async_trait::async_trait;
 use std::time::Duration;
 use tokio::time::sleep;
+use tracing::{debug, warn};
 use types::{ExecutionBlockHash, ExecutionProof, ExecutionProofId, Hash256, Slot};
 
+/// TODO(ethproofs): Ethproofs demo implementation of proof generation.
+///
 /// Dummy proof generator for testing
 ///
 /// This generator simulates the proof generation process with a configurable delay
@@ -18,7 +24,7 @@ impl DummyProofGenerator {
     pub fn new(proof_id: ExecutionProofId) -> Self {
         Self {
             proof_id,
-            generation_delay: Duration::from_millis(50),
+            generation_delay: Duration::from_millis(0),
         }
     }
 
@@ -28,6 +34,25 @@ impl DummyProofGenerator {
             proof_id,
             generation_delay: delay,
         }
+    }
+
+    /// TODO(ethproofs): Used for when Ethproofs API fails or verification fails.
+    ///
+    /// Create a fallback dummy proof
+    fn create_dummy_proof(
+        &self,
+        slot: Slot,
+        payload_hash: &ExecutionBlockHash,
+        block_root: &Hash256,
+    ) -> ProofGenerationResult<ExecutionProof> {
+        let dummy_data = format!(
+            "ethproofs_fallback_subnet_{:?}_slot_{:?}_hash_{:?}",
+            self.proof_id, slot, payload_hash
+        )
+        .into_bytes();
+
+        ExecutionProof::new(self.proof_id, slot, *payload_hash, *block_root, dummy_data)
+            .map_err(ProofGenerationError::ProofGenerationFailed)
     }
 }
 
@@ -44,17 +69,121 @@ impl ProofGenerator for DummyProofGenerator {
             sleep(self.generation_delay).await;
         }
 
-        let proof_data = vec![
-            0xFF,
-            self.proof_id.as_u8(),
-            payload_hash.0[0],
-            payload_hash.0[1],
-            payload_hash.0[2],
-            payload_hash.0[3],
-        ];
+        debug!(
+            proof_id = %self.proof_id,
+            block_hash = %payload_hash,
+            "Starting proof generation via Ethproofs API"
+        );
 
-        ExecutionProof::new(self.proof_id, slot, *payload_hash, *block_root, proof_data)
-            .map_err(ProofGenerationError::ProofGenerationFailed)
+        // Get the Ethproofs prover UUID corresponding to this proof_id
+        let prover_uuid = match VERIFIER_STORE.get_prover_uuid_for_proof_id(self.proof_id) {
+            Some(uuid) => uuid,
+            None => {
+                warn!(
+                    proof_id = %self.proof_id,
+                    "No prover UUID mapping found for this proof_id, cannot query Ethproofs"
+                );
+                return self.create_dummy_proof(slot, payload_hash, block_root);
+            }
+        };
+
+        let cluster = prover_uuid.to_string();
+
+        debug!(
+            proof_id = %self.proof_id,
+            prover_uuid = %prover_uuid,
+            "Querying Ethproofs API with single cluster"
+        );
+
+        // Fetch proofs from Ethproofs API for this proof_id's cluster
+        match fetch_proofs_list(*payload_hash, cluster).await {
+            Ok(proofs) => {
+                debug!(
+                    proof_id = %self.proof_id,
+                    block_hash = %payload_hash,
+                    fetched_proof_count = proofs.len(),
+                    "Fetched proofs from Ethproofs API"
+                );
+
+                // Try to download and verify the proof
+                if let Some(proof_entry) = proofs.first() {
+                    debug!(
+                        proof_id = proof_entry.proof_id,
+                        cluster_id = %proof_entry.cluster_id,
+                        "Attempting to download and verify proof"
+                    );
+
+                    // Download the proof binary
+                    match download_proof_binary(proof_entry.proof_id).await {
+                        Ok(proof_binary) => {
+                            // Create proof for verification
+                            match ExecutionProof::new(
+                                self.proof_id,
+                                slot,
+                                *payload_hash,
+                                *block_root,
+                                proof_binary,
+                            ) {
+                                Ok(proof) => {
+                                    // Verify the proof
+                                    if validate_proof(&proof) {
+                                        debug!(
+                                            proof_id = proof_entry.proof_id,
+                                            cluster_id = %proof_entry.cluster_id,
+                                            target_proof_id = %self.proof_id,
+                                            "Proof verification succeeded, returning"
+                                        );
+                                        return Ok(proof);
+                                    } else {
+                                        debug!(
+                                            proof_id = proof_entry.proof_id,
+                                            cluster_id = %proof_entry.cluster_id,
+                                            "Proof verification failed"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!(
+                                        proof_id = proof_entry.proof_id,
+                                        error = %e,
+                                        "Failed to create proof structure"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            debug!(
+                                proof_id = proof_entry.proof_id,
+                                error = %e,
+                                "Failed to download proof"
+                            );
+                        }
+                    }
+                } else {
+                    warn!(
+                        proof_id = %self.proof_id,
+                        "No proofs returned from Ethproofs API"
+                    );
+                }
+
+                // Fall back to dummy proof if we get here
+                warn!(
+                    proof_id = %self.proof_id,
+                    block_hash = %payload_hash,
+                    "Proof from Ethproofs failed verification, falling back to dummy proof"
+                );
+                self.create_dummy_proof(slot, payload_hash, block_root)
+            }
+            Err(e) => {
+                debug!(
+                    proof_id = %self.proof_id,
+                    block_hash = %payload_hash,
+                    error = %e,
+                    "Failed to fetch proofs from Ethproofs, using fallback dummy proof"
+                );
+                self.create_dummy_proof(slot, payload_hash, block_root)
+            }
+        }
     }
 
     fn proof_id(&self) -> ExecutionProofId {
@@ -95,12 +224,12 @@ mod tests {
 
         // Generate twice
         let proof1 = generator
-            .generate(slot, &block_hash, &block_root)
-            .await
+            // TODO(ethproofs): Changed so we don't make API calls here.
+            .create_dummy_proof(slot, &block_hash, &block_root)
             .unwrap();
         let proof2 = generator
-            .generate(slot, &block_hash, &block_root)
-            .await
+            // TODO(ethproofs): Changed so we don't make API calls here.
+            .create_dummy_proof(slot, &block_hash, &block_root)
             .unwrap();
 
         // Should be identical

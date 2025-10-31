@@ -1,11 +1,14 @@
+use crate::ethproofs_demo::validate_proof;
 use crate::proof_verification::{ProofVerificationResult, ProofVerifier, VerificationError};
 use std::time::Duration;
+use tracing::debug;
 use types::{ExecutionProof, ExecutionProofId};
 
+/// TODO(ethproofs): Ethproofs demo implementation of proof verification.
+///
 /// Dummy proof verifier for testing
 ///
-/// This verifier simulates the verification process with a configurable delay
-/// and always returns successful verification.
+/// This verifier simulates the verification process with a configurable delay.
 pub struct DummyVerifier {
     proof_id: ExecutionProofId,
     verification_delay: Duration,
@@ -16,7 +19,7 @@ impl DummyVerifier {
     pub fn new(proof_id: ExecutionProofId) -> Self {
         Self {
             proof_id,
-            verification_delay: Duration::from_millis(10),
+            verification_delay: Duration::from_millis(0),
         }
     }
 
@@ -41,10 +44,14 @@ impl ProofVerifier for DummyVerifier {
             std::thread::sleep(self.verification_delay);
         }
 
-        // Dummy verifier always succeeds
-        // In a real implementation, this would cryptographically verify that
-        // proof.proof_data is a valid zkVM proof for proof.block_hash
-        Ok(true)
+        debug!(
+            proof_id = %self.proof_id,
+            block_hash = %proof.block_hash,
+            "zkAttesting proof from Ethproofs API"
+        );
+
+        // Perform cryptographic verification using Ethproofs verifiers
+        Ok(validate_proof(proof))
     }
 
     fn proof_id(&self) -> ExecutionProofId {

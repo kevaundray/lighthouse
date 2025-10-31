@@ -16,3 +16,8 @@ pub use config::ZKVMExecutionLayerConfig;
 /// Re-export the main ZK-VM engine API and config
 pub use engine_api::ZKVMEngineApi;
 pub use registry_proof_gen::GeneratorRegistry;
+
+/// TODO(ethproofs): Used for Ethproofs demo testing.
+pub mod ethproofs_demo;
+pub mod verification_keys;
+pub mod verifiers;
