@@ -1,5 +1,6 @@
 use crate::proof_verification::{ProofVerificationResult, ProofVerifier, VerificationError};
 use std::time::Duration;
+use tracing::debug;
 use types::{ExecutionProof, ExecutionProofId};
 
 /// Dummy proof verifier for testing
@@ -31,6 +32,11 @@ impl DummyVerifier {
 
 impl ProofVerifier for DummyVerifier {
     fn verify(&self, proof: &ExecutionProof) -> ProofVerificationResult<bool> {
+        debug!(
+            "[Ethproofs] DummyVerifier::verify called for proof_id={}, block_hash={}",
+            proof.proof_id, proof.block_hash
+        );
+
         // Check that the proof is for the correct subnet
         if proof.proof_id != self.proof_id {
             return Err(VerificationError::UnsupportedProofID(proof.proof_id));
