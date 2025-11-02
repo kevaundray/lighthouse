@@ -8,7 +8,7 @@ use tokio::time::sleep;
 use tracing::{debug, warn};
 use types::{ExecutionBlockHash, ExecutionProof, ExecutionProofId, Hash256, Slot};
 
-/// TODO(ethproofs): Ethproofs demo implementation of proof generation.
+/// TODO(ethproofs): Implementation of proof generation for demo.
 ///
 /// Dummy proof generator for testing
 ///
@@ -36,7 +36,7 @@ impl DummyProofGenerator {
         }
     }
 
-    /// TODO(ethproofs): Used for when Ethproofs API fails or verification fails.
+    /// TODO(ethproofs): Used when Ethproofs API fails or verification fails.
     ///
     /// Create a fallback dummy proof
     fn create_dummy_proof(
@@ -72,7 +72,7 @@ impl ProofGenerator for DummyProofGenerator {
         debug!(
             proof_id = %self.proof_id,
             block_hash = %payload_hash,
-            "Starting proof generation via Ethproofs API"
+            "[Ethproofs] Starting proof generation"
         );
 
         // Get the Ethproofs prover UUID corresponding to this proof_id
@@ -81,7 +81,7 @@ impl ProofGenerator for DummyProofGenerator {
             None => {
                 warn!(
                     proof_id = %self.proof_id,
-                    "No prover UUID mapping found for this proof_id, cannot query Ethproofs"
+                    "[Ethproofs] No prover UUID mapping found, cannot query API"
                 );
                 return self.create_dummy_proof(slot, payload_hash, block_root);
             }
@@ -92,7 +92,7 @@ impl ProofGenerator for DummyProofGenerator {
         debug!(
             proof_id = %self.proof_id,
             prover_uuid = %prover_uuid,
-            "Querying Ethproofs API with single cluster"
+            "[Ethproofs] Querying API"
         );
 
         // Fetch proofs from Ethproofs API for this proof_id's cluster
@@ -101,18 +101,12 @@ impl ProofGenerator for DummyProofGenerator {
                 debug!(
                     proof_id = %self.proof_id,
                     block_hash = %payload_hash,
-                    fetched_proof_count = proofs.len(),
-                    "Fetched proofs from Ethproofs API"
+                    count = proofs.len(),
+                    "[Ethproofs] Fetched proofs"
                 );
 
                 // Try to download and verify the proof
                 if let Some(proof_entry) = proofs.first() {
-                    debug!(
-                        proof_id = proof_entry.proof_id,
-                        cluster_id = %proof_entry.cluster_id,
-                        "Attempting to download and verify proof"
-                    );
-
                     // Download the proof binary
                     match download_proof_binary(proof_entry.proof_id).await {
                         Ok(proof_binary) => {
@@ -130,15 +124,13 @@ impl ProofGenerator for DummyProofGenerator {
                                         debug!(
                                             proof_id = proof_entry.proof_id,
                                             cluster_id = %proof_entry.cluster_id,
-                                            target_proof_id = %self.proof_id,
-                                            "Proof verification succeeded, returning"
+                                            "[Ethproofs] Proof verification succeeded"
                                         );
                                         return Ok(proof);
                                     } else {
                                         debug!(
                                             proof_id = proof_entry.proof_id,
-                                            cluster_id = %proof_entry.cluster_id,
-                                            "Proof verification failed"
+                                            "[Ethproofs] Proof verification failed"
                                         );
                                     }
                                 }
@@ -146,7 +138,7 @@ impl ProofGenerator for DummyProofGenerator {
                                     debug!(
                                         proof_id = proof_entry.proof_id,
                                         error = %e,
-                                        "Failed to create proof structure"
+                                        "[Ethproofs] Failed to create proof structure"
                                     );
                                 }
                             }
@@ -155,14 +147,14 @@ impl ProofGenerator for DummyProofGenerator {
                             debug!(
                                 proof_id = proof_entry.proof_id,
                                 error = %e,
-                                "Failed to download proof"
+                                "[Ethproofs] Failed to download proof"
                             );
                         }
                     }
                 } else {
                     warn!(
                         proof_id = %self.proof_id,
-                        "No proofs returned from Ethproofs API"
+                        "[Ethproofs] No proofs returned from API"
                     );
                 }
 
@@ -170,7 +162,7 @@ impl ProofGenerator for DummyProofGenerator {
                 warn!(
                     proof_id = %self.proof_id,
                     block_hash = %payload_hash,
-                    "Proof from Ethproofs failed verification, falling back to dummy proof"
+                    "[Ethproofs] Proof verification failed, falling back to dummy"
                 );
                 self.create_dummy_proof(slot, payload_hash, block_root)
             }
@@ -179,7 +171,7 @@ impl ProofGenerator for DummyProofGenerator {
                     proof_id = %self.proof_id,
                     block_hash = %payload_hash,
                     error = %e,
-                    "Failed to fetch proofs from Ethproofs, using fallback dummy proof"
+                    "[Ethproofs] Failed to fetch proofs, using dummy fallback"
                 );
                 self.create_dummy_proof(slot, payload_hash, block_root)
             }

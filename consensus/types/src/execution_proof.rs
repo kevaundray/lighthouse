@@ -8,7 +8,7 @@ use tree_hash_derive::TreeHash;
 
 use super::ExecutionProofId;
 
-/// TODO(ethproofs): This is currently set to 2MB for the Ethproofs demo testing.
+/// TODO(ethproofs): Set to 2MB for the demo.
 ///
 /// Maximum size of proof data in bytes
 ///
@@ -16,7 +16,7 @@ use super::ExecutionProofId;
 /// and so this number was set to accommodate for the most zkVMs.
 pub const MAX_PROOF_DATA_BYTES: usize = 2_097_152;
 
-/// TODO(ethproofs): This is currently set to 1 for the Ethproofs demo testing.
+/// TODO(ethproofs): Set to 1 for the demo.
 ///
 /// Minimum number of execution proofs required from different proof types
 /// before marking an execution payload as available in ZK-VM mode.

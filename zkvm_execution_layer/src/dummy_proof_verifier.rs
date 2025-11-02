@@ -47,7 +47,7 @@ impl ProofVerifier for DummyVerifier {
         debug!(
             proof_id = %self.proof_id,
             block_hash = %proof.block_hash,
-            "zkAttesting proof from Ethproofs API"
+            "[Ethproofs] Verifying proof"
         );
 
         // Perform cryptographic verification using Ethproofs verifiers

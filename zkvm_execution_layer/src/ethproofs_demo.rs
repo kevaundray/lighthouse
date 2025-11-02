@@ -14,12 +14,12 @@ pub static VERIFICATION_KEY_STORE: Lazy<Option<VerificationKeyStore>> =
             debug!(
                 key_count = store.len(),
                 prover_ids = ?store.prover_ids(),
-                "Loaded verification keys"
+                "[Ethproofs] Loaded verification keys"
             );
             Some(store)
         }
         Err(e) => {
-            warn!(error = %e, "Failed to load verification keys");
+            warn!(error = %e, "[Ethproofs] Failed to load verification keys");
             None
         }
     });
@@ -27,7 +27,7 @@ pub static VERIFICATION_KEY_STORE: Lazy<Option<VerificationKeyStore>> =
 /// Global verifier store, initialized with default verifiers
 pub static VERIFIER_STORE: Lazy<VerifierStore> = Lazy::new(|| {
     let store = VerifierStore::with_defaults();
-    debug!(verifier_count = store.len(), "Initialized verifier store");
+    debug!(verifier_count = store.len(), "[Ethproofs] Initialized verifier store");
     store
 });
 
@@ -38,7 +38,7 @@ pub fn select_random_prover_id() -> [u8; 16] {
     let available_provers = VERIFIER_STORE.prover_ids();
 
     if available_provers.is_empty() {
-        warn!("No verifiers registered, cannot select prover_id");
+        warn!("[Ethproofs] No verifiers registered, cannot select prover_id");
         return [0u8; 16];
     }
 
@@ -49,7 +49,7 @@ pub fn select_random_prover_id() -> [u8; 16] {
     debug!(
         prover_id = %selected_uuid,
         available_count = available_provers.len(),
-        "Randomly selected prover_id"
+        "[Ethproofs] Randomly selected prover_id"
     );
 
     *selected_uuid.as_bytes()
@@ -101,7 +101,7 @@ pub async fn fetch_proofs_list(
             debug!(
                 block_hash = %block_hash,
                 accumulated_count = accumulated_proofs.len(),
-                "Max wait time reached, proceeding with accumulated proofs"
+                "[Ethproofs] Max wait time reached, proceeding with accumulated proofs"
             );
             if accumulated_proofs.is_empty() {
                 return Err(format!(
@@ -116,7 +116,7 @@ pub async fn fetch_proofs_list(
             block_hash = %block_hash,
             accumulated_count = accumulated_proofs.len(),
             delay_ms,
-            "Polling Ethproofs for proofs"
+            "[Ethproofs] Polling Ethproofs for proofs"
         );
 
         let response = client
@@ -146,7 +146,7 @@ pub async fn fetch_proofs_list(
                     block_hash = %block_hash,
                     accumulated_count = accumulated_proofs.len(),
                     target_count = TARGET_PROOF_COUNT,
-                    "Accumulated proofs from Ethproofs"
+                    "[Ethproofs] Accumulated proofs from Ethproofs"
                 );
 
                 // If we have all target proofs (k), return early
@@ -158,7 +158,7 @@ pub async fn fetch_proofs_list(
                 debug!(
                     block_hash = %block_hash,
                     accumulated_count = accumulated_proofs.len(),
-                    "Block not found, retrying..."
+                    "[Ethproofs] Block not found, retrying..."
                 );
             }
             status => {
@@ -184,7 +184,7 @@ pub async fn download_proof_binary(proof_id: u64) -> Result<Vec<u8>, String> {
     let client = reqwest::Client::new();
     let url = format!("https://ethproofs.org/api/v0/proofs/download/{}", proof_id);
 
-    debug!(proof_id, "Downloading proof binary from Ethproofs");
+    debug!(proof_id, "[Ethproofs] Downloading proof binary");
 
     let response = client
         .get(&url)
@@ -202,7 +202,7 @@ pub async fn download_proof_binary(proof_id: u64) -> Result<Vec<u8>, String> {
             debug!(
                 proof_id,
                 size_bytes = proof_data.len(),
-                "Successfully downloaded proof binary"
+                "[Ethproofs] Successfully downloaded proof binary"
             );
 
             Ok(proof_data.to_vec())
@@ -228,7 +228,7 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
         None => {
             warn!(
                 proof_id = %proof.proof_id,
-                "No prover UUID mapping found for this proof_id"
+                "[Ethproofs] No prover UUID mapping found for this proof_id"
             );
             return false;
         }
@@ -239,7 +239,7 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
             debug!(
                 prover_id = %prover_uuid,
                 verifier = verifier_entry.name,
-                "Running cryptographic verification"
+                "[Ethproofs] Running cryptographic verification"
             );
 
             // Run the actual cryptographic verification
@@ -248,7 +248,7 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
                     debug!(
                         prover_id = %prover_uuid,
                         verification_result = result,
-                        "Verification completed"
+                        "[Ethproofs] Verification completed"
                     );
                     result
                 }
@@ -256,7 +256,7 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
                     warn!(
                         prover_id = %prover_uuid,
                         error = %e,
-                        "Verification failed with error"
+                        "[Ethproofs] Verification failed with error"
                     );
                     false
                 }
@@ -265,7 +265,7 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
         None => {
             warn!(
                 prover_id = %prover_uuid,
-                "No verifier registered for this prover, cannot verify proof"
+                "[Ethproofs] No verifier registered for this prover, cannot verify proof"
             );
             false
         }
