@@ -234,6 +234,18 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
         }
     };
 
+    // Look up the verification key for this prover
+    let vk = match VERIFICATION_KEY_STORE.as_ref().and_then(|store| store.get(&prover_uuid)) {
+        Some(vk_entry) => &vk_entry.vk,
+        None => {
+            warn!(
+                prover_id = %prover_uuid,
+                "[Ethproofs] No verification key found for this prover"
+            );
+            return false;
+        }
+    };
+
     match VERIFIER_STORE.get(&prover_uuid) {
         Some(verifier_entry) => {
             debug!(
@@ -242,8 +254,8 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
                 "[Ethproofs] Running cryptographic verification"
             );
 
-            // Run the actual cryptographic verification
-            match (verifier_entry.verify_fn)(&proof.proof_data, &proof.proof_data) {
+            // Run the actual cryptographic verification with vk and proof data
+            match (verifier_entry.verify_fn)(vk, &proof.proof_data) {
                 Ok(result) => {
                     debug!(
                         prover_id = %prover_uuid,
