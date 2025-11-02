@@ -221,54 +221,66 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
         }
     };
 
-    // Look up the verification key for this prover
-    let vk = match VERIFICATION_KEY_STORE
-        .as_ref()
-        .and_then(|store| store.get(&prover_uuid))
-    {
-        Some(vk_entry) => &vk_entry.vk,
-        None => {
-            warn!(
-                prover_id = %prover_uuid,
-                "[Ethproofs] No verification key found for this prover"
-            );
-            return false;
-        }
-    };
-
-    match VERIFIER_STORE.get(&prover_uuid) {
-        Some(verifier_entry) => {
-            debug!(
-                prover_id = %prover_uuid,
-                verifier = verifier_entry.name,
-                "[Ethproofs] Running cryptographic verification"
-            );
-
-            // Run the actual cryptographic verification with vk and proof data
-            match (verifier_entry.verify_fn)(vk, &proof.proof_data) {
-                Ok(result) => {
+    match &*VERIFICATION_KEY_STORE {
+        Some(store) => {
+            match store.get(&prover_uuid) {
+                Some(vk) => {
                     debug!(
                         prover_id = %prover_uuid,
-                        verification_result = result,
-                        "[Ethproofs] Verification completed"
+                        vk_size = vk.size(),
+                        proof_size = proof.proof_data.len(),
+                        "[Ethproofs] Found verification key for prover"
                     );
-                    result
+
+                    // Look up the verifier for this prover
+                    match VERIFIER_STORE.get(&prover_uuid) {
+                        Some(verifier_entry) => {
+                            debug!(
+                                prover_id = %prover_uuid,
+                                verifier = verifier_entry.name,
+                                "[Ethproofs] Found verifier, running cryptographic verification"
+                            );
+
+                            // Run the actual cryptographic verification
+                            match (verifier_entry.verify_fn)(&proof.proof_data, &vk.vk) {
+                                Ok(result) => {
+                                    debug!(
+                                        prover_id = %prover_uuid,
+                                        verification_result = result,
+                                        "[Ethproofs] Verification completed"
+                                    );
+                                    result
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        prover_id = %prover_uuid,
+                                        error = %e,
+                                        "[Ethproofs] Verification failed with error"
+                                    );
+                                    false
+                                }
+                            }
+                        }
+                        None => {
+                            warn!(
+                                prover_id = %prover_uuid,
+                                "[Ethproofs] No verifier registered for this prover, cannot verify proof"
+                            );
+                            false
+                        }
+                    }
                 }
-                Err(e) => {
+                None => {
                     warn!(
                         prover_id = %prover_uuid,
-                        error = %e,
-                        "[Ethproofs] Verification failed with error"
+                        "[Ethproofs] No verification key found for this prover"
                     );
                     false
                 }
             }
         }
         None => {
-            warn!(
-                prover_id = %prover_uuid,
-                "[Ethproofs] No verifier registered for this prover, cannot verify proof"
-            );
+            warn!("[Ethproofs] Verification key store not initialized");
             false
         }
     }
