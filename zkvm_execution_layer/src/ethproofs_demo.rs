@@ -27,7 +27,10 @@ pub static VERIFICATION_KEY_STORE: Lazy<Option<VerificationKeyStore>> =
 /// Global verifier store, initialized with default verifiers
 pub static VERIFIER_STORE: Lazy<VerifierStore> = Lazy::new(|| {
     let store = VerifierStore::with_defaults();
-    debug!(verifier_count = store.len(), "[Ethproofs] Initialized verifier store");
+    debug!(
+        verifier_count = store.len(),
+        "[Ethproofs] Initialized verifier store"
+    );
     store
 });
 
@@ -70,53 +73,48 @@ pub struct ProofsListResponse {
     pub proofs: Vec<Ethproof>,
 }
 
-/// Fetch the list of proofs for a block from Ethproofs API.
+/// Fetch a proof for a block from Ethproofs API.
 ///
-/// Polls the endpoint until all 3 proofs are available or a timeout is reached, using exponential backoff.
-/// This accepts the block hash and a comma-separated string of cluster IDs to query.
+/// Polls the endpoint for a single cluster until a proof is found or a timeout is reached,
+/// using exponential backoff. This accepts the block hash and a single cluster ID to query.
 ///
-/// Returns all proofs found within the timeout window.
-pub async fn fetch_proofs_list(
+/// Returns the proof for the requested cluster, or an error if not found within the timeout window.
+pub async fn fetch_proof_from_ethproofs(
     block_hash: types::ExecutionBlockHash,
-    clusters: String,
+    cluster: String,
 ) -> Result<Vec<Ethproof>, String> {
-    const MAX_WAIT_TIME_SECS: u64 = 30;
+    const MAX_WAIT_TIME_SECS: u64 = 15;
     const INITIAL_DELAY_MS: u64 = 100;
     const MAX_DELAY_MS: u64 = 5000;
-    const TARGET_PROOF_COUNT: usize = 3;
 
     let client = reqwest::Client::new();
     let url = format!(
         "https://ethproofs.org/api/v0/proofs?block={}&clusters={}",
-        block_hash, clusters
+        block_hash, cluster
     );
 
     let start = Instant::now();
     let mut delay_ms = INITIAL_DELAY_MS;
-    let mut accumulated_proofs: Vec<Ethproof> = Vec::new();
 
     loop {
         // Check if we've exceeded max wait time
         if start.elapsed() > Duration::from_secs(MAX_WAIT_TIME_SECS) {
             debug!(
                 block_hash = %block_hash,
-                accumulated_count = accumulated_proofs.len(),
-                "[Ethproofs] Max wait time reached, proceeding with accumulated proofs"
+                cluster = %cluster,
+                "[Ethproofs] Timeout waiting for proof"
             );
-            if accumulated_proofs.is_empty() {
-                return Err(format!(
-                    "No proofs found for block {} within {} seconds",
-                    block_hash, MAX_WAIT_TIME_SECS
-                ));
-            }
-            return Ok(accumulated_proofs);
+            return Err(format!(
+                "No proof found for block {} in cluster {} within {} seconds",
+                block_hash, cluster, MAX_WAIT_TIME_SECS
+            ));
         }
 
         debug!(
             block_hash = %block_hash,
-            accumulated_count = accumulated_proofs.len(),
+            cluster = %cluster,
             delay_ms,
-            "[Ethproofs] Polling Ethproofs for proofs"
+            "[Ethproofs] Polling Ethproofs for proof"
         );
 
         let response = client
@@ -132,32 +130,21 @@ pub async fn fetch_proofs_list(
                     .await
                     .map_err(|e| format!("Failed to parse response: {}", e))?;
 
-                // Accumulate new proofs (avoid duplicates by proof_id)
-                for proof in response_data.proofs {
-                    if !accumulated_proofs
-                        .iter()
-                        .any(|p| p.proof_id == proof.proof_id)
-                    {
-                        accumulated_proofs.push(proof);
-                    }
-                }
-
-                debug!(
-                    block_hash = %block_hash,
-                    accumulated_count = accumulated_proofs.len(),
-                    target_count = TARGET_PROOF_COUNT,
-                    "[Ethproofs] Accumulated proofs from Ethproofs"
-                );
-
-                // If we have all target proofs (k), return early
-                if accumulated_proofs.len() >= TARGET_PROOF_COUNT {
-                    return Ok(accumulated_proofs);
+                // Return the first proof found for this cluster
+                if !response_data.proofs.is_empty() {
+                    debug!(
+                        block_hash = %block_hash,
+                        cluster = %cluster,
+                        proof_count = response_data.proofs.len(),
+                        "[Ethproofs] Found proof"
+                    );
+                    return Ok(response_data.proofs);
                 }
             }
             StatusCode::NOT_FOUND => {
                 debug!(
                     block_hash = %block_hash,
-                    accumulated_count = accumulated_proofs.len(),
+                    cluster = %cluster,
                     "[Ethproofs] Block not found, retrying..."
                 );
             }
@@ -235,7 +222,10 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
     };
 
     // Look up the verification key for this prover
-    let vk = match VERIFICATION_KEY_STORE.as_ref().and_then(|store| store.get(&prover_uuid)) {
+    let vk = match VERIFICATION_KEY_STORE
+        .as_ref()
+        .and_then(|store| store.get(&prover_uuid))
+    {
         Some(vk_entry) => &vk_entry.vk,
         None => {
             warn!(

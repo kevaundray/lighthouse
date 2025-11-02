@@ -1,5 +1,5 @@
 use crate::ethproofs_demo::{
-    download_proof_binary, fetch_proofs_list, validate_proof, VERIFIER_STORE,
+    VERIFIER_STORE, download_proof_binary, fetch_proof_from_ethproofs, validate_proof,
 };
 use crate::proof_generation::{ProofGenerationError, ProofGenerationResult, ProofGenerator};
 use async_trait::async_trait;
@@ -95,8 +95,8 @@ impl ProofGenerator for DummyProofGenerator {
             "[Ethproofs] Querying API"
         );
 
-        // Fetch proofs from Ethproofs API for this proof_id's cluster
-        match fetch_proofs_list(*payload_hash, cluster).await {
+        // Fetch proof from Ethproofs API for this proof_id's cluster
+        match fetch_proof_from_ethproofs(*payload_hash, cluster).await {
             Ok(proofs) => {
                 debug!(
                     proof_id = %self.proof_id,
