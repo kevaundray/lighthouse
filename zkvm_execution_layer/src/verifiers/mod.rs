@@ -26,7 +26,10 @@ pub mod ethproofs_ids {
     /// ZisK verifier UUID (proof_id = 1)
     pub const ZISK_UUID: &str = "33f14a82-47b7-42d7-9bc1-b81a46eea4fe";
 
-    /// ZKM verifier UUID (proof_id = 2)
+    /// ZKCloud verifier UUID (proof_id = 2)
+    pub const ZKCLOUD_UUID: &str = "884fcc21-d522-4b4a-b535-7cfde199485c";
+
+    /// ZKM verifier UUID (proof_id = 3)
     pub const ZKM_UUID: &str = "84a01f4b-8078-44cf-b463-90ddcd124960";
 
     /// Parse a Brevis UUID
@@ -37,6 +40,11 @@ pub mod ethproofs_ids {
     /// Parse a ZisK UUID
     pub fn zisk() -> Uuid {
         Uuid::parse_str(ZISK_UUID).expect("Valid UUID")
+    }
+
+    /// Parse a ZKCloud UUID
+    pub fn zkcloud() -> Uuid {
+        Uuid::parse_str(ZKCLOUD_UUID).expect("Valid UUID")
     }
 
     /// Parse a ZKM UUID
@@ -118,13 +126,15 @@ impl VerifierStore {
     /// For Ethproofs demo testing, this provides a hardcoded mapping of proof_ids to prover UUIDs:
     /// - proof_id 0 → brevis (Pico verifier)
     /// - proof_id 1 → zisk (ZisK verifier)
-    /// - proof_id 2 → zkm (ZKM verifier)
+    /// - proof_id 2 → zkcloud (ZisK verifier)
+    /// - proof_id 3 → zkm (ZKM verifier)
     pub fn get_prover_uuid_for_proof_id(&self, proof_id: ExecutionProofId) -> Option<Uuid> {
         let id = proof_id.as_u8() as u32;
         match id {
             0 => Some(ethproofs_ids::brevis()),
             1 => Some(ethproofs_ids::zisk()),
-            2 => Some(ethproofs_ids::zkm()),
+            2 => Some(ethproofs_ids::zkcloud()),
+            3 => Some(ethproofs_ids::zkm()),
             _ => None,
         }
     }
@@ -145,6 +155,13 @@ impl VerifierStore {
         // Register ZisK verifier
         store.register(
             ethproofs_ids::zisk(),
+            zisk::ZiskVerifier::name(),
+            zisk::ZiskVerifier::verify,
+        );
+
+        // Register ZKCloud verifier (uses ZisK verifier)
+        store.register(
+            ethproofs_ids::zkcloud(),
             zisk::ZiskVerifier::name(),
             zisk::ZiskVerifier::verify,
         );
