@@ -1,5 +1,5 @@
 use crate::ethproofs_demo::{
-    VERIFIER_STORE, download_proof_binary, fetch_proof_from_ethproofs, validate_proof,
+    download_proof_binary, fetch_proof_from_ethproofs, validate_proof, VERIFIER_STORE,
 };
 use crate::proof_generation::{ProofGenerationError, ProofGenerationResult, ProofGenerator};
 use async_trait::async_trait;
@@ -69,12 +69,6 @@ impl ProofGenerator for DummyProofGenerator {
             sleep(self.generation_delay).await;
         }
 
-        debug!(
-            proof_id = %self.proof_id,
-            block_hash = %payload_hash,
-            "[Ethproofs] Starting proof generation"
-        );
-
         // Get the Ethproofs prover UUID corresponding to this proof_id
         let prover_uuid = match VERIFIER_STORE.get_prover_uuid_for_proof_id(self.proof_id) {
             Some(uuid) => uuid,
@@ -91,20 +85,14 @@ impl ProofGenerator for DummyProofGenerator {
 
         debug!(
             proof_id = %self.proof_id,
-            prover_uuid = %prover_uuid,
-            "[Ethproofs] Querying API"
+            slot = %slot,
+            block_hash = %payload_hash,
+            "[Ethproofs] Starting proof generation"
         );
 
         // Fetch proof from Ethproofs API for this proof_id's cluster
         match fetch_proof_from_ethproofs(*payload_hash, cluster).await {
             Ok(proofs) => {
-                debug!(
-                    proof_id = %self.proof_id,
-                    block_hash = %payload_hash,
-                    count = proofs.len(),
-                    "[Ethproofs] Fetched proofs"
-                );
-
                 // Try to download and verify the proof
                 if let Some(proof_entry) = proofs.first() {
                     // Download the proof binary
@@ -119,32 +107,23 @@ impl ProofGenerator for DummyProofGenerator {
                                 proof_binary,
                             ) {
                                 Ok(proof) => {
-                                    // Verify the proof
-                                    if validate_proof(&proof) {
-                                        debug!(
-                                            proof_id = proof_entry.proof_id,
-                                            cluster_id = %proof_entry.cluster_id,
-                                            "[Ethproofs] Proof verification succeeded"
-                                        );
-                                        return Ok(proof);
-                                    } else {
-                                        debug!(
-                                            proof_id = proof_entry.proof_id,
-                                            "[Ethproofs] Proof verification failed"
-                                        );
-                                    }
-                                }
-                                Err(e) => {
                                     debug!(
                                         proof_id = proof_entry.proof_id,
-                                        error = %e,
-                                        "[Ethproofs] Failed to create proof structure"
+                                        cluster_id = %proof_entry.cluster_id,
+                                        "[Ethproofs] Proof verification check"
                                     );
+
+                                    if validate_proof(&proof) {
+                                        return Ok(proof);
+                                    }
+                                }
+                                Err(_) => {
+                                    // Proof structure creation failed, will fallback below
                                 }
                             }
                         }
                         Err(e) => {
-                            debug!(
+                            warn!(
                                 proof_id = proof_entry.proof_id,
                                 error = %e,
                                 "[Ethproofs] Failed to download proof"
@@ -159,10 +138,10 @@ impl ProofGenerator for DummyProofGenerator {
                 }
 
                 // Fall back to dummy proof if we get here
-                warn!(
+                debug!(
                     proof_id = %self.proof_id,
                     block_hash = %payload_hash,
-                    "[Ethproofs] Proof verification failed, falling back to dummy"
+                    "[Ethproofs] API proof generation failed, using dummy fallback"
                 );
                 self.create_dummy_proof(slot, payload_hash, block_root)
             }

@@ -10,14 +10,7 @@ use types::ExecutionProof;
 /// Global verification key store, loaded once on first access
 pub static VERIFICATION_KEY_STORE: Lazy<Option<VerificationKeyStore>> =
     Lazy::new(|| match VerificationKeyStore::load_embedded() {
-        Ok(store) => {
-            debug!(
-                key_count = store.len(),
-                prover_ids = ?store.prover_ids(),
-                "[Ethproofs] Loaded verification keys"
-            );
-            Some(store)
-        }
+        Ok(store) => Some(store),
         Err(e) => {
             warn!(error = %e, "[Ethproofs] Failed to load verification keys");
             None
@@ -25,38 +18,7 @@ pub static VERIFICATION_KEY_STORE: Lazy<Option<VerificationKeyStore>> =
     });
 
 /// Global verifier store, initialized with default verifiers
-pub static VERIFIER_STORE: Lazy<VerifierStore> = Lazy::new(|| {
-    let store = VerifierStore::with_defaults();
-    debug!(
-        verifier_count = store.len(),
-        "[Ethproofs] Initialized verifier store"
-    );
-    store
-});
-
-/// Select a random prover_id from available registered verifiers
-pub fn select_random_prover_id() -> [u8; 16] {
-    use rand::Rng;
-
-    let available_provers = VERIFIER_STORE.prover_ids();
-
-    if available_provers.is_empty() {
-        warn!("[Ethproofs] No verifiers registered, cannot select prover_id");
-        return [0u8; 16];
-    }
-
-    let mut rng = rand::rng();
-    let random_index = rng.random_range(0..available_provers.len());
-    let selected_uuid = available_provers[random_index];
-
-    debug!(
-        prover_id = %selected_uuid,
-        available_count = available_provers.len(),
-        "[Ethproofs] Randomly selected prover_id"
-    );
-
-    *selected_uuid.as_bytes()
-}
+pub static VERIFIER_STORE: Lazy<VerifierStore> = Lazy::new(VerifierStore::with_defaults);
 
 /// Represents a proof from the Ethproofs proofs list endpoint
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,13 +72,6 @@ pub async fn fetch_proof_from_ethproofs(
             ));
         }
 
-        debug!(
-            block_hash = %block_hash,
-            cluster = %cluster,
-            delay_ms,
-            "[Ethproofs] Polling Ethproofs for proof"
-        );
-
         let response = client
             .get(&url)
             .send()
@@ -132,21 +87,11 @@ pub async fn fetch_proof_from_ethproofs(
 
                 // Return the first proof found for this cluster
                 if !response_data.proofs.is_empty() {
-                    debug!(
-                        block_hash = %block_hash,
-                        cluster = %cluster,
-                        proof_count = response_data.proofs.len(),
-                        "[Ethproofs] Found proof"
-                    );
                     return Ok(response_data.proofs);
                 }
             }
             StatusCode::NOT_FOUND => {
-                debug!(
-                    block_hash = %block_hash,
-                    cluster = %cluster,
-                    "[Ethproofs] Block not found, retrying..."
-                );
+                // Proof not ready yet, will retry with exponential backoff
             }
             status => {
                 return Err(format!(
@@ -185,13 +130,6 @@ pub async fn download_proof_binary(proof_id: u64) -> Result<Vec<u8>, String> {
                 .bytes()
                 .await
                 .map_err(|e| format!("Failed to read response: {}", e))?;
-
-            debug!(
-                proof_id,
-                size_bytes = proof_data.len(),
-                "[Ethproofs] Successfully downloaded proof binary"
-            );
-
             Ok(proof_data.to_vec())
         }
         StatusCode::NOT_FOUND => Err(format!("Proof {} not found", proof_id)),
@@ -229,7 +167,7 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
                         prover_id = %prover_uuid,
                         vk_size = vk.size(),
                         proof_size = proof.proof_data.len(),
-                        "[Ethproofs] Found verification key for prover"
+                        "[Ethproofs] Found vk for prover"
                     );
 
                     // Look up the verifier for this prover
@@ -238,7 +176,7 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
                             debug!(
                                 prover_id = %prover_uuid,
                                 verifier = verifier_entry.name,
-                                "[Ethproofs] Found verifier, running cryptographic verification"
+                                "[Ethproofs] Found verifier, starting verification"
                             );
 
                             // Run the actual cryptographic verification
