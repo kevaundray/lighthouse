@@ -13,7 +13,7 @@ tokio = { version = "1", features = ["full"] }
 thiserror = "2"
 types = { path = "../consensus/types" }
 execution_layer = { path = "../beacon_node/execution_layer" }
-pico-prism-vm = { git = "https://github.com/brevis-network/pico.git", package = "pico-vm", branch = "main" }
+pico-prism-vm = { git = "https://github.com/ethproofs/pico.git", package = "pico-vm", branch = "ethproofs-pico-prism" }
 proofman-verifier = { git = "https://github.com/0xPolygonHermez/pil2-proofman.git", tag = "v0.12.0" }
 zkm-verifier = { git = "https://github.com/ProjectZKM/Ziren", tag = "v1.2.1" }
 bincode = { workspace = true }

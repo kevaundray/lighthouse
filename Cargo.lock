@@ -8231,7 +8231,7 @@ dependencies = [
 [[package]]
 name = "pico-derive"
 version = "0.1.0"
-source = "git+https://github.com/brevis-network/pico.git?branch=main#f6a24234c0637ded3cb6ff797cbc2e7a4f679795"
+source = "git+https://github.com/ethproofs/pico.git?branch=ethproofs-pico-prism#5fa05fc4e105fd65bb01912e2d1ffce92c836a86"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8241,7 +8241,7 @@ dependencies = [
 [[package]]
 name = "pico-vm"
 version = "1.1.6"
-source = "git+https://github.com/brevis-network/pico.git?branch=main#f6a24234c0637ded3cb6ff797cbc2e7a4f679795"
+source = "git+https://github.com/ethproofs/pico.git?branch=ethproofs-pico-prism#5fa05fc4e105fd65bb01912e2d1ffce92c836a86"
 dependencies = [
  "anyhow",
  "arrayref",
