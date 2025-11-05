@@ -1305,7 +1305,7 @@ dependencies = [
  "maplit",
  "merkle_proof",
  "metrics",
- "mockall",
+ "mockall 0.13.1",
  "mockall_double",
  "once_cell",
  "oneshot_broadcast",
@@ -6531,6 +6531,21 @@ checksum = "9366861eb2a2c436c20b12c8dbec5f798cea6b47ad99216be0282942e2c81ea0"
 
 [[package]]
 name = "mockall"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43766c2b5203b10de348ffe19f7e54564b64f3d6018ff7648d1e2d6d3a0f0a48"
+dependencies = [
+ "cfg-if",
+ "downcast",
+ "fragile",
+ "lazy_static",
+ "mockall_derive 0.12.1",
+ "predicates",
+ "predicates-tree",
+]
+
+[[package]]
+name = "mockall"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39a6bfcc6c8c7eed5ee98b9c3e33adc726054389233e201c95dab2d41a3839d2"
@@ -6538,9 +6553,21 @@ dependencies = [
  "cfg-if",
  "downcast",
  "fragile",
- "mockall_derive",
+ "mockall_derive 0.13.1",
  "predicates",
  "predicates-tree",
+]
+
+[[package]]
+name = "mockall_derive"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af7cbce79ec385a1d4f54baa90a76401eb15d9cab93685f62e7e9f942aa00ae2"
+dependencies = [
+ "cfg-if",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.111",
 ]
 
 [[package]]
@@ -8230,8 +8257,8 @@ dependencies = [
 
 [[package]]
 name = "pico-derive"
-version = "0.1.0"
-source = "git+https://github.com/ethproofs/pico.git?branch=ethproofs-pico-prism#5fa05fc4e105fd65bb01912e2d1ffce92c836a86"
+version = "1.1.8"
+source = "git+https://github.com/ethproofs/pico.git?branch=ethproofs-pico-prism#d5e301efb5b7b7032cdbc0bd2fc61cbcd2d55572"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8240,8 +8267,8 @@ dependencies = [
 
 [[package]]
 name = "pico-vm"
-version = "1.1.6"
-source = "git+https://github.com/ethproofs/pico.git?branch=ethproofs-pico-prism#5fa05fc4e105fd65bb01912e2d1ffce92c836a86"
+version = "1.1.8"
+source = "git+https://github.com/ethproofs/pico.git?branch=ethproofs-pico-prism#d5e301efb5b7b7032cdbc0bd2fc61cbcd2d55572"
 dependencies = [
  "anyhow",
  "arrayref",
@@ -8257,7 +8284,7 @@ dependencies = [
  "curve25519-dalek",
  "dashmap",
  "dashu",
- "derive_more 2.0.1",
+ "derive_more 2.1.0",
  "elf",
  "elliptic-curve",
  "eyre",
@@ -13120,6 +13147,7 @@ dependencies = [
  "execution_layer",
  "hashbrown 0.15.5",
  "lru 0.12.5",
+ "mockall 0.12.1",
  "once_cell",
  "pico-vm",
  "proofman-verifier",

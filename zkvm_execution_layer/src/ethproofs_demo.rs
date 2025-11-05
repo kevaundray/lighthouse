@@ -7,6 +7,21 @@ use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 use types::ExecutionProof;
 
+/// Trait for validating proofs
+pub trait ProofValidator: Send + Sync {
+    /// Validate a proof using the verifier store
+    fn validate(&self, proof: &ExecutionProof) -> bool;
+}
+
+/// Default implementation using the Ethproofs verifier store
+pub struct EthproofsValidator;
+
+impl ProofValidator for EthproofsValidator {
+    fn validate(&self, proof: &ExecutionProof) -> bool {
+        validate_proof(proof)
+    }
+}
+
 /// Global verification key store, loaded once on first access
 pub static VERIFICATION_KEY_STORE: Lazy<Option<VerificationKeyStore>> =
     Lazy::new(|| match VerificationKeyStore::load_embedded() {

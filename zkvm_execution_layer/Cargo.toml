@@ -27,3 +27,4 @@ tracing = { workspace = true }
 
 
 [dev-dependencies]
+mockall = "0.12"

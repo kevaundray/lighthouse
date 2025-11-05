@@ -1,5 +1,6 @@
-use crate::ethproofs_demo::validate_proof;
+use crate::ethproofs_demo::{EthproofsValidator, ProofValidator};
 use crate::proof_verification::{ProofVerificationResult, ProofVerifier, VerificationError};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::debug;
 use types::{ExecutionProof, ExecutionProofId};
@@ -12,6 +13,7 @@ use types::{ExecutionProof, ExecutionProofId};
 pub struct DummyVerifier {
     proof_id: ExecutionProofId,
     verification_delay: Duration,
+    validator: Arc<dyn ProofValidator>,
 }
 
 impl DummyVerifier {
@@ -20,6 +22,7 @@ impl DummyVerifier {
         Self {
             proof_id,
             verification_delay: Duration::from_millis(0),
+            validator: Arc::new(EthproofsValidator),
         }
     }
 
@@ -28,6 +31,20 @@ impl DummyVerifier {
         Self {
             proof_id,
             verification_delay: delay,
+            validator: Arc::new(EthproofsValidator),
+        }
+    }
+
+    /// Create a new dummy verifier with a custom validator (for testing)
+    #[cfg(test)]
+    fn with_validator(
+        proof_id: ExecutionProofId,
+        validator: Arc<dyn ProofValidator>,
+    ) -> Self {
+        Self {
+            proof_id,
+            verification_delay: Duration::from_millis(0),
+            validator,
         }
     }
 }
@@ -50,8 +67,8 @@ impl ProofVerifier for DummyVerifier {
             "[Ethproofs] Verifying proof"
         );
 
-        // Perform cryptographic verification using Ethproofs verifiers
-        Ok(validate_proof(proof))
+        // Perform cryptographic verification using the injected validator
+        Ok(self.validator.validate(proof))
     }
 
     fn proof_id(&self) -> ExecutionProofId {
@@ -62,13 +79,20 @@ impl ProofVerifier for DummyVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use types::{ExecutionBlockHash, FixedBytesExtended};
+    use mockall::mock;
+    use types::{ExecutionBlockHash, FixedBytesExtended, Hash256, Slot};
+
+    mock! {
+        TestValidator {}
+        impl ProofValidator for TestValidator {
+            fn validate(&self, proof: &ExecutionProof) -> bool;
+        }
+    }
 
     fn create_test_proof(
         subnet_id: ExecutionProofId,
         block_hash: types::ExecutionBlockHash,
     ) -> ExecutionProof {
-        use types::{Hash256, Slot};
         ExecutionProof::new(
             subnet_id,
             Slot::new(100),
@@ -82,9 +106,16 @@ mod tests {
     #[tokio::test]
     async fn test_dummy_verifier_success() {
         let subnet = ExecutionProofId::new(0).unwrap();
-        let verifier = DummyVerifier::new(subnet);
         let block_hash = ExecutionBlockHash::zero();
         let proof = create_test_proof(subnet, block_hash);
+
+        let mut mock_validator = MockTestValidator::new();
+        mock_validator
+            .expect_validate()
+            .withf(move |p| p.proof_id == subnet)
+            .returning(|_| true);
+
+        let verifier = DummyVerifier::with_validator(subnet, Arc::new(mock_validator));
 
         let result = verifier.verify(&proof);
         assert!(result.is_ok());
@@ -95,9 +126,11 @@ mod tests {
     async fn test_dummy_verifier_wrong_subnet() {
         let subnet_0 = ExecutionProofId::new(0).unwrap();
         let subnet_1 = ExecutionProofId::new(1).unwrap();
-        let verifier = DummyVerifier::new(subnet_0);
         let block_hash = ExecutionBlockHash::zero();
         let proof = create_test_proof(subnet_1, block_hash);
+
+        let mock_validator = MockTestValidator::new();
+        let verifier = DummyVerifier::with_validator(subnet_0, Arc::new(mock_validator));
 
         let result = verifier.verify(&proof);
         assert!(result.is_err());
