@@ -9,6 +9,11 @@ use tree_hash::TreeHash;
 /// TODO(zkproofs): The number 8 is a parameter that we will want to configure in the future
 pub const EXECUTION_PROOF_TYPE_COUNT: u8 = 8;
 
+/// TODO(ethproofs): Added to handle when proof generation fails.
+///
+/// Special proof ID reserved for fallback proofs
+pub const FALLBACK_EXECUTION_PROOF_ID: u8 = 255;
+
 /// ExecutionProofId identifies which zkVM/proof system a proof belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ExecutionProofId(u8);
@@ -81,9 +86,20 @@ impl ExecutionProofId {
         }
     }
 
+    /// Creates a fallback ExecutionProofId (255)
+    /// Used for dummy proofs when Ethproofs API fails or times out
+    pub fn fallback() -> Self {
+        Self(FALLBACK_EXECUTION_PROOF_ID)
+    }
+
     /// Returns the inner u8 value
     pub fn as_u8(&self) -> u8 {
         self.0
+    }
+
+    /// Check if this is a fallback proof ID
+    pub fn is_fallback(&self) -> bool {
+        self.0 == FALLBACK_EXECUTION_PROOF_ID
     }
 
     /// Returns the subnet ID as a usize

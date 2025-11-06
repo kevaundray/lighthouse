@@ -96,9 +96,38 @@ impl ProofVerifier for PicoVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn test_pico_verifier_name() {
         assert_eq!(PicoVerifier::name(), "pico");
+    }
+
+    #[test]
+    fn test_pico_verifier_with_real_proof() {
+        // Path to the test proof file
+        let proof_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src/test_proofs/brevis_79041a5b-ee8d-49b3-8207-86c7debf8e13_542871.bin");
+
+        // Path to the verification key file
+        let vk_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src/verification_keys/brevis_79041a5b-ee8d-49b3-8207-86c7debf8e13.bin");
+
+        // Read the proof and verification key
+        let proof_data = std::fs::read(&proof_path)
+            .expect("Failed to read test proof file");
+        let vk_data = std::fs::read(&vk_path)
+            .expect("Failed to read test verification key file");
+
+        // Verify the proof
+        let result = PicoVerifier::verify(&proof_data, &vk_data);
+
+        // Log the result for debugging
+        eprintln!("Proof size: {} bytes", proof_data.len());
+        eprintln!("VK size: {} bytes", vk_data.len());
+        eprintln!("Verification result: {:?}", result);
+
+        // The result should be Ok with a boolean (true if valid, false if invalid)
+        assert!(result.is_ok(), "Verification should not error: {:?}", result.err());
     }
 }

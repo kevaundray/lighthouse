@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{debug, warn};
+use types::execution_proof_id::FALLBACK_EXECUTION_PROOF_ID;
 use types::{ExecutionBlockHash, ExecutionProof, ExecutionProofId, Hash256, Slot};
 
 /// TODO(ethproofs): Implementation of proof generation for demo.
@@ -36,9 +37,9 @@ impl DummyProofGenerator {
         }
     }
 
-    /// TODO(ethproofs): Used when Ethproofs API fails or verification fails.
+    /// TODO(ethproofs): Fallback when the Ethproofs API fails or test verification fails.
     ///
-    /// Create a fallback dummy proof
+    /// Create a fallback dummy proof with a reserved fallback proof ID
     fn create_dummy_proof(
         &self,
         slot: Slot,
@@ -46,13 +47,23 @@ impl DummyProofGenerator {
         block_root: &Hash256,
     ) -> ProofGenerationResult<ExecutionProof> {
         let dummy_data = format!(
-            "ethproofs_fallback_subnet_{:?}_slot_{:?}_hash_{:?}",
-            self.proof_id, slot, payload_hash
+            "ethproofs_fallback_proof_id_{}_slot_{}_hash_{}",
+            FALLBACK_EXECUTION_PROOF_ID,
+            slot.as_u64(),
+            payload_hash
         )
         .into_bytes();
 
-        ExecutionProof::new(self.proof_id, slot, *payload_hash, *block_root, dummy_data)
-            .map_err(ProofGenerationError::ProofGenerationFailed)
+        // Use the fallback proof ID to mark this as a dummy proof
+        let fallback_proof_id = ExecutionProofId::fallback();
+        ExecutionProof::new(
+            fallback_proof_id,
+            slot,
+            *payload_hash,
+            *block_root,
+            dummy_data,
+        )
+        .map_err(ProofGenerationError::ProofGenerationFailed)
     }
 }
 
@@ -178,7 +189,8 @@ mod tests {
         assert!(result.is_ok());
 
         let proof = result.unwrap();
-        assert_eq!(proof.proof_id, subnet);
+
+        assert!(proof.proof_id.is_fallback());
         assert_eq!(proof.slot, slot);
         assert_eq!(proof.block_hash, block_hash);
         assert_eq!(proof.block_root, block_root);

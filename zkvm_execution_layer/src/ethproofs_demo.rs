@@ -162,6 +162,15 @@ pub async fn download_proof_binary(proof_id: u64) -> Result<Vec<u8>, String> {
 /// 2. Running the cryptographic verification function
 /// 3. Returning whether the proof is valid
 pub fn validate_proof(proof: &ExecutionProof) -> bool {
+    // Check if this is a fallback proof (created when Ethproofs API failed/timed out)
+    if proof.proof_id.is_fallback() {
+        debug!(
+            proof_id = %proof.proof_id,
+            "[Ethproofs] Fallback proof detected, skipping verification"
+        );
+        return true;
+    }
+
     // Get the prover UUID for this proof_id from the hardcoded mapping
     let prover_uuid = match VERIFIER_STORE.get_prover_uuid_for_proof_id(proof.proof_id) {
         Some(uuid) => uuid,
