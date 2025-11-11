@@ -818,8 +818,19 @@ pub fn cli_app() -> Command {
                 .help("Server endpoint for an execution layer JWT-authenticated HTTP \
                        JSON-RPC connection. Uses the same endpoint to populate the \
                        deposit cache.")
-                .required(true)
                 .action(ArgAction::Set)
+                .display_order(0)
+        )
+        .arg(
+            Arg::new("dummy-el")
+                .long("dummy-el")
+                .help("Start an in-process dummy execution layer for zkproofs testing. \
+                       This allows running Lighthouse without an external execution client \
+                       by using zero-knowledge proofs to validate blocks. Mutually exclusive \
+                       with --execution-endpoint.")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("execution-endpoint")
+                .help_heading(FLAG_HEADER)
                 .display_order(0)
         )
         .arg(

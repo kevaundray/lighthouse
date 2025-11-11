@@ -30,6 +30,7 @@ eth2_config = { workspace = true }
 execution_layer = { workspace = true }
 # TODO(zkproofs): add as a workspace dependency
 zkvm_execution_layer = { path = "../zkvm_execution_layer" }
+dummy_el = { path = "../dummy_el" }
 genesis = { workspace = true }
 hex = { workspace = true }
 http_api = { workspace = true }

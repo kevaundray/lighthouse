@@ -1,7 +1,15 @@
 [package]
 name = "dummy_el"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+
+[lib]
+name = "dummy_el"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dummy_el"
+path = "src/main.rs"
 
 [dependencies]
 axum = { workspace = true }
@@ -14,7 +22,3 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 jsonwebtoken = "9"
 hex = { workspace = true }
-
-[[bin]]
-name = "dummy_el"
-path = "src/main.rs"

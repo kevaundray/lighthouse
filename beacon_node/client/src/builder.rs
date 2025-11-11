@@ -25,6 +25,7 @@ use eth2::{
     BeaconNodeHttpClient, Error as ApiError, Timeouts,
     types::{BlockId, StateId},
 };
+use dummy_el;
 use execution_layer::ExecutionLayer;
 use execution_layer::test_utils::generate_genesis_header;
 use futures::channel::mpsc::Receiver;
@@ -192,6 +193,28 @@ where
         } else {
             None
         };
+
+        // Spawn the dummy execution layer if --dummy-el flag is set
+        if config.use_dummy_el {
+            info!("Spawning in-process dummy execution layer (--dummy-el)");
+
+            let dummy_el_config = dummy_el::DummyElConfig {
+                host: "127.0.0.1".to_string(),
+                engine_port: 8551,
+                rpc_port: 8545,
+                ws_port: 8546,
+                metrics_port: 9001,
+                p2p_port: 30303,
+                jwt_secret_path: None,
+            };
+
+            // Spawn the dummy EL in a background task
+            tokio::spawn(async move {
+                if let Err(e) = dummy_el::start_dummy_el(dummy_el_config).await {
+                    eprintln!("Error starting dummy execution layer: {:?}", e);
+                }
+            });
+        }
 
         let kzg_err_msg = |e| format!("Failed to load trusted setup: {:?}", e);
         let kzg = if spec.is_peer_das_scheduled() {
