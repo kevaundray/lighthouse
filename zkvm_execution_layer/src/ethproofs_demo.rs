@@ -60,7 +60,7 @@ pub async fn fetch_proof_from_ethproofs(
     block_hash: types::ExecutionBlockHash,
     cluster: String,
 ) -> Result<Vec<Ethproof>, String> {
-    const MAX_WAIT_TIME_SECS: u64 = 20;
+    const MAX_WAIT_TIME_SECS: u64 = 30;
     const INITIAL_DELAY_MS: u64 = 100;
     const MAX_DELAY_MS: u64 = 5000;
 
