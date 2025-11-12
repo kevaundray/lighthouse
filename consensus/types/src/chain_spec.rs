@@ -224,7 +224,7 @@ pub struct ChainSpec {
     /*
      * zkVM execution proof params
      */
-    /// Whether zkVM mode is enabled via CLI flag --activate-zkvm.
+    /// Whether zkVM mode is enabled via CLI flag --zk-attester.
     /// When true, the node will subscribe to execution proof gossip, verify proofs,
     /// TODO(ethproofs): Changed to Electra fork for demo.
     /// and optionally generate proofs. zkVM activates at the Fulu fork.

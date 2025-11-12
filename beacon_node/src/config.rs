@@ -270,7 +270,13 @@ pub fn get_config<E: EthSpec>(
     }
 
     // Check if --dummy-el flag is set
-    let use_dummy_el = cli_args.get_flag("dummy-el");
+    let mut use_dummy_el = cli_args.get_flag("dummy-el");
+
+    // Auto-enable --dummy-el if --zk-attester is set without --zkvm-generation-proof-types
+    if cli_args.get_flag("zk-attester") && cli_args.get_one::<String>("zkvm-generation-proof-types").is_none() {
+        use_dummy_el = true;
+    }
+
     client_config.use_dummy_el = use_dummy_el;
 
     // Either `--execution-endpoint` or `--dummy-el` must be supplied.
@@ -351,7 +357,7 @@ pub fn get_config<E: EthSpec>(
     }
 
     // Parse ZK-VM execution layer config if provided
-    if cli_args.get_flag("activate-zkvm") {
+    if cli_args.get_flag("zk-attester") {
         let gen_types_provided = cli_args.get_one::<String>("zkvm-generation-proof-types").is_some();
 
         let generation_proof_types = if let Some(gen_types_str) =
@@ -372,11 +378,9 @@ pub fn get_config<E: EthSpec>(
                 .collect::<Result<HashSet<_>, _>>()
                 .map_err(|e| format!("Invalid subnet ID: {}", e))?
         } else {
-            // If --activate-zkvm is set without --zkvm-generation-proof-types,
-            // automatically enable --dummy-el for proof verification mode
-            if !gen_types_provided {
-                client_config.use_dummy_el = true;
-                info!("--activate-zkvm set without --zkvm-generation-proof-types: automatically enabling --dummy-el for proof verification mode");
+            // No generation proof types provided - running in verification-only mode
+            if client_config.use_dummy_el {
+                info!("--zk-attester set without --zkvm-generation-proof-types: automatically enabled --dummy-el for proof verification mode");
             }
             HashSet::new()
         };

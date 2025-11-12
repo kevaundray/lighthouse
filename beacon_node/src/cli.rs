@@ -946,8 +946,8 @@ pub fn cli_app() -> Command {
         )
         /* ZK-VM Execution Layer settings */
         .arg(
-            Arg::new("activate-zkvm")
-                .long("activate-zkvm")
+            Arg::new("zk-attester")
+                .long("zk-attester")
                 .help("Activates ZKVM execution proof mode. Enables the node to subscribe to the \
                        execution_proof gossip topic, receive and verify execution proofs from peers, \
                        and advertise zkVM support in its ENR for peer discovery. \
@@ -963,7 +963,7 @@ pub fn cli_app() -> Command {
                 .help("Comma-separated list of proof type IDs to generate \
                        (e.g., '0,1' where 0=SP1+Reth, 1=Risc0+Geth). \
                        Optional - nodes can verify proofs without generating them.")
-                .requires("activate-zkvm")
+                .requires("zk-attester")
                 .action(ArgAction::Set)
                 .display_order(0)
         )

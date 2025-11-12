@@ -6,7 +6,7 @@ participants:
     cl_type: lighthouse
     cl_image: lighthouse:local
     cl_extra_params:
-      - --activate-zkvm
+      - --zk-attester
       - --zkvm-generation-proof-types=0,1
       - --target-peers=3
     count: 3
@@ -18,7 +18,7 @@ participants:
     cl_type: lighthouse
     cl_image: lighthouse:local
     cl_extra_params:
-      - --activate-zkvm
+      - --zk-attester
       - --target-peers=3
     count: 1
 network_params:
