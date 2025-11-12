@@ -352,6 +352,8 @@ pub fn get_config<E: EthSpec>(
 
     // Parse ZK-VM execution layer config if provided
     if cli_args.get_flag("activate-zkvm") {
+        let gen_types_provided = cli_args.get_one::<String>("zkvm-generation-proof-types").is_some();
+
         let generation_proof_types = if let Some(gen_types_str) =
             clap_utils::parse_optional::<String>(cli_args, "zkvm-generation-proof-types")?
         {
@@ -370,6 +372,12 @@ pub fn get_config<E: EthSpec>(
                 .collect::<Result<HashSet<_>, _>>()
                 .map_err(|e| format!("Invalid subnet ID: {}", e))?
         } else {
+            // If --activate-zkvm is set without --zkvm-generation-proof-types,
+            // automatically enable --dummy-el for proof verification mode
+            if !gen_types_provided {
+                client_config.use_dummy_el = true;
+                info!("--activate-zkvm set without --zkvm-generation-proof-types: automatically enabling --dummy-el for proof verification mode");
+            }
             HashSet::new()
         };
 
