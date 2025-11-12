@@ -4,7 +4,7 @@ use once_cell::sync::Lazy;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tracing::{info, warn};
 use types::ExecutionProof;
 
 /// Trait for validating proofs
@@ -76,7 +76,7 @@ pub async fn fetch_proof_from_ethproofs(
     loop {
         // Check if we've exceeded max wait time
         if start.elapsed() > Duration::from_secs(MAX_WAIT_TIME_SECS) {
-            debug!(
+            info!(
                 block_hash = %block_hash,
                 cluster = %cluster,
                 "[Ethproofs] Timeout waiting for proof"
@@ -131,7 +131,7 @@ pub async fn download_proof_binary(proof_id: u64) -> Result<Vec<u8>, String> {
     let client = reqwest::Client::new();
     let url = format!("https://ethproofs.org/api/v0/proofs/download/{}", proof_id);
 
-    debug!(proof_id, "[Ethproofs] Downloading proof binary");
+    info!(proof_id, "[Ethproofs] Downloading proof binary");
 
     let response = client
         .get(&url)
@@ -164,7 +164,7 @@ pub async fn download_proof_binary(proof_id: u64) -> Result<Vec<u8>, String> {
 pub fn validate_proof(proof: &ExecutionProof) -> bool {
     // Check if this is a fallback proof (created when Ethproofs API failed/timed out)
     if proof.proof_id.is_fallback() {
-        debug!(
+        info!(
             proof_id = %proof.proof_id,
             "[Ethproofs] Fallback proof detected, skipping verification"
         );
@@ -187,7 +187,7 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
         Some(store) => {
             match store.get(&prover_uuid) {
                 Some(vk) => {
-                    debug!(
+                    info!(
                         prover_id = %prover_uuid,
                         vk_size = vk.size(),
                         proof_size = proof.proof_data.len(),
@@ -197,7 +197,7 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
                     // Look up the verifier for this prover
                     match VERIFIER_STORE.get(&prover_uuid) {
                         Some(verifier_entry) => {
-                            debug!(
+                            info!(
                                 prover_id = %prover_uuid,
                                 verifier = verifier_entry.name,
                                 "[Ethproofs] Found verifier, starting verification"
@@ -206,7 +206,7 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
                             // Run the actual cryptographic verification
                             match (verifier_entry.verify_fn)(&proof.proof_data, &vk.vk) {
                                 Ok(result) => {
-                                    debug!(
+                                    info!(
                                         prover_id = %prover_uuid,
                                         verification_result = result,
                                         "[Ethproofs] Verification completed"

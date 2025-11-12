@@ -2,7 +2,7 @@ use crate::ethproofs_demo::{EthproofsValidator, ProofValidator};
 use crate::proof_verification::{ProofVerificationResult, ProofVerifier, VerificationError};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::debug;
+use tracing::info;
 use types::{ExecutionProof, ExecutionProofId};
 
 /// TODO(ethproofs): Ethproofs demo implementation of proof verification.
@@ -37,10 +37,7 @@ impl DummyVerifier {
 
     /// Create a new dummy verifier with a custom validator (for testing)
     #[cfg(test)]
-    fn with_validator(
-        proof_id: ExecutionProofId,
-        validator: Arc<dyn ProofValidator>,
-    ) -> Self {
+    fn with_validator(proof_id: ExecutionProofId, validator: Arc<dyn ProofValidator>) -> Self {
         Self {
             proof_id,
             verification_delay: Duration::from_millis(0),
@@ -61,7 +58,7 @@ impl ProofVerifier for DummyVerifier {
             std::thread::sleep(self.verification_delay);
         }
 
-        debug!(
+        info!(
             proof_id = %self.proof_id,
             block_hash = %proof.block_hash,
             "[Ethproofs] Verifying proof"

@@ -5,7 +5,7 @@ use crate::proof_generation::{ProofGenerationError, ProofGenerationResult, Proof
 use async_trait::async_trait;
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{debug, warn};
+use tracing::{info, warn};
 use types::execution_proof_id::FALLBACK_EXECUTION_PROOF_ID;
 use types::{ExecutionBlockHash, ExecutionProof, ExecutionProofId, Hash256, Slot};
 
@@ -94,7 +94,7 @@ impl ProofGenerator for DummyProofGenerator {
 
         let cluster = prover_uuid.to_string();
 
-        debug!(
+        info!(
             proof_id = %self.proof_id,
             slot = %slot,
             block_hash = %payload_hash,
@@ -118,7 +118,7 @@ impl ProofGenerator for DummyProofGenerator {
                                 proof_binary,
                             ) {
                                 Ok(proof) => {
-                                    debug!(
+                                    info!(
                                         proof_id = proof_entry.proof_id,
                                         cluster_id = %proof_entry.cluster_id,
                                         "[Ethproofs] Proof verification check"
@@ -149,7 +149,7 @@ impl ProofGenerator for DummyProofGenerator {
                 }
 
                 // Fall back to dummy proof if we get here
-                debug!(
+                info!(
                     proof_id = %self.proof_id,
                     block_hash = %payload_hash,
                     "[Ethproofs] API proof generation failed, using dummy fallback"
@@ -157,7 +157,7 @@ impl ProofGenerator for DummyProofGenerator {
                 self.create_dummy_proof(slot, payload_hash, block_root)
             }
             Err(e) => {
-                debug!(
+                info!(
                     proof_id = %self.proof_id,
                     block_hash = %payload_hash,
                     error = %e,
