@@ -273,7 +273,11 @@ pub fn get_config<E: EthSpec>(
     let mut use_dummy_el = cli_args.get_flag("dummy-el");
 
     // Auto-enable --dummy-el if --zk-attester is set without --zkvm-generation-proof-types
-    if cli_args.get_flag("zk-attester") && cli_args.get_one::<String>("zkvm-generation-proof-types").is_none() {
+    if cli_args.get_flag("zk-attester")
+        && cli_args
+            .get_one::<String>("zkvm-generation-proof-types")
+            .is_none()
+    {
         use_dummy_el = true;
     }
 
@@ -282,7 +286,8 @@ pub fn get_config<E: EthSpec>(
     // Either `--execution-endpoint` or `--dummy-el` must be supplied.
     if !use_dummy_el {
         let endpoints: Option<String> = clap_utils::parse_optional(cli_args, "execution-endpoint")?;
-        let endpoints = endpoints.ok_or("Error! Either --execution-endpoint or --dummy-el must be provided")?;
+        let endpoints =
+            endpoints.ok_or("Error! Either --execution-endpoint or --dummy-el must be provided")?;
 
         let mut el_config = execution_layer::Config::default();
 
@@ -301,7 +306,8 @@ pub fn get_config<E: EthSpec>(
             secret_file = parse_only_one_value(secret_files, PathBuf::from_str, "--execution-jwt")?;
         // Check if the JWT secret key is passed directly via cli flag and persist it to the default
         // file location.
-        } else if let Some(jwt_secret_key) = cli_args.get_one::<String>("execution-jwt-secret-key") {
+        } else if let Some(jwt_secret_key) = cli_args.get_one::<String>("execution-jwt-secret-key")
+        {
             use std::fs::File;
             use std::io::Write;
             secret_file = client_config.data_dir().join(DEFAULT_JWT_FILE);
@@ -324,7 +330,8 @@ pub fn get_config<E: EthSpec>(
             let payload_builder = parse_only_one_value(endpoint, SensitiveUrl::parse, "--builder")?;
             el_config.builder_url = Some(payload_builder);
 
-            el_config.builder_user_agent = clap_utils::parse_optional(cli_args, "builder-user-agent")?;
+            el_config.builder_user_agent =
+                clap_utils::parse_optional(cli_args, "builder-user-agent")?;
 
             el_config.builder_header_timeout =
                 clap_utils::parse_optional(cli_args, "builder-header-timeout")?
@@ -359,11 +366,11 @@ pub fn get_config<E: EthSpec>(
         // Point to the local dummy EL running on the default engine port
         el_config.execution_endpoint = Some(
             SensitiveUrl::parse("http://127.0.0.1:8551")
-                .map_err(|e| format!("Failed to parse dummy EL endpoint: {:?}", e))?
+                .map_err(|e| format!("Failed to parse dummy EL endpoint: {:?}", e))?,
         );
 
-        // Dummy EL doesn't require JWT validation
-        el_config.secret_file = None;
+        // For dummy EL, let ExecutionLayer handle JWT as usual
+        // Dummy EL will not validate JWT (no need for local testing)
         el_config.default_datadir.clone_from(client_config.data_dir());
 
         client_config.execution_layer = Some(el_config);
@@ -371,8 +378,6 @@ pub fn get_config<E: EthSpec>(
 
     // Parse ZK-VM execution layer config if provided
     if cli_args.get_flag("zk-attester") {
-        let gen_types_provided = cli_args.get_one::<String>("zkvm-generation-proof-types").is_some();
-
         let generation_proof_types = if let Some(gen_types_str) =
             clap_utils::parse_optional::<String>(cli_args, "zkvm-generation-proof-types")?
         {
@@ -393,7 +398,9 @@ pub fn get_config<E: EthSpec>(
         } else {
             // No generation proof types provided - running in verification-only mode
             if client_config.use_dummy_el {
-                info!("--zk-attester set without --zkvm-generation-proof-types: automatically enabled --dummy-el for proof verification mode");
+                info!(
+                    "--zk-attester set without --zkvm-generation-proof-types: automatically enabled --dummy-el for proof verification mode"
+                );
             }
             HashSet::new()
         };
