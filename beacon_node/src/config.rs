@@ -350,10 +350,23 @@ pub fn get_config<E: EthSpec>(
         // Store the EL config in the client config.
         client_config.execution_layer = Some(el_config);
     } else {
-        // When using --dummy-el, don't create an execution_layer config
+        // When using --dummy-el, create an execution_layer config pointing to localhost
         // The dummy EL server will be spawned in-process by the client builder
         info!("Using in-process dummy execution layer (--dummy-el)");
-        client_config.execution_layer = None;
+
+        let mut el_config = execution_layer::Config::default();
+
+        // Point to the local dummy EL running on the default engine port
+        el_config.execution_endpoint = Some(
+            SensitiveUrl::parse("http://127.0.0.1:8551")
+                .map_err(|e| format!("Failed to parse dummy EL endpoint: {:?}", e))?
+        );
+
+        // Dummy EL doesn't require JWT validation
+        el_config.secret_file = None;
+        el_config.default_datadir.clone_from(client_config.data_dir());
+
+        client_config.execution_layer = Some(el_config);
     }
 
     // Parse ZK-VM execution layer config if provided
