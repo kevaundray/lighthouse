@@ -1656,7 +1656,8 @@ pub fn cli_app() -> Command {
                 .hide(true)
         )
         .group(ArgGroup::new("execution-source")
-            .args(["execution-endpoint", "zkevm-validation"])
-            .required(true))
+            .args(&["execution-endpoint", "zkevm-validation"])
+            .required(true)
+            .multiple(true))
         .group(ArgGroup::new("enable_http").args(["http", "gui", "staking"]).multiple(true))
 }
