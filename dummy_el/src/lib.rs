@@ -3,6 +3,8 @@
 //! This module provides an in-process execution layer that returns success
 //! for all Engine API calls. It's designed to be used with zkproofs to validate
 //! blocks without needing a full execution layer.
+//!
+//! TODO(ethproofs): Changed to debug logs for demo purposes.
 
 use axum::{
     extract::State,
@@ -18,7 +20,7 @@ use serde_json::{json, Value as JsonValue};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 const JSONRPC_VERSION: &str = "2.0";
 const JWT_SECRET_LENGTH: usize = 32;
@@ -135,7 +137,7 @@ async fn handle_rpc(
     State(_state): State<Arc<AppState>>,
     Json(request): Json<JsonRpcRequest>,
 ) -> (StatusCode, Json<JsonRpcResponse>) {
-    info!(
+    debug!(
         method = %request.method,
         params = ?request.params,
         "Received RPC request"
@@ -154,7 +156,10 @@ async fn handle_rpc(
             debug!("eth_getBlockByHash: returning null");
             Ok(json!(null))
         }
-        "engine_newPayloadV1" | "engine_newPayloadV2" | "engine_newPayloadV3" | "engine_newPayloadV4" => {
+        "engine_newPayloadV1"
+        | "engine_newPayloadV2"
+        | "engine_newPayloadV3"
+        | "engine_newPayloadV4" => {
             debug!("{}: returning SYNCING status", request.method);
             Ok(json!({
                 "status": "SYNCING",
@@ -162,7 +167,9 @@ async fn handle_rpc(
                 "validationError": null
             }))
         }
-        "engine_forkchoiceUpdatedV1" | "engine_forkchoiceUpdatedV2" | "engine_forkchoiceUpdatedV3" => {
+        "engine_forkchoiceUpdatedV1"
+        | "engine_forkchoiceUpdatedV2"
+        | "engine_forkchoiceUpdatedV3" => {
             debug!("{}: returning SYNCING status", request.method);
             Ok(json!({
                 "payloadStatus": {
@@ -173,8 +180,15 @@ async fn handle_rpc(
                 "payloadId": null
             }))
         }
-        "engine_getPayloadV1" | "engine_getPayloadV2" | "engine_getPayloadV3" | "engine_getPayloadV4" | "engine_getPayloadV5" => {
-            debug!("{}: returning error (payload not available)", request.method);
+        "engine_getPayloadV1"
+        | "engine_getPayloadV2"
+        | "engine_getPayloadV3"
+        | "engine_getPayloadV4"
+        | "engine_getPayloadV5" => {
+            debug!(
+                "{}: returning error (payload not available)",
+                request.method
+            );
             Err(JsonRpcError {
                 code: -38001,
                 message: "Unknown payload".to_string(),
@@ -208,7 +222,10 @@ async fn handle_rpc(
                 "engine_getBlobsV1",
                 "engine_getBlobsV2",
             ];
-            debug!("engine_exchangeCapabilities: returning {} capabilities", capabilities.len());
+            debug!(
+                "engine_exchangeCapabilities: returning {} capabilities",
+                capabilities.len()
+            );
             Ok(json!(capabilities))
         }
         "engine_getClientVersionV1" => {
@@ -225,7 +242,7 @@ async fn handle_rpc(
             Ok(json!([]))
         }
         _ => {
-            info!(method = %request.method, "Method not found");
+            debug!(method = %request.method, "Method not found");
             Err(JsonRpcError {
                 code: -32601,
                 message: format!("Method not found: {}", request.method),
@@ -248,27 +265,27 @@ async fn handle_rpc(
         },
     };
 
-    info!(method = %request.method, success = response.error.is_none(), "RPC response sent");
+    debug!(method = %request.method, success = response.error.is_none(), "RPC response sent");
     (StatusCode::OK, Json(response))
 }
 
-async fn handle_simple_rpc(Json(request): Json<JsonRpcRequest>) -> (StatusCode, Json<JsonRpcResponse>) {
+async fn handle_simple_rpc(
+    Json(request): Json<JsonRpcRequest>,
+) -> (StatusCode, Json<JsonRpcResponse>) {
     debug!(method = %request.method, "Received simple RPC request");
 
     let result: Result<JsonValue, JsonRpcError> = match request.method.as_str() {
-        "admin_nodeInfo" => {
-            Ok(json!({
-                "id": "0ecd4a2c5f7c2a304e3acbec67efea275510d31c304fe47f4e626a2ebd5fb101",
-                "name": "Dummy-EL/v0.1.0",
-                "enode": "enode://dummy@127.0.0.1:30303",
-                "enr": "enr:-Iq4QDummy0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001",
-                "ip": "127.0.0.1",
-                "ports": {
-                    "discovery": 30303,
-                    "listener": 30303
-                }
-            }))
-        }
+        "admin_nodeInfo" => Ok(json!({
+            "id": "0ecd4a2c5f7c2a304e3acbec67efea275510d31c304fe47f4e626a2ebd5fb101",
+            "name": "Dummy-EL/v0.1.0",
+            "enode": "enode://dummy@127.0.0.1:30303",
+            "enr": "enr:-Iq4QDummy0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001",
+            "ip": "127.0.0.1",
+            "ports": {
+                "discovery": 30303,
+                "listener": 30303
+            }
+        })),
         _ => {
             // For any other method, just return a success response
             Ok(json!(null))
@@ -314,7 +331,7 @@ pub async fn start_dummy_el(config: DummyElConfig) -> anyhow::Result<()> {
     let jwt_secret = match &config.jwt_secret_path {
         Some(path) => match read_jwt_secret(path) {
             Ok(secret) => {
-                info!("JWT secret loaded from {:?}", path);
+                debug!("JWT secret loaded from {:?}", path);
                 Some(secret)
             }
             Err(e) => {
@@ -329,7 +346,7 @@ pub async fn start_dummy_el(config: DummyElConfig) -> anyhow::Result<()> {
         }
     };
 
-    info!(
+    debug!(
         host = %config.host,
         engine_port = config.engine_port,
         rpc_port = config.rpc_port,
@@ -345,35 +362,38 @@ pub async fn start_dummy_el(config: DummyElConfig) -> anyhow::Result<()> {
     // Engine API server (port 8551) with JWT auth
     let engine_app = Router::new()
         .route("/", post(handle_rpc))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .with_state(state.clone());
 
     let engine_addr = format!("{}:{}", config.host, config.engine_port)
         .parse::<SocketAddr>()
         .expect("Invalid engine address");
 
-    info!("Engine API listening on http://{}", engine_addr);
+    debug!("Engine API listening on http://{}", engine_addr);
 
     // Simple RPC server for HTTP RPC (port 8545) - no JWT auth
     let rpc_app = Router::new().route("/", post(handle_simple_rpc));
     let rpc_addr = format!("{}:{}", config.host, config.rpc_port)
         .parse::<SocketAddr>()
         .expect("Invalid RPC address");
-    info!("HTTP RPC listening on http://{}", rpc_addr);
+    debug!("HTTP RPC listening on http://{}", rpc_addr);
 
     // Simple RPC server for WebSocket (port 8546) - no JWT auth
     let ws_app = Router::new().route("/", post(handle_simple_rpc));
     let ws_addr = format!("{}:{}", config.host, config.ws_port)
         .parse::<SocketAddr>()
         .expect("Invalid WebSocket address");
-    info!("WebSocket RPC listening on http://{}", ws_addr);
+    debug!("WebSocket RPC listening on http://{}", ws_addr);
 
     // Simple server for metrics (port 9001)
     let metrics_app = Router::new().route("/", post(handle_simple_rpc));
     let metrics_addr = format!("{}:{}", config.host, config.metrics_port)
         .parse::<SocketAddr>()
         .expect("Invalid metrics address");
-    info!("Metrics listening on http://{}", metrics_addr);
+    debug!("Metrics listening on http://{}", metrics_addr);
 
     // Bind P2P discovery ports (TCP and UDP) - just to satisfy Kurtosis port checks
     let p2p_tcp_addr = format!("{}:{}", config.host, config.p2p_port)
@@ -385,7 +405,7 @@ pub async fn start_dummy_el(config: DummyElConfig) -> anyhow::Result<()> {
 
     // Spawn P2P TCP listener in a task to keep it alive
     let p2p_tcp_listener = tokio::net::TcpListener::bind(p2p_tcp_addr).await?;
-    info!("P2P TCP listening on {}", p2p_tcp_addr);
+    debug!("P2P TCP listening on {}", p2p_tcp_addr);
     let p2p_tcp_task = tokio::spawn(async move {
         loop {
             // Accept connections but do nothing with them
@@ -397,7 +417,7 @@ pub async fn start_dummy_el(config: DummyElConfig) -> anyhow::Result<()> {
 
     // Spawn P2P UDP listener in a task to keep it alive
     let p2p_udp_socket = tokio::net::UdpSocket::bind(p2p_udp_addr).await?;
-    info!("P2P UDP listening on {}", p2p_udp_addr);
+    debug!("P2P UDP listening on {}", p2p_udp_addr);
     let p2p_udp_task = tokio::spawn(async move {
         let mut buf = [0u8; 1024];
         loop {
@@ -406,7 +426,7 @@ pub async fn start_dummy_el(config: DummyElConfig) -> anyhow::Result<()> {
         }
     });
 
-    info!("Ready to accept requests on all ports");
+    debug!("Ready to accept requests on all ports");
 
     // Spawn all servers concurrently
     let engine_listener = tokio::net::TcpListener::bind(engine_addr).await?;
