@@ -4,7 +4,8 @@
 //! Each verifier implements cryptographic proof verification for a specific zkVM or proof system.
 
 pub mod pico;
-pub mod sp1_hypercube;
+// TODO: Re-enable when sp1-verifier is available as a public repo
+// pub mod sp1_hypercube;
 pub mod zisk;
 pub mod zkcloud;
 pub mod zkm;
@@ -138,7 +139,7 @@ impl VerifierStore {
     /// - proof_id 1 → zisk (ZisK verifier)
     /// - proof_id 2 → zkcloud (ZkCloud verifier)
     /// - proof_id 3 → zkm (ZKM verifier)
-    /// - proof_id 4 → sp1-hypercube (SP1 Hypercube verifier)
+    /// - proof_id 4 → sp1-hypercube (SP1 Hypercube verifier) [DISABLED - awaiting public repo]
     pub fn get_prover_uuid_for_proof_id(&self, proof_id: ExecutionProofId) -> Option<Uuid> {
         let id = proof_id.as_u8() as u32;
         match id {
@@ -146,7 +147,7 @@ impl VerifierStore {
             1 => Some(ethproofs_ids::zisk()),
             2 => Some(ethproofs_ids::zkcloud()),
             3 => Some(ethproofs_ids::zkm()),
-            4 => Some(ethproofs_ids::sp1_hypercube()),
+            // 4 => Some(ethproofs_ids::sp1_hypercube()), // TODO: Re-enable when sp1-verifier is available
             _ => None,
         }
     }
@@ -185,12 +186,13 @@ impl VerifierStore {
             zkm::ZkmVerifier::verify,
         );
 
+        // TODO: Re-enable when sp1-verifier is available as a public repo
         // Register SP1 Hypercube verifier
-        store.register(
-            ethproofs_ids::sp1_hypercube(),
-            sp1_hypercube::Sp1HypercubeVerifier::name(),
-            sp1_hypercube::Sp1HypercubeVerifier::verify,
-        );
+        // store.register(
+        //     ethproofs_ids::sp1_hypercube(),
+        //     sp1_hypercube::Sp1HypercubeVerifier::name(),
+        //     sp1_hypercube::Sp1HypercubeVerifier::verify,
+        // );
 
         store
     }

@@ -16,7 +16,8 @@ execution_layer = { path = "../beacon_node/execution_layer" }
 pico-prism-vm = { git = "https://github.com/ethproofs/pico.git", package = "pico-vm", branch = "ethproofs-pico-prism" }
 proofman-verifier = { git = "https://github.com/0xPolygonHermez/pil2-proofman.git", tag = "v0.12.0" }
 zkm-verifier = { git = "https://github.com/ProjectZKM/Ziren", tag = "v1.2.1" }
-sp1-verifier = { git = "ssh://git@github.com/succinctlabs/sp1-wip.git", rev = "b0f21d18b97cde4a419ec93a9c7c76bbb1eeeaad" }
+# TODO: Re-enable when sp1-verifier is available as a public repo
+# sp1-verifier = { git = "ssh://git@github.com/succinctlabs/sp1-wip.git", rev = "b0f21d18b97cde4a419ec93a9c7c76bbb1eeeaad" }
 bincode = { workspace = true }
 tempfile = { workspace = true }
 reqwest = { workspace = true }
