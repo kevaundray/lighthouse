@@ -822,25 +822,13 @@ pub fn cli_app() -> Command {
                 .display_order(0)
         )
         .arg(
-            Arg::new("dummy-el")
-                .long("dummy-el")
-                .help("Start an in-process dummy execution layer for zkproofs testing. \
-                       This allows running Lighthouse without an external execution client \
-                       by using zero-knowledge proofs to validate blocks. Mutually exclusive \
-                       with --execution-endpoint.")
-                .action(ArgAction::SetTrue)
-                .conflicts_with("execution-endpoint")
-                .help_heading(FLAG_HEADER)
-                .display_order(0)
-        )
-        .arg(
             Arg::new("execution-jwt")
                 .long("execution-jwt")
                 .value_name("EXECUTION-JWT")
                 .alias("jwt-secrets")
                 .help("File path which contains the hex-encoded JWT secret for the \
                        execution endpoint provided in the --execution-endpoint flag.")
-                .requires("execution-endpoint")
+                .requires_one_of(["execution-endpoint", "zk-attester"])
                 .action(ArgAction::Set)
                 .display_order(0)
         )
@@ -851,7 +839,7 @@ pub fn cli_app() -> Command {
                 .alias("jwt-secret-key")
                 .help("Hex-encoded JWT secret for the \
                        execution endpoint provided in the --execution-endpoint flag.")
-                .requires("execution-endpoint")
+                .requires_one_of(["execution-endpoint", "zk-attester"])
                 .conflicts_with("execution-jwt")
                 .action(ArgAction::Set)
                 .display_order(0)
@@ -887,7 +875,7 @@ pub fn cli_app() -> Command {
                 .help("Emergency fallback fee recipient for use in case the validator client does \
                        not have one configured. You should set this flag on the validator \
                        client instead of (or in addition to) setting it here.")
-                .requires("execution-endpoint")
+                .requires_one_of(["execution-endpoint", "zk-attester"])
                 .action(ArgAction::Set)
                 .display_order(0)
         )
@@ -897,7 +885,7 @@ pub fn cli_app() -> Command {
                 .alias("payload-builder")
                 .alias("payload-builders")
                 .help("The URL of a service compatible with the MEV-boost API.")
-                .requires("execution-endpoint")
+                .requires_one_of(["execution-endpoint", "zk-attester"])
                 .action(ArgAction::Set)
                 .display_order(0)
         )

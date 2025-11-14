@@ -269,25 +269,23 @@ pub fn get_config<E: EthSpec>(
         client_config.http_metrics.allocator_metrics_enabled = false;
     }
 
-    // Check if --dummy-el flag is set
-    let mut use_dummy_el = cli_args.get_flag("dummy-el");
-
-    // Auto-enable --dummy-el if --zk-attester is set without --zkvm-generation-proof-types
-    if cli_args.get_flag("zk-attester")
+    // Auto-enable in-process dummy execution layer if --zk-attester is set without
+    // --zkvm-generation-proof-types and no explicit --execution-endpoint is provided.
+    let use_dummy_el = cli_args.get_flag("zk-attester")
         && cli_args
             .get_one::<String>("zkvm-generation-proof-types")
             .is_none()
-    {
-        use_dummy_el = true;
-    }
+        && cli_args
+            .get_one::<String>("execution-endpoint")
+            .is_none();
 
     client_config.use_dummy_el = use_dummy_el;
 
-    // Either `--execution-endpoint` or `--dummy-el` must be supplied.
+    // Configure execution layer: either use provided endpoint or dummy EL (auto-enabled with --zk-attester)
     if !use_dummy_el {
         let endpoints: Option<String> = clap_utils::parse_optional(cli_args, "execution-endpoint")?;
         let endpoints =
-            endpoints.ok_or("Error! Either --execution-endpoint or --dummy-el must be provided")?;
+            endpoints.ok_or("Error! Either --execution-endpoint or --zk-attester must be provided")?;
 
         let mut el_config = execution_layer::Config::default();
 
