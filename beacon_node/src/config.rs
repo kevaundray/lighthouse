@@ -269,23 +269,21 @@ pub fn get_config<E: EthSpec>(
         client_config.http_metrics.allocator_metrics_enabled = false;
     }
 
-    // Auto-enable in-process dummy execution layer if --zk-attester is set without
+    // Auto-enable in-process dummy execution layer if --zkevm-validation is set without
     // --zkvm-generation-proof-types and no explicit --execution-endpoint is provided.
-    let use_dummy_el = cli_args.get_flag("zk-attester")
+    let use_dummy_el = cli_args.get_flag("zkevm-validation")
         && cli_args
             .get_one::<String>("zkvm-generation-proof-types")
             .is_none()
-        && cli_args
-            .get_one::<String>("execution-endpoint")
-            .is_none();
+        && cli_args.get_one::<String>("execution-endpoint").is_none();
 
     client_config.use_dummy_el = use_dummy_el;
 
-    // Configure execution layer: either use provided endpoint or dummy EL (auto-enabled with --zk-attester)
+    // Configure execution layer: either use provided endpoint or dummy EL (auto-enabled with --zkevm-validation)
     if !use_dummy_el {
         let endpoints: Option<String> = clap_utils::parse_optional(cli_args, "execution-endpoint")?;
-        let endpoints =
-            endpoints.ok_or("Error! Either --execution-endpoint or --zk-attester must be provided")?;
+        let endpoints = endpoints
+            .ok_or("Error! Either --execution-endpoint or --zkevm-validation must be provided")?;
 
         let mut el_config = execution_layer::Config::default();
 
@@ -355,9 +353,8 @@ pub fn get_config<E: EthSpec>(
         // Store the EL config in the client config.
         client_config.execution_layer = Some(el_config);
     } else {
-        // When using --dummy-el, create an execution_layer config pointing to localhost
-        // The dummy EL server will be spawned in-process by the client builder
-        info!("Using in-process dummy execution layer (--dummy-el)");
+        // Create an execution_layer config pointing to localhost
+        info!("Using in-process dummy execution layer (--zkevm-validation)");
 
         let mut el_config = execution_layer::Config::default();
 
@@ -369,13 +366,15 @@ pub fn get_config<E: EthSpec>(
 
         // For dummy EL, let ExecutionLayer handle JWT as usual
         // Dummy EL will not validate JWT (no need for local testing)
-        el_config.default_datadir.clone_from(client_config.data_dir());
+        el_config
+            .default_datadir
+            .clone_from(client_config.data_dir());
 
         client_config.execution_layer = Some(el_config);
     }
 
     // Parse ZK-VM execution layer config if provided
-    if cli_args.get_flag("zk-attester") {
+    if cli_args.get_flag("zkevm-validation") {
         let generation_proof_types = if let Some(gen_types_str) =
             clap_utils::parse_optional::<String>(cli_args, "zkvm-generation-proof-types")?
         {
@@ -396,9 +395,7 @@ pub fn get_config<E: EthSpec>(
         } else {
             // No generation proof types provided - running in verification-only mode
             if client_config.use_dummy_el {
-                info!(
-                    "--zk-attester set without --zkvm-generation-proof-types: automatically enabled --dummy-el for proof verification mode"
-                );
+                info!("--zkevm-validation: no EL needed for proof verification");
             }
             HashSet::new()
         };

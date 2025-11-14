@@ -828,7 +828,7 @@ pub fn cli_app() -> Command {
                 .alias("jwt-secrets")
                 .help("File path which contains the hex-encoded JWT secret for the \
                        execution endpoint provided in the --execution-endpoint flag.")
-                .requires_one_of(["execution-endpoint", "zk-attester"])
+                .requires("execution-source")
                 .action(ArgAction::Set)
                 .display_order(0)
         )
@@ -839,7 +839,7 @@ pub fn cli_app() -> Command {
                 .alias("jwt-secret-key")
                 .help("Hex-encoded JWT secret for the \
                        execution endpoint provided in the --execution-endpoint flag.")
-                .requires_one_of(["execution-endpoint", "zk-attester"])
+                .requires("execution-source")
                 .conflicts_with("execution-jwt")
                 .action(ArgAction::Set)
                 .display_order(0)
@@ -875,7 +875,7 @@ pub fn cli_app() -> Command {
                 .help("Emergency fallback fee recipient for use in case the validator client does \
                        not have one configured. You should set this flag on the validator \
                        client instead of (or in addition to) setting it here.")
-                .requires_one_of(["execution-endpoint", "zk-attester"])
+                .requires("execution-source")
                 .action(ArgAction::Set)
                 .display_order(0)
         )
@@ -885,7 +885,7 @@ pub fn cli_app() -> Command {
                 .alias("payload-builder")
                 .alias("payload-builders")
                 .help("The URL of a service compatible with the MEV-boost API.")
-                .requires_one_of(["execution-endpoint", "zk-attester"])
+                .requires("execution-source")
                 .action(ArgAction::Set)
                 .display_order(0)
         )
@@ -934,8 +934,8 @@ pub fn cli_app() -> Command {
         )
         /* ZK-VM Execution Layer settings */
         .arg(
-            Arg::new("zk-attester")
-                .long("zk-attester")
+            Arg::new("zkevm-validation")
+                .long("zkevm-validation")
                 .help("Activates ZKVM execution proof mode. Enables the node to subscribe to the \
                        execution_proof gossip topic, receive and verify execution proofs from peers, \
                        and advertise zkVM support in its ENR for peer discovery. \
@@ -951,7 +951,7 @@ pub fn cli_app() -> Command {
                 .help("Comma-separated list of proof type IDs to generate \
                        (e.g., '0,1' where 0=SP1+Reth, 1=Risc0+Geth). \
                        Optional - nodes can verify proofs without generating them.")
-                .requires("zk-attester")
+                .requires("zkevm-validation")
                 .action(ArgAction::Set)
                 .display_order(0)
         )
@@ -1655,5 +1655,8 @@ pub fn cli_app() -> Command {
                 .action(ArgAction::Set)
                 .hide(true)
         )
+        .group(ArgGroup::new("execution-source")
+            .args(["execution-endpoint", "zkevm-validation"])
+            .required(true))
         .group(ArgGroup::new("enable_http").args(["http", "gui", "staking"]).multiple(true))
 }

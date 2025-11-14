@@ -20,12 +20,12 @@ use beacon_chain::{
 use beacon_chain::{Kzg, LightClientProducerEvent};
 use beacon_processor::{BeaconProcessor, BeaconProcessorChannels};
 use beacon_processor::{BeaconProcessorConfig, BeaconProcessorQueueLengths};
+use dummy_el;
 use environment::RuntimeContext;
 use eth2::{
     BeaconNodeHttpClient, Error as ApiError, Timeouts,
     types::{BlockId, StateId},
 };
-use dummy_el;
 use execution_layer::ExecutionLayer;
 use execution_layer::test_utils::generate_genesis_header;
 use futures::channel::mpsc::Receiver;
@@ -194,9 +194,9 @@ where
             None
         };
 
-        // Spawn the dummy execution layer if --dummy-el flag is set
+        // Spawn the dummy execution layer
         if config.use_dummy_el {
-            info!("Spawning in-process dummy execution layer (--dummy-el)");
+            info!("--zkevm-validation: spawning in-process execution layer");
 
             let dummy_el_config = dummy_el::DummyElConfig {
                 host: "127.0.0.1".to_string(),
