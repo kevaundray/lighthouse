@@ -20,6 +20,7 @@ use serde_json::{json, Value as JsonValue};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
 
 const JSONRPC_VERSION: &str = "2.0";
@@ -34,6 +35,20 @@ pub struct DummyElConfig {
     pub metrics_port: u16,
     pub p2p_port: u16,
     pub jwt_secret_path: Option<PathBuf>,
+}
+
+/// Represents a prepared dummy execution layer ready to run
+pub struct PreparedDummyEl {
+    engine_listener: tokio::net::TcpListener,
+    engine_app: Router,
+    rpc_listener: tokio::net::TcpListener,
+    rpc_app: Router,
+    ws_listener: tokio::net::TcpListener,
+    ws_app: Router,
+    metrics_listener: tokio::net::TcpListener,
+    metrics_app: Router,
+    p2p_tcp_task: tokio::task::JoinHandle<()>,
+    p2p_udp_task: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Debug, Clone)]
@@ -160,21 +175,37 @@ async fn handle_rpc(
         | "engine_newPayloadV2"
         | "engine_newPayloadV3"
         | "engine_newPayloadV4" => {
-            debug!("{}: returning SYNCING status", request.method);
+            debug!("{}: returning VALID status", request.method);
+            // Extract blockHash from the ExecutionPayload (params[0])
+            let block_hash = request
+                .params
+                .get(0)
+                .and_then(|payload| payload.get("blockHash"))
+                .and_then(|hash| hash.as_str())
+                .unwrap_or("0x0000000000000000000000000000000000000000000000000000000000000000");
+
             Ok(json!({
-                "status": "SYNCING",
-                "latestValidHash": null,
+                "status": "VALID",
+                "latestValidHash": block_hash,
                 "validationError": null
             }))
         }
         "engine_forkchoiceUpdatedV1"
         | "engine_forkchoiceUpdatedV2"
         | "engine_forkchoiceUpdatedV3" => {
-            debug!("{}: returning SYNCING status", request.method);
+            debug!("{}: returning VALID status", request.method);
+            // Extract headBlockHash from the ForkchoiceState (params[0])
+            let head_block_hash = request
+                .params
+                .get(0)
+                .and_then(|state| state.get("headBlockHash"))
+                .and_then(|hash| hash.as_str())
+                .unwrap_or("0x0000000000000000000000000000000000000000000000000000000000000000");
+
             Ok(json!({
                 "payloadStatus": {
-                    "status": "SYNCING",
-                    "latestValidHash": null,
+                    "status": "VALID",
+                    "latestValidHash": head_block_hash,
                     "validationError": null
                 },
                 "payloadId": null
@@ -322,11 +353,29 @@ fn read_jwt_secret(path: &PathBuf) -> anyhow::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Start the dummy execution layer server
+/// Prepare the dummy execution layer for startup
 ///
-/// This spawns the dummy EL HTTP servers on the configured ports.
-/// Returns a task handle that should be spawned or awaited.
-pub async fn start_dummy_el(config: DummyElConfig) -> anyhow::Result<()> {
+/// This function binds all necessary ports and prepares the servers,
+/// then signals readiness via the oneshot channel before running the servers.
+/// The function does not return until the servers are shut down.
+pub async fn prepare_and_start_dummy_el(
+    config: DummyElConfig,
+    ready_tx: oneshot::Sender<()>,
+) -> anyhow::Result<()> {
+    let prepared = prepare_dummy_el(config).await?;
+
+    // Signal that we're ready
+    let _ = ready_tx.send(());
+
+    // Now run the servers
+    prepared.run().await
+}
+
+/// Prepare the dummy execution layer server without starting it
+///
+/// This binds all ports and prepares the servers but does not start accepting connections.
+/// Returns a `PreparedDummyEl` that can be run with the `run()` method.
+pub async fn prepare_dummy_el(config: DummyElConfig) -> anyhow::Result<PreparedDummyEl> {
     // Read JWT secret if provided
     let jwt_secret = match &config.jwt_secret_path {
         Some(path) => match read_jwt_secret(path) {
@@ -426,22 +475,51 @@ pub async fn start_dummy_el(config: DummyElConfig) -> anyhow::Result<()> {
         }
     });
 
-    debug!("Ready to accept requests on all ports");
-
-    // Spawn all servers concurrently
+    // Bind all servers without starting them
     let engine_listener = tokio::net::TcpListener::bind(engine_addr).await?;
     let rpc_listener = tokio::net::TcpListener::bind(rpc_addr).await?;
     let ws_listener = tokio::net::TcpListener::bind(ws_addr).await?;
     let metrics_listener = tokio::net::TcpListener::bind(metrics_addr).await?;
 
-    tokio::select! {
-        result = axum::serve(engine_listener, engine_app) => result?,
-        result = axum::serve(rpc_listener, rpc_app) => result?,
-        result = axum::serve(ws_listener, ws_app) => result?,
-        result = axum::serve(metrics_listener, metrics_app) => result?,
-        _ = p2p_tcp_task => {},
-        _ = p2p_udp_task => {},
-    }
+    debug!("All listeners bound and ready");
 
-    Ok(())
+    Ok(PreparedDummyEl {
+        engine_listener,
+        engine_app,
+        rpc_listener,
+        rpc_app,
+        ws_listener,
+        ws_app,
+        metrics_listener,
+        metrics_app,
+        p2p_tcp_task,
+        p2p_udp_task,
+    })
+}
+
+impl PreparedDummyEl {
+    /// Run the prepared dummy execution layer servers
+    pub async fn run(self) -> anyhow::Result<()> {
+        debug!("Running dummy execution layer servers");
+
+        tokio::select! {
+            result = axum::serve(self.engine_listener, self.engine_app) => result?,
+            result = axum::serve(self.rpc_listener, self.rpc_app) => result?,
+            result = axum::serve(self.ws_listener, self.ws_app) => result?,
+            result = axum::serve(self.metrics_listener, self.metrics_app) => result?,
+            _ = self.p2p_tcp_task => {},
+            _ = self.p2p_udp_task => {},
+        }
+
+        Ok(())
+    }
+}
+
+/// Start the dummy execution layer server (legacy function)
+///
+/// This is a convenience function that prepares and starts the dummy EL.
+/// For more control, use `prepare_dummy_el()` and `prepare_and_start_dummy_el()`.
+pub async fn start_dummy_el(config: DummyElConfig) -> anyhow::Result<()> {
+    let prepared = prepare_dummy_el(config).await?;
+    prepared.run().await
 }

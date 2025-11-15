@@ -208,12 +208,24 @@ where
                 jwt_secret_path: None,
             };
 
+            // Create a channel to wait for the dummy EL to be ready
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
             // Spawn the dummy EL in a background task
             tokio::spawn(async move {
-                if let Err(e) = dummy_el::start_dummy_el(dummy_el_config).await {
+                if let Err(e) = dummy_el::prepare_and_start_dummy_el(dummy_el_config, ready_tx).await
+                {
                     eprintln!("Error starting dummy execution layer: {:?}", e);
                 }
             });
+
+            // Wait for the dummy EL to be ready before continuing
+            if let Err(_) = ready_rx.await {
+                return Err(
+                    "Dummy execution layer failed to start or signal readiness".to_string(),
+                );
+            }
+            info!("Dummy execution layer is ready");
         }
 
         let kzg_err_msg = |e| format!("Failed to load trusted setup: {:?}", e);
