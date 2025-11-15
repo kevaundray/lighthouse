@@ -4,8 +4,7 @@
 //! Each verifier implements cryptographic proof verification for a specific zkVM or proof system.
 
 pub mod pico;
-// TODO: Re-enable when sp1-verifier is available as a public repo
-// pub mod sp1_hypercube;
+pub mod sp1_hypercube;
 pub mod zisk;
 pub mod zkcloud;
 pub mod zkm;
@@ -35,7 +34,7 @@ pub mod ethproofs_ids {
     /// ZKM verifier UUID (proof_id = 3)
     pub const ZKM_UUID: &str = "84a01f4b-8078-44cf-b463-90ddcd124960";
 
-    /// SP1 Hypercube verifier UUID (proof_id = 4)
+    /// SP1-Hypercube verifier UUID (proof_id = 4)
     pub const SP1_HYPERCUBE_UUID: &str = "9d0bd54d-69f9-4404-8f30-020516a8155d";
 
     /// Parse a Brevis UUID
@@ -58,7 +57,7 @@ pub mod ethproofs_ids {
         Uuid::parse_str(ZKM_UUID).expect("Valid UUID")
     }
 
-    /// Parse a SP1 Hypercube UUID
+    /// Parse a SP1-Hypercube UUID
     pub fn sp1_hypercube() -> Uuid {
         Uuid::parse_str(SP1_HYPERCUBE_UUID).expect("Valid UUID")
     }
@@ -139,7 +138,7 @@ impl VerifierStore {
     /// - proof_id 1 → zisk (ZisK verifier)
     /// - proof_id 2 → zkcloud (ZkCloud verifier)
     /// - proof_id 3 → zkm (ZKM verifier)
-    /// - proof_id 4 → sp1-hypercube (SP1 Hypercube verifier) [DISABLED - awaiting public repo]
+    /// - proof_id 4 → sp1-hypercube (SP1-Hypercube verifier)
     pub fn get_prover_uuid_for_proof_id(&self, proof_id: ExecutionProofId) -> Option<Uuid> {
         let id = proof_id.as_u8() as u32;
         match id {
@@ -147,7 +146,7 @@ impl VerifierStore {
             1 => Some(ethproofs_ids::zisk()),
             2 => Some(ethproofs_ids::zkcloud()),
             3 => Some(ethproofs_ids::zkm()),
-            // 4 => Some(ethproofs_ids::sp1_hypercube()), // TODO: Re-enable when sp1-verifier is available
+            4 => Some(ethproofs_ids::sp1_hypercube()),
             _ => None,
         }
     }
@@ -186,13 +185,12 @@ impl VerifierStore {
             zkm::ZkmVerifier::verify,
         );
 
-        // TODO: Re-enable when sp1-verifier is available as a public repo
-        // Register SP1 Hypercube verifier
-        // store.register(
-        //     ethproofs_ids::sp1_hypercube(),
-        //     sp1_hypercube::Sp1HypercubeVerifier::name(),
-        //     sp1_hypercube::Sp1HypercubeVerifier::verify,
-        // );
+        // Register SP1-Hypercube verifier
+        store.register(
+            ethproofs_ids::sp1_hypercube(),
+            sp1_hypercube::Sp1HypercubeVerifier::name(),
+            sp1_hypercube::Sp1HypercubeVerifier::verify,
+        );
 
         store
     }
