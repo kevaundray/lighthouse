@@ -60,7 +60,7 @@ pub async fn fetch_proof_from_ethproofs(
     block_hash: types::ExecutionBlockHash,
     cluster: String,
 ) -> Result<Vec<Ethproof>, String> {
-    const MAX_WAIT_TIME_SECS: u64 = 30;
+    const MAX_WAIT_TIME_SECS: u64 = 15;
     const INITIAL_DELAY_MS: u64 = 100;
     const MAX_DELAY_MS: u64 = 5000;
 
@@ -165,6 +165,8 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
     // Check if this is a fallback proof (created when Ethproofs API failed/timed out)
     if proof.proof_id.is_fallback() {
         info!(
+            slot = %proof.slot,
+            block_hash = %proof.block_hash,
             proof_id = %proof.proof_id,
             "[Ethproofs] Fallback proof detected, skipping verification"
         );
@@ -188,6 +190,8 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
             match store.get(&prover_uuid) {
                 Some(vk) => {
                     info!(
+                        slot = %proof.slot,
+                        block_hash = %proof.block_hash,
                         prover_id = %prover_uuid,
                         vk_size = vk.size(),
                         proof_size = proof.proof_data.len(),
@@ -198,6 +202,8 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
                     match VERIFIER_STORE.get(&prover_uuid) {
                         Some(verifier_entry) => {
                             info!(
+                                slot = %proof.slot,
+                                block_hash = %proof.block_hash,
                                 prover_id = %prover_uuid,
                                 verifier = verifier_entry.name,
                                 "[Ethproofs] Found verifier, starting verification"
@@ -207,6 +213,8 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
                             match (verifier_entry.verify_fn)(&proof.proof_data, &vk.vk) {
                                 Ok(result) => {
                                     info!(
+                                        slot = %proof.slot,
+                                        block_hash = %proof.block_hash,
                                         prover_id = %prover_uuid,
                                         verification_result = result,
                                         "[Ethproofs] Verification completed"
@@ -215,6 +223,8 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
                                 }
                                 Err(e) => {
                                     warn!(
+                                        slot = %proof.slot,
+                                        block_hash = %proof.block_hash,
                                         prover_id = %prover_uuid,
                                         error = %e,
                                         "[Ethproofs] Verification failed with error"
@@ -225,6 +235,8 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
                         }
                         None => {
                             warn!(
+                                slot = %proof.slot,
+                                block_hash = %proof.block_hash,
                                 prover_id = %prover_uuid,
                                 "[Ethproofs] No verifier registered for this prover, cannot verify proof"
                             );
@@ -234,6 +246,8 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
                 }
                 None => {
                     warn!(
+                        slot = %proof.slot,
+                        block_hash = %proof.block_hash,
                         prover_id = %prover_uuid,
                         "[Ethproofs] No verification key found for this prover"
                     );

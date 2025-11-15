@@ -76,12 +76,12 @@ impl TreeHash for ExecutionProofId {
 impl ExecutionProofId {
     /// Creates a new ExecutionProofId if the value is valid
     pub fn new(id: u8) -> Result<Self, String> {
-        if id < EXECUTION_PROOF_TYPE_COUNT {
+        if id < EXECUTION_PROOF_TYPE_COUNT || id == FALLBACK_EXECUTION_PROOF_ID {
             Ok(Self(id))
         } else {
             Err(format!(
-                "Invalid ExecutionProofId: {}, must be < {}",
-                id, EXECUTION_PROOF_TYPE_COUNT
+                "Invalid ExecutionProofId: {}, must be < {} or {}",
+                id, EXECUTION_PROOF_TYPE_COUNT, FALLBACK_EXECUTION_PROOF_ID
             ))
         }
     }
@@ -156,5 +156,24 @@ mod tests {
         for (idx, proof_id) in all.iter().enumerate() {
             assert_eq!(proof_id.as_usize(), idx);
         }
+    }
+
+    #[test]
+    fn test_fallback_proof_id() {
+        // Test that fallback() creates an ID with value 255
+        let fallback = ExecutionProofId::fallback();
+        assert_eq!(fallback.as_u8(), FALLBACK_EXECUTION_PROOF_ID);
+        assert!(fallback.is_fallback());
+
+        // Test that new(255) creates a valid fallback ID
+        let fallback_from_new = ExecutionProofId::new(FALLBACK_EXECUTION_PROOF_ID);
+        assert!(fallback_from_new.is_ok());
+        assert_eq!(fallback_from_new.unwrap().as_u8(), FALLBACK_EXECUTION_PROOF_ID);
+
+        // Test that fallback ID can be SSZ encoded and decoded
+        let encoded = fallback.as_ssz_bytes();
+        let decoded = ExecutionProofId::from_ssz_bytes(&encoded);
+        assert!(decoded.is_ok());
+        assert_eq!(decoded.unwrap(), fallback);
     }
 }
