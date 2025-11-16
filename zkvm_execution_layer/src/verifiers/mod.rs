@@ -3,6 +3,7 @@
 //! This module manages different proof verification systems based on prover type.
 //! Each verifier implements cryptographic proof verification for a specific zkVM or proof system.
 
+pub mod fallback;
 pub mod pico;
 pub mod sp1_hypercube;
 pub mod zisk;
@@ -19,23 +20,41 @@ pub type VerificationResult = Result<bool, String>;
 /// Ethproofs demo prover UUIDs - hardcoded mapping for demo testing
 /// These constants define the relationship between internal proof_ids (0, 1, 2, etc.)
 /// and Ethproofs prover UUIDs.
+///
+/// Proof ID Mapping:
+/// - proof_id 0 → Fallback verifier (used when Ethproofs API fails/times out)
+/// - proof_id 1 → Brevis/Pico Prism verifier
+/// - proof_id 2 → ZisK verifier
+/// - proof_id 3 → ZkCloud verifier
+/// - proof_id 4 → ZKM verifier
+/// - proof_id 5 → SP1-Hypercube verifier
+/// - proof_id 6-7 → reserved for future use
 pub mod ethproofs_ids {
     use uuid::Uuid;
 
-    /// Brevis/Pico Prism verifier UUID (proof_id = 0)
+    /// Fallback verifier UUID (proof_id = 0)
+    /// Used for dummy proofs when Ethproofs API fails or times out
+    pub const FALLBACK_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
+    /// Brevis/Pico Prism verifier UUID (proof_id = 1)
     pub const BREVIS_UUID: &str = "79041a5b-ee8d-49b3-8207-86c7debf8e13";
 
-    /// ZisK verifier UUID (proof_id = 1)
+    /// ZisK verifier UUID (proof_id = 2)
     pub const ZISK_UUID: &str = "33f14a82-47b7-42d7-9bc1-b81a46eea4fe";
 
-    /// ZkCloud verifier UUID (proof_id = 2)
+    /// ZkCloud verifier UUID (proof_id = 3)
     pub const ZKCLOUD_UUID: &str = "884fcc21-d522-4b4a-b535-7cfde199485c";
 
-    /// ZKM verifier UUID (proof_id = 3)
+    /// ZKM verifier UUID (proof_id = 4)
     pub const ZKM_UUID: &str = "84a01f4b-8078-44cf-b463-90ddcd124960";
 
-    /// SP1-Hypercube verifier UUID (proof_id = 4)
+    /// SP1-Hypercube verifier UUID (proof_id = 5)
     pub const SP1_HYPERCUBE_UUID: &str = "9d0bd54d-69f9-4404-8f30-020516a8155d";
+
+    /// Parse a Fallback UUID
+    pub fn fallback() -> Uuid {
+        Uuid::parse_str(FALLBACK_UUID).expect("Valid UUID")
+    }
 
     /// Parse a Brevis UUID
     pub fn brevis() -> Uuid {
@@ -134,19 +153,21 @@ impl VerifierStore {
     /// Get the prover UUID corresponding to a proof_id (Ethproofs demo mapping)
     ///
     /// For Ethproofs demo testing, this provides a hardcoded mapping of proof_ids to prover UUIDs:
-    /// - proof_id 0 → brevis (Pico verifier)
-    /// - proof_id 1 → zisk (ZisK verifier)
-    /// - proof_id 2 → zkcloud (ZkCloud verifier)
-    /// - proof_id 3 → zkm (ZKM verifier)
-    /// - proof_id 4 → sp1-hypercube (SP1-Hypercube verifier)
+    /// - proof_id 0 → fallback (Fallback verifier)
+    /// - proof_id 1 → brevis (Pico verifier)
+    /// - proof_id 2 → zisk (ZisK verifier)
+    /// - proof_id 3 → zkcloud (ZkCloud verifier)
+    /// - proof_id 4 → zkm (ZKM verifier)
+    /// - proof_id 5 → sp1-hypercube (SP1-Hypercube verifier)
     pub fn get_prover_uuid_for_proof_id(&self, proof_id: ExecutionProofId) -> Option<Uuid> {
         let id = proof_id.as_u8() as u32;
         match id {
-            0 => Some(ethproofs_ids::brevis()),
-            1 => Some(ethproofs_ids::zisk()),
-            2 => Some(ethproofs_ids::zkcloud()),
-            3 => Some(ethproofs_ids::zkm()),
-            4 => Some(ethproofs_ids::sp1_hypercube()),
+            0 => Some(ethproofs_ids::fallback()),
+            1 => Some(ethproofs_ids::brevis()),
+            2 => Some(ethproofs_ids::zisk()),
+            3 => Some(ethproofs_ids::zkcloud()),
+            4 => Some(ethproofs_ids::zkm()),
+            5 => Some(ethproofs_ids::sp1_hypercube()),
             _ => None,
         }
     }
@@ -156,6 +177,13 @@ impl VerifierStore {
     /// This registers verifiers for known Ethproofs prover UUIDs
     pub fn with_defaults() -> Self {
         let mut store = Self::new();
+
+        // Register Fallback verifier
+        store.register(
+            ethproofs_ids::fallback(),
+            fallback::FallbackVerifier::name(),
+            fallback::FallbackVerifier::verify,
+        );
 
         // Register Pico verifier for brevis
         store.register(

@@ -161,14 +161,15 @@ pub async fn download_proof_binary(proof_id: u64) -> Result<Vec<u8>, String> {
 /// 1. Looking up the verifier for the proof's proof_id
 /// 2. Running the cryptographic verification function
 /// 3. Returning whether the proof is valid
+///
+/// Note: Fallback proofs (proof_id = 0) bypass this pipeline and are accepted immediately.
 pub fn validate_proof(proof: &ExecutionProof) -> bool {
-    // Check if this is a fallback proof (created when Ethproofs API failed/timed out)
-    if proof.proof_id.is_fallback() {
+    // Fallback proofs (proof_id 0) are accepted without verification
+    if proof.proof_id.as_u8() == 0 {
         info!(
             slot = %proof.slot,
             block_hash = %proof.block_hash,
-            proof_id = %proof.proof_id,
-            "[Ethproofs] Fallback proof detected, skipping verification"
+            "[Ethproofs] Fallback proof accepted without cryptographic verification"
         );
         return true;
     }
@@ -206,7 +207,7 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
                                 block_hash = %proof.block_hash,
                                 prover_id = %prover_uuid,
                                 verifier = verifier_entry.name,
-                                "[Ethproofs] Found verifier, starting verification"
+                                "[Ethproofs] Verification started"
                             );
 
                             // Run the actual cryptographic verification

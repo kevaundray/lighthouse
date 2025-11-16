@@ -6,7 +6,6 @@ use async_trait::async_trait;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{info, warn};
-use types::execution_proof_id::FALLBACK_EXECUTION_PROOF_ID;
 use types::{ExecutionBlockHash, ExecutionProof, ExecutionProofId, Hash256, Slot};
 
 /// TODO(ethproofs): Implementation of proof generation for demo.
@@ -39,7 +38,8 @@ impl DummyProofGenerator {
 
     /// TODO(ethproofs): Fallback when the Ethproofs API fails or test verification fails.
     ///
-    /// Create a fallback dummy proof with a reserved fallback proof ID
+    /// Create a fallback dummy proof using proof_id 0, which maps to the FallbackVerifier.
+    /// The FallbackVerifier skips cryptographic verification and accepts all proofs.
     fn create_dummy_proof(
         &self,
         slot: Slot,
@@ -47,15 +47,15 @@ impl DummyProofGenerator {
         block_root: &Hash256,
     ) -> ProofGenerationResult<ExecutionProof> {
         let dummy_data = format!(
-            "ethproofs_fallback_proof_id_{}_slot_{}_hash_{}",
-            FALLBACK_EXECUTION_PROOF_ID,
+            "ethproofs_fallback_proof_id_0_slot_{}_hash_{}",
             slot.as_u64(),
             payload_hash
         )
         .into_bytes();
 
-        // Use the fallback proof ID to mark this as a dummy proof
-        let fallback_proof_id = ExecutionProofId::fallback();
+        // Use proof_id 0 (Fallback verifier) to mark this as a dummy proof
+        let fallback_proof_id = ExecutionProofId::new(0)
+            .expect("proof_id 0 is always valid");
         ExecutionProof::new(
             fallback_proof_id,
             slot,
@@ -190,7 +190,8 @@ mod tests {
 
         let proof = result.unwrap();
 
-        assert!(proof.proof_id.is_fallback());
+        // Should create a fallback proof (proof_id = 0)
+        assert_eq!(proof.proof_id.as_u8(), 0);
         assert_eq!(proof.slot, slot);
         assert_eq!(proof.block_hash, block_hash);
         assert_eq!(proof.block_root, block_root);

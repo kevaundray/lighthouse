@@ -9,11 +9,6 @@ use tree_hash::TreeHash;
 /// TODO(zkproofs): The number 8 is a parameter that we will want to configure in the future
 pub const EXECUTION_PROOF_TYPE_COUNT: u8 = 8;
 
-/// TODO(ethproofs): Added to handle when proof generation fails.
-///
-/// Special proof ID reserved for fallback proofs
-pub const FALLBACK_EXECUTION_PROOF_ID: u8 = 255;
-
 /// ExecutionProofId identifies which zkVM/proof system a proof belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ExecutionProofId(u8);
@@ -75,21 +70,17 @@ impl TreeHash for ExecutionProofId {
 
 impl ExecutionProofId {
     /// Creates a new ExecutionProofId if the value is valid
+    ///
+    /// Valid IDs are in the range [0, EXECUTION_PROOF_TYPE_COUNT).
     pub fn new(id: u8) -> Result<Self, String> {
-        if id < EXECUTION_PROOF_TYPE_COUNT || id == FALLBACK_EXECUTION_PROOF_ID {
+        if id < EXECUTION_PROOF_TYPE_COUNT {
             Ok(Self(id))
         } else {
             Err(format!(
-                "Invalid ExecutionProofId: {}, must be < {} or {}",
-                id, EXECUTION_PROOF_TYPE_COUNT, FALLBACK_EXECUTION_PROOF_ID
+                "Invalid ExecutionProofId: {}, must be < {}",
+                id, EXECUTION_PROOF_TYPE_COUNT
             ))
         }
-    }
-
-    /// Creates a fallback ExecutionProofId (255)
-    /// Used for dummy proofs when Ethproofs API fails or times out
-    pub fn fallback() -> Self {
-        Self(FALLBACK_EXECUTION_PROOF_ID)
     }
 
     /// Returns the inner u8 value
@@ -97,17 +88,12 @@ impl ExecutionProofId {
         self.0
     }
 
-    /// Check if this is a fallback proof ID
-    pub fn is_fallback(&self) -> bool {
-        self.0 == FALLBACK_EXECUTION_PROOF_ID
-    }
-
-    /// Returns the subnet ID as a usize
+    /// Returns the proof ID as a usize
     pub fn as_usize(&self) -> usize {
         self.0 as usize
     }
 
-    /// Returns all valid subnet IDs
+    /// Returns all valid proof IDs
     pub fn all() -> Vec<Self> {
         (0..EXECUTION_PROOF_TYPE_COUNT).map(Self).collect()
     }
@@ -156,24 +142,5 @@ mod tests {
         for (idx, proof_id) in all.iter().enumerate() {
             assert_eq!(proof_id.as_usize(), idx);
         }
-    }
-
-    #[test]
-    fn test_fallback_proof_id() {
-        // Test that fallback() creates an ID with value 255
-        let fallback = ExecutionProofId::fallback();
-        assert_eq!(fallback.as_u8(), FALLBACK_EXECUTION_PROOF_ID);
-        assert!(fallback.is_fallback());
-
-        // Test that new(255) creates a valid fallback ID
-        let fallback_from_new = ExecutionProofId::new(FALLBACK_EXECUTION_PROOF_ID);
-        assert!(fallback_from_new.is_ok());
-        assert_eq!(fallback_from_new.unwrap().as_u8(), FALLBACK_EXECUTION_PROOF_ID);
-
-        // Test that fallback ID can be SSZ encoded and decoded
-        let encoded = fallback.as_ssz_bytes();
-        let decoded = ExecutionProofId::from_ssz_bytes(&encoded);
-        assert!(decoded.is_ok());
-        assert_eq!(decoded.unwrap(), fallback);
     }
 }
