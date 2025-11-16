@@ -4,7 +4,7 @@ use once_cell::sync::Lazy;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use types::ExecutionProof;
 
 /// Trait for validating proofs
@@ -60,7 +60,7 @@ pub async fn fetch_proof_from_ethproofs(
     block_hash: types::ExecutionBlockHash,
     cluster: String,
 ) -> Result<Vec<Ethproof>, String> {
-    const MAX_WAIT_TIME_SECS: u64 = 15;
+    const MAX_WAIT_TIME_SECS: u64 = 60;
     const INITIAL_DELAY_MS: u64 = 100;
     const MAX_DELAY_MS: u64 = 5000;
 
@@ -169,7 +169,7 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
         info!(
             slot = %proof.slot,
             block_hash = %proof.block_hash,
-            "[Ethproofs] Fallback proof accepted without cryptographic verification"
+            "[Ethproofs] Fallback proof accepted"
         );
         return true;
     }
@@ -190,7 +190,7 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
         Some(store) => {
             match store.get(&prover_uuid) {
                 Some(vk) => {
-                    info!(
+                    debug!(
                         slot = %proof.slot,
                         block_hash = %proof.block_hash,
                         prover_id = %prover_uuid,
@@ -205,7 +205,6 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
                             info!(
                                 slot = %proof.slot,
                                 block_hash = %proof.block_hash,
-                                prover_id = %prover_uuid,
                                 verifier = verifier_entry.name,
                                 "[Ethproofs] Verification started"
                             );
@@ -216,7 +215,7 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
                                     info!(
                                         slot = %proof.slot,
                                         block_hash = %proof.block_hash,
-                                        prover_id = %prover_uuid,
+                                        verifier = verifier_entry.name,
                                         verification_result = result,
                                         "[Ethproofs] Verification completed"
                                     );
@@ -226,9 +225,9 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
                                     warn!(
                                         slot = %proof.slot,
                                         block_hash = %proof.block_hash,
-                                        prover_id = %prover_uuid,
+                                        verifier = verifier_entry.name,
                                         error = %e,
-                                        "[Ethproofs] Verification failed with error"
+                                        "[Ethproofs] Verification failed"
                                     );
                                     false
                                 }
@@ -239,7 +238,7 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
                                 slot = %proof.slot,
                                 block_hash = %proof.block_hash,
                                 prover_id = %prover_uuid,
-                                "[Ethproofs] No verifier registered for this prover, cannot verify proof"
+                                "[Ethproofs] No registered verifier"
                             );
                             false
                         }
@@ -250,7 +249,7 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
                         slot = %proof.slot,
                         block_hash = %proof.block_hash,
                         prover_id = %prover_uuid,
-                        "[Ethproofs] No verification key found for this prover"
+                        "[Ethproofs] No verification key found"
                     );
                     false
                 }

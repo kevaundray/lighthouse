@@ -54,8 +54,7 @@ impl DummyProofGenerator {
         .into_bytes();
 
         // Use proof_id 0 (Fallback verifier) to mark this as a dummy proof
-        let fallback_proof_id = ExecutionProofId::new(0)
-            .expect("proof_id 0 is always valid");
+        let fallback_proof_id = ExecutionProofId::new(0).expect("proof_id 0 is always valid");
         ExecutionProof::new(
             fallback_proof_id,
             slot,
@@ -152,7 +151,7 @@ impl ProofGenerator for DummyProofGenerator {
                 info!(
                     proof_id = %self.proof_id,
                     block_hash = %payload_hash,
-                    "[Ethproofs] API proof generation failed, using dummy fallback"
+                    "[Ethproofs] API proof generation failed, using fallback"
                 );
                 self.create_dummy_proof(slot, payload_hash, block_root)
             }
@@ -161,7 +160,7 @@ impl ProofGenerator for DummyProofGenerator {
                     proof_id = %self.proof_id,
                     block_hash = %payload_hash,
                     error = %e,
-                    "[Ethproofs] Failed to fetch proofs, using dummy fallback"
+                    "[Ethproofs] Failed to fetch proofs, using fallback"
                 );
                 self.create_dummy_proof(slot, payload_hash, block_root)
             }

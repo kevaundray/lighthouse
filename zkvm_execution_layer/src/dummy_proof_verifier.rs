@@ -2,7 +2,7 @@ use crate::ethproofs_demo::{EthproofsValidator, ProofValidator};
 use crate::proof_verification::{ProofVerificationResult, ProofVerifier, VerificationError};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::info;
+use tracing::debug;
 use types::{ExecutionProof, ExecutionProofId};
 
 /// TODO(ethproofs): Ethproofs demo implementation of proof verification.
@@ -58,7 +58,7 @@ impl ProofVerifier for DummyVerifier {
             std::thread::sleep(self.verification_delay);
         }
 
-        info!(
+        debug!(
             proof_id = %self.proof_id,
             block_hash = %proof.block_hash,
             "[Ethproofs] Verifying proof"
