@@ -3,6 +3,7 @@
 //! This module manages different proof verification systems based on prover type.
 //! Each verifier implements cryptographic proof verification for a specific zkVM or proof system.
 
+pub mod axiom;
 pub mod fallback;
 pub mod pico;
 pub mod sp1_hypercube;
@@ -28,7 +29,8 @@ pub type VerificationResult = Result<bool, String>;
 /// - proof_id 3 → ZkCloud verifier
 /// - proof_id 4 → ZKM verifier
 /// - proof_id 5 → SP1-Hypercube verifier
-/// - proof_id 6-7 → reserved for future use
+/// - proof_id 6 → Axiom verifier
+/// - proof_id 7 → reserved for future use
 pub mod ethproofs_ids {
     use uuid::Uuid;
 
@@ -50,6 +52,9 @@ pub mod ethproofs_ids {
 
     /// SP1-Hypercube verifier UUID (proof_id = 5)
     pub const SP1_HYPERCUBE_UUID: &str = "9d0bd54d-69f9-4404-8f30-020516a8155d";
+
+    /// Axiom verifier UUID (proof_id = 6)
+    pub const AXIOM_UUID: &str = "425971e7-78eb-4d61-95d9-e9eea62f41da";
 
     /// Parse a Fallback UUID
     pub fn fallback() -> Uuid {
@@ -79,6 +84,11 @@ pub mod ethproofs_ids {
     /// Parse a SP1-Hypercube UUID
     pub fn sp1_hypercube() -> Uuid {
         Uuid::parse_str(SP1_HYPERCUBE_UUID).expect("Valid UUID")
+    }
+
+    /// Parse an Axiom UUID
+    pub fn axiom() -> Uuid {
+        Uuid::parse_str(AXIOM_UUID).expect("Valid UUID")
     }
 }
 
@@ -159,6 +169,7 @@ impl VerifierStore {
     /// - proof_id 3 → zkcloud (ZkCloud verifier)
     /// - proof_id 4 → zkm (ZKM verifier)
     /// - proof_id 5 → sp1-hypercube (SP1-Hypercube verifier)
+    /// - proof_id 6 → axiom (Axiom verifier)
     pub fn get_prover_uuid_for_proof_id(&self, proof_id: ExecutionProofId) -> Option<Uuid> {
         let id = proof_id.as_u8() as u32;
         match id {
@@ -168,6 +179,7 @@ impl VerifierStore {
             3 => Some(ethproofs_ids::zkcloud()),
             4 => Some(ethproofs_ids::zkm()),
             5 => Some(ethproofs_ids::sp1_hypercube()),
+            6 => Some(ethproofs_ids::axiom()),
             _ => None,
         }
     }
@@ -218,6 +230,13 @@ impl VerifierStore {
             ethproofs_ids::sp1_hypercube(),
             sp1_hypercube::Sp1HypercubeVerifier::name(),
             sp1_hypercube::Sp1HypercubeVerifier::verify,
+        );
+
+        // Register Axiom verifier
+        store.register(
+            ethproofs_ids::axiom(),
+            axiom::AxiomVerifier::name(),
+            axiom::AxiomVerifier::verify,
         );
 
         store

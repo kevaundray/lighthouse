@@ -17,6 +17,8 @@ pico-prism-vm = { git = "https://github.com/ethproofs/pico.git", package = "pico
 proofman-verifier = { git = "https://github.com/0xPolygonHermez/pil2-proofman.git", tag = "v0.12.0" }
 zkm-verifier = { git = "https://github.com/ProjectZKM/Ziren", tag = "v1.2.1" }
 sp1-verifier = { git = "https://github.com/succinctlabs/hypercube-verifier.git", branch = "ethproofs_demo" }
+verify-stark = { git = "https://github.com/openvm-org/openvm.git", branch = "feat/v1-verify-stark", package = "verify-stark" }
+bitcode = { version = "0.5", features = ["serde"] }
 bincode = { workspace = true }
 tempfile = { workspace = true }
 reqwest = { workspace = true }
