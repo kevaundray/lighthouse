@@ -3,13 +3,12 @@
 //! This module manages different proof verification systems based on prover type.
 //! Each verifier implements cryptographic proof verification for a specific zkVM or proof system.
 
-pub mod axiom;
 pub mod fallback;
+pub mod openvm;
 pub mod pico;
 pub mod sp1_hypercube;
 pub mod zisk;
 pub mod zkcloud;
-pub mod zkm;
 
 use std::collections::HashMap;
 use types::ExecutionProofId;
@@ -22,15 +21,15 @@ pub type VerificationResult = Result<bool, String>;
 /// These constants define the relationship between internal proof_ids (0, 1, 2, etc.)
 /// and Ethproofs prover UUIDs.
 ///
-/// Proof ID Mapping:
+/// Proof ID Mapping (alphabetical order, Fallback first, Airbender reserved):
 /// - proof_id 0 → Fallback verifier (used when Ethproofs API fails/times out)
-/// - proof_id 1 → Brevis/Pico Prism verifier
-/// - proof_id 2 → ZisK verifier
-/// - proof_id 3 → ZkCloud verifier
-/// - proof_id 4 → ZKM verifier
-/// - proof_id 5 → SP1-Hypercube verifier
-/// - proof_id 6 → Axiom verifier
-/// - proof_id 7 → reserved for future use
+/// - proof_id 1 → Airbender verifier (reserved for future use)
+/// - proof_id 2 → OpenVM verifier
+/// - proof_id 3 → Pico Prism verifier
+/// - proof_id 4 → SP1-Hypercube verifier
+/// - proof_id 5 → ZisK 1 (Girona) verifier
+/// - proof_id 6 → ZisK 2 (Sevilla) verifier
+/// - proof_id 7 → ZisK-ZkCloud verifier
 pub mod ethproofs_ids {
     use uuid::Uuid;
 
@@ -38,47 +37,37 @@ pub mod ethproofs_ids {
     /// Used for dummy proofs when Ethproofs API fails or times out
     pub const FALLBACK_UUID: &str = "00000000-0000-0000-0000-000000000000";
 
-    /// Brevis/Pico Prism verifier UUID (proof_id = 1)
-    pub const BREVIS_UUID: &str = "79041a5b-ee8d-49b3-8207-86c7debf8e13";
+    /// OpenVM verifier UUID (proof_id = 2)
+    pub const OPENVM_UUID: &str = "425971e7-78eb-4d61-95d9-e9eea62f41da";
 
-    /// ZisK verifier UUID (proof_id = 2)
-    pub const ZISK_UUID: &str = "33f14a82-47b7-42d7-9bc1-b81a46eea4fe";
+    /// Pico Prism verifier UUID (proof_id = 3)
+    pub const PICO_UUID: &str = "f404c187-88d6-4927-963c-61760a639900";
 
-    /// ZkCloud verifier UUID (proof_id = 3)
-    pub const ZKCLOUD_UUID: &str = "884fcc21-d522-4b4a-b535-7cfde199485c";
-
-    /// ZKM verifier UUID (proof_id = 4)
-    pub const ZKM_UUID: &str = "84a01f4b-8078-44cf-b463-90ddcd124960";
-
-    /// SP1-Hypercube verifier UUID (proof_id = 5)
+    /// SP1-Hypercube verifier UUID (proof_id = 4)
     pub const SP1_HYPERCUBE_UUID: &str = "9d0bd54d-69f9-4404-8f30-020516a8155d";
 
-    /// Axiom verifier UUID (proof_id = 6)
-    pub const AXIOM_UUID: &str = "425971e7-78eb-4d61-95d9-e9eea62f41da";
+    /// ZisK 1 (Girona) verifier UUID (proof_id = 5)
+    pub const ZISK_1_GIRONA_UUID: &str = "817bbf03-07b4-466d-879b-e476322bd080";
+
+    /// ZisK 2 (Sevilla) verifier UUID (proof_id = 6)
+    pub const ZISK_2_SEVILLA_UUID: &str = "534e6cf4-3dfe-47de-bba2-a0b11d544557";
+
+    /// ZisK-ZkCloud verifier UUID (proof_id = 7)
+    pub const ZISK_ZKCLOUD_UUID: &str = "884fcc21-d522-4b4a-b535-7cfde199485c";
 
     /// Parse a Fallback UUID
     pub fn fallback() -> Uuid {
         Uuid::parse_str(FALLBACK_UUID).expect("Valid UUID")
     }
 
-    /// Parse a Brevis UUID
-    pub fn brevis() -> Uuid {
-        Uuid::parse_str(BREVIS_UUID).expect("Valid UUID")
+    /// Parse an OpenVM UUID
+    pub fn openvm() -> Uuid {
+        Uuid::parse_str(OPENVM_UUID).expect("Valid UUID")
     }
 
-    /// Parse a ZisK UUID
-    pub fn zisk() -> Uuid {
-        Uuid::parse_str(ZISK_UUID).expect("Valid UUID")
-    }
-
-    /// Parse a ZkCloud UUID
-    pub fn zkcloud() -> Uuid {
-        Uuid::parse_str(ZKCLOUD_UUID).expect("Valid UUID")
-    }
-
-    /// Parse a ZKM UUID
-    pub fn zkm() -> Uuid {
-        Uuid::parse_str(ZKM_UUID).expect("Valid UUID")
+    /// Parse a Pico UUID
+    pub fn pico() -> Uuid {
+        Uuid::parse_str(PICO_UUID).expect("Valid UUID")
     }
 
     /// Parse a SP1-Hypercube UUID
@@ -86,9 +75,19 @@ pub mod ethproofs_ids {
         Uuid::parse_str(SP1_HYPERCUBE_UUID).expect("Valid UUID")
     }
 
-    /// Parse an Axiom UUID
-    pub fn axiom() -> Uuid {
-        Uuid::parse_str(AXIOM_UUID).expect("Valid UUID")
+    /// Parse a ZisK 1 (Girona) UUID
+    pub fn zisk_1_girona() -> Uuid {
+        Uuid::parse_str(ZISK_1_GIRONA_UUID).expect("Valid UUID")
+    }
+
+    /// Parse a ZisK 2 (Sevilla) UUID
+    pub fn zisk_2_sevilla() -> Uuid {
+        Uuid::parse_str(ZISK_2_SEVILLA_UUID).expect("Valid UUID")
+    }
+
+    /// Parse a ZisK-ZkCloud UUID
+    pub fn zisk_zkcloud() -> Uuid {
+        Uuid::parse_str(ZISK_ZKCLOUD_UUID).expect("Valid UUID")
     }
 }
 
@@ -163,23 +162,25 @@ impl VerifierStore {
     /// Get the prover UUID corresponding to a proof_id (Ethproofs demo mapping)
     ///
     /// For Ethproofs demo testing, this provides a hardcoded mapping of proof_ids to prover UUIDs:
-    /// - proof_id 0 → fallback (Fallback verifier)
-    /// - proof_id 1 → brevis (Pico verifier)
-    /// - proof_id 2 → zisk (ZisK verifier)
-    /// - proof_id 3 → zkcloud (ZkCloud verifier)
-    /// - proof_id 4 → zkm (ZKM verifier)
-    /// - proof_id 5 → sp1-hypercube (SP1-Hypercube verifier)
-    /// - proof_id 6 → axiom (Axiom verifier)
+    /// - proof_id 0 → fallback
+    /// - proof_id 1 → airbender
+    /// - proof_id 2 → openvm
+    /// - proof_id 3 → pico
+    /// - proof_id 4 → sp1_hypercube
+    /// - proof_id 5 → zisk_1_girona
+    /// - proof_id 6 → zisk_2_sevilla
+    /// - proof_id 7 → zisk_zkcloud
     pub fn get_prover_uuid_for_proof_id(&self, proof_id: ExecutionProofId) -> Option<Uuid> {
         let id = proof_id.as_u8() as u32;
         match id {
             0 => Some(ethproofs_ids::fallback()),
-            1 => Some(ethproofs_ids::brevis()),
-            2 => Some(ethproofs_ids::zisk()),
-            3 => Some(ethproofs_ids::zkcloud()),
-            4 => Some(ethproofs_ids::zkm()),
-            5 => Some(ethproofs_ids::sp1_hypercube()),
-            6 => Some(ethproofs_ids::axiom()),
+            1 => None, // Reserved for Airbender
+            2 => Some(ethproofs_ids::openvm()),
+            3 => Some(ethproofs_ids::pico()),
+            4 => Some(ethproofs_ids::sp1_hypercube()),
+            5 => Some(ethproofs_ids::zisk_1_girona()),
+            6 => Some(ethproofs_ids::zisk_2_sevilla()),
+            7 => Some(ethproofs_ids::zisk_zkcloud()),
             _ => None,
         }
     }
@@ -190,53 +191,55 @@ impl VerifierStore {
     pub fn with_defaults() -> Self {
         let mut store = Self::new();
 
-        // Register Fallback verifier
+        // Register Fallback verifier (proof_id 0)
         store.register(
             ethproofs_ids::fallback(),
             fallback::FallbackVerifier::name(),
             fallback::FallbackVerifier::verify,
         );
 
-        // Register Pico verifier for brevis
+        // proof_id 1 reserved for Airbender
+
+        // Register OpenVM verifier (proof_id 2)
         store.register(
-            ethproofs_ids::brevis(),
+            ethproofs_ids::openvm(),
+            openvm::OpenvmVerifier::name(),
+            openvm::OpenvmVerifier::verify,
+        );
+
+        // Register Pico verifier (proof_id 3)
+        store.register(
+            ethproofs_ids::pico(),
             pico::PicoVerifier::name(),
             pico::PicoVerifier::verify,
         );
 
-        // Register ZisK verifier
-        store.register(
-            ethproofs_ids::zisk(),
-            zisk::ZiskVerifier::name(),
-            zisk::ZiskVerifier::verify,
-        );
-
-        // Register ZkCloud verifier (uses ZisK)
-        store.register(
-            ethproofs_ids::zkcloud(),
-            zkcloud::ZkcloudVerifier::name(),
-            zkcloud::ZkcloudVerifier::verify,
-        );
-
-        // Register ZKM verifier
-        store.register(
-            ethproofs_ids::zkm(),
-            zkm::ZkmVerifier::name(),
-            zkm::ZkmVerifier::verify,
-        );
-
-        // Register SP1-Hypercube verifier
+        // Register SP1-Hypercube verifier (proof_id 4)
         store.register(
             ethproofs_ids::sp1_hypercube(),
             sp1_hypercube::Sp1HypercubeVerifier::name(),
             sp1_hypercube::Sp1HypercubeVerifier::verify,
         );
 
-        // Register Axiom verifier
+        // Register ZisK 1 (Girona) verifier (proof_id 5)
         store.register(
-            ethproofs_ids::axiom(),
-            axiom::AxiomVerifier::name(),
-            axiom::AxiomVerifier::verify,
+            ethproofs_ids::zisk_1_girona(),
+            zisk::ZiskVerifier::name(),
+            zisk::ZiskVerifier::verify,
+        );
+
+        // Register ZisK 2 (Sevilla) verifier (proof_id 6)
+        store.register(
+            ethproofs_ids::zisk_2_sevilla(),
+            zisk::ZiskVerifier::name(),
+            zisk::ZiskVerifier::verify,
+        );
+
+        // Register ZisK-ZkCloud verifier (proof_id 7)
+        store.register(
+            ethproofs_ids::zisk_zkcloud(),
+            zkcloud::ZkcloudVerifier::name(),
+            zkcloud::ZkcloudVerifier::verify,
         );
 
         store

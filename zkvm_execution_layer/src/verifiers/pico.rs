@@ -107,11 +107,11 @@ mod tests {
     fn test_pico_verifier_with_real_proof() {
         // Path to the test proof file
         let proof_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("src/test_proofs/brevis_79041a5b-ee8d-49b3-8207-86c7debf8e13_542871.bin");
+            .join("src/test_proofs/pico_f404c187-88d6-4927-963c-61760a639900.bin");
 
         // Path to the verification key file
         let vk_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("src/verification_keys/brevis_79041a5b-ee8d-49b3-8207-86c7debf8e13.bin");
+            .join("src/verification_keys/pico_f404c187-88d6-4927-963c-61760a639900.bin");
 
         // Read the proof and verification key
         let proof_data = std::fs::read(&proof_path)

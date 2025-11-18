@@ -222,8 +222,8 @@ mod tests {
         let prover_id1 = Uuid::new_v4();
         let prover_id2 = Uuid::new_v4();
 
-        let vk1_path = vk_dir.join(format!("brevis_{}.bin", prover_id1));
-        let vk2_path = vk_dir.join(format!("zkm_{}.bin", prover_id2));
+        let vk1_path = vk_dir.join(format!("pico_{}.bin", prover_id1));
+        let vk2_path = vk_dir.join(format!("openvm_{}.bin", prover_id2));
 
         fs::write(&vk1_path, vec![1, 2, 3, 4]).unwrap();
         fs::write(&vk2_path, vec![5, 6, 7, 8, 9]).unwrap();

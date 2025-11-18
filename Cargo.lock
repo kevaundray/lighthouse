@@ -81,7 +81,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d122413f284cf2d62fb1b7db97e02edb8cda96d769b16e443a4f6195e35662b0"
 dependencies = [
  "crypto-common",
- "generic-array 0.14.7",
+ "generic-array",
 ]
 
 [[package]]
@@ -1590,7 +1590,7 @@ version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4152116fd6e9dadb291ae18fc1ec3575ed6d84c29642d97890f4b4a3417297e4"
 dependencies = [
- "generic-array 0.14.7",
+ "generic-array",
 ]
 
 [[package]]
@@ -1599,7 +1599,7 @@ version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
- "generic-array 0.14.7",
+ "generic-array",
 ]
 
 [[package]]
@@ -1867,25 +1867,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
 
 [[package]]
-name = "cbindgen"
-version = "0.27.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fce8dd7fcfcbf3a0a87d8f515194b49d6135acab73e18bd380d1d93bb1a15eb"
-dependencies = [
- "clap",
- "heck 0.4.1",
- "indexmap 2.12.1",
- "log",
- "proc-macro2",
- "quote",
- "serde",
- "serde_json",
- "syn 2.0.111",
- "tempfile",
- "toml",
-]
-
-[[package]]
 name = "cc"
 version = "1.2.48"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1989,7 +1970,7 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ee52072ec15386f770805afd189a01c8841be8696bed250fa2f13c4c0d6dfb7"
 dependencies = [
- "generic-array 0.14.7",
+ "generic-array",
 ]
 
 [[package]]
@@ -2499,7 +2480,7 @@ version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0dc92fb57ca44df6db8059111ab3af99a63d5d0f8375d9972e319a379c6bab76"
 dependencies = [
- "generic-array 0.14.7",
+ "generic-array",
  "rand_core 0.6.4",
  "subtle",
  "zeroize",
@@ -2511,7 +2492,7 @@ version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
- "generic-array 0.14.7",
+ "generic-array",
  "rand_core 0.6.4",
  "typenum",
 ]
@@ -2522,7 +2503,7 @@ version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25fab6889090c8133f3deb8f73ba3c65a7f456f66436fc012a1b1e272b1e103e"
 dependencies = [
- "generic-array 0.14.7",
+ "generic-array",
  "subtle",
 ]
 
@@ -3071,7 +3052,7 @@ version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3dd60d1080a57a05ab032377049e0591415d2b31afd7028356dbf3cc6dcb066"
 dependencies = [
- "generic-array 0.14.7",
+ "generic-array",
 ]
 
 [[package]]
@@ -3482,7 +3463,7 @@ dependencies = [
  "crypto-bigint",
  "digest 0.10.7",
  "ff 0.13.1",
- "generic-array 0.14.7",
+ "generic-array",
  "group 0.13.0",
  "hkdf",
  "pem-rfc7468",
@@ -3541,27 +3522,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "enum-map"
-version = "2.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6866f3bfdf8207509a033af1a75a7b08abda06bbaaeae6669323fd5a097df2e9"
-dependencies = [
- "enum-map-derive",
- "serde",
-]
-
-[[package]]
-name = "enum-map-derive"
-version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f282cfdfe92516eb26c2af8589c274c7c17681f5ecc03c18255fe741c6aa64eb"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.111",
-]
-
-[[package]]
 name = "enum-ordinalize"
 version = "4.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3591,29 +3551,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.111",
-]
-
-[[package]]
-name = "env_filter"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bf3c259d255ca70051b30e2e95b5446cdb8949ac4cd22c0d7fd634d89f568e2"
-dependencies = [
- "log",
- "regex",
-]
-
-[[package]]
-name = "env_logger"
-version = "0.11.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13c863f0904021b108aa8b2f55046443e6b1ebde8fd4a15c399893aae4fa069f"
-dependencies = [
- "anstream",
- "anstyle",
- "env_filter",
- "jiff",
- "log",
 ]
 
 [[package]]
@@ -4375,17 +4312,6 @@ dependencies = [
  "typenum",
  "version_check",
  "zeroize",
-]
-
-[[package]]
-name = "generic-array"
-version = "1.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eaf57c49a95fd1fe24b90b3033bee6dc7e8f1288d51494cb44e627c295e38542"
-dependencies = [
- "rustversion",
- "serde_core",
- "typenum",
 ]
 
 [[package]]
@@ -5451,7 +5377,7 @@ version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
 dependencies = [
- "generic-array 0.14.7",
+ "generic-array",
 ]
 
 [[package]]
@@ -5575,30 +5501,6 @@ name = "itoa"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
-
-[[package]]
-name = "jiff"
-version = "0.2.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49cce2b81f2098e7e3efc35bc2e0a6b7abec9d34128283d7a26fa8f32a6dbb35"
-dependencies = [
- "jiff-static",
- "log",
- "portable-atomic",
- "portable-atomic-util",
- "serde_core",
-]
-
-[[package]]
-name = "jiff-static"
-version = "0.2.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "980af8b43c3ad5d8d349ace167ec8170839f753a42d233ba19e08afe1850fa69"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.111",
-]
 
 [[package]]
 name = "jobserver"
@@ -8100,15 +8002,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "p3-air"
-version = "0.1.0"
-source = "git+https://github.com/ProjectZKM/Plonky3#faa24ca4597eebeecbf71b194b71c7d1a99b3f01"
-dependencies = [
- "p3-field 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-matrix 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
-]
-
-[[package]]
 name = "p3-baby-bear"
 version = "0.1.0"
 source = "git+https://github.com/Plonky3/Plonky3/?branch=sp1-v6#ce9cdfa52326beb93d77669cee52e23287fdb16d"
@@ -8230,21 +8123,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "p3-bn254-fr"
-version = "0.1.0"
-source = "git+https://github.com/ProjectZKM/Plonky3#faa24ca4597eebeecbf71b194b71c7d1a99b3f01"
-dependencies = [
- "ff 0.13.1",
- "halo2curves 0.7.0",
- "num-bigint 0.4.6",
- "p3-field 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-poseidon2 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-symmetric 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "rand 0.8.5",
- "serde",
-]
-
-[[package]]
 name = "p3-challenger"
 version = "0.1.0"
 source = "git+https://github.com/Plonky3/Plonky3/?branch=sp1-v6#ce9cdfa52326beb93d77669cee52e23287fdb16d"
@@ -8282,19 +8160,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "p3-challenger"
-version = "0.1.0"
-source = "git+https://github.com/ProjectZKM/Plonky3#faa24ca4597eebeecbf71b194b71c7d1a99b3f01"
-dependencies = [
- "p3-field 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-maybe-rayon 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-symmetric 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-util 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "serde",
- "tracing",
-]
-
-[[package]]
 name = "p3-circle"
 version = "0.1.0"
 source = "git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b#a4d376babf5d09497f1fab1df7f1ffce01260973"
@@ -8308,24 +8173,6 @@ dependencies = [
  "p3-matrix 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "p3-maybe-rayon 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "p3-util 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
- "serde",
- "tracing",
-]
-
-[[package]]
-name = "p3-circle"
-version = "0.1.0"
-source = "git+https://github.com/ProjectZKM/Plonky3#faa24ca4597eebeecbf71b194b71c7d1a99b3f01"
-dependencies = [
- "itertools 0.13.0",
- "p3-challenger 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-commit 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-dft 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-field 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-fri 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-matrix 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-maybe-rayon 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-util 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
  "serde",
  "tracing",
 ]
@@ -8372,20 +8219,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "p3-commit"
-version = "0.1.0"
-source = "git+https://github.com/ProjectZKM/Plonky3#faa24ca4597eebeecbf71b194b71c7d1a99b3f01"
-dependencies = [
- "itertools 0.13.0",
- "p3-challenger 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-dft 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-field 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-matrix 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-util 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "serde",
-]
-
-[[package]]
 name = "p3-dft"
 version = "0.1.0"
 source = "git+https://github.com/Plonky3/Plonky3/?branch=sp1-v6#ce9cdfa52326beb93d77669cee52e23287fdb16d"
@@ -8420,19 +8253,6 @@ dependencies = [
  "p3-matrix 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "p3-maybe-rayon 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "p3-util 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
- "tracing",
-]
-
-[[package]]
-name = "p3-dft"
-version = "0.1.0"
-source = "git+https://github.com/ProjectZKM/Plonky3#faa24ca4597eebeecbf71b194b71c7d1a99b3f01"
-dependencies = [
- "itertools 0.13.0",
- "p3-field 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-matrix 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-maybe-rayon 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-util 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
  "tracing",
 ]
 
@@ -8491,23 +8311,6 @@ dependencies = [
  "nums",
  "p3-maybe-rayon 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "p3-util 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
- "rand 0.8.5",
- "serde",
- "tracing",
-]
-
-[[package]]
-name = "p3-field"
-version = "0.1.0"
-source = "git+https://github.com/ProjectZKM/Plonky3#faa24ca4597eebeecbf71b194b71c7d1a99b3f01"
-dependencies = [
- "itertools 0.13.0",
- "num-bigint 0.4.6",
- "num-integer",
- "num-traits",
- "nums",
- "p3-maybe-rayon 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-util 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
  "rand 0.8.5",
  "serde",
  "tracing",
@@ -8584,25 +8387,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "p3-fri"
-version = "0.1.0"
-source = "git+https://github.com/ProjectZKM/Plonky3#faa24ca4597eebeecbf71b194b71c7d1a99b3f01"
-dependencies = [
- "itertools 0.13.0",
- "p3-challenger 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-commit 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-dft 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-field 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-interpolation 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-matrix 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-maybe-rayon 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-util 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "rand 0.8.5",
- "serde",
- "tracing",
-]
-
-[[package]]
 name = "p3-goldilocks"
 version = "0.1.0"
 source = "git+https://github.com/Plonky3/Plonky3.git?rev=539bbc84085efb609f4f62cb03cf49588388abdb#539bbc84085efb609f4f62cb03cf49588388abdb"
@@ -8668,17 +8452,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "p3-interpolation"
-version = "0.1.0"
-source = "git+https://github.com/ProjectZKM/Plonky3#faa24ca4597eebeecbf71b194b71c7d1a99b3f01"
-dependencies = [
- "p3-field 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-matrix 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-maybe-rayon 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-util 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
-]
-
-[[package]]
 name = "p3-keccak"
 version = "0.1.0"
 source = "git+https://github.com/Plonky3/Plonky3.git?rev=539bbc84085efb609f4f62cb03cf49588388abdb#539bbc84085efb609f4f62cb03cf49588388abdb"
@@ -8703,18 +8476,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "p3-keccak"
-version = "0.1.0"
-source = "git+https://github.com/ProjectZKM/Plonky3#faa24ca4597eebeecbf71b194b71c7d1a99b3f01"
-dependencies = [
- "itertools 0.13.0",
- "p3-field 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-symmetric 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-util 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "tiny-keccak",
-]
-
-[[package]]
 name = "p3-keccak-air"
 version = "0.1.0"
 source = "git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b#a4d376babf5d09497f1fab1df7f1ffce01260973"
@@ -8724,19 +8485,6 @@ dependencies = [
  "p3-matrix 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "p3-maybe-rayon 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "p3-util 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
- "tracing",
-]
-
-[[package]]
-name = "p3-keccak-air"
-version = "0.1.0"
-source = "git+https://github.com/ProjectZKM/Plonky3#faa24ca4597eebeecbf71b194b71c7d1a99b3f01"
-dependencies = [
- "p3-air 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-field 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-matrix 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-maybe-rayon 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-util 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
  "tracing",
 ]
 
@@ -8778,20 +8526,6 @@ dependencies = [
  "p3-monty-31 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "p3-poseidon2 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "p3-symmetric 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
- "rand 0.8.5",
- "serde",
-]
-
-[[package]]
-name = "p3-koala-bear"
-version = "0.1.0"
-source = "git+https://github.com/ProjectZKM/Plonky3#faa24ca4597eebeecbf71b194b71c7d1a99b3f01"
-dependencies = [
- "p3-field 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-mds 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-monty-31 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-poseidon2 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-symmetric 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
  "rand 0.8.5",
  "serde",
 ]
@@ -8842,21 +8576,6 @@ dependencies = [
 
 [[package]]
 name = "p3-matrix"
-version = "0.1.0"
-source = "git+https://github.com/ProjectZKM/Plonky3#faa24ca4597eebeecbf71b194b71c7d1a99b3f01"
-dependencies = [
- "itertools 0.13.0",
- "p3-field 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-maybe-rayon 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-util 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "rand 0.8.5",
- "serde",
- "tracing",
- "transpose",
-]
-
-[[package]]
-name = "p3-matrix"
 version = "0.2.3-succinct"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3e4de3f373589477cb735ea58e125898ed20935e03664b4614c7fac258b3c42f"
@@ -8887,14 +8606,6 @@ source = "git+https://github.com/Plonky3/Plonky3.git?rev=539bbc84085efb609f4f62c
 name = "p3-maybe-rayon"
 version = "0.1.0"
 source = "git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b#a4d376babf5d09497f1fab1df7f1ffce01260973"
-dependencies = [
- "rayon",
-]
-
-[[package]]
-name = "p3-maybe-rayon"
-version = "0.1.0"
-source = "git+https://github.com/ProjectZKM/Plonky3#faa24ca4597eebeecbf71b194b71c7d1a99b3f01"
 dependencies = [
  "rayon",
 ]
@@ -8944,20 +8655,6 @@ dependencies = [
  "p3-matrix 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "p3-symmetric 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "p3-util 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
- "rand 0.8.5",
-]
-
-[[package]]
-name = "p3-mds"
-version = "0.1.0"
-source = "git+https://github.com/ProjectZKM/Plonky3#faa24ca4597eebeecbf71b194b71c7d1a99b3f01"
-dependencies = [
- "itertools 0.13.0",
- "p3-dft 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-field 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-matrix 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-symmetric 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-util 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
  "rand 0.8.5",
 ]
 
@@ -9027,23 +8724,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "p3-merkle-tree"
-version = "0.1.0"
-source = "git+https://github.com/ProjectZKM/Plonky3#faa24ca4597eebeecbf71b194b71c7d1a99b3f01"
-dependencies = [
- "itertools 0.13.0",
- "p3-commit 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-field 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-matrix 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-maybe-rayon 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-symmetric 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-util 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "rand 0.8.5",
- "serde",
- "tracing",
-]
-
-[[package]]
 name = "p3-mersenne-31"
 version = "0.1.0"
 source = "git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b#a4d376babf5d09497f1fab1df7f1ffce01260973"
@@ -9058,25 +8738,6 @@ dependencies = [
  "p3-poseidon2 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "p3-symmetric 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "p3-util 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
- "rand 0.8.5",
- "serde",
-]
-
-[[package]]
-name = "p3-mersenne-31"
-version = "0.1.0"
-source = "git+https://github.com/ProjectZKM/Plonky3#faa24ca4597eebeecbf71b194b71c7d1a99b3f01"
-dependencies = [
- "itertools 0.13.0",
- "num-bigint 0.4.6",
- "p3-dft 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-field 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-matrix 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-maybe-rayon 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-mds 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-poseidon2 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-symmetric 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-util 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
  "rand 0.8.5",
  "serde",
 ]
@@ -9119,28 +8780,6 @@ dependencies = [
  "p3-util 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "rand 0.8.5",
  "serde",
- "tracing",
- "transpose",
-]
-
-[[package]]
-name = "p3-monty-31"
-version = "0.1.0"
-source = "git+https://github.com/ProjectZKM/Plonky3#faa24ca4597eebeecbf71b194b71c7d1a99b3f01"
-dependencies = [
- "itertools 0.13.0",
- "num-bigint 0.4.6",
- "p3-dft 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-field 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-matrix 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-maybe-rayon 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-mds 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-poseidon2 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-symmetric 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-util 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "rand 0.8.5",
- "serde",
- "serde_json",
  "tracing",
  "transpose",
 ]
@@ -9191,19 +8830,6 @@ dependencies = [
  "p3-mds 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "p3-symmetric 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "rand 0.8.5",
-]
-
-[[package]]
-name = "p3-poseidon2"
-version = "0.1.0"
-source = "git+https://github.com/ProjectZKM/Plonky3#faa24ca4597eebeecbf71b194b71c7d1a99b3f01"
-dependencies = [
- "gcd",
- "p3-field 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-mds 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-symmetric 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "rand 0.8.5",
- "serde",
 ]
 
 [[package]]
@@ -9263,16 +8889,6 @@ source = "git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b#a4d376ba
 dependencies = [
  "itertools 0.13.0",
  "p3-field 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
- "serde",
-]
-
-[[package]]
-name = "p3-symmetric"
-version = "0.1.0"
-source = "git+https://github.com/ProjectZKM/Plonky3#faa24ca4597eebeecbf71b194b71c7d1a99b3f01"
-dependencies = [
- "itertools 0.13.0",
- "p3-field 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
  "serde",
 ]
 
@@ -9342,24 +8958,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "p3-uni-stark"
-version = "0.1.0"
-source = "git+https://github.com/ProjectZKM/Plonky3#faa24ca4597eebeecbf71b194b71c7d1a99b3f01"
-dependencies = [
- "itertools 0.13.0",
- "p3-air 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-challenger 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-commit 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-dft 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-field 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-matrix 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-maybe-rayon 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-util 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "serde",
- "tracing",
-]
-
-[[package]]
 name = "p3-util"
 version = "0.1.0"
 source = "git+https://github.com/Plonky3/Plonky3/?branch=sp1-v6#ce9cdfa52326beb93d77669cee52e23287fdb16d"
@@ -9380,15 +8978,6 @@ name = "p3-util"
 version = "0.1.0"
 source = "git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b#a4d376babf5d09497f1fab1df7f1ffce01260973"
 dependencies = [
- "serde",
-]
-
-[[package]]
-name = "p3-util"
-version = "0.1.0"
-source = "git+https://github.com/ProjectZKM/Plonky3#faa24ca4597eebeecbf71b194b71c7d1a99b3f01"
-dependencies = [
- "lock_api",
  "serde",
 ]
 
@@ -9535,12 +9124,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
-name = "pathdiff"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
-
-[[package]]
 name = "pbkdf2"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9649,20 +9232,20 @@ dependencies = [
  "p3-blake3 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "p3-bn254-fr 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "p3-challenger 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
- "p3-circle 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
+ "p3-circle",
  "p3-commit 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "p3-dft 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "p3-field 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "p3-fri 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "p3-goldilocks 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "p3-keccak 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
- "p3-keccak-air 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
+ "p3-keccak-air",
  "p3-koala-bear 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "p3-matrix 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "p3-maybe-rayon 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "p3-mds 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "p3-merkle-tree 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
- "p3-mersenne-31 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
+ "p3-mersenne-31",
  "p3-poseidon2 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "p3-symmetric 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
  "p3-uni-stark 0.1.0 (git+https://github.com/brevis-network/Plonky3.git?rev=a4d376b)",
@@ -9815,15 +9398,6 @@ name = "portable-atomic"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f84267b20a16ea918e43c6a88433c2d54fa145c92a811b5b047ccbe153674483"
-
-[[package]]
-name = "portable-atomic-util"
-version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8a2f0d8d040d7848a709caf78912debcc3f33ee4b3cac47d73d1e1069e83507"
-dependencies = [
- "portable-atomic",
-]
 
 [[package]]
 name = "potential_utf"
@@ -11066,7 +10640,7 @@ checksum = "d3e97a565f76233a6003f9f5c54be1d9c5bdfa3eccfb189469f11ec4901c47dc"
 dependencies = [
  "base16ct",
  "der",
- "generic-array 0.14.7",
+ "generic-array",
  "pkcs8",
  "serdect",
  "subtle",
@@ -11491,12 +11065,6 @@ dependencies = [
  "tracing-subscriber",
  "types",
 ]
-
-[[package]]
-name = "size"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9fed904c7fb2856d868b92464fc8fa597fce366edea1a9cbfaa8cb5fe080bd6d"
 
 [[package]]
 name = "sketches-ddsketch"
@@ -12432,22 +12000,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.111",
-]
-
-[[package]]
-name = "substrate-bn"
-version = "0.6.0"
-source = "git+https://github.com/ziren-patches/bn.git?branch=patch-0.6.0#aba71380457d798039111e6cc0fdf2e0718c6766"
-dependencies = [
- "bytemuck",
- "byteorder",
- "cfg-if",
- "crunchy",
- "lazy_static",
- "num-bigint 0.4.6",
- "rand 0.8.5",
- "rustc-hex",
- "zkm-lib 1.2.2",
 ]
 
 [[package]]
@@ -14893,324 +14445,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zkm-core-executor"
-version = "1.2.1"
-source = "git+https://github.com/ProjectZKM/Ziren?tag=v1.2.1#cb8c24305e8889a448da3b3b06ce04b16deaa6be"
-dependencies = [
- "anyhow",
- "bincode",
- "bytemuck",
- "elf",
- "enum-map",
- "env_logger",
- "eyre",
- "hashbrown 0.14.5",
- "hex",
- "itertools 0.13.0",
- "log",
- "nohash-hasher",
- "num",
- "p3-field 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-koala-bear 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-maybe-rayon 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-symmetric 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "rand 0.8.5",
- "rayon-scan",
- "rrs-succinct",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "strum 0.26.3",
- "strum_macros 0.26.4",
- "thiserror 1.0.69",
- "tiny-keccak",
- "tracing",
- "tracing-subscriber",
- "typenum",
- "vec_map",
- "zkm-curves",
- "zkm-primitives 1.2.1",
- "zkm-stark",
-]
-
-[[package]]
-name = "zkm-core-machine"
-version = "1.2.1"
-source = "git+https://github.com/ProjectZKM/Ziren?tag=v1.2.1#cb8c24305e8889a448da3b3b06ce04b16deaa6be"
-dependencies = [
- "bincode",
- "cbindgen",
- "cc",
- "cfg-if",
- "elliptic-curve",
- "generic-array 1.3.5",
- "glob",
- "hashbrown 0.14.5",
- "hex",
- "itertools 0.13.0",
- "k256",
- "log",
- "num",
- "num_cpus",
- "p256",
- "p3-air 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-challenger 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-field 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-keccak-air 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-koala-bear 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-matrix 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-maybe-rayon 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-poseidon2 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-uni-stark 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-util 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "pathdiff",
- "rand 0.8.5",
- "rayon",
- "rayon-scan",
- "serde",
- "serde_json",
- "size",
- "snowbridge-amcl",
- "static_assertions",
- "strum 0.26.3",
- "strum_macros 0.26.4",
- "tempfile",
- "thiserror 1.0.69",
- "tiny-keccak",
- "tracing",
- "tracing-forest",
- "tracing-subscriber",
- "typenum",
- "web-time",
- "zkm-core-executor",
- "zkm-curves",
- "zkm-derive",
- "zkm-primitives 1.2.1",
- "zkm-stark",
-]
-
-[[package]]
-name = "zkm-curves"
-version = "1.2.1"
-source = "git+https://github.com/ProjectZKM/Ziren?tag=v1.2.1#cb8c24305e8889a448da3b3b06ce04b16deaa6be"
-dependencies = [
- "cfg-if",
- "curve25519-dalek",
- "dashu",
- "elliptic-curve",
- "generic-array 1.3.5",
- "itertools 0.13.0",
- "k256",
- "num",
- "p256",
- "p3-field 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "serde",
- "snowbridge-amcl",
- "typenum",
- "zkm-primitives 1.2.1",
- "zkm-stark",
-]
-
-[[package]]
-name = "zkm-derive"
-version = "1.2.1"
-source = "git+https://github.com/ProjectZKM/Ziren?tag=v1.2.1#cb8c24305e8889a448da3b3b06ce04b16deaa6be"
-dependencies = [
- "quote",
- "syn 1.0.109",
-]
-
-[[package]]
-name = "zkm-lib"
-version = "1.2.1"
-source = "git+https://github.com/ProjectZKM/Ziren?tag=v1.2.1#cb8c24305e8889a448da3b3b06ce04b16deaa6be"
-dependencies = [
- "bincode",
- "cfg-if",
- "elliptic-curve",
- "serde",
- "sha2 0.10.9",
- "zkm-primitives 1.2.1",
-]
-
-[[package]]
-name = "zkm-lib"
-version = "1.2.2"
-source = "git+https://github.com/ProjectZKM/Ziren.git#2aa1d4cc79d76c36e62a6317234308b03e3ecf7d"
-dependencies = [
- "bincode",
- "cfg-if",
- "elliptic-curve",
- "serde",
- "sha2 0.10.9",
- "zkm-primitives 1.2.2",
-]
-
-[[package]]
-name = "zkm-primitives"
-version = "1.2.1"
-source = "git+https://github.com/ProjectZKM/Ziren?tag=v1.2.1#cb8c24305e8889a448da3b3b06ce04b16deaa6be"
-dependencies = [
- "bincode",
- "hex",
- "lazy_static",
- "num-bigint 0.4.6",
- "p3-field 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-koala-bear 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-monty-31 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-poseidon2 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-symmetric 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "serde",
- "sha2 0.10.9",
-]
-
-[[package]]
-name = "zkm-primitives"
-version = "1.2.2"
-source = "git+https://github.com/ProjectZKM/Ziren.git#2aa1d4cc79d76c36e62a6317234308b03e3ecf7d"
-dependencies = [
- "bincode",
- "hex",
- "lazy_static",
- "num-bigint 0.4.6",
- "p3-field 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-koala-bear 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-monty-31 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-poseidon2 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-symmetric 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "serde",
- "sha2 0.10.9",
-]
-
-[[package]]
-name = "zkm-recursion-core"
-version = "1.2.1"
-source = "git+https://github.com/ProjectZKM/Ziren?tag=v1.2.1#cb8c24305e8889a448da3b3b06ce04b16deaa6be"
-dependencies = [
- "backtrace",
- "cbindgen",
- "cc",
- "ff 0.13.1",
- "glob",
- "hashbrown 0.14.5",
- "itertools 0.13.0",
- "p3-air 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-bn254-fr 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-challenger 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-commit 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-dft 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-field 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-fri 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-koala-bear 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-matrix 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-maybe-rayon 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-merkle-tree 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-monty-31 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-poseidon2 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-symmetric 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-util 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "pathdiff",
- "rand 0.8.5",
- "serde",
- "static_assertions",
- "thiserror 1.0.69",
- "tracing",
- "vec_map",
- "zkhash 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "zkm-core-machine",
- "zkm-derive",
- "zkm-primitives 1.2.1",
- "zkm-stark",
-]
-
-[[package]]
-name = "zkm-stark"
-version = "1.2.1"
-source = "git+https://github.com/ProjectZKM/Ziren?tag=v1.2.1#cb8c24305e8889a448da3b3b06ce04b16deaa6be"
-dependencies = [
- "arrayref",
- "hashbrown 0.14.5",
- "itertools 0.13.0",
- "num-bigint 0.4.6",
- "num-traits",
- "p3-air 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-challenger 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-circle 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-commit 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-dft 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-field 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-fri 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-keccak 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-koala-bear 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-matrix 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-maybe-rayon 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-mds 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-merkle-tree 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-mersenne-31 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-poseidon2 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-symmetric 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-uni-stark 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-util 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "rand 0.8.5",
- "rayon-scan",
- "serde",
- "strum 0.26.3",
- "strum_macros 0.26.4",
- "sysinfo 0.30.13",
- "tracing",
- "tracing-forest",
- "tracing-subscriber",
- "zkm-derive",
- "zkm-primitives 1.2.1",
- "zkm-zkvm",
-]
-
-[[package]]
-name = "zkm-verifier"
-version = "1.2.1"
-source = "git+https://github.com/ProjectZKM/Ziren?tag=v1.2.1#cb8c24305e8889a448da3b3b06ce04b16deaa6be"
-dependencies = [
- "anyhow",
- "bincode",
- "hex",
- "itertools 0.13.0",
- "lazy_static",
- "once_cell",
- "p3-commit 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-field 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-koala-bear 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-symmetric 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "p3-util 0.1.0 (git+https://github.com/ProjectZKM/Plonky3)",
- "rayon",
- "serde",
- "sha2 0.10.9",
- "strum_macros 0.26.4",
- "substrate-bn",
- "thiserror 2.0.17",
- "zkm-core-executor",
- "zkm-core-machine",
- "zkm-primitives 1.2.1",
- "zkm-recursion-core",
- "zkm-stark",
-]
-
-[[package]]
-name = "zkm-zkvm"
-version = "1.2.1"
-source = "git+https://github.com/ProjectZKM/Ziren?tag=v1.2.1#cb8c24305e8889a448da3b3b06ce04b16deaa6be"
-dependencies = [
- "bincode",
- "cfg-if",
- "getrandom 0.2.16",
- "lazy_static",
- "rand 0.8.5",
- "serde",
- "sha2 0.10.9",
- "zkm-lib 1.2.1",
- "zkm-primitives 1.2.1",
-]
-
-[[package]]
 name = "zkvm_execution_layer"
 version = "0.1.0"
 dependencies = [
@@ -15236,7 +14470,6 @@ dependencies = [
  "types",
  "uuid 0.8.2",
  "verify-stark",
- "zkm-verifier",
 ]
 
 [[package]]

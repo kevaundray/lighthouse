@@ -1,11 +1,11 @@
-//! ZkCloud proof verifier
+//! ZisK-ZkCloud proof verifier
 //!
-//! This module implements proof verification for ZkCloud using ZisK.
+//! This module implements proof verification for ZisK-ZkCloud using ZisK.
 
 use super::{ProofVerifier, VerificationResult};
 use tracing::debug;
 
-/// ZkCloud verifier (uses ZisK)
+/// ZisK-ZkCloud verifier (uses ZisK)
 pub struct ZkcloudVerifier;
 
 impl ProofVerifier for ZkcloudVerifier {
@@ -13,7 +13,7 @@ impl ProofVerifier for ZkcloudVerifier {
         debug!(
             proof_size = proof_data.len(),
             vk_size = vk_data.len(),
-            "Starting ZkCloud verification"
+            "Starting ZisK-ZkCloud verification"
         );
 
         // Delegate to ZisK verifier implementation
@@ -21,14 +21,14 @@ impl ProofVerifier for ZkcloudVerifier {
 
         debug!(
             verification_result = result,
-            "Completed ZkCloud verification"
+            "Completed ZisK-ZkCloud verification"
         );
 
         Ok(result)
     }
 
     fn name() -> &'static str {
-        "zkcloud"
+        "zisk-zkcloud"
     }
 }
 
@@ -37,7 +37,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_zkcloud_verifier_name() {
-        assert_eq!(ZkcloudVerifier::name(), "zkcloud");
+    fn test_zisk_zkcloud_verifier_name() {
+        assert_eq!(ZkcloudVerifier::name(), "zisk-zkcloud");
     }
 }
