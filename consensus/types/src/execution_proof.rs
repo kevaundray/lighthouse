@@ -16,14 +16,12 @@ use super::ExecutionProofId;
 /// and so this number was set to accommodate for the most zkVMs.
 pub const MAX_PROOF_DATA_BYTES: usize = 3_145_728;
 
-/// TODO(ethproofs): Set to 1 for the demo.
-///
 /// Minimum number of execution proofs required from different proof types
 /// before marking an execution payload as available in ZK-VM mode.
 ///
 /// This provides client diversity - nodes wait for proofs from K different
 /// zkVM+EL combinations before considering an execution payload available.
-pub const DEFAULT_MIN_PROOFS_REQUIRED: usize = 1;
+pub const DEFAULT_MIN_PROOFS_REQUIRED: usize = 2;
 
 /// Maximum number of execution proofs that can be requested or stored.
 /// This corresponds to the maximum number of proof types (zkVM+EL combinations)
