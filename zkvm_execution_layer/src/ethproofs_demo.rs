@@ -166,7 +166,7 @@ pub async fn download_proof_binary(proof_id: u64) -> Result<Vec<u8>, String> {
 pub fn validate_proof(proof: &ExecutionProof) -> bool {
     // Fallback proofs (proof_id 0) are accepted without verification
     if proof.proof_id.as_u8() == 0 {
-        info!(
+        warn!(
             slot = %proof.slot,
             block_hash = %proof.block_hash,
             "[Ethproofs] Fallback proof accepted"

@@ -51,20 +51,10 @@ mod tests {
     fn test_sp1_hypercube_verification() {
         // Load test proof and verification key
         let test_proof_path =
-            PathBuf::from("src/test_proofs/succinct_9d0bd54d-69f9-4404-8f30-020516a8155d.bin");
+            PathBuf::from("src/test_proofs/sp1_hypercube_9d0bd54d-69f9-4404-8f30-020516a8155d.bin");
         let vk_path = PathBuf::from(
-            "src/verification_keys/succinct_9d0bd54d-69f9-4404-8f30-020516a8155d.bin",
+            "src/verification_keys/sp1_hypercube_9d0bd54d-69f9-4404-8f30-020516a8155d.bin",
         );
-
-        // Skip test if files don't exist
-        if !test_proof_path.exists() || !vk_path.exists() {
-            eprintln!(
-                "Skipping SP1-Hypercube test: proof or VK file not found. \
-                 Expected: {:?} and {:?}",
-                test_proof_path, vk_path
-            );
-            return;
-        }
 
         let proof_data = std::fs::read(&test_proof_path).expect("Failed to read test proof file");
         let vk_data = std::fs::read(&vk_path).expect("Failed to read verification key file");

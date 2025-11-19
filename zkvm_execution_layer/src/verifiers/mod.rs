@@ -203,8 +203,8 @@ impl VerifierStore {
         // Register OpenVM verifier (proof_id 2)
         store.register(
             ethproofs_ids::openvm(),
-            openvm::OpenvmVerifier::name(),
-            openvm::OpenvmVerifier::verify,
+            openvm::OpenVmVerifier::name(),
+            openvm::OpenVmVerifier::verify,
         );
 
         // Register Pico verifier (proof_id 3)
@@ -238,8 +238,8 @@ impl VerifierStore {
         // Register ZisK-ZkCloud verifier (proof_id 7)
         store.register(
             ethproofs_ids::zisk_zkcloud(),
-            zkcloud::ZkcloudVerifier::name(),
-            zkcloud::ZkcloudVerifier::verify,
+            zkcloud::ZkCloudVerifier::name(),
+            zkcloud::ZkCloudVerifier::verify,
         );
 
         store

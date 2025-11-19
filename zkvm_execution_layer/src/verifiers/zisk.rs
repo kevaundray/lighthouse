@@ -47,16 +47,6 @@ mod tests {
         let vk_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("src/verification_keys/zisk_817bbf03-07b4-466d-879b-e476322bd080.bin");
 
-        // Skip test if files don't exist
-        if !test_proof_path.exists() || !vk_path.exists() {
-            eprintln!(
-                "Skipping ZisK 1 (Girona) test: proof or VK file not found. \
-                 Expected: {:?} and {:?}",
-                test_proof_path, vk_path
-            );
-            return;
-        }
-
         let proof_data = std::fs::read(&test_proof_path).expect("Failed to read test proof file");
         let vk_data = std::fs::read(&vk_path).expect("Failed to read verification key file");
 
@@ -82,16 +72,6 @@ mod tests {
             .join("src/test_proofs/zisk_534e6cf4-3dfe-47de-bba2-a0b11d544557.bin");
         let vk_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("src/verification_keys/zisk_534e6cf4-3dfe-47de-bba2-a0b11d544557.bin");
-
-        // Skip test if files don't exist
-        if !test_proof_path.exists() || !vk_path.exists() {
-            eprintln!(
-                "Skipping ZisK 2 (Sevilla) test: proof or VK file not found. \
-                 Expected: {:?} and {:?}",
-                test_proof_path, vk_path
-            );
-            return;
-        }
 
         let proof_data = std::fs::read(&test_proof_path).expect("Failed to read test proof file");
         let vk_data = std::fs::read(&vk_path).expect("Failed to read verification key file");
