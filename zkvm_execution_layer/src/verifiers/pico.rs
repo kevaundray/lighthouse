@@ -19,6 +19,7 @@ use pico_prism_vm::{
     primitives::consts::RECURSION_NUM_PVS,
 };
 use serde::{Deserialize, Serialize};
+use std::panic;
 use tracing::debug;
 
 // Serializable wrappers for MetaProof
@@ -54,7 +55,17 @@ impl KoalaBearCombineVerifier {
         proof: &MetaProof<KoalaBearPoseidon2>,
         riscv_vk: &BaseVerifyingKey<KoalaBearPoseidon2>,
     ) -> bool {
-        self.machine.verify(proof, riscv_vk).is_ok()
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            self.machine.verify(proof, riscv_vk).is_ok()
+        }));
+
+        match result {
+            Ok(verification_result) => verification_result,
+            Err(_) => {
+                debug!("Pico verification panicked - returning false");
+                false
+            }
+        }
     }
 }
 
@@ -114,10 +125,8 @@ mod tests {
             .join("src/verification_keys/pico_f404c187-88d6-4927-963c-61760a639900.bin");
 
         // Read the proof and verification key
-        let proof_data = std::fs::read(&proof_path)
-            .expect("Failed to read test proof file");
-        let vk_data = std::fs::read(&vk_path)
-            .expect("Failed to read test verification key file");
+        let proof_data = std::fs::read(&proof_path).expect("Failed to read test proof file");
+        let vk_data = std::fs::read(&vk_path).expect("Failed to read test verification key file");
 
         // Verify the proof
         let result = PicoVerifier::verify(&proof_data, &vk_data);
@@ -128,6 +137,10 @@ mod tests {
         eprintln!("Verification result: {:?}", result);
 
         // The result should be Ok with a boolean (true if valid, false if invalid)
-        assert!(result.is_ok(), "Verification should not error: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Verification should not error: {:?}",
+            result.err()
+        );
     }
 }

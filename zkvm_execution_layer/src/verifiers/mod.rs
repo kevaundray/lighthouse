@@ -44,7 +44,7 @@ pub mod ethproofs_ids {
     pub const PICO_UUID: &str = "f404c187-88d6-4927-963c-61760a639900";
 
     /// SP1-Hypercube verifier UUID (proof_id = 4)
-    pub const SP1_HYPERCUBE_UUID: &str = "9d0bd54d-69f9-4404-8f30-020516a8155d";
+    pub const SP1_HYPERCUBE_UUID: &str = "fbef2553-8cd0-4f45-b328-570b5c8688b2";
 
     /// ZisK 1 (Girona) verifier UUID (proof_id = 5)
     pub const ZISK_1_GIRONA_UUID: &str = "817bbf03-07b4-466d-879b-e476322bd080";
