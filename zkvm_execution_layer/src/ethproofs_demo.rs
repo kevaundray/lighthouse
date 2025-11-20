@@ -87,8 +87,14 @@ pub async fn fetch_proof_from_ethproofs(
             ));
         }
 
-        let response = client
-            .get(&url)
+        let mut request = client.get(&url);
+
+        // Add API key header if environment variable is set
+        if let Ok(api_key) = std::env::var("ETHPROOFS_API_KEY") {
+            request = request.header("Authorization", format!("Bearer {}", api_key));
+        }
+
+        let response = request
             .send()
             .await
             .map_err(|e| format!("Request failed: {}", e))?;
@@ -133,8 +139,14 @@ pub async fn download_proof_binary(proof_id: u64) -> Result<Vec<u8>, String> {
 
     info!(proof_id, "[Ethproofs] Downloading proof binary");
 
-    let response = client
-        .get(&url)
+    let mut request = client.get(&url);
+
+    // Add API key header if environment variable is set
+    if let Ok(api_key) = std::env::var("ETHPROOFS_API_KEY") {
+        request = request.header("Authorization", format!("Bearer {}", api_key));
+    }
+
+    let response = request
         .send()
         .await
         .map_err(|e| format!("Request failed: {}", e))?;

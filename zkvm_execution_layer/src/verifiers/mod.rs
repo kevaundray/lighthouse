@@ -38,7 +38,7 @@ pub mod ethproofs_ids {
     pub const FALLBACK_UUID: &str = "00000000-0000-0000-0000-000000000000";
 
     /// OpenVM verifier UUID (proof_id = 2)
-    pub const OPENVM_UUID: &str = "425971e7-78eb-4d61-95d9-e9eea62f41da";
+    pub const OPENVM_UUID: &str = "9b6768c0-831d-488c-ba72-05f93975a3be";
 
     /// Pico Prism verifier UUID (proof_id = 3)
     pub const PICO_UUID: &str = "f404c187-88d6-4927-963c-61760a639900";
