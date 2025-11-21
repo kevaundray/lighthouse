@@ -459,7 +459,7 @@ impl<T: BeaconChainTypes> DataAvailabilityChecker<T> {
                     verified_proofs.push((*proof).clone());
                 }
                 Ok(false) => {
-                    warn!(
+                    debug!(
                         ?proof_id,
                         ?block_root,
                         "Proof verification failed: proof is invalid"

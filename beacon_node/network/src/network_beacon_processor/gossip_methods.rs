@@ -792,29 +792,6 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
             "Received execution proof via gossip"
         );
 
-        // TODO(ethproofs): Added for demo.
-        // Check if we already have the minimum required proofs for this block
-        // If so, skip verification to avoid unnecessary processing
-        if let Some(min_proofs) = self.chain.min_execution_proofs_required() {
-            if let Some(cached_proof_ids) = self
-                .chain
-                .data_availability_checker
-                .cached_execution_proof_subnet_ids(&block_root)
-            {
-                if cached_proof_ids.len() >= min_proofs {
-                    // Already have minimum required proofs, ignore this one
-                    debug!(
-                        %block_root,
-                        %proof_id,
-                        cached_count = cached_proof_ids.len(),
-                        min_required = min_proofs,
-                        "Ignoring execution proof, minimum proofs already cached"
-                    );
-                    return;
-                }
-            }
-        }
-
         // Verify the execution proof for gossip
         match self
             .chain
@@ -897,7 +874,7 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
                         )
                     }
                     GossipExecutionProofError::ProofVerificationFailed(ref reason) => {
-                        warn!(
+                        debug!(
                             error = ?err,
                             %block_root,
                             %proof_id,

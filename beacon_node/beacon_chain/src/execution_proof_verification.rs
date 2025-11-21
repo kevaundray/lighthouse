@@ -3,7 +3,7 @@ use crate::{BeaconChain, BeaconChainError, BeaconChainTypes};
 use slot_clock::SlotClock;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 use types::{ChainSpec, EthSpec, ExecutionProof, ExecutionProofId, Hash256, Slot};
 
 /// An error occurred while validating a gossip execution proof.
@@ -347,7 +347,7 @@ fn verify_zkvm_proof<T: BeaconChainTypes>(
             Ok(())
         }
         Ok(false) => {
-            warn!(%block_root, %subnet_id, "Proof verification failed: proof is invalid");
+            debug!(%block_root, %subnet_id, "Proof verification failed: proof is invalid");
             Err(GossipExecutionProofError::ProofVerificationFailed(format!(
                 "zkVM proof verification failed for block_root={}, subnet_id={}",
                 block_root, subnet_id
