@@ -284,10 +284,10 @@ impl<T: BeaconChainTypes> DataAvailabilityChecker<T> {
     ) -> Result<bool, AvailabilityCheckError> {
         let Some(verifier_registry) = &self.verifier_registry else {
             // No verifier configured but receiving proofs - this is a configuration error.
-            // If the chain spec enables zkVM, the node must have --zkevm-validation flag set.
+            // If the chain spec enables execution proofs, the node must have --execution-proofs flag set.
             return Err(AvailabilityCheckError::ProofVerificationError(
-                "Node is receiving execution proofs but zkVM verification is not enabled. \
-                 Use --zkevm-validation flag to enable proof verification."
+                "Node is receiving execution proofs but proof verification is not enabled. \
+                 Use --execution-proofs flag to enable proof verification."
                     .to_string(),
             ));
         };

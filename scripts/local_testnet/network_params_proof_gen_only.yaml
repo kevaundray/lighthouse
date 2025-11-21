@@ -6,8 +6,8 @@ participants:
     cl_type: lighthouse
     cl_image: lighthouse:local
     cl_extra_params:
-      - --zkevm-validation
-      - --zkvm-generation-proof-types=0,1
+      - --execution-proofs
+      - --execution-proof-types=0,1
       - --target-peers=3
     count: 4
 network_params:

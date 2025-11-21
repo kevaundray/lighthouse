@@ -196,7 +196,7 @@ where
 
         // Spawn the dummy execution layer
         if config.use_dummy_el {
-            info!("--zkevm-validation: spawning in-process execution layer");
+            info!("--execution-proofs: spawning in-process execution layer");
 
             let dummy_el_config = dummy_el::DummyElConfig {
                 host: "127.0.0.1".to_string(),

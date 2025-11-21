@@ -932,26 +932,26 @@ pub fn cli_app() -> Command {
                 .action(ArgAction::Set)
                 .display_order(0)
         )
-        /* ZK-VM Execution Layer settings */
+        /* Execution Proofs settings */
         .arg(
-            Arg::new("zkevm-validation")
-                .long("zkevm-validation")
-                .help("Activates ZKVM execution proof mode. Enables the node to subscribe to the \
+            Arg::new("execution-proofs")
+                .long("execution-proofs")
+                .help("Activates execution proof mode. Enables the node to subscribe to the \
                        execution_proof gossip topic, receive and verify execution proofs from peers, \
-                       and advertise zkVM support in its ENR for peer discovery. \
-                       Use --zkvm-generation-proof-types to specify which proof types this node \
+                       and advertise execution proof support in its ENR for peer discovery. \
+                       Use --execution-proof-types to specify which proof types this node \
                        should generate (optional - nodes can verify without generating).")
                 .action(ArgAction::SetTrue)
                 .display_order(0)
         )
         .arg(
-            Arg::new("zkvm-generation-proof-types")
-                .long("zkvm-generation-proof-types")
+            Arg::new("execution-proof-types")
+                .long("execution-proof-types")
                 .value_name("PROOF_TYPE_IDS")
                 .help("Comma-separated list of proof type IDs to generate \
                        (e.g., '0,1' where 0=SP1+Reth, 1=Risc0+Geth). \
                        Optional - nodes can verify proofs without generating them.")
-                .requires("zkevm-validation")
+                .requires("execution-proofs")
                 .action(ArgAction::Set)
                 .display_order(0)
         )
@@ -1656,7 +1656,7 @@ pub fn cli_app() -> Command {
                 .hide(true)
         )
         .group(ArgGroup::new("execution-source")
-            .args(&["execution-endpoint", "zkevm-validation"])
+            .args(&["execution-endpoint", "execution-proofs"])
             .required(true)
             .multiple(true))
         .group(ArgGroup::new("enable_http").args(["http", "gui", "staking"]).multiple(true))

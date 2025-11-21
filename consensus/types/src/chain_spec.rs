@@ -222,9 +222,9 @@ pub struct ChainSpec {
     pub gloas_fork_epoch: Option<Epoch>,
 
     /*
-     * zkVM execution proof params
+     * Execution proof params
      */
-    /// Whether zkVM mode is enabled via CLI flag --zkevm-validation.
+    /// Whether execution proofs are enabled via CLI flag --execution-proofs.
     /// When true, the node will subscribe to execution proof gossip, verify proofs,
     /// TODO(ethproofs): Changed to Electra fork for demo.
     /// and optionally generate proofs. zkVM activates at the Fulu fork.

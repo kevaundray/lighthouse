@@ -269,21 +269,21 @@ pub fn get_config<E: EthSpec>(
         client_config.http_metrics.allocator_metrics_enabled = false;
     }
 
-    // Auto-enable in-process dummy execution layer if --zkevm-validation is set without
-    // --zkvm-generation-proof-types and no explicit --execution-endpoint is provided.
-    let use_dummy_el = cli_args.get_flag("zkevm-validation")
+    // Auto-enable in-process dummy execution layer if --execution-proofs is set without
+    // --execution-proof-types and no explicit --execution-endpoint is provided.
+    let use_dummy_el = cli_args.get_flag("execution-proofs")
         && cli_args
-            .get_one::<String>("zkvm-generation-proof-types")
+            .get_one::<String>("execution-proof-types")
             .is_none()
         && cli_args.get_one::<String>("execution-endpoint").is_none();
 
     client_config.use_dummy_el = use_dummy_el;
 
-    // Configure execution layer: either use provided endpoint or dummy EL (auto-enabled with --zkevm-validation)
+    // Configure execution layer: either use provided endpoint or dummy EL (auto-enabled with --execution-proofs)
     if !use_dummy_el {
         let endpoints: Option<String> = clap_utils::parse_optional(cli_args, "execution-endpoint")?;
         let endpoints = endpoints
-            .ok_or("Error! Either --execution-endpoint or --zkevm-validation must be provided")?;
+            .ok_or("Error! Either --execution-endpoint or --execution-proofs must be provided")?;
 
         let mut el_config = execution_layer::Config::default();
 
@@ -354,7 +354,7 @@ pub fn get_config<E: EthSpec>(
         client_config.execution_layer = Some(el_config);
     } else {
         // Create an execution_layer config pointing to localhost
-        info!("Using in-process dummy execution layer (--zkevm-validation)");
+        info!("Using in-process dummy execution layer (--execution-proofs)");
 
         let mut el_config = execution_layer::Config::default();
 
@@ -373,10 +373,10 @@ pub fn get_config<E: EthSpec>(
         client_config.execution_layer = Some(el_config);
     }
 
-    // Parse ZK-VM execution layer config if provided
-    if cli_args.get_flag("zkevm-validation") {
+    // Parse execution proofs config if provided
+    if cli_args.get_flag("execution-proofs") {
         let generation_proof_types = if let Some(gen_types_str) =
-            clap_utils::parse_optional::<String>(cli_args, "zkvm-generation-proof-types")?
+            clap_utils::parse_optional::<String>(cli_args, "execution-proof-types")?
         {
             gen_types_str
                 .split(',')
@@ -384,7 +384,7 @@ pub fn get_config<E: EthSpec>(
                 .collect::<Result<Vec<u8>, _>>()
                 .map_err(|e| {
                     format!(
-                        "Invalid proof type ID in --zkvm-generation-proof-types: {}",
+                        "Invalid proof type ID in --execution-proof-types: {}",
                         e
                     )
                 })?
@@ -395,7 +395,7 @@ pub fn get_config<E: EthSpec>(
         } else {
             // No generation proof types provided - running in verification-only mode
             if client_config.use_dummy_el {
-                info!("--zkevm-validation: no EL needed for proof verification");
+                info!("--execution-proofs: no EL needed for proof verification");
             }
             HashSet::new()
         };
