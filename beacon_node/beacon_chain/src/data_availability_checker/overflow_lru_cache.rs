@@ -15,7 +15,7 @@ use parking_lot::{MappedRwLockReadGuard, RwLock, RwLockReadGuard, RwLockWriteGua
 use std::cmp::Ordering;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use tracing::{Span, debug, debug_span};
+use tracing::{Span, debug, debug_span, info};
 use types::beacon_block_body::KzgCommitments;
 use types::blob_sidecar::BlobIdentifier;
 use types::{
@@ -365,6 +365,26 @@ impl<E: EthSpec> PendingComponents<E> {
                 // Not enough execution proofs yet
                 return Ok(None);
             }
+
+            // Log when minimum proofs requirement is met
+            let proof_ids: Vec<_> = self.verified_execution_proofs
+                .iter()
+                .map(|p| p.proof_id.as_u8().to_string())
+                .collect();
+
+            let slot = self.verified_execution_proofs
+                .first()
+                .map(|p| p.slot);
+
+            self.span.in_scope(|| {
+                if let Some(slot) = slot {
+                    info!("[Ethproofs] Minimum required execution proofs received: {}/{} proof_ids=[{}] slot={}",
+                          num_proofs, min_proofs, proof_ids.join(", "), slot);
+                } else {
+                    info!("[Ethproofs] Minimum required execution proofs received: {}/{} proof_ids=[{}]",
+                          num_proofs, min_proofs, proof_ids.join(", "));
+                }
+            });
         }
 
         // Block is available, construct `AvailableExecutedBlock`
@@ -396,6 +416,15 @@ impl<E: EthSpec> PendingComponents<E> {
         };
 
         self.span.in_scope(|| {
+            let proof_count = self.execution_proof_subnet_count();
+            if proof_count > 0 {
+                let slot = self.block.as_ref().map(|b| b.as_block().slot());
+                if let Some(slot) = slot {
+                    info!("[Ethproofs] Block ready for validation with {} execution proofs slot={}", proof_count, slot);
+                } else {
+                    info!("[Ethproofs] Block ready for validation with {} execution proofs", proof_count);
+                }
+            }
             debug!("Block and all data components are available");
         });
         Ok(Some(AvailableExecutedBlock::new(

@@ -806,6 +806,16 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
 
                 self.propagate_validation_result(message_id, peer_id, MessageAcceptance::Accept);
 
+                let gossip_verified_proof_slot = gossip_verified_proof.slot();
+                let gossip_verified_proof_subnet = gossip_verified_proof.subnet_id();
+
+                info!(
+                    %block_root,
+                    subnet_id = %gossip_verified_proof_subnet,
+                    slot = %gossip_verified_proof_slot,
+                    "[Ethproofs] Execution proof accepted and gossiped to peers"
+                );
+
                 // Process the verified proof through DA checker
                 self.process_gossip_verified_execution_proof(
                     peer_id,
@@ -1368,7 +1378,7 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
                     info!(
                         %block_root,
                         %subnet_id,
-                        "Gossipsub execution proof processed, imported fully available block"
+                        "[Ethproofs] Block fully available, imported with execution proofs"
                     );
                     self.chain.recompute_head_at_current_slot().await;
 

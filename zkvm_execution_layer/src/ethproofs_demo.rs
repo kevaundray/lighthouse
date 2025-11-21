@@ -215,21 +215,19 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
                     match VERIFIER_STORE.get(&prover_uuid) {
                         Some(verifier_entry) => {
                             info!(
-                                slot = %proof.slot,
-                                block_hash = %proof.block_hash,
-                                verifier = verifier_entry.name,
-                                "[Ethproofs] Verification started"
+                                "[Ethproofs] Verification started: verifier={} slot={}",
+                                verifier_entry.name,
+                                proof.slot
                             );
 
                             // Run the actual cryptographic verification
                             match (verifier_entry.verify_fn)(&proof.proof_data, &vk.vk) {
                                 Ok(result) => {
                                     info!(
-                                        slot = %proof.slot,
-                                        block_hash = %proof.block_hash,
-                                        verifier = verifier_entry.name,
-                                        verification_result = result,
-                                        "[Ethproofs] Verification completed"
+                                        "[Ethproofs] Verification completed: verifier={} slot={} result={}",
+                                        verifier_entry.name,
+                                        proof.slot,
+                                        result
                                     );
                                     result
                                 }
