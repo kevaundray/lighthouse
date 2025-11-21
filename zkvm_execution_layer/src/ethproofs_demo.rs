@@ -4,7 +4,7 @@ use once_cell::sync::Lazy;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use types::ExecutionProof;
 
 /// Trait for validating proofs
@@ -27,7 +27,7 @@ pub static VERIFICATION_KEY_STORE: Lazy<Option<VerificationKeyStore>> =
     Lazy::new(|| match VerificationKeyStore::load_embedded() {
         Ok(store) => Some(store),
         Err(e) => {
-            warn!(error = %e, "[Ethproofs] Failed to load verification keys");
+            debug!(error = %e, "[Ethproofs] Failed to load verification keys");
             None
         }
     });
@@ -178,7 +178,7 @@ pub async fn download_proof_binary(proof_id: u64) -> Result<Vec<u8>, String> {
 pub fn validate_proof(proof: &ExecutionProof) -> bool {
     // Fallback proofs (proof_id 0) are accepted without verification
     if proof.proof_id.as_u8() == 0 {
-        warn!(
+        debug!(
             slot = %proof.slot,
             block_hash = %proof.block_hash,
             "[Ethproofs] Fallback proof accepted"
@@ -190,7 +190,7 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
     let prover_uuid = match VERIFIER_STORE.get_prover_uuid_for_proof_id(proof.proof_id) {
         Some(uuid) => uuid,
         None => {
-            warn!(
+            debug!(
                 proof_id = %proof.proof_id,
                 "[Ethproofs] No prover UUID mapping found for this proof_id"
             );
@@ -216,8 +216,7 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
                         Some(verifier_entry) => {
                             info!(
                                 "[Ethproofs] Verification started: verifier={} slot={}",
-                                verifier_entry.name,
-                                proof.slot
+                                verifier_entry.name, proof.slot
                             );
 
                             // Run the actual cryptographic verification
@@ -232,7 +231,7 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
                                     result
                                 }
                                 Err(e) => {
-                                    warn!(
+                                    debug!(
                                         slot = %proof.slot,
                                         block_hash = %proof.block_hash,
                                         verifier = verifier_entry.name,
@@ -244,7 +243,7 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
                             }
                         }
                         None => {
-                            warn!(
+                            debug!(
                                 slot = %proof.slot,
                                 block_hash = %proof.block_hash,
                                 prover_id = %prover_uuid,
@@ -255,7 +254,7 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
                     }
                 }
                 None => {
-                    warn!(
+                    debug!(
                         slot = %proof.slot,
                         block_hash = %proof.block_hash,
                         prover_id = %prover_uuid,
@@ -266,7 +265,7 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
             }
         }
         None => {
-            warn!("[Ethproofs] Verification key store not initialized");
+            debug!("[Ethproofs] Verification key store not initialized");
             false
         }
     }

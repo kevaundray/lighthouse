@@ -1,11 +1,9 @@
-use crate::ethproofs_demo::{
-    download_proof_binary, fetch_proof_from_ethproofs, validate_proof, VERIFIER_STORE,
-};
+use crate::ethproofs_demo::{download_proof_binary, fetch_proof_from_ethproofs, VERIFIER_STORE};
 use crate::proof_generation::{ProofGenerationError, ProofGenerationResult, ProofGenerator};
 use async_trait::async_trait;
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{info, warn};
+use tracing::{debug, info};
 use types::{ExecutionBlockHash, ExecutionProof, ExecutionProofId, Hash256, Slot};
 
 /// TODO(ethproofs): Implementation of proof generation for demo.
@@ -83,7 +81,7 @@ impl ProofGenerator for DummyProofGenerator {
         let prover_uuid = match VERIFIER_STORE.get_prover_uuid_for_proof_id(self.proof_id) {
             Some(uuid) => uuid,
             None => {
-                warn!(
+                debug!(
                     proof_id = %self.proof_id,
                     "[Ethproofs] No prover UUID mapping found, cannot query API"
                 );
@@ -96,7 +94,6 @@ impl ProofGenerator for DummyProofGenerator {
         info!(
             proof_id = %self.proof_id,
             slot = %slot,
-            block_hash = %payload_hash,
             "[Ethproofs] Starting proof generation"
         );
 
@@ -117,15 +114,7 @@ impl ProofGenerator for DummyProofGenerator {
                                 proof_binary,
                             ) {
                                 Ok(proof) => {
-                                    info!(
-                                        proof_id = proof_entry.proof_id,
-                                        cluster_id = %proof_entry.cluster_id,
-                                        "[Ethproofs] Proof verification check"
-                                    );
-
-                                    if validate_proof(&proof) {
-                                        return Ok(proof);
-                                    }
+                                    return Ok(proof);
                                 }
                                 Err(_) => {
                                     // Proof structure creation failed, will fallback below
@@ -133,7 +122,7 @@ impl ProofGenerator for DummyProofGenerator {
                             }
                         }
                         Err(e) => {
-                            warn!(
+                            debug!(
                                 proof_id = proof_entry.proof_id,
                                 error = %e,
                                 "[Ethproofs] Failed to download proof"
@@ -141,14 +130,13 @@ impl ProofGenerator for DummyProofGenerator {
                         }
                     }
                 } else {
-                    warn!(
+                    debug!(
                         proof_id = %self.proof_id,
                         "[Ethproofs] No proofs returned from API"
                     );
                 }
 
-                // Fall back to dummy proof if we get here
-                info!(
+                debug!(
                     proof_id = %self.proof_id,
                     block_hash = %payload_hash,
                     "[Ethproofs] API proof generation failed, using fallback"
@@ -156,7 +144,7 @@ impl ProofGenerator for DummyProofGenerator {
                 self.create_dummy_proof(slot, payload_hash, block_root)
             }
             Err(e) => {
-                info!(
+                debug!(
                     proof_id = %self.proof_id,
                     block_hash = %payload_hash,
                     error = %e,
