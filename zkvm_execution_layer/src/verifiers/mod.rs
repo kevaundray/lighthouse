@@ -3,6 +3,7 @@
 //! This module manages different proof verification systems based on prover type.
 //! Each verifier implements cryptographic proof verification for a specific zkVM or proof system.
 
+pub mod airbender;
 pub mod fallback;
 pub mod openvm;
 pub mod pico;
@@ -37,6 +38,9 @@ pub mod ethproofs_ids {
     /// Used for dummy proofs when Ethproofs API fails or times out
     pub const FALLBACK_UUID: &str = "00000000-0000-0000-0000-000000000000";
 
+    /// Airbender verifier UUID (proof_id = 1)
+    pub const AIRBENDER_UUID: &str = "b18507c4-50f3-4638-854a-ed625c7e685a";
+
     /// OpenVM verifier UUID (proof_id = 2)
     pub const OPENVM_UUID: &str = "9b6768c0-831d-488c-ba72-05f93975a3be";
 
@@ -58,6 +62,11 @@ pub mod ethproofs_ids {
     /// Parse a Fallback UUID
     pub fn fallback() -> Uuid {
         Uuid::parse_str(FALLBACK_UUID).expect("Valid UUID")
+    }
+
+    /// Parse an Airbender UUID
+    pub fn airbender() -> Uuid {
+        Uuid::parse_str(AIRBENDER_UUID).expect("Valid UUID")
     }
 
     /// Parse an OpenVM UUID
@@ -174,7 +183,7 @@ impl VerifierStore {
         let id = proof_id.as_u8() as u32;
         match id {
             0 => Some(ethproofs_ids::fallback()),
-            1 => None, // Reserved for Airbender
+            1 => Some(ethproofs_ids::airbender()),
             2 => Some(ethproofs_ids::openvm()),
             3 => Some(ethproofs_ids::pico()),
             4 => Some(ethproofs_ids::sp1_hypercube()),
@@ -198,7 +207,12 @@ impl VerifierStore {
             fallback::FallbackVerifier::verify,
         );
 
-        // proof_id 1 reserved for Airbender
+        // Register Airbender verifier (proof_id 1)
+        store.register(
+            ethproofs_ids::airbender(),
+            airbender::AirbenderVerifier::name(),
+            airbender::AirbenderVerifier::verify,
+        );
 
         // Register OpenVM verifier (proof_id 2)
         store.register(
