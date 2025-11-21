@@ -367,14 +367,13 @@ impl<E: EthSpec> PendingComponents<E> {
             }
 
             // Log when minimum proofs requirement is met
-            let proof_ids: Vec<_> = self.verified_execution_proofs
+            let proof_ids: Vec<_> = self
+                .verified_execution_proofs
                 .iter()
                 .map(|p| p.proof_id.as_u8().to_string())
                 .collect();
 
-            let slot = self.verified_execution_proofs
-                .first()
-                .map(|p| p.slot);
+            let slot = self.verified_execution_proofs.first().map(|p| p.slot);
 
             self.span.in_scope(|| {
                 if let Some(slot) = slot {
@@ -420,9 +419,15 @@ impl<E: EthSpec> PendingComponents<E> {
             if proof_count > 0 {
                 let slot = self.block.as_ref().map(|b| b.as_block().slot());
                 if let Some(slot) = slot {
-                    info!("[Ethproofs] Block ready for validation with {} execution proofs slot={}", proof_count, slot);
+                    info!(
+                        "[Ethproofs] Block ready for validation with {} execution proofs slot={}",
+                        proof_count, slot
+                    );
                 } else {
-                    info!("[Ethproofs] Block ready for validation with {} execution proofs", proof_count);
+                    info!(
+                        "[Ethproofs] Block ready for validation with {} execution proofs",
+                        proof_count
+                    );
                 }
             }
             debug!("Block and all data components are available");
@@ -704,6 +709,18 @@ impl<T: BeaconChainTypes> DataAvailabilityCheckerInner<T> {
         if execution_proofs.peek().is_none() {
             // No proofs to process
             return Ok(Availability::MissingComponents(block_root));
+        }
+
+        // TODO(ethproofs): Added for demo.
+        // Check if we already have the minimum required proofs
+        // If so, don't add more to avoid unnecessary processing
+        if let Some(min_proofs) = self.spec.zkvm_min_proofs_required() {
+            if let Some(pending) = self.critical.read().peek(&block_root) {
+                if pending.execution_proof_subnet_count() >= min_proofs {
+                    // Already have minimum required proofs, skip adding more
+                    return Ok(Availability::MissingComponents(block_root));
+                }
+            }
         }
 
         // Try to get epoch from existing pending components (if block already arrived)
