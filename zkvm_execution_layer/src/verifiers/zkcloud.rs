@@ -46,10 +46,9 @@ mod tests {
     fn test_zisk_zkcloud_verification() {
         // Load test proof and verification key
         let test_proof_path =
-            PathBuf::from("src/test_proofs/zisk_zkcloud_884fcc21-d522-4b4a-b535-7cfde199485c.bin");
-        let vk_path = PathBuf::from(
-            "src/verification_keys/zisk_zkcloud_884fcc21-d522-4b4a-b535-7cfde199485c.bin",
-        );
+            PathBuf::from("src/test_proofs/zkcloud_884fcc21-d522-4b4a-b535-7cfde199485c.bin");
+        let vk_path =
+            PathBuf::from("src/verification_keys/zkcloud_884fcc21-d522-4b4a-b535-7cfde199485c.bin");
 
         let proof_data = std::fs::read(&test_proof_path).expect("Failed to read test proof file");
         let vk_data = std::fs::read(&vk_path).expect("Failed to read verification key file");

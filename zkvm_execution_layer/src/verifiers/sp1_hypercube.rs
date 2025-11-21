@@ -51,10 +51,9 @@ mod tests {
     fn test_sp1_hypercube_verification() {
         // Load test proof and verification key
         let test_proof_path =
-            PathBuf::from("src/test_proofs/sp1_hypercube_9d0bd54d-69f9-4404-8f30-020516a8155d.bin");
-        let vk_path = PathBuf::from(
-            "src/verification_keys/sp1_hypercube_9d0bd54d-69f9-4404-8f30-020516a8155d.bin",
-        );
+            PathBuf::from("src/test_proofs/sp1_fbef2553-8cd0-4f45-b328-570b5c8688b2.bin");
+        let vk_path =
+            PathBuf::from("src/verification_keys/sp1_fbef2553-8cd0-4f45-b328-570b5c8688b2.bin");
 
         let proof_data = std::fs::read(&test_proof_path).expect("Failed to read test proof file");
         let vk_data = std::fs::read(&vk_path).expect("Failed to read verification key file");
