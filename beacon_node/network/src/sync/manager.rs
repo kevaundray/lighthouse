@@ -45,6 +45,7 @@ use crate::service::NetworkMessage;
 use crate::status::ToStatusMessage;
 use crate::sync::block_lookups::{
     BlobRequestState, BlockComponent, BlockRequestState, CustodyRequestState, DownloadResult,
+    ProofRequestState,
 };
 use crate::sync::custody_backfill_sync::CustodyBackFillSync;
 use crate::sync::network_context::{PeerGroup, RpcResponseResult};
@@ -73,7 +74,8 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace};
 use types::{
-    BlobSidecar, DataColumnSidecar, EthSpec, ForkContext, Hash256, SignedBeaconBlock, Slot,
+    BlobSidecar, DataColumnSidecar, EthSpec, ExecutionProof, ForkContext, Hash256,
+    SignedBeaconBlock, Slot,
 };
 
 /// The number of slots ahead of us that is allowed before requesting a long-range (batch)  Sync
@@ -132,6 +134,14 @@ pub enum SyncMessage<E: EthSpec> {
         seen_timestamp: Duration,
     },
 
+    /// An execution proof has been received from the RPC
+    RpcExecutionProof {
+        sync_request_id: SyncRequestId,
+        peer_id: PeerId,
+        execution_proof: Option<Arc<ExecutionProof>>,
+        seen_timestamp: Duration,
+    },
+
     /// A block with an unknown parent has been received.
     UnknownParentBlock(PeerId, Arc<SignedBeaconBlock<E>>, Hash256),
 
@@ -183,6 +193,7 @@ pub enum BlockProcessType {
     SingleBlock { id: Id },
     SingleBlob { id: Id },
     SingleCustodyColumn(Id),
+    SingleExecutionProof { id: Id },
 }
 
 impl BlockProcessType {
@@ -190,7 +201,8 @@ impl BlockProcessType {
         match self {
             BlockProcessType::SingleBlock { id }
             | BlockProcessType::SingleBlob { id }
-            | BlockProcessType::SingleCustodyColumn(id) => *id,
+            | BlockProcessType::SingleCustodyColumn(id)
+            | BlockProcessType::SingleExecutionProof { id } => *id,
         }
     }
 }
@@ -490,6 +502,9 @@ impl<T: BeaconChainTypes> SyncManager<T> {
             }
             SyncRequestId::SingleBlob { id } => {
                 self.on_single_blob_response(id, peer_id, RpcEvent::RPCError(error))
+            }
+            SyncRequestId::SingleExecutionProof { id } => {
+                self.on_single_execution_proof_response(id, peer_id, RpcEvent::RPCError(error))
             }
             SyncRequestId::DataColumnsByRoot(req_id) => {
                 self.on_data_columns_by_root_response(req_id, peer_id, RpcEvent::RPCError(error))
@@ -833,6 +848,17 @@ impl<T: BeaconChainTypes> SyncManager<T> {
             } => {
                 self.rpc_data_column_received(sync_request_id, peer_id, data_column, seen_timestamp)
             }
+            SyncMessage::RpcExecutionProof {
+                sync_request_id,
+                peer_id,
+                execution_proof,
+                seen_timestamp,
+            } => self.rpc_execution_proof_received(
+                sync_request_id,
+                peer_id,
+                execution_proof,
+                seen_timestamp,
+            ),
             SyncMessage::UnknownParentBlock(peer_id, block, block_root) => {
                 let block_slot = block.slot();
                 let parent_root = block.parent_root();
@@ -1186,6 +1212,25 @@ impl<T: BeaconChainTypes> SyncManager<T> {
         }
     }
 
+    fn rpc_execution_proof_received(
+        &mut self,
+        sync_request_id: SyncRequestId,
+        peer_id: PeerId,
+        execution_proof: Option<Arc<ExecutionProof>>,
+        seen_timestamp: Duration,
+    ) {
+        match sync_request_id {
+            SyncRequestId::SingleExecutionProof { id } => self.on_single_execution_proof_response(
+                id,
+                peer_id,
+                RpcEvent::from_chunk(execution_proof, seen_timestamp),
+            ),
+            _ => {
+                crit!(%peer_id, "bad request id for execution_proof");
+            }
+        }
+    }
+
     fn on_single_blob_response(
         &mut self,
         id: SingleLookupReqId,
@@ -1195,6 +1240,27 @@ impl<T: BeaconChainTypes> SyncManager<T> {
         if let Some(resp) = self.network.on_single_blob_response(id, peer_id, blob) {
             self.block_lookups
                 .on_download_response::<BlobRequestState<T::EthSpec>>(
+                    id,
+                    resp.map(|(value, seen_timestamp)| {
+                        (value, PeerGroup::from_single(peer_id), seen_timestamp)
+                    }),
+                    &mut self.network,
+                )
+        }
+    }
+
+    fn on_single_execution_proof_response(
+        &mut self,
+        id: SingleLookupReqId,
+        peer_id: PeerId,
+        execution_proof: RpcEvent<Arc<ExecutionProof>>,
+    ) {
+        if let Some(resp) =
+            self.network
+                .on_single_execution_proof_response(id, peer_id, execution_proof)
+        {
+            self.block_lookups
+                .on_download_response::<ProofRequestState>(
                     id,
                     resp.map(|(value, seen_timestamp)| {
                         (value, PeerGroup::from_single(peer_id), seen_timestamp)

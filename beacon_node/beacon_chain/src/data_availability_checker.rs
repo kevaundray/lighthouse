@@ -18,12 +18,13 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 use task_executor::TaskExecutor;
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, instrument, warn};
 use types::blob_sidecar::{BlobIdentifier, BlobSidecar, FixedBlobSidecarList};
 use types::{
     BlobSidecarList, BlockImportSource, ChainSpec, DataColumnSidecar, DataColumnSidecarList, Epoch,
-    EthSpec, Hash256, SignedBeaconBlock, Slot,
+    EthSpec, ExecutionProof, ExecutionProofId, Hash256, SignedBeaconBlock, Slot,
 };
+use zkvm_execution_layer::registry_proof_verification::VerifierRegistry;
 
 mod error;
 mod overflow_lru_cache;
@@ -86,6 +87,8 @@ pub struct DataAvailabilityChecker<T: BeaconChainTypes> {
     kzg: Arc<Kzg>,
     custody_context: Arc<CustodyContext<T::EthSpec>>,
     spec: Arc<ChainSpec>,
+    /// Registry of proof verifiers for different zkVM proof IDs.
+    verifier_registry: Option<Arc<VerifierRegistry>>,
 }
 
 pub type AvailabilityAndReconstructedColumns<E> = (Availability<E>, DataColumnSidecarList<E>);
@@ -118,6 +121,7 @@ impl<E: EthSpec> Debug for Availability<E> {
 }
 
 impl<T: BeaconChainTypes> DataAvailabilityChecker<T> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         complete_blob_backfill: bool,
         slot_clock: T::SlotClock,
@@ -125,12 +129,15 @@ impl<T: BeaconChainTypes> DataAvailabilityChecker<T> {
         store: BeaconStore<T>,
         custody_context: Arc<CustodyContext<T::EthSpec>>,
         spec: Arc<ChainSpec>,
+        verifier_registry: Option<Arc<VerifierRegistry>>,
+        has_execution_layer_and_proof_gen: bool,
     ) -> Result<Self, AvailabilityCheckError> {
         let inner = DataAvailabilityCheckerInner::new(
             OVERFLOW_LRU_CAPACITY_NON_ZERO,
             store,
             custody_context.clone(),
             spec.clone(),
+            has_execution_layer_and_proof_gen,
         )?;
         Ok(Self {
             complete_blob_backfill,
@@ -139,6 +146,7 @@ impl<T: BeaconChainTypes> DataAvailabilityChecker<T> {
             kzg,
             custody_context,
             spec,
+            verifier_registry,
         })
     }
 
@@ -169,6 +177,54 @@ impl<T: BeaconChainTypes> DataAvailabilityChecker<T> {
             })
     }
 
+    /// Return the set of cached execution proof IDs for `block_root`. Returns None if there is
+    /// no block component for `block_root`.
+    pub fn cached_execution_proof_subnet_ids(
+        &self,
+        block_root: &Hash256,
+    ) -> Option<Vec<ExecutionProofId>> {
+        self.availability_cache
+            .peek_pending_components(block_root, |components| {
+                components.map(|components| {
+                    components
+                        .get_cached_execution_proofs()
+                        .iter()
+                        .map(|proof| proof.proof_id)
+                        .collect::<Vec<_>>()
+                })
+            })
+    }
+
+    /// Get proof IDs we already have for a block.
+    /// Used when creating RPC requests to tell peers what we don't need.
+    pub fn get_existing_proof_ids(&self, block_root: &Hash256) -> Option<Vec<ExecutionProofId>> {
+        self.availability_cache
+            .peek_pending_components(block_root, |components| {
+                components.map(|components| {
+                    components
+                        .get_cached_execution_proofs()
+                        .iter()
+                        .map(|proof| proof.proof_id)
+                        .collect::<Vec<_>>()
+                })
+            })
+    }
+
+    /// Get all execution proofs we have for a block.
+    /// Used when responding to RPC requests.
+    pub fn get_execution_proofs(&self, block_root: &Hash256) -> Option<Vec<Arc<ExecutionProof>>> {
+        self.availability_cache
+            .peek_pending_components(block_root, |components| {
+                components.map(|components| {
+                    components
+                        .get_cached_execution_proofs()
+                        .iter()
+                        .map(|proof| Arc::new(proof.clone()))
+                        .collect::<Vec<_>>()
+                })
+            })
+    }
+
     /// Return the set of cached custody column indexes for `block_root`. Returns None if there is
     /// no block component for `block_root`.
     pub fn cached_data_column_indexes(&self, block_root: &Hash256) -> Option<Vec<u64>> {
@@ -191,6 +247,63 @@ impl<T: BeaconChainTypes> DataAvailabilityChecker<T> {
                     cached_column_opt.is_some_and(|cached| *cached == *data_column)
                 })
             })
+    }
+
+    /// Check if an execution proof is already cached in the availability cache.
+    ///
+    /// We usually call this method if the proof was made available ia RPC, and we later receive it via Gossip.
+    /// If it exists in the cache, we know it has already passed validation,
+    /// even though this particular instance may not have been seen/published on gossip yet.
+    pub fn is_execution_proof_cached(
+        &self,
+        block_root: &Hash256,
+        execution_proof: &ExecutionProof,
+    ) -> bool {
+        self.availability_cache
+            .peek_pending_components(block_root, |components| {
+                components.is_some_and(|components| {
+                    components
+                        .get_cached_execution_proofs()
+                        .iter()
+                        .any(|cached| cached == execution_proof)
+                })
+            })
+    }
+
+    /// Verify a single execution proof for gossip.
+    ///
+    /// This performs cryptographic verification of the proof without requiring the full block.
+    ///
+    /// Returns:
+    /// - Ok(true) if proof is valid
+    /// - Ok(false) if proof is invalid
+    /// - Err if no verifier is configured or verification fails
+    pub fn verify_execution_proof_for_gossip(
+        &self,
+        proof: &ExecutionProof,
+    ) -> Result<bool, AvailabilityCheckError> {
+        let Some(verifier_registry) = &self.verifier_registry else {
+            // No verifier configured but receiving proofs - this is a configuration error.
+            // If the chain spec enables zkVM, the node must have --activate-zkvm flag set.
+            return Err(AvailabilityCheckError::ProofVerificationError(
+                "Node is receiving execution proofs but zkVM verification is not enabled. \
+                 Use --activate-zkvm flag to enable proof verification."
+                    .to_string(),
+            ));
+        };
+
+        let subnet_id = proof.proof_id;
+        let verifier = verifier_registry.get_verifier(subnet_id).ok_or_else(|| {
+            warn!(?subnet_id, "No verifier registered for subnet");
+            AvailabilityCheckError::UnsupportedProofID(subnet_id)
+        })?;
+
+        verifier.verify(proof).map_err(|e| {
+            AvailabilityCheckError::ProofVerificationError(format!(
+                "Proof verification failed: {:?}",
+                e
+            ))
+        })
     }
 
     /// Get a blob from the availability cache.
@@ -269,6 +382,117 @@ impl<T: BeaconChainTypes> DataAvailabilityChecker<T> {
             .put_kzg_verified_data_columns(block_root, verified_custody_columns)
     }
 
+    /// Put a list of execution proofs received via RPC into the availability cache.
+    /// This performs cryptographic verification on the proofs.
+    #[instrument(skip_all, level = "trace")]
+    pub fn put_rpc_execution_proofs(
+        &self,
+        block_root: Hash256,
+        proofs: Vec<Arc<types::ExecutionProof>>,
+    ) -> Result<Availability<T::EthSpec>, AvailabilityCheckError> {
+        debug!(
+            ?block_root,
+            num_proofs = proofs.len(),
+            "Verifying and storing execution proofs in DA checker"
+        );
+
+        // If no verifier registry is configured, skip verification
+        let Some(verifier_registry) = &self.verifier_registry else {
+            debug!(
+                ?block_root,
+                "No verifier registry configured, storing proofs without verification"
+            );
+            let owned_proofs = proofs.iter().map(|p| (**p).clone());
+            return self
+                .availability_cache
+                .put_verified_execution_proofs(block_root, owned_proofs);
+        };
+
+        // Get the execution payload hash from the block
+        let execution_payload_hash = self
+            .availability_cache
+            .peek_pending_components(&block_root, |components| {
+                components.and_then(|c| c.block.as_ref().and_then(|b| b.execution_payload_hash()))
+            })
+            .ok_or_else(|| {
+                warn!(
+                    ?block_root,
+                    "Cannot verify proofs: block not in cache or has no execution payload"
+                );
+                AvailabilityCheckError::MissingExecutionPayload
+            })?;
+
+        debug!(
+            ?block_root,
+            ?execution_payload_hash,
+            "Got execution payload hash for proof verification"
+        );
+
+        let mut verified_proofs = Vec::new();
+        for proof in proofs {
+            let proof_id = proof.proof_id;
+
+            // Check that the proof's block_hash matches the execution payload hash
+            if proof.block_hash != execution_payload_hash {
+                warn!(
+                    ?block_root,
+                    ?proof_id,
+                    proof_hash = ?proof.block_hash,
+                    ?execution_payload_hash,
+                    "Proof execution payload hash mismatch"
+                );
+                return Err(AvailabilityCheckError::ExecutionPayloadHashMismatch {
+                    proof_hash: proof.block_hash,
+                    block_hash: execution_payload_hash,
+                });
+            }
+
+            let verifier = verifier_registry.get_verifier(proof_id).ok_or_else(|| {
+                warn!(?proof_id, "No verifier registered for proof ID");
+                AvailabilityCheckError::UnsupportedProofID(proof_id)
+            })?;
+
+            // Verify the proof (proof contains block_hash internally)
+            match verifier.verify(&proof) {
+                Ok(true) => {
+                    debug!(?proof_id, ?block_root, "Proof verification succeeded");
+                    verified_proofs.push((*proof).clone());
+                }
+                Ok(false) => {
+                    warn!(
+                        ?proof_id,
+                        ?block_root,
+                        "Proof verification failed: proof is invalid"
+                    );
+                    return Err(AvailabilityCheckError::InvalidProof {
+                        proof_id,
+                        reason: "Proof verification returns false".to_string(),
+                    });
+                }
+                Err(e) => {
+                    warn!(
+                        ?proof_id,
+                        ?block_root,
+                        error = ?e,
+                        "Proof verification error"
+                    );
+                    return Err(AvailabilityCheckError::ProofVerificationError(
+                        e.to_string(),
+                    ));
+                }
+            }
+        }
+
+        debug!(
+            ?block_root,
+            verified_count = verified_proofs.len(),
+            "All proofs verified successfully"
+        );
+
+        self.availability_cache
+            .put_verified_execution_proofs(block_root, verified_proofs)
+    }
+
     /// Check if we've cached other blobs for this block. If it completes a set and we also
     /// have a block cached, return the `Availability` variant triggering block import.
     /// Otherwise cache the blob sidecar.
@@ -336,6 +560,20 @@ impl<T: BeaconChainTypes> DataAvailabilityChecker<T> {
     ) -> Result<Availability<T::EthSpec>, AvailabilityCheckError> {
         self.availability_cache
             .put_kzg_verified_data_columns(block_root, custody_columns)
+    }
+
+    /// Put execution proofs into the availability cache as pending components.
+    ///
+    /// Returns `Availability` which has information about whether all components have been
+    /// received or more are required.
+    #[instrument(skip_all, level = "trace")]
+    pub fn put_verified_execution_proofs<I: IntoIterator<Item = types::ExecutionProof>>(
+        &self,
+        block_root: Hash256,
+        execution_proofs: I,
+    ) -> Result<Availability<T::EthSpec>, AvailabilityCheckError> {
+        self.availability_cache
+            .put_verified_execution_proofs(block_root, execution_proofs)
     }
 
     /// Check if we have all the blobs for a block. Returns `Availability` which has information
@@ -564,6 +802,44 @@ impl<T: BeaconChainTypes> DataAvailabilityChecker<T> {
                 now_epoch >= deneb_epoch
             })
         })
+    }
+
+    /// The epoch at which we require execution proofs for block processing.
+    ///
+    /// Note: This follows the same pattern as blob retention: proofs are required starting from
+    /// the zkvm_fork epoch, but only retained for a configured number of epochs.
+    ///
+    /// TODO(zkproofs): We don't store proofs forever and we also don't store
+    /// blobs forever, perhaps we should because when the blob disappears, we may not
+    /// be able to remake the proof when we put blobs in blocks.
+    /// We don't for now because proofs are quite large at the moment.
+    ///
+    /// Returns `None` if ZK-VM mode is disabled.
+    pub fn execution_proof_boundary(&self) -> Option<Epoch> {
+        let zkvm_fork_epoch = self.spec.zkvm_fork_epoch()?;
+
+        let current_epoch = self.slot_clock.now()?.epoch(T::EthSpec::slots_per_epoch());
+
+        // Calculate retention boundary
+        let proof_retention_epoch =
+            current_epoch.saturating_sub(self.spec.min_epochs_for_execution_proof_requests);
+
+        // Return max of fork epoch and retention boundary
+        // This ensures:
+        // 1. Proofs are never required before the zkvm fork
+        // 2. Proofs are only retained for the configured number of epochs
+        Some(std::cmp::max(zkvm_fork_epoch, proof_retention_epoch))
+    }
+
+    /// Returns true if the given epoch lies within the proof retention boundary.
+    pub fn execution_proof_check_required_for_epoch(&self, block_epoch: Epoch) -> bool {
+        self.execution_proof_boundary()
+            .is_some_and(|boundary_epoch| block_epoch >= boundary_epoch)
+    }
+
+    /// Returns the minimum number of execution proofs required for ZK-VM mode.
+    pub fn min_execution_proofs_required(&self) -> Option<usize> {
+        self.spec.zkvm_min_proofs_required()
     }
 
     /// Collects metrics from the data availability checker.
@@ -866,11 +1142,11 @@ mod test {
     use crate::CustodyContext;
     use crate::custody_context::NodeCustodyType;
     use crate::test_utils::{
-        EphemeralHarnessType, NumBlobs, generate_rand_block_and_data_columns, get_kzg,
+        EphemeralHarnessType, NumBlobs, generate_data_column_indices_rand_order,
+        generate_rand_block_and_data_columns, get_kzg,
     };
     use rand::SeedableRng;
     use rand::prelude::StdRng;
-    use rand::seq::SliceRandom;
     use slot_clock::{SlotClock, TestingSlotClock};
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -892,8 +1168,6 @@ mod test {
 
         let da_checker = new_da_checker(spec.clone());
         let custody_context = &da_checker.custody_context;
-        let all_column_indices_ordered =
-            init_custody_context_with_ordered_columns(custody_context, &mut rng, &spec);
 
         // GIVEN a single 32 ETH validator is attached slot 0
         let epoch = Epoch::new(0);
@@ -926,7 +1200,8 @@ mod test {
             &spec,
         );
         let block_root = Hash256::random();
-        let requested_columns = &all_column_indices_ordered[..10];
+        let custody_columns = custody_context.custody_columns_for_epoch(None, &spec);
+        let requested_columns = &custody_columns[..10];
         da_checker
             .put_rpc_custody_columns(
                 block_root,
@@ -971,8 +1246,6 @@ mod test {
 
         let da_checker = new_da_checker(spec.clone());
         let custody_context = &da_checker.custody_context;
-        let all_column_indices_ordered =
-            init_custody_context_with_ordered_columns(custody_context, &mut rng, &spec);
 
         // GIVEN a single 32 ETH validator is attached slot 0
         let epoch = Epoch::new(0);
@@ -1006,7 +1279,8 @@ mod test {
             &spec,
         );
         let block_root = Hash256::random();
-        let requested_columns = &all_column_indices_ordered[..10];
+        let custody_columns = custody_context.custody_columns_for_epoch(None, &spec);
+        let requested_columns = &custody_columns[..10];
         let gossip_columns = data_columns
             .into_iter()
             .filter(|d| requested_columns.contains(&d.index))
@@ -1096,8 +1370,6 @@ mod test {
 
         let da_checker = new_da_checker(spec.clone());
         let custody_context = &da_checker.custody_context;
-        let all_column_indices_ordered =
-            init_custody_context_with_ordered_columns(custody_context, &mut rng, &spec);
 
         // Set custody requirement to 65 columns (enough to trigger reconstruction)
         let epoch = Epoch::new(1);
@@ -1127,7 +1399,8 @@ mod test {
 
         // Add 64 columns to the da checker (enough to be able to reconstruct)
         // Order by all_column_indices_ordered, then take first 64
-        let custody_columns = all_column_indices_ordered
+        let custody_columns = custody_context.custody_columns_for_epoch(None, &spec);
+        let custody_columns = custody_columns
             .iter()
             .filter_map(|&col_idx| data_columns.iter().find(|d| d.index == col_idx).cloned())
             .take(64)
@@ -1177,19 +1450,6 @@ mod test {
         );
     }
 
-    fn init_custody_context_with_ordered_columns(
-        custody_context: &Arc<CustodyContext<E>>,
-        mut rng: &mut StdRng,
-        spec: &ChainSpec,
-    ) -> Vec<u64> {
-        let mut all_data_columns = (0..spec.number_of_custody_groups).collect::<Vec<_>>();
-        all_data_columns.shuffle(&mut rng);
-        custody_context
-            .init_ordered_data_columns_from_custody_groups(all_data_columns.clone(), spec)
-            .expect("should initialise ordered custody columns");
-        all_data_columns
-    }
-
     fn new_da_checker(spec: Arc<ChainSpec>) -> DataAvailabilityChecker<T> {
         let slot_clock = TestingSlotClock::new(
             Slot::new(0),
@@ -1198,7 +1458,12 @@ mod test {
         );
         let kzg = get_kzg(&spec);
         let store = Arc::new(HotColdDB::open_ephemeral(<_>::default(), spec.clone()).unwrap());
-        let custody_context = Arc::new(CustodyContext::new(NodeCustodyType::Fullnode, &spec));
+        let ordered_custody_column_indices = generate_data_column_indices_rand_order::<E>();
+        let custody_context = Arc::new(CustodyContext::new(
+            NodeCustodyType::Fullnode,
+            ordered_custody_column_indices,
+            &spec,
+        ));
         let complete_blob_backfill = false;
         DataAvailabilityChecker::new(
             complete_blob_backfill,
@@ -1207,6 +1472,8 @@ mod test {
             store,
             custody_context,
             spec,
+            None,
+            false,
         )
         .expect("should initialise data availability checker")
     }

@@ -42,6 +42,7 @@ use parking_lot::{Mutex, RwLockWriteGuard};
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
 use rayon::prelude::*;
 use sensitive_url::SensitiveUrl;
 use slot_clock::{SlotClock, TestingSlotClock};
@@ -59,6 +60,7 @@ use store::{HotColdDB, ItemStore, MemoryStore, config::StoreConfig};
 use task_executor::TaskExecutor;
 use task_executor::{ShutdownReason, test_utils::TestRuntime};
 use tree_hash::TreeHash;
+use types::data_column_custody_group::CustodyIndex;
 use types::indexed_attestation::IndexedAttestationBase;
 use types::payload::BlockProductionVersion;
 use types::test_utils::TestRandom;
@@ -220,6 +222,7 @@ pub struct Builder<T: BeaconChainTypes> {
     testing_slot_clock: Option<TestingSlotClock>,
     validator_monitor_config: Option<ValidatorMonitorConfig>,
     genesis_state_builder: Option<InteropGenesisBuilder<T::EthSpec>>,
+    zkvm_execution_layer_config: Option<zkvm_execution_layer::ZKVMExecutionLayerConfig>,
     node_custody_type: NodeCustodyType,
     runtime: TestRuntime,
 }
@@ -366,6 +369,7 @@ where
             testing_slot_clock: None,
             validator_monitor_config: None,
             genesis_state_builder: None,
+            zkvm_execution_layer_config: None,
             node_custody_type: NodeCustodyType::Fullnode,
             runtime,
         }
@@ -540,6 +544,13 @@ where
         self
     }
 
+    /// Enable zkVM execution proof verification with dummy verifiers for testing.
+    pub fn zkvm_with_dummy_verifiers(mut self) -> Self {
+        self.zkvm_execution_layer_config =
+            Some(zkvm_execution_layer::ZKVMExecutionLayerConfig::default());
+        self
+    }
+
     pub fn with_genesis_state_builder(
         mut self,
         f: impl FnOnce(InteropGenesisBuilder<E>) -> InteropGenesisBuilder<E>,
@@ -576,9 +587,16 @@ where
             .shutdown_sender(shutdown_tx)
             .chain_config(chain_config)
             .node_custody_type(self.node_custody_type)
+            .ordered_custody_column_indices(generate_data_column_indices_rand_order::<E>())
             .event_handler(Some(ServerSentEventHandler::new_with_capacity(5)))
             .validator_monitor_config(validator_monitor_config)
             .rng(Box::new(StdRng::seed_from_u64(42)));
+
+        builder = if let Some(zkvm_config) = self.zkvm_execution_layer_config {
+            builder.zkvm_execution_layer_config(Some(zkvm_config))
+        } else {
+            builder
+        };
 
         builder = if let Some(mutator) = self.initial_mutator {
             mutator(builder)
@@ -604,15 +622,6 @@ where
         };
 
         let chain = builder.build().expect("should build");
-
-        chain
-            .data_availability_checker
-            .custody_context()
-            .init_ordered_data_columns_from_custody_groups(
-                (0..spec.number_of_custody_groups).collect(),
-                &spec,
-            )
-            .expect("should initialise custody context");
 
         BeaconChainHarness {
             spec: chain.spec.clone(),
@@ -3392,4 +3401,10 @@ pub fn generate_data_column_sidecars_from_block<E: EthSpec>(
         spec,
     )
     .unwrap()
+}
+
+pub fn generate_data_column_indices_rand_order<E: EthSpec>() -> Vec<CustodyIndex> {
+    let mut indices = (0..E::number_of_columns() as u64).collect::<Vec<_>>();
+    indices.shuffle(&mut StdRng::seed_from_u64(42));
+    indices
 }

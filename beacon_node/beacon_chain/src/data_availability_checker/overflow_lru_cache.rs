@@ -55,6 +55,16 @@ impl<E: EthSpec> CachedBlock<E> {
             .blob_kzg_commitments()
             .map_or(0, |commitments| commitments.len())
     }
+
+    /// Get the execution payload hash if this block has an execution payload
+    pub fn execution_payload_hash(&self) -> Option<types::ExecutionBlockHash> {
+        self.as_block()
+            .message()
+            .body()
+            .execution_payload()
+            .ok()
+            .map(|payload| payload.execution_payload_ref().block_hash())
+    }
 }
 
 /// This represents the components of a partially available block
@@ -74,6 +84,7 @@ pub struct PendingComponents<E: EthSpec> {
     pub block_root: Hash256,
     pub verified_blobs: RuntimeFixedVector<Option<KzgVerifiedBlob<E>>>,
     pub verified_data_columns: Vec<KzgVerifiedCustodyDataColumn<E>>,
+    pub verified_execution_proofs: Vec<types::ExecutionProof>,
     pub block: Option<CachedBlock<E>>,
     pub reconstruction_started: bool,
     span: Span,
@@ -199,6 +210,50 @@ impl<E: EthSpec> PendingComponents<E> {
         Ok(())
     }
 
+    /// Returns an immutable reference to the cached execution proofs.
+    pub fn get_cached_execution_proofs(&self) -> &[types::ExecutionProof] {
+        &self.verified_execution_proofs
+    }
+
+    /// Check if we have a specific proof
+    pub fn has_proof_with_id(&self, proof_id: types::ExecutionProofId) -> bool {
+        self.verified_execution_proofs
+            .iter()
+            .any(|proof| proof.proof_id == proof_id)
+    }
+
+    /// Get the number of unique subnet proofs we have
+    pub fn execution_proof_subnet_count(&self) -> usize {
+        self.verified_execution_proofs.len()
+    }
+
+    /// Merges a single execution proof into the cache.
+    ///
+    /// Proofs are only inserted if:
+    /// 1. We don't already have a proof from this subnet for this block
+    /// 2. The proof's block_hash matches the cached block_root (if block exists)
+    pub fn merge_execution_proof(&mut self, proof: types::ExecutionProof) {
+        // Verify the proof is for the correct block
+        // ExecutionBlockHash is a wrapper around Hash256, so we need to convert
+
+        // Don't insert duplicate proofs
+        if self.has_proof_with_id(proof.proof_id) {
+            return;
+        }
+
+        self.verified_execution_proofs.push(proof);
+    }
+
+    /// Merges a given set of execution proofs into the cache.
+    pub fn merge_execution_proofs<I: IntoIterator<Item = types::ExecutionProof>>(
+        &mut self,
+        execution_proofs: I,
+    ) {
+        for proof in execution_proofs {
+            self.merge_execution_proof(proof);
+        }
+    }
+
     /// Inserts a new block and revalidates the existing blobs against it.
     ///
     /// Blobs that don't match the new block's commitments are evicted.
@@ -213,10 +268,11 @@ impl<E: EthSpec> PendingComponents<E> {
     ///
     /// WARNING: This function can potentially take a lot of time if the state needs to be
     /// reconstructed from disk. Ensure you are not holding any write locks while calling this.
-    pub fn make_available<R>(
+    fn make_available<R>(
         &self,
         spec: &Arc<ChainSpec>,
         num_expected_columns_opt: Option<usize>,
+        has_execution_layer_and_proof_gen: bool,
         recover: R,
     ) -> Result<Option<AvailableExecutedBlock<E>>, AvailabilityCheckError>
     where
@@ -294,6 +350,23 @@ impl<E: EthSpec> PendingComponents<E> {
             return Ok(None);
         };
 
+        // Check if this node needs execution proofs to validate blocks.
+        // Nodes that have EL and generate proofs validate via EL execution.
+        // Nodes that have EL but DON'T generate proofs are lightweight verifiers and wait for proofs.
+        // TODO(zkproofs): This is a technicality mainly because we cannot remove the EL on kurtosis
+        // ie each CL is coupled with an EL
+        let needs_execution_proofs =
+            spec.zkvm_min_proofs_required().is_some() && !has_execution_layer_and_proof_gen;
+
+        if needs_execution_proofs {
+            let min_proofs = spec.zkvm_min_proofs_required().unwrap();
+            let num_proofs = self.execution_proof_subnet_count();
+            if num_proofs < min_proofs {
+                // Not enough execution proofs yet
+                return Ok(None);
+            }
+        }
+
         // Block is available, construct `AvailableExecutedBlock`
 
         let blobs_available_timestamp = match blob_data {
@@ -340,6 +413,7 @@ impl<E: EthSpec> PendingComponents<E> {
             block_root,
             verified_blobs: RuntimeFixedVector::new(vec![None; max_len]),
             verified_data_columns: vec![],
+            verified_execution_proofs: vec![],
             block: None,
             reconstruction_started: false,
             span,
@@ -372,7 +446,9 @@ impl<E: EthSpec> PendingComponents<E> {
 
     pub fn status_str(&self, num_expected_columns_opt: Option<usize>) -> String {
         let block_count = if self.block.is_some() { 1 } else { 0 };
-        if let Some(num_expected_columns) = num_expected_columns_opt {
+        let proof_count = self.execution_proof_subnet_count();
+
+        let base_status = if let Some(num_expected_columns) = num_expected_columns_opt {
             format!(
                 "block {} data_columns {}/{}",
                 block_count,
@@ -391,6 +467,13 @@ impl<E: EthSpec> PendingComponents<E> {
                 self.verified_blobs.iter().flatten().count(),
                 num_expected_blobs
             )
+        };
+
+        // Append execution proof count if we have any
+        if proof_count > 0 {
+            format!("{} proofs {}", base_status, proof_count)
+        } else {
+            base_status
         }
     }
 }
@@ -405,6 +488,10 @@ pub struct DataAvailabilityCheckerInner<T: BeaconChainTypes> {
     state_cache: StateLRUCache<T>,
     custody_context: Arc<CustodyContext<T::EthSpec>>,
     spec: Arc<ChainSpec>,
+    /// Whether this node has an execution layer AND generates proofs.
+    /// - true: Node has EL and generates proofs → validates via EL execution
+    /// - false: Node either has no EL, or has EL but doesn't generate → waits for proofs (lightweight verifier)
+    has_execution_layer_and_proof_gen: bool,
 }
 
 // This enum is only used internally within the crate in the reconstruction function to improve
@@ -422,12 +509,14 @@ impl<T: BeaconChainTypes> DataAvailabilityCheckerInner<T> {
         beacon_store: BeaconStore<T>,
         custody_context: Arc<CustodyContext<T::EthSpec>>,
         spec: Arc<ChainSpec>,
+        has_execution_layer_and_proof_gen: bool,
     ) -> Result<Self, AvailabilityCheckError> {
         Ok(Self {
             critical: RwLock::new(LruCache::new(capacity)),
             state_cache: StateLRUCache::new(beacon_store, spec.clone()),
             custody_context,
             spec,
+            has_execution_layer_and_proof_gen,
         })
     }
 
@@ -575,6 +664,53 @@ impl<T: BeaconChainTypes> DataAvailabilityCheckerInner<T> {
         )
     }
 
+    /// Puts execution proofs into the availability cache as pending components.
+    pub fn put_verified_execution_proofs<I: IntoIterator<Item = types::ExecutionProof>>(
+        &self,
+        block_root: Hash256,
+        execution_proofs: I,
+    ) -> Result<Availability<T::EthSpec>, AvailabilityCheckError> {
+        let mut execution_proofs = execution_proofs.into_iter().peekable();
+
+        if execution_proofs.peek().is_none() {
+            // No proofs to process
+            return Ok(Availability::MissingComponents(block_root));
+        }
+
+        // Try to get epoch from existing pending components (if block already arrived)
+        // Otherwise use Epoch::new(0) as placeholder (will be corrected when block arrives)
+        // Also the component cannot be marked as available, if the block is missing
+        let epoch = self
+            .critical
+            .read()
+            .peek(&block_root)
+            .and_then(|pending| pending.epoch())
+            .unwrap_or_else(|| types::Epoch::new(0));
+
+        let pending_components =
+            self.update_or_insert_pending_components(block_root, epoch, |pending_components| {
+                pending_components.merge_execution_proofs(execution_proofs);
+                Ok(())
+            })?;
+
+        let num_expected_columns_opt = self.get_num_expected_columns(epoch);
+
+        pending_components.span.in_scope(|| {
+            debug!(
+                component = "execution_proofs",
+                status = pending_components.status_str(num_expected_columns_opt),
+                num_proofs = pending_components.execution_proof_subnet_count(),
+                "Component added to data availability checker"
+            );
+        });
+
+        self.check_availability_and_cache_components(
+            block_root,
+            pending_components,
+            num_expected_columns_opt,
+        )
+    }
+
     fn check_availability_and_cache_components(
         &self,
         block_root: Hash256,
@@ -584,6 +720,7 @@ impl<T: BeaconChainTypes> DataAvailabilityCheckerInner<T> {
         if let Some(available_block) = pending_components.make_available(
             &self.spec,
             num_expected_columns_opt,
+            self.has_execution_layer_and_proof_gen,
             |block, span| self.state_cache.recover_pending_executed_block(block, span),
         )? {
             // Explicitly drop read lock before acquiring write lock
@@ -823,6 +960,7 @@ impl<T: BeaconChainTypes> DataAvailabilityCheckerInner<T> {
 mod test {
     use super::*;
 
+    use crate::test_utils::generate_data_column_indices_rand_order;
     use crate::{
         blob_verification::GossipVerifiedBlob,
         block_verification::PayloadVerificationOutcome,
@@ -1023,13 +1161,18 @@ mod test {
         let spec = harness.spec.clone();
         let test_store = harness.chain.store.clone();
         let capacity_non_zero = new_non_zero_usize(capacity);
-        let custody_context = Arc::new(CustodyContext::new(NodeCustodyType::Fullnode, &spec));
+        let custody_context = Arc::new(CustodyContext::new(
+            NodeCustodyType::Fullnode,
+            generate_data_column_indices_rand_order::<E>(),
+            &spec,
+        ));
         let cache = Arc::new(
             DataAvailabilityCheckerInner::<T>::new(
                 capacity_non_zero,
                 test_store,
                 custody_context,
                 spec.clone(),
+                false,
             )
             .expect("should create cache"),
         );

@@ -114,6 +114,7 @@ pub struct BeaconProcessorQueueLengths {
     unknown_light_client_update_queue: usize,
     rpc_block_queue: usize,
     rpc_blob_queue: usize,
+    rpc_execution_proof_queue: usize,
     rpc_custody_column_queue: usize,
     column_reconstruction_queue: usize,
     chain_segment_queue: usize,
@@ -121,11 +122,13 @@ pub struct BeaconProcessorQueueLengths {
     gossip_block_queue: usize,
     gossip_blob_queue: usize,
     gossip_data_column_queue: usize,
+    gossip_execution_proof_queue: usize,
     delayed_block_queue: usize,
     status_queue: usize,
     block_brange_queue: usize,
     block_broots_queue: usize,
     blob_broots_queue: usize,
+    execution_proof_broots_queue: usize,
     blob_brange_queue: usize,
     dcbroots_queue: usize,
     dcbrange_queue: usize,
@@ -178,6 +181,7 @@ impl BeaconProcessorQueueLengths {
             unknown_light_client_update_queue: 128,
             rpc_block_queue: 1024,
             rpc_blob_queue: 1024,
+            rpc_execution_proof_queue: 1024,
             // We don't request more than `PARENT_DEPTH_TOLERANCE` (32) lookups, so we can limit
             // this queue size. With 48 max blobs per block, each column sidecar list could be up to 12MB.
             rpc_custody_column_queue: 64,
@@ -187,11 +191,13 @@ impl BeaconProcessorQueueLengths {
             gossip_block_queue: 1024,
             gossip_blob_queue: 1024,
             gossip_data_column_queue: 1024,
+            gossip_execution_proof_queue: 1024,
             delayed_block_queue: 1024,
             status_queue: 1024,
             block_brange_queue: 1024,
             block_broots_queue: 1024,
             blob_broots_queue: 1024,
+            execution_proof_broots_queue: 1024,
             blob_brange_queue: 1024,
             dcbroots_queue: 1024,
             dcbrange_queue: 1024,
@@ -579,6 +585,7 @@ pub enum Work<E: EthSpec> {
     GossipBlock(AsyncFn),
     GossipBlobSidecar(AsyncFn),
     GossipDataColumnSidecar(AsyncFn),
+    GossipExecutionProof(AsyncFn),
     DelayedImportBlock {
         beacon_block_slot: Slot,
         beacon_block_root: Hash256,
@@ -597,6 +604,9 @@ pub enum Work<E: EthSpec> {
     RpcBlobs {
         process_fn: AsyncFn,
     },
+    RpcExecutionProofs {
+        process_fn: AsyncFn,
+    },
     RpcCustodyColumn(AsyncFn),
     ColumnReconstruction(AsyncFn),
     IgnoredRpcBlock {
@@ -609,6 +619,7 @@ pub enum Work<E: EthSpec> {
     BlocksByRootsRequest(AsyncFn),
     BlobsByRangeRequest(BlockingFn),
     BlobsByRootsRequest(BlockingFn),
+    ExecutionProofsByRootsRequest(BlockingFn),
     DataColumnsByRootsRequest(BlockingFn),
     DataColumnsByRangeRequest(BlockingFn),
     GossipBlsToExecutionChange(BlockingFn),
@@ -641,6 +652,7 @@ pub enum WorkType {
     GossipBlock,
     GossipBlobSidecar,
     GossipDataColumnSidecar,
+    GossipExecutionProof,
     DelayedImportBlock,
     GossipVoluntaryExit,
     GossipProposerSlashing,
@@ -651,6 +663,7 @@ pub enum WorkType {
     GossipLightClientOptimisticUpdate,
     RpcBlock,
     RpcBlobs,
+    RpcExecutionProofs,
     RpcCustodyColumn,
     ColumnReconstruction,
     IgnoredRpcBlock,
@@ -661,6 +674,7 @@ pub enum WorkType {
     BlocksByRootsRequest,
     BlobsByRangeRequest,
     BlobsByRootsRequest,
+    ExecutionProofsByRootsRequest,
     DataColumnsByRootsRequest,
     DataColumnsByRangeRequest,
     GossipBlsToExecutionChange,
@@ -688,6 +702,7 @@ impl<E: EthSpec> Work<E> {
             Work::GossipBlock(_) => WorkType::GossipBlock,
             Work::GossipBlobSidecar(_) => WorkType::GossipBlobSidecar,
             Work::GossipDataColumnSidecar(_) => WorkType::GossipDataColumnSidecar,
+            Work::GossipExecutionProof(_) => WorkType::GossipExecutionProof,
             Work::DelayedImportBlock { .. } => WorkType::DelayedImportBlock,
             Work::GossipVoluntaryExit(_) => WorkType::GossipVoluntaryExit,
             Work::GossipProposerSlashing(_) => WorkType::GossipProposerSlashing,
@@ -701,6 +716,7 @@ impl<E: EthSpec> Work<E> {
             Work::GossipBlsToExecutionChange(_) => WorkType::GossipBlsToExecutionChange,
             Work::RpcBlock { .. } => WorkType::RpcBlock,
             Work::RpcBlobs { .. } => WorkType::RpcBlobs,
+            Work::RpcExecutionProofs { .. } => WorkType::RpcExecutionProofs,
             Work::RpcCustodyColumn { .. } => WorkType::RpcCustodyColumn,
             Work::ColumnReconstruction(_) => WorkType::ColumnReconstruction,
             Work::IgnoredRpcBlock { .. } => WorkType::IgnoredRpcBlock,
@@ -711,6 +727,7 @@ impl<E: EthSpec> Work<E> {
             Work::BlocksByRootsRequest(_) => WorkType::BlocksByRootsRequest,
             Work::BlobsByRangeRequest(_) => WorkType::BlobsByRangeRequest,
             Work::BlobsByRootsRequest(_) => WorkType::BlobsByRootsRequest,
+            Work::ExecutionProofsByRootsRequest(_) => WorkType::ExecutionProofsByRootsRequest,
             Work::DataColumnsByRootsRequest(_) => WorkType::DataColumnsByRootsRequest,
             Work::DataColumnsByRangeRequest(_) => WorkType::DataColumnsByRangeRequest,
             Work::LightClientBootstrapRequest(_) => WorkType::LightClientBootstrapRequest,
@@ -865,6 +882,7 @@ impl<E: EthSpec> BeaconProcessor<E> {
         // Using a FIFO queue since blocks need to be imported sequentially.
         let mut rpc_block_queue = FifoQueue::new(queue_lengths.rpc_block_queue);
         let mut rpc_blob_queue = FifoQueue::new(queue_lengths.rpc_blob_queue);
+        let mut rpc_execution_proof_queue = FifoQueue::new(queue_lengths.rpc_execution_proof_queue);
         let mut rpc_custody_column_queue = FifoQueue::new(queue_lengths.rpc_custody_column_queue);
         let mut column_reconstruction_queue =
             LifoQueue::new(queue_lengths.column_reconstruction_queue);
@@ -873,12 +891,16 @@ impl<E: EthSpec> BeaconProcessor<E> {
         let mut gossip_block_queue = FifoQueue::new(queue_lengths.gossip_block_queue);
         let mut gossip_blob_queue = FifoQueue::new(queue_lengths.gossip_blob_queue);
         let mut gossip_data_column_queue = FifoQueue::new(queue_lengths.gossip_data_column_queue);
+        let mut gossip_execution_proof_queue =
+            FifoQueue::new(queue_lengths.gossip_execution_proof_queue);
         let mut delayed_block_queue = FifoQueue::new(queue_lengths.delayed_block_queue);
 
         let mut status_queue = FifoQueue::new(queue_lengths.status_queue);
         let mut block_brange_queue = FifoQueue::new(queue_lengths.block_brange_queue);
         let mut block_broots_queue = FifoQueue::new(queue_lengths.block_broots_queue);
         let mut blob_broots_queue = FifoQueue::new(queue_lengths.blob_broots_queue);
+        let mut execution_proof_broots_queue =
+            FifoQueue::new(queue_lengths.execution_proof_broots_queue);
         let mut blob_brange_queue = FifoQueue::new(queue_lengths.blob_brange_queue);
         let mut dcbroots_queue = FifoQueue::new(queue_lengths.dcbroots_queue);
         let mut dcbrange_queue = FifoQueue::new(queue_lengths.dcbrange_queue);
@@ -1039,6 +1061,8 @@ impl<E: EthSpec> BeaconProcessor<E> {
                                 Some(item)
                             } else if let Some(item) = rpc_blob_queue.pop() {
                                 Some(item)
+                            } else if let Some(item) = rpc_execution_proof_queue.pop() {
+                                Some(item)
                             } else if let Some(item) = rpc_custody_column_queue.pop() {
                                 Some(item)
                             } else if let Some(item) = rpc_custody_column_queue.pop() {
@@ -1054,6 +1078,8 @@ impl<E: EthSpec> BeaconProcessor<E> {
                             } else if let Some(item) = gossip_blob_queue.pop() {
                                 Some(item)
                             } else if let Some(item) = gossip_data_column_queue.pop() {
+                                Some(item)
+                            } else if let Some(item) = gossip_execution_proof_queue.pop() {
                                 Some(item)
                             } else if let Some(item) = column_reconstruction_queue.pop() {
                                 Some(item)
@@ -1198,6 +1224,8 @@ impl<E: EthSpec> BeaconProcessor<E> {
                                 Some(item)
                             } else if let Some(item) = blob_broots_queue.pop() {
                                 Some(item)
+                            } else if let Some(item) = execution_proof_broots_queue.pop() {
+                                Some(item)
                             } else if let Some(item) = dcbroots_queue.pop() {
                                 Some(item)
                             } else if let Some(item) = dcbrange_queue.pop() {
@@ -1325,6 +1353,9 @@ impl<E: EthSpec> BeaconProcessor<E> {
                             Work::GossipDataColumnSidecar { .. } => {
                                 gossip_data_column_queue.push(work, work_id)
                             }
+                            Work::GossipExecutionProof { .. } => {
+                                gossip_execution_proof_queue.push(work, work_id)
+                            }
                             Work::DelayedImportBlock { .. } => {
                                 delayed_block_queue.push(work, work_id)
                             }
@@ -1351,6 +1382,9 @@ impl<E: EthSpec> BeaconProcessor<E> {
                                 rpc_block_queue.push(work, work_id)
                             }
                             Work::RpcBlobs { .. } => rpc_blob_queue.push(work, work_id),
+                            Work::RpcExecutionProofs { .. } => {
+                                rpc_execution_proof_queue.push(work, work_id)
+                            }
                             Work::RpcCustodyColumn { .. } => {
                                 rpc_custody_column_queue.push(work, work_id)
                             }
@@ -1393,6 +1427,9 @@ impl<E: EthSpec> BeaconProcessor<E> {
                             Work::BlobsByRootsRequest { .. } => {
                                 blob_broots_queue.push(work, work_id)
                             }
+                            Work::ExecutionProofsByRootsRequest { .. } => {
+                                execution_proof_broots_queue.push(work, work_id)
+                            }
                             Work::DataColumnsByRootsRequest { .. } => {
                                 dcbroots_queue.push(work, work_id)
                             }
@@ -1424,6 +1461,7 @@ impl<E: EthSpec> BeaconProcessor<E> {
                         WorkType::GossipBlock => gossip_block_queue.len(),
                         WorkType::GossipBlobSidecar => gossip_blob_queue.len(),
                         WorkType::GossipDataColumnSidecar => gossip_data_column_queue.len(),
+                        WorkType::GossipExecutionProof => gossip_execution_proof_queue.len(),
                         WorkType::DelayedImportBlock => delayed_block_queue.len(),
                         WorkType::GossipVoluntaryExit => gossip_voluntary_exit_queue.len(),
                         WorkType::GossipProposerSlashing => gossip_proposer_slashing_queue.len(),
@@ -1438,6 +1476,7 @@ impl<E: EthSpec> BeaconProcessor<E> {
                         }
                         WorkType::RpcBlock => rpc_block_queue.len(),
                         WorkType::RpcBlobs | WorkType::IgnoredRpcBlock => rpc_blob_queue.len(),
+                        WorkType::RpcExecutionProofs => rpc_execution_proof_queue.len(),
                         WorkType::RpcCustodyColumn => rpc_custody_column_queue.len(),
                         WorkType::ColumnReconstruction => column_reconstruction_queue.len(),
                         WorkType::ChainSegment => chain_segment_queue.len(),
@@ -1447,6 +1486,9 @@ impl<E: EthSpec> BeaconProcessor<E> {
                         WorkType::BlocksByRootsRequest => block_broots_queue.len(),
                         WorkType::BlobsByRangeRequest => blob_brange_queue.len(),
                         WorkType::BlobsByRootsRequest => blob_broots_queue.len(),
+                        WorkType::ExecutionProofsByRootsRequest => {
+                            execution_proof_broots_queue.len()
+                        }
                         WorkType::DataColumnsByRootsRequest => dcbroots_queue.len(),
                         WorkType::DataColumnsByRangeRequest => dcbrange_queue.len(),
                         WorkType::GossipBlsToExecutionChange => {
@@ -1594,16 +1636,19 @@ impl<E: EthSpec> BeaconProcessor<E> {
             } => task_spawner.spawn_async(process_fn),
             Work::RpcBlock { process_fn }
             | Work::RpcBlobs { process_fn }
+            | Work::RpcExecutionProofs { process_fn }
             | Work::RpcCustodyColumn(process_fn)
             | Work::ColumnReconstruction(process_fn) => task_spawner.spawn_async(process_fn),
             Work::IgnoredRpcBlock { process_fn } => task_spawner.spawn_blocking(process_fn),
             Work::GossipBlock(work)
             | Work::GossipBlobSidecar(work)
-            | Work::GossipDataColumnSidecar(work) => task_spawner.spawn_async(async move {
+            | Work::GossipDataColumnSidecar(work)
+            | Work::GossipExecutionProof(work) => task_spawner.spawn_async(async move {
                 work.await;
             }),
             Work::BlobsByRangeRequest(process_fn)
             | Work::BlobsByRootsRequest(process_fn)
+            | Work::ExecutionProofsByRootsRequest(process_fn)
             | Work::DataColumnsByRootsRequest(process_fn)
             | Work::DataColumnsByRangeRequest(process_fn) => {
                 task_spawner.spawn_blocking(process_fn)

@@ -4,6 +4,7 @@ use crate::compute_light_client_updates::{
 };
 use crate::config::{ClientGenesis, Config as ClientConfig};
 use crate::notifier::spawn_notifier;
+use beacon_chain::ProofGenerationEvent;
 use beacon_chain::attestation_simulator::start_attestation_simulator_service;
 use beacon_chain::data_availability_checker::start_availability_cache_maintenance_service;
 use beacon_chain::graffiti_calculator::start_engine_version_cache_refresh_service;
@@ -28,9 +29,11 @@ use execution_layer::ExecutionLayer;
 use execution_layer::test_utils::generate_genesis_header;
 use futures::channel::mpsc::Receiver;
 use genesis::{DEFAULT_ETH1_BLOCK_HASH, interop_genesis_state};
+use lighthouse_network::identity::Keypair;
 use lighthouse_network::{NetworkGlobals, prometheus_client::registry::Registry};
 use monitoring_api::{MonitoringHttpClient, ProcessType};
 use network::{NetworkConfig, NetworkSenders, NetworkService};
+use proof_generation_service;
 use rand::SeedableRng;
 use rand::rngs::{OsRng, StdRng};
 use slasher::Slasher;
@@ -41,12 +44,13 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use store::database::interface::BeaconNodeBackend;
 use timer::spawn_timer;
-use tracing::{debug, info, warn};
-use types::data_column_custody_group::get_custody_groups_ordered;
+use tracing::{debug, info, instrument, warn};
+use types::data_column_custody_group::compute_ordered_custody_column_indices;
 use types::{
     BeaconState, BlobSidecarList, ChainSpec, EthSpec, ExecutionBlockHash, Hash256,
     SignedBeaconBlock, test_utils::generate_deterministic_keypairs,
 };
+use zkvm_execution_layer;
 
 /// Interval between polling the eth1 node for genesis information.
 pub const ETH1_GENESIS_UPDATE_INTERVAL_MILLIS: u64 = 7_000;
@@ -88,6 +92,8 @@ pub struct ClientBuilder<T: BeaconChainTypes> {
     beacon_processor_config: Option<BeaconProcessorConfig>,
     beacon_processor_channels: Option<BeaconProcessorChannels<T::EthSpec>>,
     light_client_server_rv: Option<Receiver<LightClientProducerEvent<T::EthSpec>>>,
+    proof_generation_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<ProofGenerationEvent<T::EthSpec>>>,
     eth_spec_instance: T::EthSpec,
 }
 
@@ -122,6 +128,7 @@ where
             beacon_processor_config: None,
             beacon_processor_channels: None,
             light_client_server_rv: None,
+            proof_generation_rx: None,
         }
     }
 
@@ -150,10 +157,12 @@ where
 
     /// Initializes the `BeaconChainBuilder`. The `build_beacon_chain` method will need to be
     /// called later in order to actually instantiate the `BeaconChain`.
+    #[instrument(skip_all)]
     pub async fn beacon_chain_builder(
         mut self,
         client_genesis: ClientGenesis,
         config: ClientConfig,
+        node_id: [u8; 32],
     ) -> Result<Self, String> {
         let store = self.store.clone();
         let chain_spec = self.chain_spec.clone();
@@ -191,6 +200,23 @@ where
             Kzg::new_from_trusted_setup_no_precomp(&config.trusted_setup).map_err(kzg_err_msg)?
         };
 
+        // Modify spec if zkvm mode is enabled via CLI
+        let spec = if let Some(zkvm_config) = &config.zkvm_execution_layer {
+            let mut modified_spec = (*spec).clone();
+
+            modified_spec.zkvm_enabled = true;
+            modified_spec.zkvm_min_proofs_required = zkvm_config.min_proofs_required;
+
+            Arc::new(modified_spec)
+        } else {
+            spec
+        };
+
+        let ordered_custody_column_indices =
+            compute_ordered_custody_column_indices::<E>(node_id, &spec).map_err(|e| {
+                format!("Failed to compute ordered custody column indices: {:?}", e)
+        })?;
+
         let builder = BeaconChainBuilder::new(eth_spec_instance, Arc::new(kzg))
             .store(store)
             .task_executor(context.executor.clone())
@@ -202,7 +228,9 @@ where
             .beacon_graffiti(beacon_graffiti)
             .event_handler(event_handler)
             .execution_layer(execution_layer)
+            .zkvm_execution_layer_config(config.zkvm_execution_layer.clone())
             .node_custody_type(config.chain.node_custody_type)
+            .ordered_custody_column_indices(ordered_custody_column_indices)
             .validator_monitor_config(config.validator_monitor.clone())
             .rng(Box::new(
                 StdRng::try_from_rng(&mut OsRng)
@@ -221,6 +249,44 @@ where
             );
             self.light_client_server_rv = Some(rv);
             builder.light_client_server_tx(tx)
+        } else {
+            builder
+        };
+
+        // Set up proof generation service if zkVM is configured with generation proof types
+        let builder = if let Some(ref zkvm_config) = config.zkvm_execution_layer {
+            if !zkvm_config.generation_proof_types.is_empty() {
+                // Validate that proof generation requires an execution layer
+                // Proof-generating nodes will validate blocks via EL execution, not proofs
+                if config.execution_layer.is_none() {
+                    return Err(
+                        "Proof generation requires an EL. \
+                        Nodes generating proofs must validate blocks via an execution layer. \
+                        To run a lightweight verifier node (without EL), omit --zkvm-generation-proof-types."
+                            .into(),
+                    );
+                }
+
+                // Create channel for proof generation events
+                let (proof_gen_tx, proof_gen_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<ProofGenerationEvent<E>>();
+
+                // Create generator registry with enabled proof types
+                let registry = Arc::new(
+                    zkvm_execution_layer::GeneratorRegistry::new_with_dummy_generators(
+                        zkvm_config.generation_proof_types.clone(),
+                    ),
+                );
+
+                // Store receiver for later when we spawn the service
+                self.proof_generation_rx = Some(proof_gen_rx);
+
+                builder
+                    .zkvm_generator_registry(registry)
+                    .proof_generation_tx(proof_gen_tx)
+            } else {
+                builder
+            }
         } else {
             builder
         };
@@ -345,10 +411,11 @@ where
                     .map_err(|e| format!("Unable to parse weak subj state SSZ: {:?}", e))?;
                 let anchor_block = SignedBeaconBlock::from_ssz_bytes(&anchor_block_bytes, &spec)
                     .map_err(|e| format!("Unable to parse weak subj block SSZ: {:?}", e))?;
-                let anchor_blobs = if anchor_block.message().body().has_blobs() {
+
+                // Providing blobs is optional now and not providing them is recommended.
+                // Backfill can handle downloading the blobs or columns for the checkpoint block.
+                let anchor_blobs = if let Some(anchor_blobs_bytes) = anchor_blobs_bytes {
                     let max_blobs_len = spec.max_blobs_per_block(anchor_block.epoch()) as usize;
-                    let anchor_blobs_bytes = anchor_blobs_bytes
-                        .ok_or("Blobs for checkpoint must be provided using --checkpoint-blobs")?;
                     Some(
                         BlobSidecarList::from_ssz_bytes(&anchor_blobs_bytes, max_blobs_len)
                             .map_err(|e| format!("Unable to parse weak subj blobs SSZ: {e:?}"))?,
@@ -409,7 +476,11 @@ where
 
                 debug!("Downloaded finalized block");
 
-                let blobs = if block.message().body().has_blobs() {
+                // `get_blob_sidecars` API is deprecated from Fulu and may not be supported by all servers
+                let is_before_fulu = !spec
+                    .fork_name_at_slot::<E>(finalized_block_slot)
+                    .fulu_enabled();
+                let blobs = if is_before_fulu && block.message().body().has_blobs() {
                     debug!("Downloading finalized blobs");
                     if let Some(response) = remote
                         .get_blob_sidecars::<E>(BlockId::Root(block_root), None, &spec)
@@ -453,7 +524,11 @@ where
     }
 
     /// Starts the networking stack.
-    pub async fn network(mut self, config: Arc<NetworkConfig>) -> Result<Self, String> {
+    pub async fn network(
+        mut self,
+        config: Arc<NetworkConfig>,
+        local_keypair: Keypair,
+    ) -> Result<Self, String> {
         let beacon_chain = self
             .beacon_chain
             .clone()
@@ -481,11 +556,10 @@ where
             context.executor,
             libp2p_registry.as_mut(),
             beacon_processor_channels.beacon_processor_tx.clone(),
+            local_keypair,
         )
         .await
         .map_err(|e| format!("Failed to start network: {:?}", e))?;
-
-        init_custody_context(beacon_chain, &network_globals)?;
 
         self.network_globals = Some(network_globals);
         self.network_senders = Some(network_senders);
@@ -597,6 +671,7 @@ where
     ///
     /// If type inference errors are being raised, see the comment on the definition of `Self`.
     #[allow(clippy::type_complexity)]
+    #[instrument(name = "build_client", skip_all)]
     pub fn build(
         mut self,
     ) -> Result<Client<Witness<TSlotClock, E, THotStore, TColdStore>>, String> {
@@ -777,6 +852,26 @@ where
                 beacon_chain.task_executor.clone(),
                 beacon_chain.clone(),
             );
+
+            // Start proof generation service if configured
+            if let Some(proof_gen_rx) = self.proof_generation_rx {
+                let network_tx = self
+                    .network_senders
+                    .as_ref()
+                    .ok_or("proof_generation_service requires network_senders")?
+                    .network_send();
+
+                let service = proof_generation_service::ProofGenerationService::new(
+                    beacon_chain.clone(),
+                    proof_gen_rx,
+                    network_tx,
+                );
+
+                runtime_context.executor.spawn(
+                    async move { service.run().await },
+                    "proof_generation_service",
+                );
+            }
         }
 
         Ok(Client {
@@ -788,21 +883,6 @@ where
     }
 }
 
-fn init_custody_context<T: BeaconChainTypes>(
-    chain: Arc<BeaconChain<T>>,
-    network_globals: &NetworkGlobals<T::EthSpec>,
-) -> Result<(), String> {
-    let node_id = network_globals.local_enr().node_id().raw();
-    let spec = &chain.spec;
-    let custody_groups_ordered =
-        get_custody_groups_ordered(node_id, spec.number_of_custody_groups, spec)
-            .map_err(|e| format!("Failed to compute custody groups: {:?}", e))?;
-    chain
-        .data_availability_checker
-        .custody_context()
-        .init_ordered_data_columns_from_custody_groups(custody_groups_ordered, spec)
-}
-
 impl<TSlotClock, E, THotStore, TColdStore>
     ClientBuilder<Witness<TSlotClock, E, THotStore, TColdStore>>
 where
@@ -812,6 +892,7 @@ where
     TColdStore: ItemStore<E> + 'static,
 {
     /// Consumes the internal `BeaconChainBuilder`, attaching the resulting `BeaconChain` to self.
+    #[instrument(skip_all)]
     pub fn build_beacon_chain(mut self) -> Result<Self, String> {
         let context = self
             .runtime_context

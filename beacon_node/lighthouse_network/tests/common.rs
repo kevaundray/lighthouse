@@ -16,6 +16,7 @@ use types::{
 
 type E = MinimalEthSpec;
 
+use lighthouse_network::identity::secp256k1;
 use lighthouse_network::rpc::config::InboundRateLimiterConfig;
 use tempfile::Builder as TempBuilder;
 
@@ -29,6 +30,8 @@ pub fn spec_with_all_forks_enabled() -> ChainSpec {
     chain_spec.electra_fork_epoch = Some(Epoch::new(5));
     chain_spec.fulu_fork_epoch = Some(Epoch::new(6));
     chain_spec.gloas_fork_epoch = Some(Epoch::new(7));
+    // Enable zkVM
+    chain_spec.zkvm_enabled = true;
 
     // check that we have all forks covered
     assert!(chain_spec.fork_epoch(ForkName::latest()).is_some());
@@ -108,7 +111,7 @@ pub fn build_config(
     config.set_ipv4_listening_address(std::net::Ipv4Addr::UNSPECIFIED, port, port, port);
     config.enr_address = (Some(std::net::Ipv4Addr::LOCALHOST), None);
     config.boot_nodes_enr.append(&mut boot_nodes);
-    config.network_dir = path.into_path();
+    config.network_dir = path.keep();
     config.disable_peer_scoring = disable_peer_scoring;
     config.inbound_rate_limiter_config = inbound_rate_limiter;
     Arc::new(config)
@@ -138,10 +141,15 @@ pub async fn build_libp2p_instance(
         libp2p_registry: None,
     };
     Libp2pInstance(
-        LibP2PService::new(executor, libp2p_context, custody_group_count)
-            .await
-            .expect("should build libp2p instance")
-            .0,
+        LibP2PService::new(
+            executor,
+            libp2p_context,
+            custody_group_count,
+            secp256k1::Keypair::generate().into(),
+        )
+        .await
+        .expect("should build libp2p instance")
+        .0,
         signal,
     )
 }

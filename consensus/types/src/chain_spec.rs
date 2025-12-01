@@ -222,6 +222,17 @@ pub struct ChainSpec {
     pub gloas_fork_epoch: Option<Epoch>,
 
     /*
+     * zkVM execution proof params
+     */
+    /// Whether zkVM mode is enabled via CLI flag --activate-zkvm.
+    /// When true, the node will subscribe to execution proof gossip, verify proofs,
+    /// and optionally generate proofs. zkVM activates at the Fulu fork.
+    /// Unlike other forks, this is not a network-wide activation but a per-node opt-in.
+    pub zkvm_enabled: bool,
+    /// Minimum number of execution proofs required from different subnets.
+    /// Only used when zkvm_enabled is true.
+    pub zkvm_min_proofs_required: usize,
+    /*
      * Networking
      */
     pub boot_nodes: Vec<String>,
@@ -262,6 +273,11 @@ pub struct ChainSpec {
      */
     pub(crate) blob_schedule: BlobSchedule,
     pub min_epochs_for_data_column_sidecars_requests: u64,
+
+    /*
+     * Networking zkvm
+     */
+    pub min_epochs_for_execution_proof_requests: u64,
 
     /*
      * Networking Gloas
@@ -477,6 +493,44 @@ impl ChainSpec {
     pub fn is_gloas_scheduled(&self) -> bool {
         self.gloas_fork_epoch
             .is_some_and(|gloas_fork_epoch| gloas_fork_epoch != self.far_future_epoch)
+    }
+
+    /// Returns true if zkVM mode is enabled via CLI flag.
+    /// Unlike other forks, this is set via CLI and indicates per-node opt-in.
+    pub fn is_zkvm_enabled(&self) -> bool {
+        self.zkvm_enabled
+    }
+
+    /// Returns the epoch at which zkVM activates.
+    /// Currently uses Fulu fork epoch.
+    /// Returns None if zkVM is disabled or Fulu is not scheduled.
+    pub fn zkvm_fork_epoch(&self) -> Option<Epoch> {
+        if self.zkvm_enabled {
+            self.fulu_fork_epoch
+        } else {
+            None
+        }
+    }
+
+    /// Returns true if zkVM mode is enabled for the given epoch.
+    pub fn is_zkvm_enabled_for_epoch(&self, epoch: Epoch) -> bool {
+        self.zkvm_fork_epoch()
+            .is_some_and(|zkvm_fork_epoch| epoch >= zkvm_fork_epoch)
+    }
+
+    /// Returns true if zkVM mode can be used at the given fork.
+    pub fn is_zkvm_enabled_for_fork(&self, fork_name: ForkName) -> bool {
+        self.is_zkvm_enabled() && fork_name.fulu_enabled()
+    }
+
+    /// Returns the minimum number of execution proofs required.
+    /// Only meaningful when zkVM is enabled.
+    pub fn zkvm_min_proofs_required(&self) -> Option<usize> {
+        if self.is_zkvm_enabled() {
+            Some(self.zkvm_min_proofs_required)
+        } else {
+            None
+        }
     }
 
     /// Returns a full `Fork` struct for a given epoch.
@@ -1125,6 +1179,12 @@ impl ChainSpec {
             gloas_fork_epoch: None,
 
             /*
+             * zkVM execution proof params
+             */
+            zkvm_enabled: false,
+            zkvm_min_proofs_required: default_zkvm_min_proofs_required(),
+
+            /*
              * Network specific
              */
             boot_nodes: vec![],
@@ -1183,6 +1243,12 @@ impl ChainSpec {
             min_epochs_for_data_column_sidecars_requests:
                 default_min_epochs_for_data_column_sidecars_requests(),
             max_data_columns_by_root_request: default_data_columns_by_root_request(),
+
+            /*
+             * Networking zkvm specific
+             */
+            min_epochs_for_execution_proof_requests:
+                default_min_epochs_for_execution_proof_requests(),
 
             /*
              * Application specific
@@ -1259,6 +1325,10 @@ impl ChainSpec {
             // Gloas
             gloas_fork_version: [0x07, 0x00, 0x00, 0x00],
             gloas_fork_epoch: None,
+            // zkVM
+            zkvm_enabled: false,
+            zkvm_min_proofs_required: 0,
+            min_epochs_for_execution_proof_requests: 2,
             // Other
             network_id: 2, // lighthouse testnet network id
             deposit_chain_id: 5,
@@ -1485,6 +1555,12 @@ impl ChainSpec {
             gloas_fork_epoch: None,
 
             /*
+             * zkVM execution proof params
+             */
+            zkvm_enabled: false,
+            zkvm_min_proofs_required: default_zkvm_min_proofs_required(),
+
+            /*
              * Network specific
              */
             boot_nodes: vec![],
@@ -1534,6 +1610,12 @@ impl ChainSpec {
             min_epochs_for_data_column_sidecars_requests:
                 default_min_epochs_for_data_column_sidecars_requests(),
             max_data_columns_by_root_request: default_data_columns_by_root_request(),
+
+            /*
+             * Networking zkvm specific
+             */
+            min_epochs_for_execution_proof_requests:
+                default_min_epochs_for_execution_proof_requests(),
 
             /*
              * Application specific
@@ -1995,6 +2077,11 @@ const fn default_min_epochs_for_blob_sidecars_requests() -> u64 {
     4096
 }
 
+const fn default_min_epochs_for_execution_proof_requests() -> u64 {
+    // TODO(zkproofs): add into consensus-specs with rational
+    2
+}
+
 const fn default_blob_sidecar_subnet_count() -> u64 {
     6
 }
@@ -2023,6 +2110,12 @@ const fn default_max_per_epoch_activation_exit_churn_limit() -> u64 {
 
 const fn default_max_blobs_per_block_electra() -> u64 {
     9
+}
+
+/// Minimum number of execution proofs required from different subnets
+/// before marking an execution payload as available in ZK-VM mode.
+pub const fn default_zkvm_min_proofs_required() -> usize {
+    crate::execution_proof::DEFAULT_MIN_PROOFS_REQUIRED
 }
 
 const fn default_attestation_propagation_slot_range() -> u64 {

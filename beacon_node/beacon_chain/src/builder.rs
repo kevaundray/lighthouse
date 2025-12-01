@@ -2,6 +2,7 @@ use crate::ChainConfig;
 use crate::CustodyContext;
 use crate::beacon_chain::{
     BEACON_CHAIN_DB_KEY, CanonicalHead, LightClientProducerEvent, OP_POOL_DB_KEY,
+    ProofGenerationEvent,
 };
 use crate::beacon_proposer_cache::BeaconProposerCache;
 use crate::custody_context::NodeCustodyType;
@@ -13,6 +14,7 @@ use crate::kzg_utils::build_data_column_sidecars;
 use crate::light_client_server_cache::LightClientServerCache;
 use crate::migrate::{BackgroundMigrator, MigratorConfig};
 use crate::observed_data_sidecars::ObservedDataSidecars;
+use crate::observed_execution_proofs::ObservedExecutionProofs;
 use crate::persisted_beacon_chain::PersistedBeaconChain;
 use crate::persisted_custody::load_custody_context;
 use crate::shuffling_cache::{BlockShufflingIds, ShufflingCache};
@@ -39,10 +41,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use store::{Error as StoreError, HotColdDB, ItemStore, KeyValueStoreOp};
 use task_executor::{ShutdownReason, TaskExecutor};
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error, info};
+use types::data_column_custody_group::CustodyIndex;
 use types::{
-    BeaconBlock, BeaconState, BlobSidecarList, ChainSpec, DataColumnSidecarList, Epoch, EthSpec,
-    FixedBytesExtended, Hash256, Signature, SignedBeaconBlock, Slot,
+    BeaconBlock, BeaconState, BlobSidecarList, ChainSpec, ColumnIndex, DataColumnSidecarList,
+    Epoch, EthSpec, FixedBytesExtended, Hash256, Signature, SignedBeaconBlock, Slot,
 };
 
 /// An empty struct used to "witness" all the `BeaconChainTypes` traits. It has no user-facing
@@ -102,7 +106,18 @@ pub struct BeaconChainBuilder<T: BeaconChainTypes> {
     task_executor: Option<TaskExecutor>,
     validator_monitor_config: Option<ValidatorMonitorConfig>,
     node_custody_type: NodeCustodyType,
+    ordered_custody_column_indices: Option<Vec<CustodyIndex>>,
     rng: Option<Box<dyn RngCore + Send>>,
+    /// ZK-VM execution layer configuration.
+    ///
+    /// TODO(zkproofs): When this is Some(_), the traditional ExecutionLayer should
+    /// be replaced with ZkVmEngineApi from zkvm_execution_layer. This would allow the
+    /// --execution-endpoint CLI flag to be optional when running in ZK-VM mode.
+    zkvm_execution_layer_config: Option<zkvm_execution_layer::ZKVMExecutionLayerConfig>,
+    /// Registry of zkVM proof generators for currently altruistic proof generation
+    zkvm_generator_registry: Option<Arc<zkvm_execution_layer::GeneratorRegistry>>,
+    /// Sender to notify proof generation service of blocks needing proofs
+    proof_generation_tx: Option<UnboundedSender<ProofGenerationEvent<T::EthSpec>>>,
 }
 
 impl<TSlotClock, E, THotStore, TColdStore>
@@ -141,7 +156,11 @@ where
             task_executor: None,
             validator_monitor_config: None,
             node_custody_type: NodeCustodyType::Fullnode,
+            ordered_custody_column_indices: None,
             rng: None,
+            zkvm_execution_layer_config: None,
+            zkvm_generator_registry: None,
+            proof_generation_tx: None,
         }
     }
 
@@ -647,6 +666,26 @@ where
         self
     }
 
+    /// Sets the ZK-VM execution layer configuration.
+    /// When set, enables ZK-VM execution proof verification mode.
+    pub fn zkvm_execution_layer_config(
+        mut self,
+        config: Option<zkvm_execution_layer::ZKVMExecutionLayerConfig>,
+    ) -> Self {
+        self.zkvm_execution_layer_config = config;
+        self
+    }
+
+    /// Sets the ordered custody column indices for this node.
+    /// This is used to determine the data columns the node is required to custody.
+    pub fn ordered_custody_column_indices(
+        mut self,
+        ordered_custody_column_indices: Vec<ColumnIndex>,
+    ) -> Self {
+        self.ordered_custody_column_indices = Some(ordered_custody_column_indices);
+        self
+    }
+
     /// Sets the `BeaconChain` event handler backend.
     ///
     /// For example, provide `ServerSentEventHandler` as a `handler`.
@@ -679,6 +718,21 @@ where
     /// Sets a `Sender` to allow the beacon chain to trigger light_client update production.
     pub fn light_client_server_tx(mut self, sender: Sender<LightClientProducerEvent<E>>) -> Self {
         self.light_client_server_tx = Some(sender);
+        self
+    }
+
+    /// Sets the zkVM generator registry for altruistic proof generation.
+    pub fn zkvm_generator_registry(
+        mut self,
+        registry: Arc<zkvm_execution_layer::GeneratorRegistry>,
+    ) -> Self {
+        self.zkvm_generator_registry = Some(registry);
+        self
+    }
+
+    /// Sets a `Sender` to notify the proof generation service of new blocks.
+    pub fn proof_generation_tx(mut self, sender: UnboundedSender<ProofGenerationEvent<E>>) -> Self {
+        self.proof_generation_tx = Some(sender);
         self
     }
 
@@ -740,6 +794,9 @@ where
             .genesis_state_root
             .ok_or("Cannot build without a genesis state root")?;
         let validator_monitor_config = self.validator_monitor_config.unwrap_or_default();
+        let ordered_custody_column_indices = self
+            .ordered_custody_column_indices
+            .ok_or("Cannot build without ordered custody column indices")?;
         let rng = self.rng.ok_or("Cannot build without an RNG")?;
         let beacon_proposer_cache: Arc<Mutex<BeaconProposerCache>> = <_>::default();
 
@@ -942,15 +999,23 @@ where
                 custody,
                 self.node_custody_type,
                 head_epoch,
+                ordered_custody_column_indices,
                 &self.spec,
             )
         } else {
             (
-                CustodyContext::new(self.node_custody_type, &self.spec),
+                CustodyContext::new(
+                    self.node_custody_type,
+                    ordered_custody_column_indices,
+                    &self.spec,
+                ),
                 None,
             )
         };
         debug!(?custody_context, "Loaded persisted custody context");
+
+        let has_execution_layer_and_proof_gen =
+            self.execution_layer.is_some() && self.zkvm_generator_registry.is_some();
 
         let beacon_chain = BeaconChain {
             spec: self.spec.clone(),
@@ -984,6 +1049,7 @@ where
             observed_block_producers: <_>::default(),
             observed_column_sidecars: RwLock::new(ObservedDataSidecars::new(self.spec.clone())),
             observed_blob_sidecars: RwLock::new(ObservedDataSidecars::new(self.spec.clone())),
+            observed_execution_proofs: RwLock::new(ObservedExecutionProofs::default()),
             observed_slashable: <_>::default(),
             observed_voluntary_exits: <_>::default(),
             observed_proposer_slashings: <_>::default(),
@@ -1029,11 +1095,22 @@ where
                     store,
                     Arc::new(custody_context),
                     self.spec,
+                    // Create verifier registry if zkvm mode is enabled
+                    // For now, we use dummy verifiers for all subnets
+                    self.zkvm_execution_layer_config
+                        .as_ref()
+                        .map(|_| Arc::new(zkvm_execution_layer::registry_proof_verification::VerifierRegistry::new_with_dummy_verifiers())),
+                    // Pass whether this node has an execution layer AND generates proofs
+                    // Nodes with EL+proof-gen validate via traditional execution
+                    // Nodes with EL but no proof-gen wait for proofs (lightweight verifier)
+                    has_execution_layer_and_proof_gen,
                 )
                 .map_err(|e| format!("Error initializing DataAvailabilityChecker: {:?}", e))?,
             ),
             kzg: self.kzg.clone(),
             rng: Arc::new(Mutex::new(rng)),
+            zkvm_generator_registry: self.zkvm_generator_registry,
+            proof_generation_tx: self.proof_generation_tx,
         };
 
         let head = beacon_chain.head_snapshot();
@@ -1220,7 +1297,9 @@ fn build_data_columns_from_blobs<E: EthSpec>(
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::test_utils::{EphemeralHarnessType, get_kzg};
+    use crate::test_utils::{
+        EphemeralHarnessType, generate_data_column_indices_rand_order, get_kzg,
+    };
     use ethereum_hashing::hash;
     use genesis::{
         DEFAULT_ETH1_BLOCK_HASH, generate_deterministic_keypairs, interop_genesis_state,
@@ -1272,6 +1351,9 @@ mod test {
             .expect("should configure testing slot clock")
             .shutdown_sender(shutdown_tx)
             .rng(Box::new(StdRng::seed_from_u64(42)))
+            .ordered_custody_column_indices(
+                generate_data_column_indices_rand_order::<MinimalEthSpec>(),
+            )
             .build()
             .expect("should build");
 
