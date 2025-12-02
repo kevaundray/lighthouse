@@ -116,7 +116,12 @@ impl ProofGenerator for DummyProofGenerator {
                                 Ok(proof) => {
                                     return Ok(proof);
                                 }
-                                Err(_) => {
+                                Err(e) => {
+                                    debug!(
+                                        proof_id = %self.proof_id,
+                                        error = %e,
+                                        "[Ethproofs] Failed to create ExecutionProof"
+                                    );
                                     // Proof structure creation failed, will fallback below
                                 }
                             }

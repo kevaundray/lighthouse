@@ -8,13 +8,13 @@ use tree_hash_derive::TreeHash;
 
 use super::ExecutionProofId;
 
-/// TODO(ethproofs): Set to 3MB for the demo.
+/// TODO(ethproofs): Set to 2MB for the demo.
 ///
 /// Maximum size of proof data in bytes
 ///
 /// Note: Most proofs will fit within 300KB. Some zkVMs have 1MB proofs (currently)
 /// and so this number was set to accommodate for the most zkVMs.
-pub const MAX_PROOF_DATA_BYTES: usize = 3_145_728;
+pub const MAX_PROOF_DATA_BYTES: usize = 2_097_152;
 
 /// Minimum number of execution proofs required from different proof types
 /// before marking an execution payload as available in ZK-VM mode.
@@ -28,7 +28,7 @@ pub const DEFAULT_MIN_PROOFS_REQUIRED: usize = 2;
 /// that can be supported, which is currently 8 (ExecutionProofId is 0-7).
 pub const MAX_PROOFS: usize = 8;
 
-type ProofData = VariableList<u8, typenum::U1048576>;
+type ProofData = VariableList<u8, typenum::U2097152>;
 
 /// ExecutionProof represents a cryptographic `proof of execution` that
 /// an execution payload is valid.
