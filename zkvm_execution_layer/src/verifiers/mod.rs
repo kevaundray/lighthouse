@@ -6,6 +6,7 @@
 pub mod airbender;
 pub mod fallback;
 pub mod openvm;
+pub mod panic_safe;
 pub mod pico;
 pub mod sp1_hypercube;
 pub mod zisk;

@@ -3,7 +3,7 @@
 //! This module implements proof verification for Airbender zkVM.
 //! Currently a placeholder implementation - full verification logic will be implemented separately.
 
-use super::{ProofVerifier, VerificationResult};
+use super::{panic_safe, ProofVerifier, VerificationResult};
 use tracing::debug;
 
 /// Airbender verifier
@@ -14,21 +14,23 @@ pub struct AirbenderVerifier;
 
 impl ProofVerifier for AirbenderVerifier {
     fn verify(proof_data: &[u8], _vk_data: &[u8]) -> VerificationResult {
-        debug!(
-            proof_size = proof_data.len(),
-            "Starting Airbender verification (placeholder)"
-        );
+        panic_safe::safe_verify(|| {
+            debug!(
+                proof_size = proof_data.len(),
+                "Starting Airbender verification (placeholder)"
+            );
 
-        // Validate proof data is not empty
-        if proof_data.is_empty() {
-            debug!("Invalid input: proof data is empty");
-            return Ok(false);
-        }
+            // Validate proof data is not empty
+            if proof_data.is_empty() {
+                debug!("Invalid input: proof data is empty");
+                return Ok(false);
+            }
 
-        // Placeholder: always return true for valid proof data
-        // TODO(ethproofs): Implement full verification logic with execution_utils
-        debug!("Airbender verification placeholder - returning true");
-        Ok(true)
+            // Placeholder: always return true for valid proof data
+            // TODO(ethproofs): Implement full verification logic with execution_utils
+            debug!("Airbender verification placeholder - returning true");
+            Ok(true)
+        })
     }
 
     fn name() -> &'static str {

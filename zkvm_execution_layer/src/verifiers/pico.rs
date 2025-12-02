@@ -2,7 +2,7 @@
 //!
 //! This module implements proof verification for Pico Prism zkVM using KoalaBear field arithmetic.
 
-use super::{ProofVerifier, VerificationResult};
+use super::{panic_safe, ProofVerifier, VerificationResult};
 use pico_prism_vm::{
     configs::{
         config::{StarkGenericConfig, Val},
@@ -19,7 +19,6 @@ use pico_prism_vm::{
     primitives::consts::RECURSION_NUM_PVS,
 };
 use serde::{Deserialize, Serialize};
-use std::panic;
 use tracing::debug;
 
 // Serializable wrappers for MetaProof
@@ -55,17 +54,7 @@ impl KoalaBearCombineVerifier {
         proof: &MetaProof<KoalaBearPoseidon2>,
         riscv_vk: &BaseVerifyingKey<KoalaBearPoseidon2>,
     ) -> bool {
-        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            self.machine.verify(proof, riscv_vk).is_ok()
-        }));
-
-        match result {
-            Ok(verification_result) => verification_result,
-            Err(_) => {
-                debug!("Pico verification panicked - returning false");
-                false
-            }
-        }
+        self.machine.verify(proof, riscv_vk).is_ok()
     }
 }
 
@@ -74,29 +63,31 @@ pub struct PicoVerifier;
 
 impl ProofVerifier for PicoVerifier {
     fn verify(proof_data: &[u8], vk_data: &[u8]) -> VerificationResult {
-        debug!(
-            proof_size = proof_data.len(),
-            vk_size = vk_data.len(),
-            "Starting Pico verification"
-        );
+        panic_safe::safe_verify(|| {
+            debug!(
+                proof_size = proof_data.len(),
+                vk_size = vk_data.len(),
+                "Starting Pico verification"
+            );
 
-        // Deserialize the KoalaBear proof
-        let serializable_proof: SerializableKoalaBearMetaProof =
-            bincode::deserialize(proof_data)
-                .map_err(|e| format!("Failed to deserialize proof: {}", e))?;
-        let proof = serializable_proof.to_meta_proof();
+            // Deserialize the KoalaBear proof
+            let serializable_proof: SerializableKoalaBearMetaProof =
+                bincode::deserialize(proof_data)
+                    .map_err(|e| format!("Failed to deserialize proof: {}", e))?;
+            let proof = serializable_proof.to_meta_proof();
 
-        // Deserialize KoalaBear verification key
-        let riscv_vk: BaseVerifyingKey<KoalaBearPoseidon2> = bincode::deserialize(vk_data)
-            .map_err(|e| format!("Failed to deserialize verification key: {}", e))?;
+            // Deserialize KoalaBear verification key
+            let riscv_vk: BaseVerifyingKey<KoalaBearPoseidon2> = bincode::deserialize(vk_data)
+                .map_err(|e| format!("Failed to deserialize verification key: {}", e))?;
 
-        // Create and run verifier
-        let verifier = KoalaBearCombineVerifier::new();
-        let result = verifier.verify(&proof, &riscv_vk);
+            // Create and run verifier
+            let verifier = KoalaBearCombineVerifier::new();
+            let result = verifier.verify(&proof, &riscv_vk);
 
-        debug!(verification_result = result, "Completed Pico verification");
+            debug!(verification_result = result, "Completed Pico verification");
 
-        Ok(result)
+            Ok(result)
+        })
     }
 
     fn name() -> &'static str {

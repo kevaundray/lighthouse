@@ -2,7 +2,7 @@
 //!
 //! This module implements proof verification for ZisK zkVM using the proofman-verifier.
 
-use super::{ProofVerifier, VerificationResult};
+use super::{panic_safe, ProofVerifier, VerificationResult};
 use tracing::debug;
 
 /// ZisK verifier
@@ -10,18 +10,20 @@ pub struct ZiskVerifier;
 
 impl ProofVerifier for ZiskVerifier {
     fn verify(proof_data: &[u8], vk_data: &[u8]) -> VerificationResult {
-        debug!(
-            proof_size = proof_data.len(),
-            vk_size = vk_data.len(),
-            "Starting ZisK verification"
-        );
+        panic_safe::safe_verify(|| {
+            debug!(
+                proof_size = proof_data.len(),
+                vk_size = vk_data.len(),
+                "Starting ZisK verification"
+            );
 
-        // Call the proofman-verifier verify function
-        let result = proofman_verifier::verify(proof_data, vk_data);
+            // Call the proofman-verifier verify function
+            let result = proofman_verifier::verify(proof_data, vk_data);
 
-        debug!(verification_result = result, "Completed ZisK verification");
+            debug!(verification_result = result, "Completed ZisK verification");
 
-        Ok(result)
+            Ok(result)
+        })
     }
 
     fn name() -> &'static str {

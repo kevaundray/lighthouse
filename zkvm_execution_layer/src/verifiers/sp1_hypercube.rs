@@ -2,7 +2,7 @@
 //!
 //! This module implements proof verification for SP1-Hypercube zkVM using the sp1-verifier.
 
-use super::{ProofVerifier, VerificationResult};
+use super::{panic_safe, ProofVerifier, VerificationResult};
 use sp1_verifier::compressed::SP1CompressedVerifierRaw;
 use tracing::debug;
 
@@ -11,25 +11,27 @@ pub struct Sp1HypercubeVerifier;
 
 impl ProofVerifier for Sp1HypercubeVerifier {
     fn verify(proof_data: &[u8], vk_data: &[u8]) -> VerificationResult {
-        debug!(
-            proof_size = proof_data.len(),
-            vk_size = vk_data.len(),
-            "Starting SP1-Hypercube verification"
-        );
+        panic_safe::safe_verify(|| {
+            debug!(
+                proof_size = proof_data.len(),
+                vk_size = vk_data.len(),
+                "Starting SP1-Hypercube verification"
+            );
 
-        // Call the sp1-verifier verify function via SP1CompressedVerifierRaw
-        // vk_data should be the serialized vkey hash (bincode serialized [SP1Field; 8])
-        // Returns Result<(), CompressedError> where Ok(()) means verification succeeded
-        match SP1CompressedVerifierRaw::verify(proof_data, vk_data) {
-            Ok(()) => {
-                debug!("SP1-Hypercube verification succeeded");
-                Ok(true)
+            // Call the sp1-verifier verify function via SP1CompressedVerifierRaw
+            // vk_data should be the serialized vkey hash (bincode serialized [SP1Field; 8])
+            // Returns Result<(), CompressedError> where Ok(()) means verification succeeded
+            match SP1CompressedVerifierRaw::verify(proof_data, vk_data) {
+                Ok(()) => {
+                    debug!("SP1-Hypercube verification succeeded");
+                    Ok(true)
+                }
+                Err(e) => {
+                    debug!(error = ?e, "SP1-Hypercube verification failed");
+                    Ok(false)
+                }
             }
-            Err(e) => {
-                debug!(error = ?e, "SP1-Hypercube verification failed");
-                Ok(false)
-            }
-        }
+        })
     }
 
     fn name() -> &'static str {

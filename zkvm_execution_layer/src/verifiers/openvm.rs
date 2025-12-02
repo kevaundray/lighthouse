@@ -2,7 +2,7 @@
 //!
 //! This module implements proof verification for OpenVM using the OpenVM verify-stark library.
 
-use super::{ProofVerifier, VerificationResult};
+use super::{panic_safe, ProofVerifier, VerificationResult};
 use tracing::debug;
 use verify_stark::{verify_vm_stark_proof, vk::VmStarkVerifyingKey};
 
@@ -11,32 +11,34 @@ pub struct OpenVmVerifier;
 
 impl ProofVerifier for OpenVmVerifier {
     fn verify(proof_data: &[u8], vk_data: &[u8]) -> VerificationResult {
-        debug!(
-            proof_size = proof_data.len(),
-            vk_size = vk_data.len(),
-            "Starting OpenVM verification"
-        );
+        panic_safe::safe_verify(|| {
+            debug!(
+                proof_size = proof_data.len(),
+                vk_size = vk_data.len(),
+                "Starting OpenVM verification"
+            );
 
-        // Deserialize the verification key from bitcode bytes
-        let vk: VmStarkVerifyingKey = match bitcode::deserialize(vk_data) {
-            Ok(vk) => vk,
-            Err(e) => {
-                debug!(error = ?e, "Failed to deserialize OpenVM verification key");
-                return Ok(false);
-            }
-        };
+            // Deserialize the verification key from bitcode bytes
+            let vk: VmStarkVerifyingKey = match bitcode::deserialize(vk_data) {
+                Ok(vk) => vk,
+                Err(e) => {
+                    debug!(error = ?e, "Failed to deserialize OpenVM verification key");
+                    return Ok(false);
+                }
+            };
 
-        // Verify the proof using the OpenVM verify-stark library
-        match verify_vm_stark_proof(&vk, proof_data) {
-            Ok(()) => {
-                debug!("OpenVM verification succeeded");
-                Ok(true)
+            // Verify the proof using the OpenVM verify-stark library
+            match verify_vm_stark_proof(&vk, proof_data) {
+                Ok(()) => {
+                    debug!("OpenVM verification succeeded");
+                    Ok(true)
+                }
+                Err(e) => {
+                    debug!(error = ?e, "OpenVM verification failed");
+                    Ok(false)
+                }
             }
-            Err(e) => {
-                debug!(error = ?e, "OpenVM verification failed");
-                Ok(false)
-            }
-        }
+        })
     }
 
     fn name() -> &'static str {
@@ -58,9 +60,9 @@ mod tests {
     fn test_openvm_verification() {
         // Load test proof and verification key
         let test_proof_path =
-            PathBuf::from("src/test_proofs/openvm_425971e7-78eb-4d61-95d9-e9eea62f41da.bin");
+            PathBuf::from("src/test_proofs/openvm_9b6768c0-831d-488c-ba72-05f93975a3be.bin");
         let vk_path =
-            PathBuf::from("src/verification_keys/openvm_425971e7-78eb-4d61-95d9-e9eea62f41da.bin");
+            PathBuf::from("src/verification_keys/openvm_9b6768c0-831d-488c-ba72-05f93975a3be.bin");
 
         let proof_data = std::fs::read(&test_proof_path).expect("Failed to read test proof file");
         let vk_data = std::fs::read(&vk_path).expect("Failed to read verification key file");
