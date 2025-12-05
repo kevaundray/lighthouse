@@ -2,6 +2,7 @@ use crate::proof_generation::{ProofGenerationError, ProofGenerationResult, Proof
 use async_trait::async_trait;
 use std::time::Duration;
 use tokio::time::sleep;
+use tracing::debug;
 use types::{ExecutionBlockHash, ExecutionProof, ExecutionProofId, Hash256, Slot};
 
 /// Dummy proof generator for testing
@@ -39,6 +40,11 @@ impl ProofGenerator for DummyProofGenerator {
         payload_hash: &ExecutionBlockHash,
         block_root: &Hash256,
     ) -> ProofGenerationResult<ExecutionProof> {
+        debug!(
+            "[Ethproofs] DummyProofGenerator::generate called for proof_id={}, slot={}, block_hash={}",
+            self.proof_id, slot, payload_hash
+        );
+
         // Simulate proof generation work
         if !self.generation_delay.is_zero() {
             sleep(self.generation_delay).await;

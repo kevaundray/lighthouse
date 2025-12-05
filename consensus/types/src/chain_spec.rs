@@ -226,6 +226,7 @@ pub struct ChainSpec {
      */
     /// Whether zkVM mode is enabled via CLI flag --activate-zkvm.
     /// When true, the node will subscribe to execution proof gossip, verify proofs,
+    /// TODO(ethproofs): Changed to Electra fork epoch.
     /// and optionally generate proofs. zkVM activates at the Fulu fork.
     /// Unlike other forks, this is not a network-wide activation but a per-node opt-in.
     pub zkvm_enabled: bool,
@@ -501,12 +502,14 @@ impl ChainSpec {
         self.zkvm_enabled
     }
 
+    /// TODO(ethproofs): Changed to Electra fork epoch.
+    ///
     /// Returns the epoch at which zkVM activates.
     /// Currently uses Fulu fork epoch.
     /// Returns None if zkVM is disabled or Fulu is not scheduled.
     pub fn zkvm_fork_epoch(&self) -> Option<Epoch> {
         if self.zkvm_enabled {
-            self.fulu_fork_epoch
+            self.electra_fork_epoch
         } else {
             None
         }
@@ -518,9 +521,11 @@ impl ChainSpec {
             .is_some_and(|zkvm_fork_epoch| epoch >= zkvm_fork_epoch)
     }
 
+    /// TODO(ethproofs): Changed to Electra fork epoch.
+    ///
     /// Returns true if zkVM mode can be used at the given fork.
     pub fn is_zkvm_enabled_for_fork(&self, fork_name: ForkName) -> bool {
-        self.is_zkvm_enabled() && fork_name.fulu_enabled()
+        self.is_zkvm_enabled() && fork_name.electra_enabled()
     }
 
     /// Returns the minimum number of execution proofs required.
