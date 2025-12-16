@@ -1,10 +1,15 @@
-use crate::verification_keys::VerificationKeyStore;
+use crate::active_provers_loader;
+use crate::ethproofs_prover_registry::EthproofsProverRegistry;
+use crate::verification_keys::ExecutionProofVerificationKey;
 use crate::verifiers::VerifierStore;
 use once_cell::sync::Lazy;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, info};
+use tokio::sync::RwLock;
+use tracing::{debug, info, warn};
 use types::ExecutionProof;
 
 /// Trait for validating proofs
@@ -22,18 +27,57 @@ impl ProofValidator for EthproofsValidator {
     }
 }
 
-/// Global verification key store, loaded once on first access
-pub static VERIFICATION_KEY_STORE: Lazy<Option<VerificationKeyStore>> =
-    Lazy::new(|| match VerificationKeyStore::load_embedded() {
-        Ok(store) => Some(store),
-        Err(e) => {
-            debug!(error = %e, "[Ethproofs] Failed to load verification keys");
-            None
-        }
-    });
+/// Global prover registry for dynamic proof type mapping
+pub static PROVER_REGISTRY: Lazy<Arc<RwLock<EthproofsProverRegistry>>> =
+    Lazy::new(|| Arc::new(RwLock::new(EthproofsProverRegistry::new())));
 
-/// Global verifier store, initialized with default verifiers
-pub static VERIFIER_STORE: Lazy<VerifierStore> = Lazy::new(VerifierStore::with_defaults);
+/// Global dynamic verification keys, keyed by proof_id
+pub static DYNAMIC_VK_STORE: Lazy<Arc<RwLock<HashMap<u8, ExecutionProofVerificationKey>>>> =
+    Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
+
+/// Global verifier store, initialized with verifiers registered by zkvm_slug
+pub static VERIFIER_STORE: Lazy<VerifierStore> = Lazy::new(|| {
+    let mut store = VerifierStore::new();
+    // Register verifiers by zkvm_slug for dynamic prover loading
+    store.register_all_by_slug();
+    store
+});
+
+/// Load active provers from the Ethproofs API during initialization
+///
+/// This should be called during beacon node startup to populate the prover registry
+/// with active provers from the Ethproofs API. It uses:
+/// - API URL: https://ethproofs.org
+/// - API Key: ETHPROOFS_API_KEY environment variable (optional)
+///
+/// Returns Ok(()) if successful, or logs a warning if loading fails.
+pub async fn initialize_ethproofs_provers() -> Result<(), String> {
+    info!("[Ethproofs] Initializing active provers from API");
+
+    // Load active provers from API (verification keys endpoint is public)
+    match active_provers_loader::load_active_provers().await {
+        Ok((registry, vk_store)) => {
+            // Update the global registry and VK store
+            {
+                let mut reg = PROVER_REGISTRY.write().await;
+                *reg = registry;
+            }
+
+            {
+                let mut vks = DYNAMIC_VK_STORE.write().await;
+                *vks = vk_store;
+            }
+
+            info!("[Ethproofs] Successfully initialized active provers from API");
+            Ok(())
+        }
+        Err(e) => {
+            warn!("[Ethproofs] Failed to load active provers: {}", e);
+            // Return error so caller can decide how to handle it
+            Err(e)
+        }
+    }
+}
 
 /// Represents a proof from the Ethproofs proofs list endpoint
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,17 +211,23 @@ pub async fn download_proof_binary(proof_id: u64) -> Result<Vec<u8>, String> {
     }
 }
 
-/// Validate a proof using the verifier store
+/// Validate a proof using the dynamic verifier system
 ///
 /// This function performs cryptographic verification of a proof by:
-/// 1. Looking up the verifier for the proof's proof_id
-/// 2. Running the cryptographic verification function
-/// 3. Returning whether the proof is valid
+/// 1. Fallback proofs (proof_id = 0) are accepted without verification
+/// 2. Looks up proof_id in EthproofsProverRegistry to get zkvm_slug
+/// 3. Looks up proof_id in dynamic VK store to get verification key
+/// 4. Looks up zkvm_slug in verifier store to run verification
 ///
-/// Note: Fallback proofs (proof_id = 0) bypass this pipeline and are accepted immediately.
+/// The dynamic system must be initialized by calling `load_active_provers()` during
+/// beacon node startup. If not initialized, verification will fail.
+///
+/// Returns true if the proof is valid, false otherwise.
 pub fn validate_proof(proof: &ExecutionProof) -> bool {
+    let proof_id = proof.proof_id.as_u8();
+
     // Fallback proofs (proof_id 0) are accepted without verification
-    if proof.proof_id.as_u8() == 0 {
+    if proof_id == 0 {
         debug!(
             slot = %proof.slot,
             block_hash = %proof.block_hash,
@@ -186,86 +236,109 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
         return true;
     }
 
-    // Get the prover UUID for this proof_id from the hardcoded mapping
-    let prover_uuid = match VERIFIER_STORE.get_prover_uuid_for_proof_id(proof.proof_id) {
-        Some(uuid) => uuid,
-        None => {
-            debug!(
-                proof_id = %proof.proof_id,
-                "[Ethproofs] No prover UUID mapping found for this proof_id"
+    // Use dynamic system (must be initialized via load_active_provers())
+    let registry = match PROVER_REGISTRY.try_read() {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(
+                proof_id = proof_id,
+                error = %e,
+                "[Ethproofs] Failed to read prover registry"
             );
             return false;
         }
     };
 
-    match &*VERIFICATION_KEY_STORE {
-        Some(store) => {
-            match store.get(&prover_uuid) {
-                Some(vk) => {
-                    debug!(
-                        slot = %proof.slot,
-                        block_hash = %proof.block_hash,
-                        prover_id = %prover_uuid,
-                        vk_size = vk.size(),
-                        proof_size = proof.proof_data.len(),
-                        "[Ethproofs] Found vk for prover"
-                    );
+    if registry.is_empty() {
+        warn!(
+            proof_id = proof_id,
+            "[Ethproofs] Prover registry not initialized. Call load_active_provers() during startup."
+        );
+        return false;
+    }
 
-                    // Look up the verifier for this prover
-                    match VERIFIER_STORE.get(&prover_uuid) {
-                        Some(verifier_entry) => {
-                            info!(
-                                "[Ethproofs] Verification started: verifier={} slot={}",
-                                verifier_entry.name, proof.slot
-                            );
-
-                            // Run the actual cryptographic verification
-                            match (verifier_entry.verify_fn)(&proof.proof_data, &vk.vk) {
-                                Ok(result) => {
-                                    info!(
-                                        "[Ethproofs] Verification completed: verifier={} slot={} result={}",
-                                        verifier_entry.name,
-                                        proof.slot,
-                                        result
-                                    );
-                                    result
-                                }
-                                Err(e) => {
-                                    debug!(
-                                        slot = %proof.slot,
-                                        block_hash = %proof.block_hash,
-                                        verifier = verifier_entry.name,
-                                        error = %e,
-                                        "[Ethproofs] Verification failed"
-                                    );
-                                    false
-                                }
-                            }
-                        }
-                        None => {
-                            debug!(
-                                slot = %proof.slot,
-                                block_hash = %proof.block_hash,
-                                prover_id = %prover_uuid,
-                                "[Ethproofs] No registered verifier"
-                            );
-                            false
-                        }
-                    }
-                }
-                None => {
-                    debug!(
-                        slot = %proof.slot,
-                        block_hash = %proof.block_hash,
-                        prover_id = %prover_uuid,
-                        "[Ethproofs] No verification key found"
-                    );
-                    false
-                }
-            }
-        }
+    let prover_info = match registry.get_by_proof_id(proof_id) {
+        Some(info) => info,
         None => {
-            debug!("[Ethproofs] Verification key store not initialized");
+            debug!(
+                proof_id = proof_id,
+                "[Ethproofs] Proof ID not found in registry"
+            );
+            return false;
+        }
+    };
+
+    // Get VK from dynamic store
+    let vk_store = match DYNAMIC_VK_STORE.try_read() {
+        Ok(store) => store,
+        Err(e) => {
+            warn!(
+                proof_id = proof_id,
+                error = %e,
+                "[Ethproofs] Failed to read VK store"
+            );
+            return false;
+        }
+    };
+
+    let vk = match vk_store.get(&proof_id) {
+        Some(vk) => vk,
+        None => {
+            warn!(
+                proof_id = proof_id,
+                "[Ethproofs] Verification key not found for proof_id"
+            );
+            return false;
+        }
+    };
+
+    // Get verifier by zkvm_slug
+    let verifier_entry = match VERIFIER_STORE.get_by_slug(&prover_info.zkvm_slug) {
+        Some(entry) => entry,
+        None => {
+            warn!(
+                proof_id = proof_id,
+                zkvm_slug = %prover_info.zkvm_slug,
+                "[Ethproofs] Verifier not found for zkvm_slug"
+            );
+            return false;
+        }
+    };
+
+    debug!(
+        slot = %proof.slot,
+        block_hash = %proof.block_hash,
+        proof_id = proof_id,
+        zkvm_slug = %prover_info.zkvm_slug,
+        vk_size = vk.size(),
+        proof_size = proof.proof_data.len(),
+        "[Ethproofs] Found proof, VK, and verifier"
+    );
+
+    info!(
+        "[Ethproofs] Verification started: verifier={} slot={}",
+        verifier_entry.name, proof.slot
+    );
+
+    // Run the actual cryptographic verification
+    match (verifier_entry.verify_fn)(&proof.proof_data, &vk.vk) {
+        Ok(result) => {
+            info!(
+                "[Ethproofs] Verification completed: verifier={} slot={} result={}",
+                verifier_entry.name,
+                proof.slot,
+                result
+            );
+            result
+        }
+        Err(e) => {
+            debug!(
+                slot = %proof.slot,
+                block_hash = %proof.block_hash,
+                verifier = verifier_entry.name,
+                error = %e,
+                "[Ethproofs] Verification failed"
+            );
             false
         }
     }

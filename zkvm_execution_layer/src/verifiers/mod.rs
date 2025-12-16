@@ -10,96 +10,11 @@ pub mod panic_safe;
 pub mod pico;
 pub mod sp1_hypercube;
 pub mod zisk;
-pub mod zkcloud;
 
 use std::collections::HashMap;
-use types::ExecutionProofId;
-use uuid::Uuid;
 
 /// Result type for proof verification
 pub type VerificationResult = Result<bool, String>;
-
-/// Ethproofs demo prover UUIDs - hardcoded mapping for demo testing
-/// These constants define the relationship between internal proof_ids (0, 1, 2, etc.)
-/// and Ethproofs prover UUIDs.
-///
-/// Proof ID Mapping (alphabetical order, Fallback first, Airbender reserved):
-/// - proof_id 0 → Fallback verifier (used when Ethproofs API fails/times out)
-/// - proof_id 1 → Airbender verifier (reserved for future use)
-/// - proof_id 2 → OpenVM verifier
-/// - proof_id 3 → Pico Prism verifier
-/// - proof_id 4 → SP1-Hypercube verifier
-/// - proof_id 5 → ZisK 1 (Girona) verifier
-/// - proof_id 6 → ZisK 2 (Sevilla) verifier
-/// - proof_id 7 → ZisK-ZkCloud verifier
-pub mod ethproofs_ids {
-    use uuid::Uuid;
-
-    /// Fallback verifier UUID (proof_id = 0)
-    /// Used for dummy proofs when Ethproofs API fails or times out
-    pub const FALLBACK_UUID: &str = "00000000-0000-0000-0000-000000000000";
-
-    /// Airbender verifier UUID (proof_id = 1)
-    pub const AIRBENDER_UUID: &str = "b18507c4-50f3-4638-854a-ed625c7e685a";
-
-    /// OpenVM verifier UUID (proof_id = 2)
-    pub const OPENVM_UUID: &str = "9b6768c0-831d-488c-ba72-05f93975a3be";
-
-    /// Pico Prism verifier UUID (proof_id = 3)
-    pub const PICO_UUID: &str = "f404c187-88d6-4927-963c-61760a639900";
-
-    /// SP1-Hypercube verifier UUID (proof_id = 4)
-    pub const SP1_HYPERCUBE_UUID: &str = "fbef2553-8cd0-4f45-b328-570b5c8688b2";
-
-    /// ZisK 1 (Girona) verifier UUID (proof_id = 5)
-    pub const ZISK_1_GIRONA_UUID: &str = "817bbf03-07b4-466d-879b-e476322bd080";
-
-    /// ZisK 2 (Sevilla) verifier UUID (proof_id = 6)
-    pub const ZISK_2_SEVILLA_UUID: &str = "534e6cf4-3dfe-47de-bba2-a0b11d544557";
-
-    /// ZisK-ZkCloud verifier UUID (proof_id = 7)
-    pub const ZISK_ZKCLOUD_UUID: &str = "884fcc21-d522-4b4a-b535-7cfde199485c";
-
-    /// Parse a Fallback UUID
-    pub fn fallback() -> Uuid {
-        Uuid::parse_str(FALLBACK_UUID).expect("Valid UUID")
-    }
-
-    /// Parse an Airbender UUID
-    pub fn airbender() -> Uuid {
-        Uuid::parse_str(AIRBENDER_UUID).expect("Valid UUID")
-    }
-
-    /// Parse an OpenVM UUID
-    pub fn openvm() -> Uuid {
-        Uuid::parse_str(OPENVM_UUID).expect("Valid UUID")
-    }
-
-    /// Parse a Pico UUID
-    pub fn pico() -> Uuid {
-        Uuid::parse_str(PICO_UUID).expect("Valid UUID")
-    }
-
-    /// Parse a SP1-Hypercube UUID
-    pub fn sp1_hypercube() -> Uuid {
-        Uuid::parse_str(SP1_HYPERCUBE_UUID).expect("Valid UUID")
-    }
-
-    /// Parse a ZisK 1 (Girona) UUID
-    pub fn zisk_1_girona() -> Uuid {
-        Uuid::parse_str(ZISK_1_GIRONA_UUID).expect("Valid UUID")
-    }
-
-    /// Parse a ZisK 2 (Sevilla) UUID
-    pub fn zisk_2_sevilla() -> Uuid {
-        Uuid::parse_str(ZISK_2_SEVILLA_UUID).expect("Valid UUID")
-    }
-
-    /// Parse a ZisK-ZkCloud UUID
-    pub fn zisk_zkcloud() -> Uuid {
-        Uuid::parse_str(ZISK_ZKCLOUD_UUID).expect("Valid UUID")
-    }
-}
 
 /// Trait for proof verifiers
 pub trait ProofVerifier: Send + Sync {
@@ -123,140 +38,107 @@ pub struct VerifierEntry {
     pub verify_fn: VerifierFn,
 }
 
-/// Manager for multiple proof verifiers, keyed by prover UUID
+/// Manager for proof verifiers, keyed by zkvm_slug
+///
+/// Verifiers are registered by zkvm_slug (e.g., "sp1-hypercube", "zisk") and looked up
+/// based on the proof system specified by the prover. This supports dynamic prover loading
+/// where verification keys and provers come from the Ethproofs API.
 #[derive(Default)]
 pub struct VerifierStore {
-    /// Map of prover_id to verifier function
-    verifiers: HashMap<Uuid, VerifierEntry>,
+    /// Map of zkvm_slug to verifier function (for dynamic prover loading)
+    verifiers_by_slug: HashMap<String, VerifierEntry>,
 }
 
 impl VerifierStore {
     /// Create a new empty verifier store
     pub fn new() -> Self {
         Self {
-            verifiers: HashMap::new(),
+            verifiers_by_slug: HashMap::new(),
         }
     }
 
-    /// Register a verifier for a specific prover UUID
-    pub fn register(&mut self, prover_id: Uuid, name: &'static str, verify_fn: VerifierFn) {
-        self.verifiers
-            .insert(prover_id, VerifierEntry { name, verify_fn });
+    /// Register a verifier for a specific zkvm_slug
+    pub fn register_by_slug(
+        &mut self,
+        zkvm_slug: String,
+        name: &'static str,
+        verify_fn: VerifierFn,
+    ) {
+        self.verifiers_by_slug
+            .insert(zkvm_slug, VerifierEntry { name, verify_fn });
     }
 
-    /// Get a verifier entry for a specific prover UUID
-    pub fn get(&self, prover_id: &Uuid) -> Option<&VerifierEntry> {
-        self.verifiers.get(prover_id)
+    /// Get a verifier entry for a specific zkvm_slug
+    pub fn get_by_slug(&self, zkvm_slug: &str) -> Option<&VerifierEntry> {
+        self.verifiers_by_slug.get(zkvm_slug)
     }
 
-    /// Check if a verifier exists for a prover
-    pub fn contains(&self, prover_id: &Uuid) -> bool {
-        self.verifiers.contains_key(prover_id)
+    /// Check if a verifier exists for a zkvm_slug
+    pub fn contains_slug(&self, zkvm_slug: &str) -> bool {
+        self.verifiers_by_slug.contains_key(zkvm_slug)
     }
 
     /// Get the number of registered verifiers
     pub fn len(&self) -> usize {
-        self.verifiers.len()
+        self.verifiers_by_slug.len()
     }
 
     /// Check if the store is empty
     pub fn is_empty(&self) -> bool {
-        self.verifiers.is_empty()
+        self.verifiers_by_slug.is_empty()
     }
 
-    /// Get all registered prover IDs
-    pub fn prover_ids(&self) -> Vec<Uuid> {
-        self.verifiers.keys().copied().collect()
+    /// Get all registered zkvm slugs
+    pub fn zkvm_slugs(&self) -> Vec<String> {
+        self.verifiers_by_slug.keys().cloned().collect()
     }
 
-    /// Get the prover UUID corresponding to a proof_id (Ethproofs demo mapping)
+    /// Register all verifiers by their zkvm_slug
     ///
-    /// For Ethproofs demo testing, this provides a hardcoded mapping of proof_ids to prover UUIDs:
-    /// - proof_id 0 → fallback
-    /// - proof_id 1 → airbender
-    /// - proof_id 2 → openvm
-    /// - proof_id 3 → pico
-    /// - proof_id 4 → sp1_hypercube
-    /// - proof_id 5 → zisk_1_girona
-    /// - proof_id 6 → zisk_2_sevilla
-    /// - proof_id 7 → zisk_zkcloud
-    pub fn get_prover_uuid_for_proof_id(&self, proof_id: ExecutionProofId) -> Option<Uuid> {
-        let id = proof_id.as_u8() as u32;
-        match id {
-            0 => Some(ethproofs_ids::fallback()),
-            1 => Some(ethproofs_ids::airbender()),
-            2 => Some(ethproofs_ids::openvm()),
-            3 => Some(ethproofs_ids::pico()),
-            4 => Some(ethproofs_ids::sp1_hypercube()),
-            5 => Some(ethproofs_ids::zisk_1_girona()),
-            6 => Some(ethproofs_ids::zisk_2_sevilla()),
-            7 => Some(ethproofs_ids::zisk_zkcloud()),
-            _ => None,
-        }
-    }
-
-    /// Create a store with default verifiers registered
-    ///
-    /// This registers verifiers for known Ethproofs prover UUIDs
-    pub fn with_defaults() -> Self {
-        let mut store = Self::new();
-
-        // Register Fallback verifier (proof_id 0)
-        store.register(
-            ethproofs_ids::fallback(),
+    /// This is used for dynamic prover loading where verification keys and provers
+    /// come from the Ethproofs API. All verifiers are registered once by their slug,
+    /// and then can be looked up based on the prover's zkvm_slug.
+    pub fn register_all_by_slug(&mut self) {
+        // Register Fallback verifier
+        self.register_by_slug(
+            "fallback".to_string(),
             fallback::FallbackVerifier::name(),
             fallback::FallbackVerifier::verify,
         );
 
-        // Register Airbender verifier (proof_id 1)
-        store.register(
-            ethproofs_ids::airbender(),
+        // Register Airbender verifier
+        self.register_by_slug(
+            "airbender".to_string(),
             airbender::AirbenderVerifier::name(),
             airbender::AirbenderVerifier::verify,
         );
 
-        // Register OpenVM verifier (proof_id 2)
-        store.register(
-            ethproofs_ids::openvm(),
+        // Register OpenVM verifier
+        self.register_by_slug(
+            "openvm".to_string(),
             openvm::OpenVmVerifier::name(),
             openvm::OpenVmVerifier::verify,
         );
 
-        // Register Pico verifier (proof_id 3)
-        store.register(
-            ethproofs_ids::pico(),
+        // Register Pico verifier
+        self.register_by_slug(
+            "pico".to_string(),
             pico::PicoVerifier::name(),
             pico::PicoVerifier::verify,
         );
 
-        // Register SP1-Hypercube verifier (proof_id 4)
-        store.register(
-            ethproofs_ids::sp1_hypercube(),
+        // Register SP1-Hypercube verifier
+        self.register_by_slug(
+            "sp1-hypercube".to_string(),
             sp1_hypercube::Sp1HypercubeVerifier::name(),
             sp1_hypercube::Sp1HypercubeVerifier::verify,
         );
 
-        // Register ZisK 1 (Girona) verifier (proof_id 5)
-        store.register(
-            ethproofs_ids::zisk_1_girona(),
+        // Register ZisK verifier
+        self.register_by_slug(
+            "zisk".to_string(),
             zisk::ZiskVerifier::name(),
             zisk::ZiskVerifier::verify,
         );
-
-        // Register ZisK 2 (Sevilla) verifier (proof_id 6)
-        store.register(
-            ethproofs_ids::zisk_2_sevilla(),
-            zisk::ZiskVerifier::name(),
-            zisk::ZiskVerifier::verify,
-        );
-
-        // Register ZisK-ZkCloud verifier (proof_id 7)
-        store.register(
-            ethproofs_ids::zisk_zkcloud(),
-            zkcloud::ZkCloudVerifier::name(),
-            zkcloud::ZkCloudVerifier::verify,
-        );
-
-        store
     }
 }

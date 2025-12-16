@@ -290,6 +290,13 @@ where
 
         // Set up proof generation service if zkVM is configured with generation proof types
         let builder = if let Some(ref zkvm_config) = config.zkvm_execution_layer {
+            // Initialize Ethproofs provers from API
+            if let Err(e) = zkvm_execution_layer::ethproofs_demo::initialize_ethproofs_provers().await {
+                warn!("[Ethproofs] Failed to initialize provers during startup: {}", e);
+                // Continue startup even if prover initialization fails - nodes can still verify
+                // existing proofs, but won't be able to query the API for new proofs
+            }
+
             if !zkvm_config.generation_proof_types.is_empty() {
                 // Validate that proof generation requires an execution layer
                 // Proof-generating nodes will validate blocks via EL execution, not proofs

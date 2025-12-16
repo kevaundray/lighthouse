@@ -1,4 +1,4 @@
-use crate::ethproofs_demo::{download_proof_binary, fetch_proof_from_ethproofs, VERIFIER_STORE};
+use crate::ethproofs_demo::{download_proof_binary, fetch_proof_from_ethproofs, PROVER_REGISTRY};
 use crate::proof_generation::{ProofGenerationError, ProofGenerationResult, ProofGenerator};
 use async_trait::async_trait;
 use std::time::Duration;
@@ -77,19 +77,30 @@ impl ProofGenerator for DummyProofGenerator {
             sleep(self.generation_delay).await;
         }
 
-        // Get the Ethproofs prover UUID corresponding to this proof_id
-        let prover_uuid = match VERIFIER_STORE.get_prover_uuid_for_proof_id(self.proof_id) {
-            Some(uuid) => uuid,
-            None => {
+        // Get the cluster ID corresponding to this proof_id from the dynamic registry
+        let registry = match PROVER_REGISTRY.try_read() {
+            Ok(r) => r,
+            Err(_) => {
                 debug!(
                     proof_id = %self.proof_id,
-                    "[Ethproofs] No prover UUID mapping found, cannot query API"
+                    "[Ethproofs] Failed to read prover registry, cannot query API"
                 );
                 return self.create_dummy_proof(slot, payload_hash, block_root);
             }
         };
 
-        let cluster = prover_uuid.to_string();
+        let cluster_id = match registry.get_cluster_id(self.proof_id.as_u8()) {
+            Some(id) => id,
+            None => {
+                debug!(
+                    proof_id = %self.proof_id,
+                    "[Ethproofs] Proof ID not found in registry, cannot query API"
+                );
+                return self.create_dummy_proof(slot, payload_hash, block_root);
+            }
+        };
+
+        let cluster = cluster_id.to_string();
 
         info!(
             proof_id = %self.proof_id,

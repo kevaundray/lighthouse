@@ -25,7 +25,7 @@ where
             } else {
                 "Unknown panic occurred during verification".to_string()
             };
-            error!(panic_message = %panic_msg, "Verifier panicked, returning false");
+            error!(panic_message = %panic_msg, "[Ethproofs] Verifier panicked, returning false");
             Ok(false)
         }
     }

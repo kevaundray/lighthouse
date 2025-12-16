@@ -21,3 +21,9 @@ pub use registry_proof_gen::GeneratorRegistry;
 pub mod ethproofs_demo;
 pub mod verification_keys;
 pub mod verifiers;
+
+/// Ethproofs prover registry for dynamic proof type mapping
+pub mod ethproofs_prover_registry;
+
+/// Dynamic loader for active provers from Ethproofs API
+pub mod active_provers_loader;
