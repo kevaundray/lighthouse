@@ -43,12 +43,9 @@ pub static VERIFIER_STORE: Lazy<VerifierStore> = Lazy::new(|| {
     store
 });
 
-/// Load active provers from the Ethproofs API during initialization
+/// Load active provers from the Ethproofs API during initialization.
 ///
-/// This should be called during beacon node startup to populate the prover registry
-/// with active provers from the Ethproofs API. It uses:
-/// - API URL: https://ethproofs.org
-/// - API Key: ETHPROOFS_API_KEY environment variable (optional)
+/// This should be called during beacon node startup to populate the prover registry.
 ///
 /// Returns Ok(()) if successful, or logs a warning if loading fails.
 pub async fn initialize_ethproofs_provers() -> Result<(), String> {
@@ -325,9 +322,7 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
         Ok(result) => {
             info!(
                 "[Ethproofs] Verification completed: verifier={} slot={} result={}",
-                verifier_entry.name,
-                proof.slot,
-                result
+                verifier_entry.name, proof.slot, result
             );
             result
         }

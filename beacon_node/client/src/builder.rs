@@ -39,6 +39,7 @@ use rand::SeedableRng;
 use rand::rngs::{OsRng, StdRng};
 use slasher::Slasher;
 use slasher_service::SlasherService;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,8 +49,8 @@ use timer::spawn_timer;
 use tracing::{debug, info, instrument, warn};
 use types::data_column_custody_group::compute_ordered_custody_column_indices;
 use types::{
-    BeaconState, BlobSidecarList, ChainSpec, EthSpec, ExecutionBlockHash, Hash256,
-    SignedBeaconBlock, test_utils::generate_deterministic_keypairs,
+    BeaconState, BlobSidecarList, ChainSpec, EthSpec, ExecutionBlockHash, ExecutionProofId,
+    Hash256, SignedBeaconBlock, test_utils::generate_deterministic_keypairs,
 };
 use zkvm_execution_layer;
 
@@ -309,23 +310,68 @@ where
                     );
                 }
 
-                // Create channel for proof generation events
-                let (proof_gen_tx, proof_gen_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<ProofGenerationEvent<E>>();
+                // Filter generation_proof_types to only include those available from Ethproofs API
+                let available_proof_ids: HashSet<ExecutionProofId> =
+                    zkvm_execution_layer::ethproofs_demo::PROVER_REGISTRY
+                        .try_read()
+                        .map(|r| {
+                            r.proof_ids()
+                                .into_iter()
+                                .filter_map(|id| ExecutionProofId::new(id).ok())
+                                .collect()
+                        })
+                        .unwrap_or_default();
 
-                // Create generator registry with enabled proof types
-                let registry = Arc::new(
-                    zkvm_execution_layer::GeneratorRegistry::new_with_dummy_generators(
-                        zkvm_config.generation_proof_types.clone(),
-                    ),
-                );
+                let requested_proof_types = &zkvm_config.generation_proof_types;
+                let filtered_proof_types: HashSet<ExecutionProofId> = requested_proof_types
+                    .iter()
+                    .filter(|proof_id| {
+                        if available_proof_ids.contains(proof_id) {
+                            true
+                        } else {
+                            warn!(
+                                proof_id = %proof_id.as_u8(),
+                                "[Ethproofs] Requested proof_id not available from API, skipping generator creation"
+                            );
+                            false
+                        }
+                    })
+                    .copied()
+                    .collect();
 
-                // Store receiver for later when we spawn the service
-                self.proof_generation_rx = Some(proof_gen_rx);
+                if filtered_proof_types.is_empty() {
+                    warn!(
+                        "[Ethproofs] No valid proof generators available. \
+                        Requested proof types not found in Ethproofs API. \
+                        Node will only verify proofs, not generate them."
+                    );
+                    builder
+                } else {
+                    info!(
+                        available = available_proof_ids.len(),
+                        requested = requested_proof_types.len(),
+                        enabled = filtered_proof_types.len(),
+                        "[Ethproofs] Proof generation configured"
+                    );
 
-                builder
-                    .zkvm_generator_registry(registry)
-                    .proof_generation_tx(proof_gen_tx)
+                    // Create channel for proof generation events
+                    let (proof_gen_tx, proof_gen_rx) =
+                        tokio::sync::mpsc::unbounded_channel::<ProofGenerationEvent<E>>();
+
+                    // Create generator registry with filtered proof types
+                    let registry = Arc::new(
+                        zkvm_execution_layer::GeneratorRegistry::new_with_dummy_generators(
+                            filtered_proof_types,
+                        ),
+                    );
+
+                    // Store receiver for later when we spawn the service
+                    self.proof_generation_rx = Some(proof_gen_rx);
+
+                    builder
+                        .zkvm_generator_registry(registry)
+                        .proof_generation_tx(proof_gen_tx)
+                }
             } else {
                 builder
             }
