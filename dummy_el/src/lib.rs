@@ -7,7 +7,7 @@
 //! TODO(ethproofs): Changed to debug logs for demo purposes.
 
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{Request, StatusCode},
     middleware::{self, Next},
     response::Response,
@@ -409,8 +409,11 @@ pub async fn prepare_dummy_el(config: DummyElConfig) -> anyhow::Result<PreparedD
     let state = Arc::new(AppState { jwt_secret });
 
     // Engine API server (port 8551) with JWT auth
+    // Set body limit to 5MB to accommodate large execution payloads
+    // (max realistic payload ~1.8MB raw + JSON encoding overhead)
     let engine_app = Router::new()
         .route("/", post(handle_rpc))
+        .layer(DefaultBodyLimit::max(5 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -424,21 +427,27 @@ pub async fn prepare_dummy_el(config: DummyElConfig) -> anyhow::Result<PreparedD
     debug!("Engine API listening on http://{}", engine_addr);
 
     // Simple RPC server for HTTP RPC (port 8545) - no JWT auth
-    let rpc_app = Router::new().route("/", post(handle_simple_rpc));
+    let rpc_app = Router::new()
+        .route("/", post(handle_simple_rpc))
+        .layer(DefaultBodyLimit::max(5 * 1024 * 1024));
     let rpc_addr = format!("{}:{}", config.host, config.rpc_port)
         .parse::<SocketAddr>()
         .expect("Invalid RPC address");
     debug!("HTTP RPC listening on http://{}", rpc_addr);
 
     // Simple RPC server for WebSocket (port 8546) - no JWT auth
-    let ws_app = Router::new().route("/", post(handle_simple_rpc));
+    let ws_app = Router::new()
+        .route("/", post(handle_simple_rpc))
+        .layer(DefaultBodyLimit::max(5 * 1024 * 1024));
     let ws_addr = format!("{}:{}", config.host, config.ws_port)
         .parse::<SocketAddr>()
         .expect("Invalid WebSocket address");
     debug!("WebSocket RPC listening on http://{}", ws_addr);
 
     // Simple server for metrics (port 9001)
-    let metrics_app = Router::new().route("/", post(handle_simple_rpc));
+    let metrics_app = Router::new()
+        .route("/", post(handle_simple_rpc))
+        .layer(DefaultBodyLimit::max(5 * 1024 * 1024));
     let metrics_addr = format!("{}:{}", config.host, config.metrics_port)
         .parse::<SocketAddr>()
         .expect("Invalid metrics address");
