@@ -76,6 +76,44 @@ pub async fn initialize_ethproofs_provers() -> Result<(), String> {
     }
 }
 
+/// Spawn a background task that periodically refreshes the prover registry.
+///
+/// This ensures the node stays in sync with changes to active provers on Ethproofs
+/// without requiring a restart. If a refresh fails, the existing data is retained.
+pub fn spawn_prover_refresh_task(refresh_interval: Duration) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(refresh_interval).await;
+
+            debug!("[Ethproofs] Refreshing active provers from API");
+
+            match active_provers_loader::load_active_provers().await {
+                Ok((registry, vk_store)) => {
+                    // Update the global registry
+                    {
+                        let mut reg = PROVER_REGISTRY.write().await;
+                        *reg = registry;
+                    }
+
+                    // Update the global VK store
+                    {
+                        let mut vks = DYNAMIC_VK_STORE.write().await;
+                        *vks = vk_store;
+                    }
+
+                    info!("[Ethproofs] Refreshed active provers from API");
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "[Ethproofs] Failed to refresh provers, keeping existing data"
+                    );
+                }
+            }
+        }
+    });
+}
+
 /// Represents a proof from the Ethproofs proofs list endpoint
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ethproof {

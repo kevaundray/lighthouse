@@ -298,6 +298,12 @@ where
                 // existing proofs, but won't be able to query the API for new proofs
             }
 
+            // Spawn background task to periodically refresh active provers from API
+            // This ensures the node stays in sync with Ethproofs without requiring restarts
+            zkvm_execution_layer::ethproofs_demo::spawn_prover_refresh_task(
+                std::time::Duration::from_secs(300), // Refresh every 5 minutes
+            );
+
             if !zkvm_config.generation_proof_types.is_empty() {
                 // Validate that proof generation requires an execution layer
                 // Proof-generating nodes will validate blocks via EL execution, not proofs
