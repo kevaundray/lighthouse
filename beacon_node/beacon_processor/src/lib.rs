@@ -1436,9 +1436,6 @@ impl<E: EthSpec> BeaconProcessor<E> {
                             Work::DataColumnsByRangeRequest { .. } => {
                                 dcbrange_queue.push(work, work_id)
                             }
-                            Work::ExecutionProofsByRootsRequest { .. } => {
-                                blob_broots_queue.push(work, work_id)
-                            }
                             Work::UnknownLightClientOptimisticUpdate { .. } => {
                                 unknown_light_client_update_queue.push(work, work_id)
                             }
@@ -1494,7 +1491,6 @@ impl<E: EthSpec> BeaconProcessor<E> {
                         }
                         WorkType::DataColumnsByRootsRequest => dcbroots_queue.len(),
                         WorkType::DataColumnsByRangeRequest => dcbrange_queue.len(),
-                        WorkType::ExecutionProofsByRootsRequest => blob_broots_queue.len(),
                         WorkType::GossipBlsToExecutionChange => {
                             gossip_bls_to_execution_change_queue.len()
                         }
