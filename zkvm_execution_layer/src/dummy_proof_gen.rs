@@ -78,16 +78,7 @@ impl ProofGenerator for DummyProofGenerator {
         }
 
         // Get the cluster ID corresponding to this proof_id from the dynamic registry
-        let registry = match PROVER_REGISTRY.try_read() {
-            Ok(r) => r,
-            Err(_) => {
-                debug!(
-                    proof_id = %self.proof_id,
-                    "[Ethproofs] Failed to read prover registry, cannot query API"
-                );
-                return self.create_dummy_proof(slot, payload_hash, block_root);
-            }
-        };
+        let registry = PROVER_REGISTRY.read().await;
 
         let cluster_id = match registry.get_cluster_id(self.proof_id.as_u8()) {
             Some(id) => id,
