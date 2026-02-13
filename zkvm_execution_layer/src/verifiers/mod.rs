@@ -142,3 +142,131 @@ impl VerifierStore {
         );
     }
 }
+
+/// Fixture-based integration tests for verifiers.
+///
+/// These tests load real proof and VK data from local files and run verification.
+/// They are `#[ignore]`d by default so they don't run in CI.
+///
+/// # Setup
+///
+/// Place fixture files under `zkvm_execution_layer/src/test_fixtures/<slug>/`:
+///
+/// ```text
+/// zkvm_execution_layer/src/test_fixtures/
+///   airbender/
+///     proof.bin          # vk.bin not needed (setup embedded at compile time)
+///   sp1-hypercube/
+///     proof.bin
+///     vk.bin
+///   openvm/
+///     proof.bin
+///     vk.bin
+///   pico/
+///     proof.bin
+///     vk.bin
+///   zisk/
+///     proof.bin
+///     vk.bin
+/// ```
+///
+/// # Running
+///
+/// Run all fixture tests:
+/// ```sh
+/// cargo test -p zkvm_execution_layer verify_fixture -- --ignored
+/// ```
+///
+/// Run a single verifier:
+/// ```sh
+/// cargo test -p zkvm_execution_layer verify_fixture_airbender -- --ignored
+/// ```
+#[cfg(test)]
+mod fixture_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Resolve the fixtures directory relative to the workspace root.
+    fn fixtures_dir() -> PathBuf {
+        // `CARGO_MANIFEST_DIR` points to `zkvm_execution_layer/`
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/test_fixtures")
+    }
+
+    /// Run verification for a given slug using real fixture files.
+    ///
+    /// `proof.bin` is required. `vk.bin` is optional — if absent, an empty
+    /// slice is passed (some verifiers like airbender embed their own setup).
+    fn verify_fixture(slug: &str) {
+        let dir = fixtures_dir().join(slug);
+        let proof_path = dir.join("proof.bin");
+        let vk_path = dir.join("vk.bin");
+
+        assert!(
+            proof_path.exists(),
+            "Missing fixture: {}",
+            proof_path.display()
+        );
+
+        let proof_data = std::fs::read(&proof_path)
+            .unwrap_or_else(|e| panic!("Failed to read {}: {}", proof_path.display(), e));
+        let vk_data = if vk_path.exists() {
+            std::fs::read(&vk_path)
+                .unwrap_or_else(|e| panic!("Failed to read {}: {}", vk_path.display(), e))
+        } else {
+            vec![]
+        };
+
+        println!(
+            "[{}] proof: {} bytes, vk: {} bytes{}",
+            slug,
+            proof_data.len(),
+            vk_data.len(),
+            if vk_data.is_empty() { " (embedded)" } else { "" }
+        );
+
+        let mut store = VerifierStore::new();
+        store.register_all_by_slug();
+
+        let entry = store
+            .get_by_slug(slug)
+            .unwrap_or_else(|| panic!("No verifier registered for slug '{}'", slug));
+
+        let result = (entry.verify_fn)(&proof_data, &vk_data);
+
+        match result {
+            Ok(true) => println!("[{}] Verification PASSED", slug),
+            Ok(false) => panic!("[{}] Verification returned false", slug),
+            Err(e) => panic!("[{}] Verification error: {}", slug, e),
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn verify_fixture_airbender() {
+        verify_fixture("airbender");
+    }
+
+    #[test]
+    #[ignore]
+    fn verify_fixture_sp1_hypercube() {
+        verify_fixture("sp1-hypercube");
+    }
+
+    #[test]
+    #[ignore]
+    fn verify_fixture_openvm() {
+        verify_fixture("openvm");
+    }
+
+    #[test]
+    #[ignore]
+    fn verify_fixture_pico() {
+        verify_fixture("pico");
+    }
+
+    #[test]
+    #[ignore]
+    fn verify_fixture_zisk() {
+        verify_fixture("zisk");
+    }
+}

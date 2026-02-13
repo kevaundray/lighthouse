@@ -214,7 +214,8 @@ where
 
             // Spawn the dummy EL in a background task
             tokio::spawn(async move {
-                if let Err(e) = dummy_el::prepare_and_start_dummy_el(dummy_el_config, ready_tx).await
+                if let Err(e) =
+                    dummy_el::prepare_and_start_dummy_el(dummy_el_config, ready_tx).await
                 {
                     eprintln!("Error starting dummy execution layer: {:?}", e);
                 }
@@ -222,9 +223,7 @@ where
 
             // Wait for the dummy EL to be ready before continuing
             if let Err(_) = ready_rx.await {
-                return Err(
-                    "Dummy execution layer failed to start or signal readiness".to_string(),
-                );
+                return Err("Dummy execution layer failed to start or signal readiness".to_string());
             }
             info!("Dummy execution layer is ready");
         }
@@ -251,7 +250,7 @@ where
         let ordered_custody_column_indices =
             compute_ordered_custody_column_indices::<E>(node_id, &spec).map_err(|e| {
                 format!("Failed to compute ordered custody column indices: {:?}", e)
-        })?;
+            })?;
 
         let builder = BeaconChainBuilder::new(eth_spec_instance, Arc::new(kzg))
             .store(store)
@@ -292,8 +291,13 @@ where
         // Set up proof generation service if zkVM is configured with generation proof types
         let builder = if let Some(ref zkvm_config) = config.zkvm_execution_layer {
             // Initialize Ethproofs provers from API
-            if let Err(e) = zkvm_execution_layer::ethproofs_demo::initialize_ethproofs_provers().await {
-                warn!("[Ethproofs] Failed to initialize provers during startup: {}", e);
+            if let Err(e) =
+                zkvm_execution_layer::ethproofs_demo::initialize_ethproofs_provers().await
+            {
+                warn!(
+                    "[Ethproofs] Failed to initialize provers during startup: {}",
+                    e
+                );
                 // Continue startup even if prover initialization fails - nodes can still verify
                 // existing proofs, but won't be able to query the API for new proofs
             }

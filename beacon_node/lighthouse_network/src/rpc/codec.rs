@@ -574,9 +574,7 @@ fn handle_rpc_request<E: EthSpec>(
             let request = ExecutionProofsByRootRequest::from_ssz_bytes(decoded_buffer)
                 .map_err(RPCError::SSZDecodeError)?;
 
-            request
-                .validate(spec)
-                .map_err(RPCError::InvalidData)?;
+            request.validate(spec).map_err(RPCError::InvalidData)?;
 
             Ok(Some(RequestType::ExecutionProofsByRoot(request)))
         }

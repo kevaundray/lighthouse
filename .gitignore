@@ -18,4 +18,7 @@ genesis.ssz
 # VSCode
 /.vscode
 
+# Local test fixtures (real proofs/VKs for manual verification)
+test_fixtures/
+
 .DS_Store

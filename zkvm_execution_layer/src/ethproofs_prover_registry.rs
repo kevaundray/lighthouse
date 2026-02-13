@@ -43,13 +43,7 @@ impl EthproofsProverRegistry {
     }
 
     /// Register a prover for a given proof_id
-    pub fn register(
-        &mut self,
-        proof_id: u8,
-        cluster_id: Uuid,
-        zkvm_slug: String,
-        team: String,
-    ) {
+    pub fn register(&mut self, proof_id: u8, cluster_id: Uuid, zkvm_slug: String, team: String) {
         let cluster_id_str = cluster_id.to_string();
 
         let info = ProverInfo {
@@ -70,7 +64,9 @@ impl EthproofsProverRegistry {
 
     /// Get zkvm_slug by cluster_id
     pub fn get_zkvm_slug(&self, cluster_id: &Uuid) -> Option<&str> {
-        self.by_cluster_id.get(&cluster_id.to_string()).map(|s| s.as_str())
+        self.by_cluster_id
+            .get(&cluster_id.to_string())
+            .map(|s| s.as_str())
     }
 
     /// Get cluster_id by proof_id
@@ -119,7 +115,12 @@ mod tests {
         let mut registry = EthproofsProverRegistry::new();
         let cluster_id = Uuid::parse_str("fbef2553-8cd0-4f45-b328-570b5c8688b2").unwrap();
 
-        registry.register(4, cluster_id, "sp1-hypercube".to_string(), "ethproofs".to_string());
+        registry.register(
+            4,
+            cluster_id,
+            "sp1-hypercube".to_string(),
+            "ethproofs".to_string(),
+        );
 
         assert!(registry.has_proof_id(4));
         assert_eq!(registry.get_cluster_id(4), Some(cluster_id));
@@ -132,7 +133,12 @@ mod tests {
         let cluster_id_1 = Uuid::parse_str("fbef2553-8cd0-4f45-b328-570b5c8688b2").unwrap();
         let cluster_id_2 = Uuid::parse_str("884fcc21-d522-4b4a-b535-7cfde199485c").unwrap();
 
-        registry.register(4, cluster_id_1, "sp1-hypercube".to_string(), "ethproofs".to_string());
+        registry.register(
+            4,
+            cluster_id_1,
+            "sp1-hypercube".to_string(),
+            "ethproofs".to_string(),
+        );
         registry.register(7, cluster_id_2, "zisk".to_string(), "ethproofs".to_string());
 
         assert_eq!(registry.len(), 2);
