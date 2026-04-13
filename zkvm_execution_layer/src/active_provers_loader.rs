@@ -82,8 +82,9 @@ pub async fn load_active_provers() -> Result<
     let mut registry = EthproofsProverRegistry::new();
     let mut vk_store = HashMap::new();
 
-    for (proof_id, prover) in sorted_provers.iter().enumerate() {
-        let proof_id = proof_id as u8;
+    for (index, prover) in sorted_provers.iter().enumerate() {
+        // Start at 1 to reserve proof_id 0 for fallback proofs
+        let proof_id = (index + 1) as u8;
 
         // Check if verifier exists for this zkvm_slug
         if !VERIFIER_STORE.contains_slug(&prover.zkvm) {
