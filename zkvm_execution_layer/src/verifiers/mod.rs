@@ -5,7 +5,7 @@
 
 pub mod airbender;
 pub mod fallback;
-pub mod openvm;
+pub mod openvm2;
 pub mod panic_safe;
 pub mod pico;
 pub mod sp1_hypercube;
@@ -113,13 +113,6 @@ impl VerifierStore {
             airbender::AirbenderVerifier::verify,
         );
 
-        // Register OpenVM verifier
-        self.register_by_slug(
-            "openvm".to_string(),
-            openvm::OpenVmVerifier::name(),
-            openvm::OpenVmVerifier::verify,
-        );
-
         // Register Pico verifier
         self.register_by_slug(
             "pico".to_string(),
@@ -132,6 +125,13 @@ impl VerifierStore {
             "sp1-hypercube".to_string(),
             sp1_hypercube::Sp1HypercubeVerifier::name(),
             sp1_hypercube::Sp1HypercubeVerifier::verify,
+        );
+
+        // Register OpenVM v2 verifier
+        self.register_by_slug(
+            "openvm2".to_string(),
+            openvm2::OpenVm2Verifier::name(),
+            openvm2::OpenVm2Verifier::verify,
         );
 
         // Register ZisK verifier
@@ -159,7 +159,7 @@ impl VerifierStore {
 ///   sp1-hypercube/
 ///     proof.bin
 ///     vk.bin
-///   openvm/
+///   openvm2/
 ///     proof.bin
 ///     vk.bin
 ///   pico/
@@ -221,7 +221,11 @@ mod fixture_tests {
             slug,
             proof_data.len(),
             vk_data.len(),
-            if vk_data.is_empty() { " (embedded)" } else { "" }
+            if vk_data.is_empty() {
+                " (embedded)"
+            } else {
+                ""
+            }
         );
 
         let mut store = VerifierStore::new();
@@ -254,8 +258,8 @@ mod fixture_tests {
 
     #[test]
     #[ignore]
-    fn verify_fixture_openvm() {
-        verify_fixture("openvm");
+    fn verify_fixture_openvm2() {
+        verify_fixture("openvm2");
     }
 
     #[test]

@@ -163,4 +163,5 @@ mod tests {
         let b64 = "!!!invalid!!!";
         assert!(base64_to_vec(b64).is_err());
     }
+
 }
