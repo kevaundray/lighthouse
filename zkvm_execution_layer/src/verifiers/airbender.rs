@@ -4,8 +4,10 @@
 //! zksync-airbender unified circuit verifier. Ported from the WASM reference
 //! implementation in ethereum-prover/proof_verifier_js/wasm.
 //!
-//! The circuit setup and layout artifacts are embedded at compile time
-//! (matching the WASM verifier approach), so no external VK data is required.
+//! The circuit setup and layout artifacts are embedded at compile time as
+//! defaults. When VK data is provided (e.g. from the Ethproofs API), it is
+//! expected to have a 4-byte big-endian length prefix separating the setup
+//! and layout sections, matching the format used by the WASM verifier.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -276,19 +278,56 @@ fn verify_in_unified_layer(
 /// unified circuit verifier. Proof data is expected to be gzip-compressed,
 /// bincode v2 serialized `UnrolledProgramProof`.
 ///
-/// The circuit setup and layout are embedded at compile time, so `vk_data` is
-/// ignored (pass `&[]`).
+/// If `vk_data` is non-empty, it is expected to contain a 4-byte big-endian
+/// length prefix followed by setup and layout bytes:
+/// `[setup_len (4 BE bytes)][setup bytes][layout bytes]`.
+/// If `vk_data` is empty, the embedded compile-time artifacts are used.
 pub struct AirbenderVerifier;
 
-impl ProofVerifier for AirbenderVerifier {
-    fn verify(proof_data: &[u8], _vk_data: &[u8]) -> VerificationResult {
-        panic_safe::safe_verify(|| {
-            debug!(proof_size = proof_data.len(), "Starting Airbender verification");
+/// Parse VK bytes with a 4-byte big-endian length prefix into setup and layout slices.
+fn parse_vk_data(vk_data: &[u8]) -> Result<(&[u8], &[u8]), String> {
+    if vk_data.len() < 4 {
+        return Err("vk_data too short to contain length prefix".to_string());
+    }
+    let setup_len = u32::from_be_bytes(
+        vk_data[..4]
+            .try_into()
+            .map_err(|_| "Failed to read setup length prefix".to_string())?,
+    ) as usize;
+    if vk_data.len() < 4 + setup_len {
+        return Err(format!(
+            "vk_data setup length ({}) exceeds remaining buffer ({})",
+            setup_len,
+            vk_data.len() - 4
+        ));
+    }
+    let setup = &vk_data[4..4 + setup_len];
+    let layout = &vk_data[4 + setup_len..];
+    Ok((setup, layout))
+}
 
-            // Get the embedded verifier context (parsed once on first call)
-            let ctx = VERIFIER_CONTEXT
-                .as_ref()
-                .map_err(|e| format!("Failed to initialize verifier context: {}", e))?;
+impl ProofVerifier for AirbenderVerifier {
+    fn verify(proof_data: &[u8], vk_data: &[u8]) -> VerificationResult {
+        panic_safe::safe_verify(|| {
+            debug!(
+                proof_size = proof_data.len(),
+                vk_size = vk_data.len(),
+                "Starting Airbender verification"
+            );
+
+            // Parse or use embedded verifier context
+            let custom_ctx;
+            let ctx = if vk_data.is_empty() {
+                // Use the embedded verifier context (parsed once on first call)
+                VERIFIER_CONTEXT
+                    .as_ref()
+                    .map_err(|e| format!("Failed to initialize verifier context: {}", e))?
+            } else {
+                // Parse VK data with 4-byte length prefix
+                let (setup_bytes, layout_bytes) = parse_vk_data(vk_data)?;
+                custom_ctx = VerifierContext::parse(setup_bytes, layout_bytes)?;
+                &custom_ctx
+            };
 
             // Decompress proof data (gzip)
             let mut decoder = flate2::read::GzDecoder::new(proof_data);
@@ -364,5 +403,57 @@ mod tests {
             "Embedded artifacts should parse: {:?}",
             VERIFIER_CONTEXT.as_ref().err()
         );
+    }
+
+    #[test]
+    fn test_parse_vk_data_valid() {
+        // 3-byte setup, 2-byte layout
+        let mut vk = vec![0, 0, 0, 3]; // setup_len = 3
+        vk.extend_from_slice(&[0xAA, 0xBB, 0xCC]); // setup
+        vk.extend_from_slice(&[0xDD, 0xEE]); // layout
+
+        let (setup, layout) = parse_vk_data(&vk).unwrap();
+        assert_eq!(setup, &[0xAA, 0xBB, 0xCC]);
+        assert_eq!(layout, &[0xDD, 0xEE]);
+    }
+
+    #[test]
+    fn test_parse_vk_data_too_short() {
+        assert!(parse_vk_data(&[0, 0]).is_err());
+    }
+
+    #[test]
+    fn test_parse_vk_data_setup_len_exceeds_buffer() {
+        // Claims 10-byte setup but only 2 bytes follow the prefix
+        let vk = vec![0, 0, 0, 10, 0xAA, 0xBB];
+        assert!(parse_vk_data(&vk).is_err());
+    }
+
+    #[test]
+    fn test_parse_vk_data_empty_layout() {
+        // setup_len exactly fills the remaining buffer, leaving empty layout
+        let mut vk = vec![0, 0, 0, 2];
+        vk.extend_from_slice(&[0xAA, 0xBB]);
+
+        let (setup, layout) = parse_vk_data(&vk).unwrap();
+        assert_eq!(setup, &[0xAA, 0xBB]);
+        assert!(layout.is_empty());
+    }
+
+    #[test]
+    fn test_verify_with_empty_vk_uses_defaults() {
+        // Passing empty vk_data should use embedded defaults (same as before)
+        let result = AirbenderVerifier::verify(&[], &[]);
+        match result {
+            Ok(verified) => assert!(!verified, "Empty proof should not verify"),
+            Err(_) => {}
+        }
+    }
+
+    #[test]
+    fn test_verify_with_invalid_vk_prefix() {
+        // Too-short vk_data should produce an error
+        let result = AirbenderVerifier::verify(&[], &[0, 0]);
+        assert!(result.is_err() || result == Ok(false));
     }
 }
