@@ -17,8 +17,8 @@ impl ProofVerifier for ZiskVerifier {
                 "Starting ZisK verification"
             );
 
-            // Call the proofman-verifier verify function
-            let result = proofman_verifier::verify(proof_data, vk_data);
+            let result =
+                proofman_verifier::verify_vadcop_final_compressed_bytes(proof_data, vk_data);
 
             debug!(verification_result = result, "Completed ZisK verification");
 
