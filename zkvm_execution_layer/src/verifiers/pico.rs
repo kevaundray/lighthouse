@@ -3,7 +3,7 @@
 //! This module implements proof verification for Pico Prism zkVM using KoalaBear field arithmetic.
 
 use super::{panic_safe, ProofVerifier, VerificationResult};
-use pico_prism_vm::{
+use pico_vm::{
     configs::{
         config::{StarkGenericConfig, Val},
         stark_config::KoalaBearPoseidon2,
