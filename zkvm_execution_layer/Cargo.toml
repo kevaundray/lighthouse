@@ -27,9 +27,9 @@ once_cell = { workspace = true }
 tracing = { workspace = true }
 base64 = "0.22"
 # Airbender verifier dependencies
-full_statement_verifier = { git = "https://github.com/matter-labs/zksync-airbender", rev = "cef19b3", default-features = false, features = ["unified_verifier_only_security_80"] }
-verifier_common = { git = "https://github.com/matter-labs/zksync-airbender", rev = "cef19b3", default-features = false, features = ["proof_utils"] }
-airbender-prover = { package = "prover", git = "https://github.com/matter-labs/zksync-airbender", rev = "cef19b3", default-features = false, features = ["definitions_only"] }
+full_statement_verifier = { git = "https://github.com/matter-labs/zksync-airbender", rev = "73d69b5346b3c2350fa104a56ec4df78840cea99", default-features = false, features = ["unified_verifier_only_security_80", "unified_verifier_only_security_100"] }
+verifier_common = { git = "https://github.com/matter-labs/zksync-airbender", rev = "73d69b5346b3c2350fa104a56ec4df78840cea99", default-features = false, features = ["proof_utils", "security_80", "security_100"] }
+airbender-prover = { package = "prover", git = "https://github.com/matter-labs/zksync-airbender", rev = "73d69b5346b3c2350fa104a56ec4df78840cea99", default-features = false, features = ["definitions_only"] }
 bincode2 = { package = "bincode", version = "2", features = ["serde"] }
 flate2 = "1"
 

@@ -1,13 +1,18 @@
-//! Airbender STARK proof verifier
+//! Airbender STARK proof verifier (100-bit security)
 //!
-//! This module implements proof verification for Airbender zkVM using the
-//! zksync-airbender unified circuit verifier. Ported from the WASM reference
-//! implementation in ethereum-prover/proof_verifier_js/wasm.
+//! This module implements 100-bit proof verification for the Airbender zkVM,
+//! using the zksync-airbender unified circuit verifier. Ported from the
+//! reference implementation in ethereum-prover/proof_verifier_js/wasm.
 //!
-//! The circuit setup and layout artifacts are embedded at compile time as
-//! defaults. When VK data is provided (e.g. from the Ethproofs API), it is
-//! expected to have a 4-byte big-endian length prefix separating the setup
-//! and layout sections, matching the format used by the WASM verifier.
+//! The verification key is a single-file envelope (magic `EVKEY001`) that
+//! carries its security level explicitly. The proof is a gzip-compressed,
+//! bincode-encoded envelope (magic `EPROOF01`) that also carries its
+//! security level. Both `proof_data` and `vk_data` are required — no
+//! embedded defaults are used.
+//!
+//! Shared types (`UnrolledProgramSetup`, `UnrolledProgramProof`,
+//! `CompiledCircuitsSet`) and the underlying verification routine are
+//! defined here and reused by the 80-bit verifier in `airbender_80.rs`.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -22,76 +27,44 @@ use full_statement_verifier::definitions::{
     OP_VERIFY_UNIFIED_RECURSION_LAYER_IN_UNIFIED_CIRCUIT,
     OP_VERIFY_UNROLLED_RECURSION_LAYER_IN_UNIFIED_CIRCUIT,
 };
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
+use verifier_common::SecurityModel;
 use verifier_common::cs::one_row_compiler::CompiledCircuitArtifact;
 use verifier_common::field::Mersenne31Field;
 use verifier_common::proof_flattener;
 use verifier_common::prover::definitions::MerkleTreeCap;
 
-const CAP_SIZE: usize = 64;
-const NUM_COSETS: usize = 2;
+pub(super) const CAP_SIZE: usize = 64;
+pub(super) const NUM_COSETS: usize = 2;
 
 /// Stack size for the verification thread (128 MB).
 /// The airbender verifier requires a large stack for recursive proof verification.
-const VERIFICATION_THREAD_STACK_SIZE: usize = 1 << 27;
+pub(super) const VERIFICATION_THREAD_STACK_SIZE: usize = 1 << 27;
 
 // ---------------------------------------------------------------------------
-// Embedded circuit artifacts (from ethereum-prover/artifacts/)
-// ---------------------------------------------------------------------------
-
-const DEFAULT_SETUP_BIN: &[u8] =
-    include_bytes!("airbender_artifacts/recursion_unified_setup.bin");
-const DEFAULT_LAYOUT_BIN: &[u8] =
-    include_bytes!("airbender_artifacts/recursion_unified_layouts.bin");
-
-/// Parsed setup and layout, initialized once on first use.
-static VERIFIER_CONTEXT: Lazy<Result<VerifierContext, String>> =
-    Lazy::new(|| VerifierContext::parse(DEFAULT_SETUP_BIN, DEFAULT_LAYOUT_BIN));
-
-struct VerifierContext {
-    setup: UnrolledProgramSetup,
-    layout: CompiledCircuitsSet,
-}
-
-impl VerifierContext {
-    fn parse(setup_bin: &[u8], layout_bin: &[u8]) -> Result<Self, String> {
-        let (setup, _): (UnrolledProgramSetup, usize) =
-            bincode2::serde::decode_from_slice(setup_bin, bincode2::config::standard())
-                .map_err(|e| format!("Failed to parse setup: {}", e))?;
-
-        let (layout, _): (CompiledCircuitsSet, usize) =
-            bincode2::serde::decode_from_slice(layout_bin, bincode2::config::standard())
-                .map_err(|e| format!("Failed to parse layout: {}", e))?;
-
-        Ok(Self { setup, layout })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Types mirrored from ethereum-prover/proof_verifier_js/wasm/src/unified_verifier.rs
+// Shared types mirrored from ethereum-prover/proof_verifier_js/wasm
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Hash, Serialize, Deserialize)]
-struct CompiledCircuitsSet {
-    compiled_circuit_families: BTreeMap<u8, CompiledCircuitArtifact<Mersenne31Field>>,
-    compiled_inits_and_teardowns: Option<CompiledCircuitArtifact<Mersenne31Field>>,
+pub(super) struct CompiledCircuitsSet {
+    pub(super) compiled_circuit_families: BTreeMap<u8, CompiledCircuitArtifact<Mersenne31Field>>,
+    pub(super) compiled_inits_and_teardowns: Option<CompiledCircuitArtifact<Mersenne31Field>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-struct FinalRegisterValue {
-    value: u32,
-    last_access_timestamp: TimestampScalar,
+pub(super) struct FinalRegisterValue {
+    pub(super) value: u32,
+    pub(super) last_access_timestamp: TimestampScalar,
 }
 
 #[derive(Clone, Debug, Hash, Serialize, Deserialize)]
-struct UnrolledProgramSetup {
-    expected_final_pc: u32,
-    binary_hash: [u8; 32],
-    circuit_families_setups: BTreeMap<u8, [MerkleTreeCap<CAP_SIZE>; NUM_COSETS]>,
-    inits_and_teardowns_setup: [MerkleTreeCap<CAP_SIZE>; NUM_COSETS],
-    end_params: [u32; 8],
+pub(super) struct UnrolledProgramSetup {
+    pub(super) expected_final_pc: u32,
+    pub(super) binary_hash: [u8; 32],
+    pub(super) circuit_families_setups: BTreeMap<u8, [MerkleTreeCap<CAP_SIZE>; NUM_COSETS]>,
+    pub(super) inits_and_teardowns_setup: [MerkleTreeCap<CAP_SIZE>; NUM_COSETS],
+    pub(super) end_params: [u32; 8],
 }
 
 impl UnrolledProgramSetup {
@@ -115,16 +88,16 @@ impl UnrolledProgramSetup {
 }
 
 #[derive(Clone, Debug, Hash, Serialize, Deserialize)]
-struct UnrolledProgramProof {
-    final_pc: u32,
-    final_timestamp: TimestampScalar,
-    circuit_families_proofs: BTreeMap<u8, Vec<UnrolledModeProof>>,
-    inits_and_teardowns_proofs: Vec<UnrolledModeProof>,
-    delegation_proofs: BTreeMap<u32, Vec<Proof>>,
-    register_final_values: [FinalRegisterValue; 32],
-    recursion_chain_preimage: Option<[u32; 16]>,
-    recursion_chain_hash: Option<[u32; 8]>,
-    pow_challenge: u64,
+pub(super) struct UnrolledProgramProof {
+    pub(super) final_pc: u32,
+    pub(super) final_timestamp: TimestampScalar,
+    pub(super) circuit_families_proofs: BTreeMap<u8, Vec<UnrolledModeProof>>,
+    pub(super) inits_and_teardowns_proofs: Vec<UnrolledModeProof>,
+    pub(super) delegation_proofs: BTreeMap<u32, Vec<Proof>>,
+    pub(super) register_final_values: [FinalRegisterValue; 32],
+    pub(super) recursion_chain_preimage: Option<[u32; 16]>,
+    pub(super) recursion_chain_hash: Option<[u32; 8]>,
+    pub(super) pow_challenge: u64,
 }
 
 impl UnrolledProgramProof {
@@ -204,8 +177,27 @@ impl UnrolledProgramProof {
 }
 
 // ---------------------------------------------------------------------------
-// Proof flattening and verification
+// Shared verifier context and verification driver
 // ---------------------------------------------------------------------------
+
+pub(super) struct VerifierContext {
+    pub(super) setup: UnrolledProgramSetup,
+    pub(super) layout: CompiledCircuitsSet,
+}
+
+impl VerifierContext {
+    pub(super) fn parse(setup_bin: &[u8], layout_bin: &[u8]) -> Result<Self, String> {
+        let (setup, _): (UnrolledProgramSetup, usize) =
+            bincode2::serde::decode_from_slice(setup_bin, bincode2::config::standard())
+                .map_err(|e| format!("Failed to parse setup: {}", e))?;
+
+        let (layout, _): (CompiledCircuitsSet, usize) =
+            bincode2::serde::decode_from_slice(layout_bin, bincode2::config::standard())
+                .map_err(|e| format!("Failed to parse layout: {}", e))?;
+
+        Ok(Self { setup, layout })
+    }
+}
 
 fn flatten_proof_into_responses(
     proof: &UnrolledProgramProof,
@@ -251,10 +243,11 @@ fn flatten_proof_into_responses(
     responses
 }
 
-fn verify_in_unified_layer(
+pub(super) fn verify_in_unified_layer(
     proof: &UnrolledProgramProof,
     setup: &UnrolledProgramSetup,
     compiled_layouts: &CompiledCircuitsSet,
+    security: SecurityModel,
     input_is_unrolled: bool,
 ) -> Result<[u32; 16], String> {
     let responses = flatten_proof_into_responses(proof, setup, compiled_layouts, input_is_unrolled);
@@ -267,7 +260,7 @@ fn verify_in_unified_layer(
             airbender_prover::nd_source_std::set_iterator(it);
 
             full_statement_verifier::unified_circuit_statement::
-                verify_unrolled_or_unified_circuit_recursion_layer()
+                verify_unrolled_or_unified_circuit_recursion_layer(security)
         })
         .map_err(|e| format!("Failed to spawn verifier thread: {}", e))?
         .join()
@@ -275,42 +268,108 @@ fn verify_in_unified_layer(
 }
 
 // ---------------------------------------------------------------------------
-// ProofVerifier implementation
+// 100-bit envelope formats (single-file VK and tagged proof)
 // ---------------------------------------------------------------------------
 
-/// Airbender STARK verifier
-///
-/// Verifies proofs produced by the Airbender zkVM using the zksync-airbender
-/// unified circuit verifier. Proof data is expected to be gzip-compressed,
-/// bincode v2 serialized `UnrolledProgramProof`.
-///
-/// If `vk_data` is non-empty, it is expected to contain a 4-byte big-endian
-/// length prefix followed by setup and layout bytes:
-/// `[setup_len (4 BE bytes)][setup bytes][layout bytes]`.
-/// If `vk_data` is empty, the embedded compile-time artifacts are used.
-pub struct AirbenderVerifier;
+const VERIFICATION_KEY_MAGIC: [u8; 8] = *b"EVKEY001";
+const VERIFICATION_KEY_FORMAT_VERSION: u8 = 1;
+const PROOF_MAGIC: [u8; 8] = *b"EPROOF01";
+const PROOF_FORMAT_VERSION: u8 = 1;
+const SECURITY_LEVEL_WIRE_100: u8 = 100;
 
-/// Parse VK bytes with a 4-byte big-endian length prefix into setup and layout slices.
-fn parse_vk_data(vk_data: &[u8]) -> Result<(&[u8], &[u8]), String> {
-    if vk_data.len() < 4 {
-        return Err("vk_data too short to contain length prefix".to_string());
-    }
-    let setup_len = u32::from_be_bytes(
-        vk_data[..4]
-            .try_into()
-            .map_err(|_| "Failed to read setup length prefix".to_string())?,
-    ) as usize;
-    if vk_data.len() < 4 + setup_len {
+#[derive(Debug, Serialize, Deserialize)]
+struct EncodedVerificationKey {
+    magic: [u8; 8],
+    version: u8,
+    security: u8,
+    setup: UnrolledProgramSetup,
+    layouts: CompiledCircuitsSet,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct EncodedProof {
+    magic: [u8; 8],
+    version: u8,
+    security: u8,
+    proof: UnrolledProgramProof,
+}
+
+fn decode_exact<T: serde::de::DeserializeOwned>(bytes: &[u8], what: &str) -> Result<T, String> {
+    let (value, bytes_read): (T, usize) =
+        bincode2::serde::decode_from_slice(bytes, bincode2::config::standard())
+            .map_err(|e| format!("failed to parse {what}: {e}"))?;
+
+    if bytes_read != bytes.len() {
         return Err(format!(
-            "vk_data setup length ({}) exceeds remaining buffer ({})",
-            setup_len,
-            vk_data.len() - 4
+            "failed to parse {what}: trailing {} byte(s) indicate an incompatible format",
+            bytes.len() - bytes_read
         ));
     }
-    let setup = &vk_data[4..4 + setup_len];
-    let layout = &vk_data[4 + setup_len..];
-    Ok((setup, layout))
+
+    Ok(value)
 }
+
+fn decode_verification_key(bytes: &[u8]) -> Result<VerifierContext, String> {
+    if !bytes.starts_with(&VERIFICATION_KEY_MAGIC) {
+        return Err("verification key magic does not match expected value".to_string());
+    }
+
+    let encoded = decode_exact::<EncodedVerificationKey>(bytes, "verification key")?;
+    if encoded.version != VERIFICATION_KEY_FORMAT_VERSION {
+        return Err(format!(
+            "unsupported verification key version {}",
+            encoded.version
+        ));
+    }
+    if encoded.security != SECURITY_LEVEL_WIRE_100 {
+        return Err(format!(
+            "airbender verifier requires 100-bit verification key, got {}-bit",
+            encoded.security
+        ));
+    }
+
+    Ok(VerifierContext {
+        setup: encoded.setup,
+        layout: encoded.layouts,
+    })
+}
+
+fn decode_proof_envelope(bytes: &[u8]) -> Result<UnrolledProgramProof, String> {
+    if !bytes.starts_with(&PROOF_MAGIC) {
+        return Err("proof envelope magic does not match expected value".to_string());
+    }
+
+    let encoded = decode_exact::<EncodedProof>(bytes, "proof envelope")?;
+    if encoded.version != PROOF_FORMAT_VERSION {
+        return Err(format!(
+            "unsupported proof envelope version {}",
+            encoded.version
+        ));
+    }
+    if encoded.security != SECURITY_LEVEL_WIRE_100 {
+        return Err(format!(
+            "airbender verifier requires 100-bit proof, got {}-bit",
+            encoded.security
+        ));
+    }
+
+    Ok(encoded.proof)
+}
+
+// ---------------------------------------------------------------------------
+// ProofVerifier implementation (100-bit)
+// ---------------------------------------------------------------------------
+
+/// Airbender STARK verifier (100-bit security)
+///
+/// Verifies proofs produced by the Airbender zkVM at 100-bit security using
+/// the zksync-airbender unified circuit verifier.
+///
+/// - `proof_data` must be gzip-compressed bytes of an `EPROOF01` envelope.
+/// - `vk_data` must be the raw bytes of an `EVKEY001` envelope.
+///
+/// Both inputs are required; there are no embedded defaults.
+pub struct AirbenderVerifier;
 
 impl ProofVerifier for AirbenderVerifier {
     fn verify(proof_data: &[u8], vk_data: &[u8]) -> VerificationResult {
@@ -318,46 +377,38 @@ impl ProofVerifier for AirbenderVerifier {
             debug!(
                 proof_size = proof_data.len(),
                 vk_size = vk_data.len(),
-                "Starting Airbender verification"
+                "Starting Airbender (100-bit) verification"
             );
 
-            // Parse or use embedded verifier context
-            let custom_ctx;
-            let ctx = if vk_data.is_empty() {
-                // Use the embedded verifier context (parsed once on first call)
-                VERIFIER_CONTEXT
-                    .as_ref()
-                    .map_err(|e| format!("Failed to initialize verifier context: {}", e))?
-            } else {
-                // Parse VK data with 4-byte length prefix
-                let (setup_bytes, layout_bytes) = parse_vk_data(vk_data)?;
-                custom_ctx = VerifierContext::parse(setup_bytes, layout_bytes)?;
-                &custom_ctx
-            };
+            if vk_data.is_empty() {
+                return Err("airbender verifier requires non-empty vk_data".to_string());
+            }
 
-            // Decompress proof data (gzip)
+            let ctx = decode_verification_key(vk_data)?;
+
             let mut decoder = flate2::read::GzDecoder::new(proof_data);
             let mut decompressed = Vec::new();
             decoder
                 .read_to_end(&mut decompressed)
                 .map_err(|e| format!("Failed to decompress proof: {}", e))?;
 
-            // Deserialize proof (bincode v2)
-            let (proof, _): (UnrolledProgramProof, usize) =
-                bincode2::serde::decode_from_slice(&decompressed, bincode2::config::standard())
-                    .map_err(|e| format!("Failed to deserialize proof: {}", e))?;
+            let proof = decode_proof_envelope(&decompressed)?;
 
-            // Determine if proof is unrolled based on setup structure
             let input_is_unrolled = ctx.setup.circuit_families_setups.len() > 1;
 
-            // Run verification in a dedicated thread with large stack
-            match verify_in_unified_layer(&proof, &ctx.setup, &ctx.layout, input_is_unrolled) {
+            match verify_in_unified_layer(
+                &proof,
+                &ctx.setup,
+                &ctx.layout,
+                SecurityModel::Security100,
+                input_is_unrolled,
+            ) {
                 Ok(_result) => {
-                    debug!("Airbender verification succeeded");
+                    debug!("Airbender (100-bit) verification succeeded");
                     Ok(true)
                 }
                 Err(e) => {
-                    debug!(error = %e, "Airbender verification failed");
+                    debug!(error = %e, "Airbender (100-bit) verification failed");
                     Ok(false)
                 }
             }
@@ -379,87 +430,37 @@ mod tests {
     }
 
     #[test]
-    fn test_airbender_empty_proof() {
+    fn test_airbender_requires_vk() {
+        // Empty vk_data must be rejected — no embedded defaults for 100-bit.
         let result = AirbenderVerifier::verify(&[], &[]);
-        // Empty proof will fail at decompression - either Err or Ok(false) is acceptable
-        match result {
-            Ok(verified) => assert!(!verified, "Empty proof should not verify"),
-            Err(_) => {}
-        }
-    }
-
-    #[test]
-    fn test_airbender_invalid_proof() {
-        let invalid_proof = vec![0u8; 100];
-
-        let result = AirbenderVerifier::verify(&invalid_proof, &[]);
-
-        // Should not panic - can return either Err or Ok(false) for invalid data
-        match result {
-            Ok(verified) => assert!(!verified, "Invalid data should not verify"),
-            Err(_) => {}
-        }
-    }
-
-    #[test]
-    fn test_embedded_artifacts_parse() {
-        // Verify the embedded setup and layout can be parsed successfully
         assert!(
-            VERIFIER_CONTEXT.is_ok(),
-            "Embedded artifacts should parse: {:?}",
-            VERIFIER_CONTEXT.as_ref().err()
+            result.is_err(),
+            "100-bit verifier must reject empty vk_data, got {:?}",
+            result
         );
     }
 
     #[test]
-    fn test_parse_vk_data_valid() {
-        // 3-byte setup, 2-byte layout
-        let mut vk = vec![0, 0, 0, 3]; // setup_len = 3
-        vk.extend_from_slice(&[0xAA, 0xBB, 0xCC]); // setup
-        vk.extend_from_slice(&[0xDD, 0xEE]); // layout
-
-        let (setup, layout) = parse_vk_data(&vk).unwrap();
-        assert_eq!(setup, &[0xAA, 0xBB, 0xCC]);
-        assert_eq!(layout, &[0xDD, 0xEE]);
+    fn test_airbender_rejects_invalid_vk_magic() {
+        // Random bytes without EVKEY001 magic should be rejected.
+        let vk = vec![0u8; 64];
+        let result = AirbenderVerifier::verify(&[], &vk);
+        assert!(
+            result.is_err(),
+            "verifier must reject vk with invalid magic, got {:?}",
+            result
+        );
     }
 
     #[test]
-    fn test_parse_vk_data_too_short() {
-        assert!(parse_vk_data(&[0, 0]).is_err());
-    }
-
-    #[test]
-    fn test_parse_vk_data_setup_len_exceeds_buffer() {
-        // Claims 10-byte setup but only 2 bytes follow the prefix
-        let vk = vec![0, 0, 0, 10, 0xAA, 0xBB];
-        assert!(parse_vk_data(&vk).is_err());
-    }
-
-    #[test]
-    fn test_parse_vk_data_empty_layout() {
-        // setup_len exactly fills the remaining buffer, leaving empty layout
-        let mut vk = vec![0, 0, 0, 2];
-        vk.extend_from_slice(&[0xAA, 0xBB]);
-
-        let (setup, layout) = parse_vk_data(&vk).unwrap();
-        assert_eq!(setup, &[0xAA, 0xBB]);
-        assert!(layout.is_empty());
-    }
-
-    #[test]
-    fn test_verify_with_empty_vk_uses_defaults() {
-        // Passing empty vk_data should use embedded defaults (same as before)
-        let result = AirbenderVerifier::verify(&[], &[]);
+    fn test_airbender_invalid_proof_with_valid_vk_magic() {
+        // VK starts with magic but is otherwise garbage — should error on parse.
+        let mut vk = VERIFICATION_KEY_MAGIC.to_vec();
+        vk.extend_from_slice(&[0u8; 32]);
+        let result = AirbenderVerifier::verify(&[0u8; 100], &vk);
         match result {
-            Ok(verified) => assert!(!verified, "Empty proof should not verify"),
+            Ok(verified) => assert!(!verified, "Invalid data should not verify"),
             Err(_) => {}
         }
-    }
-
-    #[test]
-    fn test_verify_with_invalid_vk_prefix() {
-        // Too-short vk_data should produce an error
-        let result = AirbenderVerifier::verify(&[], &[0, 0]);
-        assert!(result.is_err() || result == Ok(false));
     }
 }

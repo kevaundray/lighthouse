@@ -4,6 +4,7 @@
 //! Each verifier implements cryptographic proof verification for a specific zkVM or proof system.
 
 pub mod airbender;
+pub mod airbender_80;
 pub mod fallback;
 pub mod openvm2;
 pub mod panic_safe;
@@ -106,11 +107,18 @@ impl VerifierStore {
             fallback::FallbackVerifier::verify,
         );
 
-        // Register Airbender verifier
+        // Register Airbender verifier (100-bit security, single-file VK)
         self.register_by_slug(
             "airbender".to_string(),
             airbender::AirbenderVerifier::name(),
             airbender::AirbenderVerifier::verify,
+        );
+
+        // Register Airbender legacy verifier (80-bit security, split VK + embedded defaults)
+        self.register_by_slug(
+            "airbender-80".to_string(),
+            airbender_80::Airbender80Verifier::name(),
+            airbender_80::Airbender80Verifier::verify,
         );
 
         // Register Pico verifier
@@ -155,7 +163,11 @@ impl VerifierStore {
 /// ```text
 /// zkvm_execution_layer/src/test_fixtures/
 ///   airbender/
-///     proof.bin          # vk.bin not needed (setup embedded at compile time)
+///     proof.bin          # 100-bit EPROOF01 envelope (gzipped)
+///     vk.bin             # 100-bit EVKEY001 verification key (required)
+///   airbender-80/
+///     proof.bin          # legacy 80-bit proof (gzipped)
+///                        # vk.bin optional (embedded defaults used if absent)
 ///   sp1-hypercube/
 ///     proof.bin
 ///     vk.bin
@@ -248,6 +260,12 @@ mod fixture_tests {
     #[ignore]
     fn verify_fixture_airbender() {
         verify_fixture("airbender");
+    }
+
+    #[test]
+    #[ignore]
+    fn verify_fixture_airbender_80() {
+        verify_fixture("airbender-80");
     }
 
     #[test]
