@@ -16,6 +16,8 @@ pico-vm = { git = "https://github.com/brevis-network/pico.git", branch = "ethpro
 proofman-verifier = { git = "https://github.com/0xPolygonHermez/pil2-proofman.git", tag = "v0.16.0" }
 sp1-verifier = { git = "https://github.com/succinctlabs/hypercube-verifier.git", branch = "ethproofs_demo" }
 openvm-verify-stark-host = { git = "https://github.com/openvm-org/openvm.git", branch = "develop-v2.0.0-rc.1", default-features = false }
+openvm-circuit = { git = "https://github.com/openvm-org/openvm.git", branch = "develop-v2.0.0-rc.1", default-features = false }
+openvm-stark-sdk = { git = "https://github.com/openvm-org/stark-backend.git", branch = "develop-v2", default-features = false }
 bitcode = { version = "0.6.5", default-features = false, features = ["serde"] }
 serde = { version = "1.0.201", default-features = false, features = ["derive"] }
 bincode = { workspace = true }
@@ -32,6 +34,7 @@ verifier_common = { git = "https://github.com/matter-labs/zksync-airbender", rev
 airbender-prover = { package = "prover", git = "https://github.com/matter-labs/zksync-airbender", rev = "73d69b5346b3c2350fa104a56ec4df78840cea99", default-features = false, features = ["definitions_only"] }
 bincode2 = { package = "bincode", version = "2", features = ["serde"] }
 flate2 = "1"
+zstd = { workspace = true }
 
 [dev-dependencies]
 mockall = "0.12"

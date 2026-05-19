@@ -14549,6 +14549,8 @@ dependencies = [
  "lru 0.12.5",
  "mockall 0.12.1",
  "once_cell",
+ "openvm-circuit",
+ "openvm-stark-sdk",
  "openvm-verify-stark-host",
  "pico-vm",
  "proofman-verifier",
@@ -14565,6 +14567,7 @@ dependencies = [
  "types",
  "uuid 0.8.2",
  "verifier_common",
+ "zstd 0.13.3",
 ]
 
 [[package]]
