@@ -3675,18 +3675,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "enum_dispatch"
-version = "0.3.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa18ce2bc66555b3218614519ac839ddb759a7d6720732f979ef8d13be147ecd"
-dependencies = [
- "once_cell",
- "proc-macro2",
- "quote",
- "syn 2.0.111",
-]
-
-[[package]]
 name = "environment"
 version = "0.1.2"
 dependencies = [
@@ -7689,17 +7677,15 @@ dependencies = [
 [[package]]
 name = "openvm-circuit"
 version = "2.0.0-beta.2"
-source = "git+https://github.com/openvm-org/openvm.git?branch=develop-v2.0.0-rc.1#b8194ef7a93d5abead2ef60d2ce9a38e2b287521"
+source = "git+https://github.com/openvm-org/openvm.git?branch=develop-v2.0.0-rc.2#191cfb8de2e6cee00f440f6490082f62ac3099bf"
 dependencies = [
  "abi_stable",
  "backtrace",
  "bytesize",
  "cfg-if",
  "dashmap",
- "derivative",
  "derive-new 0.6.0",
  "derive_more 1.0.0",
- "enum_dispatch",
  "eyre",
  "getset",
  "itertools 0.14.0",
@@ -7726,7 +7712,7 @@ dependencies = [
 [[package]]
 name = "openvm-circuit-derive"
 version = "2.0.0-beta.2"
-source = "git+https://github.com/openvm-org/openvm.git?branch=develop-v2.0.0-rc.1#b8194ef7a93d5abead2ef60d2ce9a38e2b287521"
+source = "git+https://github.com/openvm-org/openvm.git?branch=develop-v2.0.0-rc.2#191cfb8de2e6cee00f440f6490082f62ac3099bf"
 dependencies = [
  "itertools 0.14.0",
  "proc-macro2",
@@ -7737,7 +7723,7 @@ dependencies = [
 [[package]]
 name = "openvm-circuit-primitives"
 version = "2.0.0-beta.2"
-source = "git+https://github.com/openvm-org/openvm.git?branch=develop-v2.0.0-rc.1#b8194ef7a93d5abead2ef60d2ce9a38e2b287521"
+source = "git+https://github.com/openvm-org/openvm.git?branch=develop-v2.0.0-rc.2#191cfb8de2e6cee00f440f6490082f62ac3099bf"
 dependencies = [
  "derive-new 0.6.0",
  "itertools 0.14.0",
@@ -7755,7 +7741,7 @@ dependencies = [
 [[package]]
 name = "openvm-circuit-primitives-derive"
 version = "2.0.0-beta.2"
-source = "git+https://github.com/openvm-org/openvm.git?branch=develop-v2.0.0-rc.1#b8194ef7a93d5abead2ef60d2ce9a38e2b287521"
+source = "git+https://github.com/openvm-org/openvm.git?branch=develop-v2.0.0-rc.2#191cfb8de2e6cee00f440f6490082f62ac3099bf"
 dependencies = [
  "itertools 0.14.0",
  "proc-macro2",
@@ -7811,7 +7797,7 @@ dependencies = [
 [[package]]
 name = "openvm-instructions"
 version = "2.0.0-beta.2"
-source = "git+https://github.com/openvm-org/openvm.git?branch=develop-v2.0.0-rc.1#b8194ef7a93d5abead2ef60d2ce9a38e2b287521"
+source = "git+https://github.com/openvm-org/openvm.git?branch=develop-v2.0.0-rc.2#191cfb8de2e6cee00f440f6490082f62ac3099bf"
 dependencies = [
  "backtrace",
  "derive-new 0.6.0",
@@ -7828,7 +7814,7 @@ dependencies = [
 [[package]]
 name = "openvm-instructions-derive"
 version = "2.0.0-beta.2"
-source = "git+https://github.com/openvm-org/openvm.git?branch=develop-v2.0.0-rc.1#b8194ef7a93d5abead2ef60d2ce9a38e2b287521"
+source = "git+https://github.com/openvm-org/openvm.git?branch=develop-v2.0.0-rc.2#191cfb8de2e6cee00f440f6490082f62ac3099bf"
 dependencies = [
  "quote",
  "syn 2.0.111",
@@ -7837,7 +7823,7 @@ dependencies = [
 [[package]]
 name = "openvm-poseidon2-air"
 version = "2.0.0-beta.2"
-source = "git+https://github.com/openvm-org/openvm.git?branch=develop-v2.0.0-rc.1#b8194ef7a93d5abead2ef60d2ce9a38e2b287521"
+source = "git+https://github.com/openvm-org/openvm.git?branch=develop-v2.0.0-rc.2#191cfb8de2e6cee00f440f6490082f62ac3099bf"
 dependencies = [
  "derivative",
  "lazy_static",
@@ -7855,7 +7841,7 @@ dependencies = [
 [[package]]
 name = "openvm-recursion-circuit-derive"
 version = "2.0.0-beta.2"
-source = "git+https://github.com/openvm-org/openvm.git?branch=develop-v2.0.0-rc.1#b8194ef7a93d5abead2ef60d2ce9a38e2b287521"
+source = "git+https://github.com/openvm-org/openvm.git?branch=develop-v2.0.0-rc.2#191cfb8de2e6cee00f440f6490082f62ac3099bf"
 dependencies = [
  "quote",
  "syn 2.0.111",
@@ -7920,7 +7906,7 @@ dependencies = [
 [[package]]
 name = "openvm-verify-stark-host"
 version = "2.0.0-beta.2"
-source = "git+https://github.com/openvm-org/openvm.git?branch=develop-v2.0.0-rc.1#b8194ef7a93d5abead2ef60d2ce9a38e2b287521"
+source = "git+https://github.com/openvm-org/openvm.git?branch=develop-v2.0.0-rc.2#191cfb8de2e6cee00f440f6490082f62ac3099bf"
 dependencies = [
  "bitcode",
  "eyre",

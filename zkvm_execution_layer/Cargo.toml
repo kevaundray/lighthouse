@@ -15,8 +15,8 @@ execution_layer = { path = "../beacon_node/execution_layer" }
 pico-vm = { git = "https://github.com/brevis-network/pico.git", branch = "ethproofs-pico-v2.0.0" }
 proofman-verifier = { git = "https://github.com/0xPolygonHermez/pil2-proofman.git", tag = "v0.18.0" }
 sp1-verifier = { git = "https://github.com/succinctlabs/hypercube-verifier.git", branch = "ethproofs_demo" }
-openvm-verify-stark-host = { git = "https://github.com/openvm-org/openvm.git", branch = "develop-v2.0.0-rc.1", default-features = false }
-openvm-circuit = { git = "https://github.com/openvm-org/openvm.git", branch = "develop-v2.0.0-rc.1", default-features = false }
+openvm-verify-stark-host = { git = "https://github.com/openvm-org/openvm.git", branch = "develop-v2.0.0-rc.2", default-features = false }
+openvm-circuit = { git = "https://github.com/openvm-org/openvm.git", branch = "develop-v2.0.0-rc.2", default-features = false }
 openvm-stark-sdk = { git = "https://github.com/openvm-org/stark-backend.git", branch = "develop-v2", default-features = false }
 bitcode = { version = "0.6.5", default-features = false, features = ["serde"] }
 serde = { version = "1.0.201", default-features = false, features = ["derive"] }
