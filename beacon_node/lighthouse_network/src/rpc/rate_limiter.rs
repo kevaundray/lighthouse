@@ -396,12 +396,33 @@ impl RPCRateLimiter {
         RPCRateLimiterBuilder::default()
     }
 
+    /// The instant the rate limiter was created. Logical time offsets used by the `*_at` methods
+    /// are measured relative to this. Exposed for deterministic tests.
+    #[cfg(test)]
+    pub(crate) fn init_time(&self) -> Instant {
+        self.init_time
+    }
+
     pub fn allows<Item: RateLimiterItem>(
         &mut self,
         peer_id: &PeerId,
         request: &Item,
     ) -> Result<(), RateLimitedErr> {
-        let time_since_start = self.init_time.elapsed();
+        self.allows_at(Instant::now(), peer_id, request)
+    }
+
+    /// As [`RPCRateLimiter::allows`], but uses the supplied `now` to compute the elapsed time
+    /// since the limiter was created.
+    ///
+    /// The production path (via [`RPCRateLimiter::allows`]) passes `Instant::now()`; tests can
+    /// supply their own `now` to advance logical time deterministically without sleeping.
+    pub(crate) fn allows_at<Item: RateLimiterItem>(
+        &mut self,
+        now: Instant,
+        peer_id: &PeerId,
+        request: &Item,
+    ) -> Result<(), RateLimitedErr> {
+        let time_since_start = now.saturating_duration_since(self.init_time);
         let tokens = request
             .max_responses(
                 self.fork_context.current_fork_epoch(),
@@ -434,7 +455,14 @@ impl RPCRateLimiter {
     }
 
     pub fn prune(&mut self) {
-        let time_since_start = self.init_time.elapsed();
+        self.prune_at(Instant::now());
+    }
+
+    /// As [`RPCRateLimiter::prune`], but uses the supplied `now` to compute the elapsed time since
+    /// the limiter was created. The production path passes `Instant::now()`; tests can advance
+    /// logical time deterministically.
+    pub(crate) fn prune_at(&mut self, now: Instant) {
+        let time_since_start = now.saturating_duration_since(self.init_time);
 
         let Self {
             prune_interval: _,
@@ -678,5 +706,162 @@ mod tests {
 
         let result = limiter.allows(Duration::from_secs_f32(0.0), &10, tokens);
         assert!(matches!(result, Err(RateLimitedErr::TooLarge)));
+    }
+
+    /// A partial refill after a partial interval should make exactly the refilled tokens
+    /// available, and no more.
+    ///
+    /// Quota: 4 tokens per 2s => 1 token replenished every 0.5s. After consuming all 4 tokens at
+    /// t=0, at t=1.0s exactly 2 tokens have been replenished: two 1-token requests succeed and a
+    /// third fails. This is a pure-math (logical time) test of the token-bucket refill edge case.
+    #[test]
+    fn partial_refill_after_partial_interval() {
+        let mut limiter = Limiter::from_quota(Quota {
+            replenish_all_every: Duration::from_secs(2),
+            max_tokens: NonZeroU64::new(4).unwrap(),
+        })
+        .unwrap();
+        let key = 1;
+
+        // Drain the full bucket at t=0.
+        assert!(limiter.allows(Duration::from_secs(0), &key, 4).is_ok());
+        // Immediately after, the bucket is empty.
+        assert!(limiter.allows(Duration::from_secs(0), &key, 1).is_err());
+
+        // After 1.0s, exactly 2 tokens are replenished (1 token / 0.5s).
+        assert!(
+            limiter
+                .allows(Duration::from_secs_f32(1.0), &key, 1)
+                .is_ok()
+        );
+        assert!(
+            limiter
+                .allows(Duration::from_secs_f32(1.0), &key, 1)
+                .is_ok()
+        );
+        // The third token at t=1.0s is not yet available.
+        assert!(
+            limiter
+                .allows(Duration::from_secs_f32(1.0), &key, 1)
+                .is_err()
+        );
+    }
+
+    /// Deterministic ("Tier A") tests at the `RPCRateLimiter` level, exercising the injectable
+    /// time seam (`allows_at` / `init_time`). No real time elapses: all time is logical, expressed
+    /// as offsets from the limiter's `init_time`.
+    mod rpc_rate_limiter_deterministic {
+        use crate::rpc::config::RateLimiterConfig;
+        use crate::rpc::rate_limiter::{RPCRateLimiter, RateLimitedErr};
+        use crate::rpc::{Ping, RequestType};
+        use libp2p::PeerId;
+        use std::num::NonZeroU64;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use types::{EthSpec, ForkContext, Hash256, MainnetEthSpec, Slot};
+
+        fn fork_context() -> Arc<ForkContext> {
+            Arc::new(ForkContext::new::<MainnetEthSpec>(
+                Slot::new(0),
+                Hash256::ZERO,
+                &MainnetEthSpec::default_spec(),
+            ))
+        }
+
+        /// Build a limiter whose Ping protocol allows `max_tokens` tokens every `secs` seconds.
+        fn limiter_with_ping_quota(max_tokens: u64, secs: u64) -> RPCRateLimiter {
+            let config = RateLimiterConfig {
+                ping_quota: crate::rpc::rate_limiter::Quota::n_every(
+                    NonZeroU64::new(max_tokens).unwrap(),
+                    secs,
+                ),
+                ..Default::default()
+            };
+            RPCRateLimiter::new_with_config(config, fork_context()).unwrap()
+        }
+
+        fn ping(data: u64) -> RequestType<MainnetEthSpec> {
+            RequestType::Ping(Ping { data })
+        }
+
+        /// The limiter allows up to capacity, then rejects once the bucket is empty.
+        #[tokio::test]
+        async fn allows_up_to_capacity_then_rejects() {
+            // 3 tokens (each Ping = 1 token) per 30s.
+            let mut limiter = limiter_with_ping_quota(3, 30);
+            let peer = PeerId::random();
+            let t0 = limiter.init_time();
+
+            // All requests happen at the same logical instant t0.
+            assert!(limiter.allows_at(t0, &peer, &ping(0)).is_ok());
+            assert!(limiter.allows_at(t0, &peer, &ping(1)).is_ok());
+            assert!(limiter.allows_at(t0, &peer, &ping(2)).is_ok());
+
+            // The 4th request at the same instant is rejected (bucket empty).
+            assert!(matches!(
+                limiter.allows_at(t0, &peer, &ping(3)),
+                Err(RateLimitedErr::TooSoon(_))
+            ));
+        }
+
+        /// After advancing logical time enough to refill, requests are allowed again.
+        #[tokio::test]
+        async fn refills_after_logical_time_advance() {
+            // 1 token per 10s, so a full refill takes 10s.
+            let mut limiter = limiter_with_ping_quota(1, 10);
+            let peer = PeerId::random();
+            let t0 = limiter.init_time();
+
+            // Consume the single token.
+            assert!(limiter.allows_at(t0, &peer, &ping(0)).is_ok());
+            // Immediately rejected.
+            assert!(matches!(
+                limiter.allows_at(t0, &peer, &ping(1)),
+                Err(RateLimitedErr::TooSoon(_))
+            ));
+
+            // Still too soon after 9 logical seconds.
+            assert!(matches!(
+                limiter.allows_at(t0 + Duration::from_secs(9), &peer, &ping(2)),
+                Err(RateLimitedErr::TooSoon(_))
+            ));
+
+            // After 10 logical seconds the token is replenished and the request is allowed.
+            assert!(
+                limiter
+                    .allows_at(t0 + Duration::from_secs(10), &peer, &ping(3))
+                    .is_ok()
+            );
+        }
+
+        /// `prune_at` removes keys whose bucket is full by the given logical time, but keeps keys
+        /// that are still rate limited.
+        #[tokio::test]
+        async fn prune_at_respects_logical_time() {
+            // 1 token per 10s.
+            let mut limiter = limiter_with_ping_quota(1, 10);
+            let peer = PeerId::random();
+            let t0 = limiter.init_time();
+
+            // Consume the token, putting the peer's TAT into the future (bucket not yet full).
+            assert!(limiter.allows_at(t0, &peer, &ping(0)).is_ok());
+
+            // Pruning at t0 must NOT remove the peer: their bucket is not full yet, so a new
+            // request at t0 is still rate limited.
+            limiter.prune_at(t0);
+            assert!(matches!(
+                limiter.allows_at(t0, &peer, &ping(1)),
+                Err(RateLimitedErr::TooSoon(_))
+            ));
+
+            // Pruning well after the bucket has refilled removes the key; a subsequent request is
+            // treated as a fresh (full-bucket) peer and is allowed.
+            limiter.prune_at(t0 + Duration::from_secs(100));
+            assert!(
+                limiter
+                    .allows_at(t0 + Duration::from_secs(100), &peer, &ping(2))
+                    .is_ok()
+            );
+        }
     }
 }

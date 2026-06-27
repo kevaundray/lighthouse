@@ -458,10 +458,13 @@ impl<E: EthSpec> PeerInfo<E> {
         self.partial_message_subnets.clear()
     }
 
-    /// Applies decay rates to a non-trusted peer's score.
-    pub(super) fn score_update(&mut self) {
+    /// Applies decay rates to a non-trusted peer's score using the supplied `now`.
+    ///
+    /// The production path passes `Instant::now()` (via the peer manager heartbeat); tests can
+    /// advance logical time deterministically instead of relying on the wall clock.
+    pub(super) fn score_update_at(&mut self, now: std::time::Instant) {
         if !self.is_trusted {
-            self.score.update()
+            self.score.update_at(now)
         }
     }
 
