@@ -219,15 +219,12 @@ impl RealScore {
         self.update_state();
     }
 
-    /// Applies time-based logic such as decay rates to the score.
-    /// This function should be called periodically.
-    pub fn update(&mut self) {
-        self.update_at(Instant::now())
-    }
-
     /// Applies time-based logic such as decay rates to the score with the given now value.
-    /// This private sub function is mainly used for testing.
-    fn update_at(&mut self, now: Instant) {
+    /// This function should be called periodically.
+    ///
+    /// The production path passes `Instant::now()` (via the peer manager heartbeat). Tests can
+    /// drive decay/ban-expiry deterministically by supplying their own `now`.
+    pub(crate) fn update_at(&mut self, now: Instant) {
         // Decay the current score
         // Using exponential decay based on a constant half life.
 
@@ -288,7 +285,7 @@ macro_rules! apply {
 }
 
 apply!(apply_peer_action, peer_action: PeerAction);
-apply!(update);
+apply!(update_at, now: Instant);
 apply!(update_gossipsub_score, new_score: f64, ignore: bool);
 #[cfg(test)]
 apply!(test_add, score: f64);
@@ -346,6 +343,14 @@ impl std::fmt::Display for Score {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:.2}", self.score())
     }
+}
+
+/// Test-only re-exports of internal scoring constants so deterministic tests in other modules can
+/// reason about ban-expiry timing without duplicating magic numbers.
+#[cfg(test)]
+pub mod testing {
+    /// The number of seconds we ban a peer for before their score begins to decay.
+    pub const BANNED_BEFORE_DECAY: super::Duration = super::BANNED_BEFORE_DECAY;
 }
 
 #[cfg(test)]

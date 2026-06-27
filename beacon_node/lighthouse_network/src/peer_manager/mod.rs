@@ -8,6 +8,9 @@ use discv5::Enr;
 use libp2p::identify::Info as IdentifyInfo;
 use lru_cache::LRUTimeCache;
 use peerdb::{BanOperation, BanResult, ScoreUpdateResult};
+use rand::RngCore;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use smallvec::SmallVec;
 use std::{
@@ -76,6 +79,14 @@ pub const PRIORITY_PEER_EXCESS: f32 = 0.2;
 /// The numbre of inbound libp2p peers we have seen before we consider our NAT to be open.
 pub const LIBP2P_NAT_OPEN_THRESHOLD: usize = 3;
 
+/// The default RNG used by the [`PeerManager`] for peer-selection randomness in production.
+///
+/// This is seeded from OS entropy (equivalent randomness to the previously-used thread-local RNG),
+/// but is `Send` so it can live inside the `PeerManager`.
+fn default_rng() -> Box<dyn RngCore + Send> {
+    Box::new(StdRng::from_os_rng())
+}
+
 /// The main struct that handles peer's reputation and connection status.
 pub struct PeerManager<E: EthSpec> {
     /// Storage of network globals to access the `PeerDB`.
@@ -122,6 +133,13 @@ pub struct PeerManager<E: EthSpec> {
     /// Keeps track of whether the QUIC protocol is enabled or not.
     quic_enabled: bool,
     trusted_peers: HashSet<Enr>,
+    /// Random number generator used for peer-selection randomness (e.g. shuffling prune
+    /// candidates).
+    ///
+    /// In production this is backed by the thread-local RNG, preserving the previous behaviour.
+    /// Tests can replace it with a seeded RNG to make peer selection deterministic via
+    /// [`PeerManager::set_rng`].
+    rng: Box<dyn RngCore + Send>,
 }
 
 /// The events that the `PeerManager` outputs (requests).
@@ -203,7 +221,17 @@ impl<E: EthSpec> PeerManager<E> {
             metrics_enabled,
             quic_enabled,
             trusted_peers: Default::default(),
+            rng: default_rng(),
         })
+    }
+
+    /// Replace the RNG used for peer-selection randomness.
+    ///
+    /// This is intended for tests that want deterministic peer selection by supplying a seeded
+    /// RNG. Production code uses the default thread-local RNG installed in [`PeerManager::new`].
+    #[cfg(test)]
+    pub(crate) fn set_rng(&mut self, rng: Box<dyn RngCore + Send>) {
+        self.rng = rng;
     }
 
     /* Public accessible functions */
@@ -1198,6 +1226,7 @@ impl<E: EthSpec> PeerManager<E> {
     /// Find the best candidate for removal from the densest custody subnet.
     ///
     /// Returns the PeerId of the candidate to remove, or None if no suitable candidate found.
+    #[allow(clippy::too_many_arguments)]
     fn find_prune_candidate(
         &self,
         column_subnet: DataColumnSubnetId,
@@ -1206,12 +1235,13 @@ impl<E: EthSpec> PeerManager<E> {
         sampling_subnets: &HashSet<DataColumnSubnetId>,
         connected_outbound_peer_count: usize,
         outbound_peers_pruned: usize,
+        rng: &mut dyn RngCore,
     ) -> Option<PeerId> {
         let peers_on_subnet_clone = column_subnet_to_peers.get(&column_subnet)?.clone();
 
         // Create a sorted list of peers prioritized for removal
         let mut sorted_peers = peers_on_subnet_clone;
-        sorted_peers.shuffle(&mut rand::rng());
+        sorted_peers.shuffle(rng);
         sorted_peers.sort_by_key(|peer_id| {
             if let Some(peer_info) = peer_subnet_info.get(peer_id) {
                 (
@@ -1354,6 +1384,10 @@ impl<E: EthSpec> PeerManager<E> {
             let mut peer_subnet_info = self.build_peer_subnet_info(&peers_to_prune);
             let mut custody_subnet_to_peers = Self::build_custody_subnet_lookup(&peer_subnet_info);
 
+            // Temporarily take the RNG out of `self` so we can pass it to `find_prune_candidate`
+            // (which borrows `&self`) without a borrow conflict. It is always put back below.
+            let mut rng = std::mem::replace(&mut self.rng, default_rng());
+
             // Attempt to prune peers to `target_peers`, or until we run out of peers to prune.
             while peers_to_prune.len() < connected_peer_count.saturating_sub(self.target_peers) {
                 let custody_subnet_with_most_peers = custody_subnet_to_peers
@@ -1374,6 +1408,7 @@ impl<E: EthSpec> PeerManager<E> {
                         &sampling_subnets,
                         connected_outbound_peer_count,
                         outbound_peers_pruned,
+                        rng.as_mut(),
                     ) {
                         // Update outbound peer count if needed
                         if let Some(candidate_info) = peer_subnet_info.get(&candidate_peer)
@@ -1399,6 +1434,9 @@ impl<E: EthSpec> PeerManager<E> {
                     break;
                 }
             }
+
+            // Restore the RNG we temporarily took out above.
+            self.rng = rng;
         }
 
         // Disconnect the pruned peers.
@@ -1422,6 +1460,15 @@ impl<E: EthSpec> PeerManager<E> {
     ///
     /// NOTE: Discovery will only add a new query if one isn't already queued.
     fn heartbeat(&mut self) {
+        self.heartbeat_at(Instant::now());
+    }
+
+    /// As [`PeerManager::heartbeat`], but uses the supplied `now` to drive the time-based parts of
+    /// the heartbeat (score decay / ban expiry).
+    ///
+    /// The production path (the libp2p poll loop) calls [`PeerManager::heartbeat`] with
+    /// `Instant::now()`. Tests can advance logical time deterministically by calling this directly.
+    fn heartbeat_at(&mut self, now: Instant) {
         // Optionally run a discovery query if we need more peers.
         self.maintain_peer_count(0);
         self.maintain_trusted_peers();
@@ -1434,7 +1481,7 @@ impl<E: EthSpec> PeerManager<E> {
         self.network_globals.peers.write().cleanup_dialing_peers();
 
         // Updates peer's scores and unban any peers if required.
-        let actions = self.network_globals.peers.write().update_scores();
+        let actions = self.network_globals.peers.write().update_scores_at(now);
         for (peer_id, action) in actions {
             self.handle_score_action(&peer_id, action, None);
         }
@@ -3257,5 +3304,260 @@ mod tests {
             !discovery_events.is_empty(),
             "Should generate discovery events when PeerDAS is enabled, but found no discovery events"
         );
+    }
+
+    /// Deterministic ("Tier A") tests for the `PeerManager`.
+    ///
+    /// These tests mirror the approach used by the sync subsystem's `TestRig`: they avoid all
+    /// sources of non-determinism so that outcomes are reproducible.
+    ///
+    /// The two sources of non-determinism in the `PeerManager` are:
+    ///   1. Time: score decay and ban expiry. These are driven by an injectable `now` threaded
+    ///      through `PeerManager::heartbeat_at`. Tests advance *logical* time (offsets from a
+    ///      reference `Instant`) instead of sleeping, so no wall-clock time elapses.
+    ///   2. Randomness: peer selection during pruning shuffles candidates. The `PeerManager` holds
+    ///      an injectable RNG (`PeerManager::set_rng`) which tests seed with a fixed
+    ///      `ChaCha20Rng::from_seed([..])` to make selection reproducible.
+    mod deterministic_tests {
+        use super::*;
+        use crate::peer_manager::peerdb::score::ScoreState;
+        use rand_chacha::ChaCha20Rng;
+
+        /// A small deterministic test harness for the `PeerManager`.
+        ///
+        /// It owns a `PeerManager` configured with a seeded RNG and a fixed reference `Instant`
+        /// (`t0`) from which all logical time offsets are computed. Helpers let a test connect
+        /// peers, report peer actions, advance logical time (by running a heartbeat at a given
+        /// offset), and inspect the resulting score / connection / ban state.
+        struct PeerManagerRig {
+            peer_manager: PeerManager<E>,
+            /// Reference instant. All logical time is expressed as offsets from here.
+            t0: Instant,
+        }
+
+        impl PeerManagerRig {
+            /// Build a rig with a seeded RNG so that any peer-selection randomness is reproducible.
+            async fn new(target_peer_count: usize, seed: [u8; 32]) -> Self {
+                let mut peer_manager = build_peer_manager(target_peer_count).await;
+                peer_manager.set_rng(Box::new(ChaCha20Rng::from_seed(seed)));
+                // Capture the reference instant *after* construction. New peers created below will
+                // anchor their score `last_updated` at roughly this instant.
+                let t0 = Instant::now();
+                Self { peer_manager, t0 }
+            }
+
+            /// Connect an inbound peer.
+            fn connect_ingoing(&mut self, peer_id: &PeerId) {
+                self.peer_manager.inject_connect_ingoing(
+                    peer_id,
+                    "/ip4/0.0.0.0".parse().unwrap(),
+                    None,
+                );
+            }
+
+            /// Report a peer action (e.g. a downscore or a fatal action).
+            fn report(&mut self, peer_id: &PeerId, action: PeerAction) {
+                self.peer_manager.report_peer(
+                    peer_id,
+                    action,
+                    ReportSource::PeerManager,
+                    None,
+                    "deterministic_test",
+                );
+            }
+
+            /// Run a heartbeat at logical time `t0 + offset`. This is how tests advance time
+            /// without sleeping: score decay / ban expiry are computed against this `now`.
+            fn heartbeat_after(&mut self, offset: Duration) {
+                self.peer_manager.heartbeat_at(self.t0 + offset);
+            }
+
+            /// The current score-derived state of a peer (Healthy / ForcedDisconnect / Banned).
+            fn score_state(&self, peer_id: &PeerId) -> Option<ScoreState> {
+                self.peer_manager
+                    .network_globals
+                    .peers
+                    .read()
+                    .peer_info(peer_id)
+                    .map(|info| info.score_state())
+            }
+
+            /// The numeric score of a peer.
+            fn score(&self, peer_id: &PeerId) -> f64 {
+                self.peer_manager
+                    .network_globals
+                    .peers
+                    .read()
+                    .score(peer_id)
+            }
+
+            /// Whether the peer is currently considered banned by its score.
+            fn is_banned(&self, peer_id: &PeerId) -> bool {
+                matches!(
+                    self.peer_manager.ban_status(peer_id),
+                    Some(BanResult::BadScore)
+                )
+            }
+        }
+
+        /// A peer reported with `PeerAction::Fatal` is immediately banned (no heartbeat / time
+        /// advance required).
+        #[tokio::test]
+        async fn fatal_action_bans_immediately() {
+            let peer = PeerId::random();
+            let mut rig = PeerManagerRig::new(50, [0u8; 32]).await;
+            rig.connect_ingoing(&peer);
+
+            assert_eq!(rig.score_state(&peer), Some(ScoreState::Healthy));
+            assert!(!rig.is_banned(&peer));
+
+            rig.report(&peer, PeerAction::Fatal);
+
+            assert_eq!(rig.score_state(&peer), Some(ScoreState::Banned));
+            assert!(rig.is_banned(&peer));
+        }
+
+        /// A peer accumulates downscores across several reports and transitions
+        /// Healthy -> ForcedDisconnect -> Banned at the expected thresholds.
+        ///
+        /// `LowToleranceError` is -10 per report. Disconnect threshold is -20, ban threshold is
+        /// -50, so we expect: Healthy until the 2nd report (-20 -> ForcedDisconnect), and Banned
+        /// once the score reaches -50 (the 5th report).
+        #[tokio::test]
+        async fn downscores_transition_healthy_disconnect_banned() {
+            let peer = PeerId::random();
+            let mut rig = PeerManagerRig::new(50, [1u8; 32]).await;
+            rig.connect_ingoing(&peer);
+
+            // 1 report: score -10, still Healthy (disconnect threshold is -20).
+            rig.report(&peer, PeerAction::LowToleranceError);
+            assert!((rig.score(&peer) - -10.0).abs() < 1e-9);
+            assert_eq!(rig.score_state(&peer), Some(ScoreState::Healthy));
+
+            // 2 reports: score -20, now ForcedDisconnect.
+            rig.report(&peer, PeerAction::LowToleranceError);
+            assert!((rig.score(&peer) - -20.0).abs() < 1e-9);
+            assert_eq!(rig.score_state(&peer), Some(ScoreState::ForcedDisconnect));
+
+            // 4 reports: score -40, still ForcedDisconnect (ban threshold is -50).
+            rig.report(&peer, PeerAction::LowToleranceError);
+            rig.report(&peer, PeerAction::LowToleranceError);
+            assert!((rig.score(&peer) - -40.0).abs() < 1e-9);
+            assert_eq!(rig.score_state(&peer), Some(ScoreState::ForcedDisconnect));
+
+            // 5 reports: score -50, now Banned.
+            rig.report(&peer, PeerAction::LowToleranceError);
+            assert!((rig.score(&peer) - -50.0).abs() < 1e-9);
+            assert_eq!(rig.score_state(&peer), Some(ScoreState::Banned));
+            assert!(rig.is_banned(&peer));
+        }
+
+        /// The same transition reachable via `MidToleranceError` (-5 per report). Ban requires 10
+        /// reports (-50).
+        #[tokio::test]
+        async fn mid_tolerance_downscores_eventually_ban() {
+            let peer = PeerId::random();
+            let mut rig = PeerManagerRig::new(50, [2u8; 32]).await;
+            rig.connect_ingoing(&peer);
+
+            // 9 reports: -45, still ForcedDisconnect.
+            for _ in 0..9 {
+                rig.report(&peer, PeerAction::MidToleranceError);
+            }
+            assert!((rig.score(&peer) - -45.0).abs() < 1e-9);
+            assert_eq!(rig.score_state(&peer), Some(ScoreState::ForcedDisconnect));
+
+            // 10th report: -50, Banned.
+            rig.report(&peer, PeerAction::MidToleranceError);
+            assert!((rig.score(&peer) - -50.0).abs() < 1e-9);
+            assert_eq!(rig.score_state(&peer), Some(ScoreState::Banned));
+        }
+
+        /// Ban expiry: after advancing logical time past the ban duration, the peer's ban decays.
+        ///
+        /// When a peer is banned, its score `last_updated` is pushed `BANNED_BEFORE_DECAY` into the
+        /// future, so the score does not decay until that period elapses. We verify that:
+        ///   - immediately after a ban, and right up to the ban-before-decay boundary, the peer
+        ///     stays banned even when heartbeats run;
+        ///   - once logical time passes the boundary, a heartbeat lets the score decay above the
+        ///     ban threshold and the peer is no longer banned.
+        ///
+        /// All time advances are logical (offsets from `t0`); no real sleeping occurs.
+        #[tokio::test]
+        async fn ban_decays_after_logical_time_advance() {
+            use peerdb::score::testing::BANNED_BEFORE_DECAY;
+
+            let peer = PeerId::random();
+            let mut rig = PeerManagerRig::new(50, [3u8; 32]).await;
+            rig.connect_ingoing(&peer);
+
+            // Ban the peer.
+            rig.report(&peer, PeerAction::Fatal);
+            assert!(rig.is_banned(&peer));
+
+            // Running a heartbeat just before the ban-before-decay boundary must NOT decay the
+            // ban: the peer is still banned.
+            rig.heartbeat_after(BANNED_BEFORE_DECAY.saturating_sub(Duration::from_secs(1)));
+            assert!(
+                rig.is_banned(&peer),
+                "peer should remain banned before the ban-before-decay period elapses"
+            );
+
+            // Advance logical time well past the ban-before-decay boundary and run a heartbeat.
+            // The score should now decay above the ban threshold and the peer unbans.
+            // We advance an extra ~5 half-lives (SCORE_HALFLIFE = 600s) to ensure the score (which
+            // starts at the floor of -100) decays above the -50 ban threshold.
+            rig.heartbeat_after(BANNED_BEFORE_DECAY + Duration::from_secs(3600));
+
+            assert!(
+                !rig.is_banned(&peer),
+                "peer should no longer be banned after ban decays; score = {}",
+                rig.score(&peer)
+            );
+            assert!(
+                rig.score(&peer) > -50.0,
+                "score should have decayed above the ban threshold, got {}",
+                rig.score(&peer)
+            );
+        }
+
+        /// Determinism: running the same scenario twice with the same seed produces identical
+        /// outcomes (identical final scores for the same sequence of reports).
+        ///
+        /// We use the same fixed `PeerId`s across both runs so the comparison is well-defined.
+        #[tokio::test]
+        async fn same_seed_produces_identical_outcomes() {
+            // Fixed peer ids so both runs operate on identical inputs.
+            let peers: Vec<PeerId> = (0..6).map(|_| PeerId::random()).collect();
+            let actions = [
+                PeerAction::LowToleranceError,
+                PeerAction::MidToleranceError,
+                PeerAction::HighToleranceError,
+            ];
+
+            async fn run_scenario(peers: &[PeerId], actions: &[PeerAction]) -> Vec<(PeerId, f64)> {
+                let mut rig = PeerManagerRig::new(3, [7u8; 32]).await;
+                for peer in peers {
+                    rig.connect_ingoing(peer);
+                }
+                // Apply a deterministic sequence of reports.
+                for (i, peer) in peers.iter().enumerate() {
+                    rig.report(peer, actions[i % actions.len()]);
+                }
+                // Run a heartbeat at a fixed logical time (this exercises the seeded RNG via the
+                // pruning path, since we connected more peers than the target of 3).
+                rig.heartbeat_after(Duration::from_secs(0));
+
+                peers.iter().map(|p| (*p, rig.score(p))).collect()
+            }
+
+            let run_a = run_scenario(&peers, &actions).await;
+            let run_b = run_scenario(&peers, &actions).await;
+
+            assert_eq!(
+                run_a, run_b,
+                "the same seed and inputs must produce identical final scores"
+            );
+        }
     }
 }
