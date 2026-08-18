@@ -1,12 +1,15 @@
+use crate::pq_profile::is_lean_pq_devnet_v1;
 use consensus_signature::{
     AggregationContribution, AggregationError, AggregationJob, AggregationService,
     AggregationSigner, OneTimeUseId, PqPublicKey, SameMessageClaim, SameMessageEvidence,
     SigningDuty, SigningIdError, V1_MAX_AGGREGATION_CONTRIBUTIONS, V1_MAX_AGGREGATION_SIGNERS,
-    is_individual_same_message_evidence,
+    VerificationClass, is_individual_same_message_evidence,
 };
 use std::collections::BTreeMap;
+#[cfg(feature = "pq-verification")]
+use types::AttestationRef;
 use types::{
-    Attestation, BeaconState, BeaconStateError, ChainSpec, Domain, EthSpec, ForkName, SignedRoot,
+    Attestation, BeaconState, BeaconStateError, ChainSpec, Domain, EthSpec, SignedRoot,
     SingleAttestation,
 };
 
@@ -38,6 +41,7 @@ pub enum PqAttestationInvalid {
     DuplicateSignerIndex(u64),
     NonCanonicalSignerOrder,
     MismatchedAttestationData,
+    InvalidTargetEpoch,
     InvalidCommittee,
     InvalidBitfield,
     InvalidAttesterIndex(u64),
@@ -62,6 +66,23 @@ pub enum PqAttestationLocalError {
 /// recursive evidence against the exact claim and signer set, then returns it byte-identically
 /// without invoking aggregate proving.
 pub async fn verify_pq_attestation_job(
+    service: &AggregationService,
+    class: VerificationClass,
+    job: AggregationJob,
+) -> Result<SameMessageEvidence, PqAttestationError> {
+    service
+        .verify(class, job)
+        .await
+        .map_err(|error| match error {
+            AggregationError::InvalidEvidence => {
+                PqAttestationError::Invalid(PqAttestationInvalid::InvalidEvidence)
+            }
+            local => PqAttestationError::Local(PqAttestationLocalError::Aggregation(local)),
+        })
+}
+
+/// Executes a locally constructed multi-contribution aggregation request.
+pub async fn aggregate_pq_attestation_job(
     service: &AggregationService,
     job: AggregationJob,
 ) -> Result<SameMessageEvidence, PqAttestationError> {
@@ -132,13 +153,43 @@ pub struct VerifiedPqAttestation<E: EthSpec> {
 }
 
 impl<E: EthSpec> PreparedPqAttestation<E> {
-    /// Performs contextual evidence verification and seals the owned candidate on success.
+    /// Performs reserved contextual evidence verification and seals the owned candidate.
     pub async fn verify(
         self,
         service: &AggregationService,
+        class: VerificationClass,
     ) -> Result<VerifiedPqAttestation<E>, PqAttestationError> {
-        let evidence = verify_pq_attestation_job(service, self.job).await?;
-        let mut attestation = self.attestation;
+        let Self {
+            attestation,
+            signer_indices,
+            claim,
+            job,
+        } = self;
+        let evidence = verify_pq_attestation_job(service, class, job).await?;
+        Self::seal(attestation, signer_indices, claim, evidence)
+    }
+
+    /// Performs local recursive aggregation and seals the owned candidate on success.
+    pub async fn aggregate(
+        self,
+        service: &AggregationService,
+    ) -> Result<VerifiedPqAttestation<E>, PqAttestationError> {
+        let Self {
+            attestation,
+            signer_indices,
+            claim,
+            job,
+        } = self;
+        let evidence = aggregate_pq_attestation_job(service, job).await?;
+        Self::seal(attestation, signer_indices, claim, evidence)
+    }
+
+    fn seal(
+        mut attestation: Attestation<E>,
+        signer_indices: Vec<u64>,
+        claim: SameMessageClaim,
+        evidence: SameMessageEvidence,
+    ) -> Result<VerifiedPqAttestation<E>, PqAttestationError> {
         match &mut attestation {
             Attestation::Electra(electra) => electra.signature = evidence,
             Attestation::Base(_) => {
@@ -149,8 +200,8 @@ impl<E: EthSpec> PreparedPqAttestation<E> {
         }
         Ok(VerifiedPqAttestation {
             attestation,
-            signer_indices: self.signer_indices,
-            claim: self.claim,
+            signer_indices,
+            claim,
         })
     }
 }
@@ -185,6 +236,165 @@ pub fn prepare_pq_attestation<E: EthSpec>(
         attestation,
         signer_indices,
         claim,
+        job,
+    })
+}
+
+#[cfg(feature = "pq-verification")]
+pub(crate) struct PqAttestationPreflight {
+    signer_indices: Vec<u64>,
+    signers: Vec<AggregationSigner>,
+    claim: SameMessageClaim,
+}
+
+#[cfg(feature = "pq-verification")]
+pub(crate) fn preflight_pq_attestation_from_bits<E: EthSpec>(
+    state: &BeaconState<E>,
+    key_cache: &PqValidatorKeyCache,
+    attestation: AttestationRef<'_, E>,
+    spec: &ChainSpec,
+) -> Result<PqAttestationPreflight, PqAttestationError> {
+    preflight_pq_attestation_ref_from_bits(state, key_cache, attestation, spec, true)
+}
+
+#[cfg(feature = "pq-verification")]
+pub(crate) fn preflight_pq_attestation_verification_job<E: EthSpec>(
+    state: &BeaconState<E>,
+    key_cache: &PqValidatorKeyCache,
+    attestation: AttestationRef<'_, E>,
+    spec: &ChainSpec,
+) -> Result<PqAttestationPreflight, PqAttestationError> {
+    preflight_pq_attestation_ref_from_bits(state, key_cache, attestation, spec, false)
+}
+
+#[cfg(feature = "pq-verification")]
+fn preflight_pq_attestation_ref_from_bits<E: EthSpec>(
+    state: &BeaconState<E>,
+    key_cache: &PqValidatorKeyCache,
+    attestation: AttestationRef<'_, E>,
+    spec: &ChainSpec,
+    require_single_committee: bool,
+) -> Result<PqAttestationPreflight, PqAttestationError> {
+    let electra = match attestation {
+        AttestationRef::Electra(electra) => electra,
+        AttestationRef::Base(_) => {
+            return Err(PqAttestationError::Invalid(
+                PqAttestationInvalid::BaseAttestation,
+            ));
+        }
+    };
+    validate_v1_profile(state, spec, electra.data.slot)?;
+    if electra.data.target.epoch != electra.data.slot.epoch(E::slots_per_epoch()) {
+        return Err(PqAttestationError::Invalid(
+            PqAttestationInvalid::InvalidTargetEpoch,
+        ));
+    }
+    if electra.data.index != 0 {
+        return Err(PqAttestationError::Invalid(
+            PqAttestationInvalid::InvalidCommittee,
+        ));
+    }
+    if require_single_committee {
+        let mut selected = electra.committee_bits.iter().filter(|selected| *selected);
+        if selected.next().is_none() || selected.next().is_some() {
+            return Err(PqAttestationError::Invalid(
+                PqAttestationInvalid::InvalidCommittee,
+            ));
+        }
+    }
+    if key_cache.len() != state.validators().len() {
+        return Err(PqAttestationError::Local(
+            PqAttestationLocalError::CacheInvariant,
+        ));
+    }
+    let signer_indices = electra_attesting_indices(state, electra)?;
+    if signer_indices.len() > V1_MAX_AGGREGATION_SIGNERS {
+        return Err(PqAttestationError::Invalid(
+            PqAttestationInvalid::TooManySigners {
+                actual: signer_indices.len(),
+                max: V1_MAX_AGGREGATION_SIGNERS,
+            },
+        ));
+    }
+    let mut signers = Vec::with_capacity(signer_indices.len());
+    for &validator_index in &signer_indices {
+        let validator_position = usize::try_from(validator_index).map_err(|_| {
+            PqAttestationError::Invalid(PqAttestationInvalid::InvalidAttesterIndex(validator_index))
+        })?;
+        let validator =
+            state
+                .validators()
+                .get(validator_position)
+                .ok_or(PqAttestationError::Invalid(
+                    PqAttestationInvalid::InvalidAttesterIndex(validator_index),
+                ))?;
+        let public_key = key_cache
+            .get(validator_index)
+            .ok_or(PqAttestationError::Local(
+                PqAttestationLocalError::CacheInvariant,
+            ))?;
+        if public_key != &validator.pubkey {
+            return Err(PqAttestationError::Local(
+                PqAttestationLocalError::CacheInvariant,
+            ));
+        }
+        signers.push(AggregationSigner {
+            validator_index,
+            public_key: *public_key,
+        });
+    }
+    let one_time_use_id =
+        OneTimeUseId::for_lean_pq_devnet_v1(electra.data.slot.as_u64(), SigningDuty::Attestation)
+            .map_err(|error| PqAttestationError::Local(PqAttestationLocalError::SigningId(error)))?;
+    let domain = spec.get_domain(
+        electra.data.target.epoch,
+        Domain::BeaconAttester,
+        &state.fork(),
+        state.genesis_validators_root(),
+    );
+    Ok(PqAttestationPreflight {
+        signer_indices,
+        signers,
+        claim: SameMessageClaim::new(electra.data.signing_root(domain).0, one_time_use_id),
+    })
+}
+
+#[cfg(feature = "pq-verification")]
+pub(crate) fn materialize_pq_attestation_verification_job<E: EthSpec>(
+    attestation: AttestationRef<'_, E>,
+    preflight: &PqAttestationPreflight,
+    materializations: &mut usize,
+) -> Result<AggregationJob, PqAttestationError> {
+    let AttestationRef::Electra(electra) = attestation else {
+        return Err(PqAttestationError::Local(
+            PqAttestationLocalError::CacheInvariant,
+        ));
+    };
+    *materializations = materializations.saturating_add(1);
+    Ok(AggregationJob {
+        claim: preflight.claim,
+        expected_signers: preflight.signers.clone(),
+        contributions: vec![AggregationContribution {
+            signers: preflight.signers.clone(),
+            evidence: electra.signature.clone(),
+        }],
+    })
+}
+
+#[cfg(feature = "pq-verification")]
+pub(crate) fn materialize_prepared_pq_attestation<E: EthSpec>(
+    attestation: AttestationRef<'_, E>,
+    preflight: PqAttestationPreflight,
+    materializations: &mut usize,
+) -> Result<PreparedPqAttestation<E>, PqAttestationError> {
+    let job =
+        materialize_pq_attestation_verification_job(attestation, &preflight, materializations)?;
+    *materializations = materializations.saturating_add(1);
+    let attestation = attestation.clone_as_attestation();
+    Ok(PreparedPqAttestation {
+        attestation,
+        signer_indices: preflight.signer_indices,
+        claim: preflight.claim,
         job,
     })
 }
@@ -357,6 +567,11 @@ pub fn build_pq_single_attestation_job<E: EthSpec>(
     spec: &ChainSpec,
 ) -> Result<AggregationJob, PqAttestationError> {
     validate_v1_profile(state, spec, attestation.data.slot)?;
+    if attestation.data.target.epoch != attestation.data.slot.epoch(E::slots_per_epoch()) {
+        return Err(PqAttestationError::Invalid(
+            PqAttestationInvalid::InvalidTargetEpoch,
+        ));
+    }
     if attestation.data.index != 0 {
         return Err(PqAttestationError::Invalid(
             PqAttestationInvalid::InvalidCommittee,
@@ -455,6 +670,11 @@ pub fn build_pq_attestation_job<E: EthSpec>(
         }
     };
     validate_v1_profile(state, spec, first_data.slot)?;
+    if first_data.target.epoch != first_data.slot.epoch(E::slots_per_epoch()) {
+        return Err(PqAttestationError::Invalid(
+            PqAttestationInvalid::InvalidTargetEpoch,
+        ));
+    }
     if first_data.index != 0 {
         return Err(PqAttestationError::Invalid(
             PqAttestationInvalid::InvalidCommittee,
@@ -684,23 +904,7 @@ fn validate_v1_profile<E: EthSpec>(
     spec: &ChainSpec,
     attestation_slot: types::Slot,
 ) -> Result<(), PqAttestationError> {
-    let genesis_epoch = E::genesis_epoch();
-    let is_electra_v1 = state.fork_name(spec) == Ok(ForkName::Electra)
-        && state.fork_name_unchecked() == ForkName::Electra
-        && spec.fork_name_at_slot::<E>(attestation_slot) == ForkName::Electra
-        && spec.altair_fork_epoch == Some(genesis_epoch)
-        && spec.bellatrix_fork_epoch == Some(genesis_epoch)
-        && spec.capella_fork_epoch == Some(genesis_epoch)
-        && spec.deneb_fork_epoch == Some(genesis_epoch)
-        && spec.electra_fork_epoch == Some(genesis_epoch)
-        && !spec.is_fulu_scheduled()
-        && !spec.is_gloas_scheduled()
-        && state.eth1_data().deposit_count == 0
-        && state.eth1_deposit_index() == 0
-        && state
-            .pending_deposits()
-            .is_ok_and(|deposits| deposits.is_empty());
-    if is_electra_v1 {
+    if is_lean_pq_devnet_v1(state, spec, attestation_slot) {
         Ok(())
     } else {
         Err(PqAttestationError::Local(

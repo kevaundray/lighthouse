@@ -1004,3 +1004,72 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   164,420 bytes, and child+child took 76.066 seconds and emitted 159,551 bytes. The timed command
   tree peaked at 2,615,112 KiB RSS with zero swaps; this is not a worker-thread-only memory
   measurement.
+
+### 2026-08-18: Owned PQ consensus verification transitions implemented
+
+- `state_processing/pq-verification` is a narrow compile profile layered on `pq-attestation`.
+  It adds no dependency on the synchronous BLS `SignatureSet` or `BlockSignatureVerifier` graph.
+  The shared `pq_profile` predicate freezes Electra-from-genesis, the deposit-disabled state, and
+  the no-Fulu/no-Gloas schedule in one place. A normal-edge graph audit remains the authoritative
+  isolation check: invoking `cargo test -p state_processing --features pq-verification` also pulls
+  that package's unconditional BLS-oriented dev dependencies and feature-unifies incompatible wire
+  profiles, so behavioral tests live in the normal-dependency `pq_devnet` harness.
+- Three private-constructor transitions own the exact object they authenticate:
+  `PreparedPqBlockProposal -> VerifiedPqBlockProposal`,
+  `PreparedPqBlock -> VerifiedPqBlock`, and
+  `PreparedPqAggregateAndProof -> VerifiedPqAggregateAndProof`. Blocks are held in one `Arc` from
+  preparation through sealing. The aggregate token owns its exact signed aggregate plus a sealed
+  `VerifiedPqAttestation`. Prepared values retain no state, cache, committee, or shuffling borrow;
+  compile-fail examples pin private fields and inner-evidence opacity.
+- Preparation validates the profile, fork shape, expected proposer, registry/cache identity,
+  validator and aggregator indices, committee membership, selection eligibility, Electra
+  bitfields, signer union, evidence framing/caps, and `target.epoch == data.slot.epoch()` before
+  submitting backend work. Individual PQ fields are promoted to one-contribution
+  `SameMessageEvidence` only inside a private job helper. The full block prepares proposal, RANDAO,
+  and every included attestation job synchronously, then verifies them sequentially through the
+  reserved `Block` class. Aggregate gossip prepares selection, inner attestation, and outer jobs,
+  then verifies them sequentially through `Gossip`. No verified token is returned on an
+  intermediate success.
+- Claim derivation is domain-specific and centralized: proposal uses the block epoch/domain and
+  proposal-slot `BeaconBlockProposal` leaf; RANDAO signs the proposal epoch with the RANDAO domain
+  but consumes the proposal-slot `RandaoReveal` leaf; inner attestation uses its target epoch for
+  the attester domain and data slot for the attestation leaf; selection and outer
+  aggregate-and-proof both use the aggregate data slot and distinct V1 duty leaves. The outer
+  domain deliberately follows the slot epoch, and mismatched attestation target/slot epochs are
+  rejected structurally. V1 still uses this epoch-bound RANDAO claim. A hash-chain/hash-onion
+  RANDAO remains a future versioned profile requiring a genesis commitment, state/wire transition,
+  rollback and backup policy, and no silent renumbering of the frozen V1 14-leaf layout.
+- Attestation execution now makes admission intent explicit. Contextual verification requires a
+  `VerificationClass`, while the aggregation coordinator calls the separate local `aggregate`
+  method. This prevents one-contribution block/gossip verification from accidentally entering the
+  low-priority proving class and prevents local multi-contribution proving from claiming a reserved
+  verification slot.
+- Fast isolated tests cover owned/`Send` prepared values, base and unselected-aggregator shapes,
+  target/slot mismatch, malformed/truncated and cap-plus-one evidence, structural rejection on a
+  scalar build before unavailable backend use, and stable peer-invalid versus unavailable,
+  resource, panic, and internal local failures. The scalar suite passed 12/12 in 0.17 seconds. The
+  serialized journal-backed AVX2 integration generates one real two-signer recursive proof and
+  verifies valid proposal, RANDAO, raw block attestation, selection proof, recursive inner
+  evidence, and outer signature. It rejects wrong root, proposal leaf, proposer key, aggregator
+  key, and recursive signer bits/set, and proves a mixed block returns the RANDAO component only
+  after its valid proposal. The final focused run passed 1/1 in 300.83 seconds (321.75 seconds
+  command wall including an AVX2 rebuild), peaked at 1,284,288 KiB RSS, and reported zero swaps.
+- Spec-review follow-up split compound preparation into borrow-only whole-object preflight and a
+  later materialization phase. A harness-only, `#[doc(hidden)]` counter seam proves malformed final
+  block and aggregate inputs cause zero evidence work; it counts owned clones, claim tree hashes,
+  and the PQ selection proof's transient SSZ serialization. Aggregator eligibility and hashing are
+  deferred until inner and outer structural preflight succeeds. Ordinary `pq-verification` and
+  `pq-devnet` do not enable the seam. Out-of-current-epoch proposal slots now have a dedicated
+  peer-invalid result, while genuine state/cache failures remain local. The production aggregation
+  error mapper is directly covered for invalid evidence and every local error class. Real AVX2
+  precedence checks are mutation-sensitive: RANDAO-first produced `RandaoReveal` instead of
+  `BlockProposal`, and outer-first produced `AggregateAndProof` instead of both `SelectionProof`
+  and `AggregateAttestation`; restored production order passed all checks.
+- Final quality review made the whole-object preflight sensitivity non-tautological. With the old
+  ordering, a malformed final block attestation observed one proposal-root hash instead of zero,
+  and a structurally valid unselected aggregate observed selection serialization plus an outer-root
+  hash (two units) instead of selection alone (one unit). Both focused tests now pass with the
+  intended counts. `PqConsensusError::source` directly exposes its four nested local cause shapes
+  (direct or attestation-nested signing-ID and aggregation failures); its peer-invalid and plain
+  local terminal variants deliberately return no source. The source test's RED was `None` instead
+  of the expected `SlotOutOfRange` cause.

@@ -4,6 +4,7 @@ use attestation_aggregation::{
 };
 use consensus_signature::{
     AggregationService, OneTimeUseId, PqPublicKey, PqSameMessageEvidence, SigningDuty,
+    VerificationClass,
 };
 use futures::executor::block_on;
 use pq_signing::{PqKeyUnlock, PqKeystore, PqSigningAuthority, provision_usage_journal};
@@ -184,7 +185,8 @@ fn real_two_raw_candidates_commit_one_contextual_aggregate_and_retry_after_failu
             &spec,
         )
         .expect("owned verification request");
-        let verified = block_on(prepared.verify(&service)).expect("valid raw evidence");
+        let verified = block_on(prepared.verify(&service, VerificationClass::Gossip))
+            .expect("valid raw evidence");
         assert!(matches!(
             coordinator.insert_verified(verified),
             InsertOutcome::Inserted { .. }
@@ -250,9 +252,8 @@ fn real_two_raw_candidates_commit_one_contextual_aggregate_and_retry_after_failu
             .map(|_| ()),
         Err(attestation_aggregation::PrepareAggregateError::AlreadyInFlight)
     );
-    let aggregate = match block_on(prepared.execute()) {
-        AggregateOutcome::Aggregated(aggregate) => aggregate,
-        _ => panic!("two raw candidates should aggregate"),
+    let AggregateOutcome::Aggregated(aggregate) = block_on(prepared.execute()) else {
+        panic!("two raw candidates should aggregate");
     };
     assert_eq!(aggregate.signer_indices(), signer_indices);
     assert_eq!(aggregate.attestation().num_set_aggregation_bits(), 2);
@@ -260,9 +261,8 @@ fn real_two_raw_candidates_commit_one_contextual_aggregate_and_retry_after_failu
     let singleton = coordinator
         .prepare_aggregate(&bucket, &state, &key_cache, &spec)
         .expect("installed aggregate is the only candidate");
-    let singleton = match block_on(singleton.execute()) {
-        AggregateOutcome::Singleton(singleton) => singleton,
-        _ => panic!("a singleton must bypass aggregate proving"),
+    let AggregateOutcome::Singleton(singleton) = block_on(singleton.execute()) else {
+        panic!("a singleton must bypass aggregate proving");
     };
     assert!(Arc::ptr_eq(&aggregate, &singleton));
 
@@ -274,7 +274,8 @@ fn real_two_raw_candidates_commit_one_contextual_aggregate_and_retry_after_failu
         &spec,
     )
     .expect("owned child verification request");
-    let verified_child = block_on(child.verify(&service)).expect("contextual child verification");
+    let verified_child = block_on(child.verify(&service, VerificationClass::Gossip))
+        .expect("contextual child verification");
     assert_eq!(
         verified_child.attestation().signature().as_bytes(),
         aggregate.attestation().signature().as_bytes()
@@ -290,7 +291,11 @@ fn real_two_raw_candidates_commit_one_contextual_aggregate_and_retry_after_failu
         OneTimeUseId::for_lean_pq_devnet_v1(0, SigningDuty::BeaconBlockProposal)
             .expect("proposal leaf");
     assert_eq!(
-        block_on(verify_pq_attestation_job(&service, wrong_leaf)),
+        block_on(verify_pq_attestation_job(
+            &service,
+            VerificationClass::Gossip,
+            wrong_leaf,
+        )),
         Err(PqAttestationError::Invalid(
             PqAttestationInvalid::InvalidEvidence
         ))
@@ -310,7 +315,7 @@ fn real_two_raw_candidates_commit_one_contextual_aggregate_and_retry_after_failu
     )
     .expect("structurally valid wrong root");
     assert!(matches!(
-        block_on(wrong_root.verify(&service)),
+        block_on(wrong_root.verify(&service, VerificationClass::Gossip)),
         Err(PqAttestationError::Invalid(
             PqAttestationInvalid::InvalidEvidence
         ))
@@ -333,7 +338,7 @@ fn real_two_raw_candidates_commit_one_contextual_aggregate_and_retry_after_failu
     )
     .expect("structurally valid wrong bits");
     assert!(matches!(
-        block_on(wrong_bits.verify(&service)),
+        block_on(wrong_bits.verify(&service, VerificationClass::Gossip)),
         Err(PqAttestationError::Invalid(
             PqAttestationInvalid::InvalidEvidence
         ))

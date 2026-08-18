@@ -1,6 +1,6 @@
 use consensus_signature::{
     AggregationService, OneTimeUseId, PqPublicKey, PqRawSignature, PqSameMessageEvidence,
-    SigningDuty, V1_MAX_AGGREGATION_CONTRIBUTIONS,
+    SigningDuty, V1_MAX_AGGREGATION_CONTRIBUTIONS, VerificationClass,
 };
 use futures::executor::block_on;
 use pq_signing::{PqKeyUnlock, PqKeystore, PqSigningAuthority, provision_usage_journal};
@@ -8,9 +8,9 @@ use ssz::Encode;
 use ssz_types::{BitList, BitVector};
 use state_processing::{
     DirectGenesisValidator, PqAttestationCacheError, PqAttestationContribution, PqAttestationError,
-    PqAttestationInvalid, PqAttestationLocalError, PqValidatorKeyCache, build_pq_attestation_job,
-    build_pq_single_attestation_job, initialize_beacon_state_from_validators,
-    verify_pq_attestation_job,
+    PqAttestationInvalid, PqAttestationLocalError, PqValidatorKeyCache,
+    aggregate_pq_attestation_job, build_pq_attestation_job, build_pq_single_attestation_job,
+    initialize_beacon_state_from_validators, verify_pq_attestation_job,
 };
 use types::{
     Attestation, AttestationData, AttestationElectra, BeaconState, ChainSpec, Checkpoint, Domain,
@@ -680,7 +680,11 @@ fn invalid_single_evidence_is_classified_as_peer_invalid() {
     let service = AggregationService::new().expect("PQ aggregation service");
 
     assert_eq!(
-        block_on(verify_pq_attestation_job(&service, job)),
+        block_on(verify_pq_attestation_job(
+            &service,
+            VerificationClass::Gossip,
+            job,
+        )),
         Err(state_processing::PqAttestationError::Invalid(
             state_processing::PqAttestationInvalid::InvalidEvidence,
         ))
@@ -812,13 +816,17 @@ fn valid_raw_and_two_signer_evidence_are_verified_against_bits_and_cache_keys() 
     let single_job = build_pq_attestation_job(&state, &cache, &requests[..1], &spec)
         .expect("single raw contribution");
     let single_bytes = single_job.contributions[0].evidence.as_bytes().to_vec();
-    let promoted =
-        block_on(verify_pq_attestation_job(&service, single_job)).expect("valid raw evidence");
+    let promoted = block_on(verify_pq_attestation_job(
+        &service,
+        VerificationClass::Gossip,
+        single_job,
+    ))
+    .expect("valid raw evidence");
     assert_eq!(promoted.as_bytes(), single_bytes);
 
     let aggregate_job =
         build_pq_attestation_job(&state, &cache, &requests, &spec).expect("two contribution job");
-    let aggregate = block_on(verify_pq_attestation_job(&service, aggregate_job))
+    let aggregate = block_on(aggregate_pq_attestation_job(&service, aggregate_job))
         .expect("valid two-signer evidence");
     assert_ne!(
         aggregate.as_bytes(),
@@ -839,8 +847,12 @@ fn valid_raw_and_two_signer_evidence_are_verified_against_bits_and_cache_keys() 
     let child_job = build_pq_attestation_job(&state, &cache, &child_request, &spec)
         .expect("two-signer child evidence job");
     let child_bytes = child_job.contributions[0].evidence.as_bytes().to_vec();
-    let verified_child = block_on(verify_pq_attestation_job(&service, child_job))
-        .expect("two-signer recursive evidence verifies");
+    let verified_child = block_on(verify_pq_attestation_job(
+        &service,
+        VerificationClass::Gossip,
+        child_job,
+    ))
+    .expect("two-signer recursive evidence verifies");
     assert_eq!(verified_child.as_bytes(), child_bytes);
 
     let single_with_recursive_proof = SingleAttestation {
@@ -861,7 +873,11 @@ fn valid_raw_and_two_signer_evidence_are_verified_against_bits_and_cache_keys() 
         build_pq_attestation_job(&state, &cache, &requests[..1], &spec).expect("job");
     wrong_root.claim.signing_root[0] ^= 1;
     assert_eq!(
-        block_on(verify_pq_attestation_job(&service, wrong_root)),
+        block_on(verify_pq_attestation_job(
+            &service,
+            VerificationClass::Gossip,
+            wrong_root,
+        )),
         Err(state_processing::PqAttestationError::Invalid(
             state_processing::PqAttestationInvalid::InvalidEvidence,
         ))
@@ -873,7 +889,11 @@ fn valid_raw_and_two_signer_evidence_are_verified_against_bits_and_cache_keys() 
         OneTimeUseId::for_lean_pq_devnet_v1(0, SigningDuty::BeaconBlockProposal)
             .expect("proposal leaf");
     assert_eq!(
-        block_on(verify_pq_attestation_job(&service, wrong_leaf)),
+        block_on(verify_pq_attestation_job(
+            &service,
+            VerificationClass::Gossip,
+            wrong_leaf,
+        )),
         Err(state_processing::PqAttestationError::Invalid(
             state_processing::PqAttestationInvalid::InvalidEvidence,
         ))
@@ -885,7 +905,11 @@ fn valid_raw_and_two_signer_evidence_are_verified_against_bits_and_cache_keys() 
     wrong_key.expected_signers[0].public_key = wrong_public_key;
     wrong_key.contributions[0].signers[0].public_key = wrong_public_key;
     assert_eq!(
-        block_on(verify_pq_attestation_job(&service, wrong_key)),
+        block_on(verify_pq_attestation_job(
+            &service,
+            VerificationClass::Gossip,
+            wrong_key,
+        )),
         Err(state_processing::PqAttestationError::Invalid(
             state_processing::PqAttestationInvalid::InvalidEvidence,
         ))
@@ -906,7 +930,11 @@ fn valid_raw_and_two_signer_evidence_are_verified_against_bits_and_cache_keys() 
     let wrong_bits_job = build_pq_attestation_job(&state, &cache, &wrong_bits_request, &spec)
         .expect("structurally valid wrong-bits job");
     assert_eq!(
-        block_on(verify_pq_attestation_job(&service, wrong_bits_job)),
+        block_on(verify_pq_attestation_job(
+            &service,
+            VerificationClass::Gossip,
+            wrong_bits_job,
+        )),
         Err(state_processing::PqAttestationError::Invalid(
             state_processing::PqAttestationInvalid::InvalidEvidence,
         ))

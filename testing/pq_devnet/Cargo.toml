@@ -29,6 +29,7 @@ pq-devnet = [
     "dep:validator_dir",
     "dep:zeroize",
 ]
+pq-verification-testing = ["pq-devnet", "state_processing/pq-verification-testing"]
 
 [dependencies]
 attestation_aggregation = { workspace = true, optional = true, features = ["pq-attestation"] }
@@ -43,7 +44,7 @@ serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 ssz_types = { workspace = true, optional = true }
-state_processing = { workspace = true, optional = true, features = ["pq-genesis", "pq-attestation"] }
+state_processing = { workspace = true, optional = true, features = ["pq-genesis", "pq-verification"] }
 types = { workspace = true, optional = true, features = ["pq-devnet"] }
 validator_dir = { workspace = true, optional = true, features = ["pq-devnet"] }
 zeroize = { workspace = true, optional = true }
@@ -70,3 +71,8 @@ required-features = ["pq-devnet"]
 name = "pq_attestation_aggregation"
 path = "tests/pq_attestation_aggregation.rs"
 required-features = ["pq-devnet"]
+
+[[test]]
+name = "pq_consensus_verification"
+path = "tests/pq_consensus_verification.rs"
+required-features = ["pq-verification-testing"]

@@ -1684,6 +1684,37 @@ rollback/backup policy, and must not silently renumber V1 leaves.
 
 **Step 3: Verify and commit**
 
+Implementation evidence: RED first failed on the absent owned proposal API, then on the absent
+full-block/aggregate transitions, unselected-aggregator admission, and target/slot epoch mismatch.
+The final scalar isolated suite passed 12/12. The serialized journal-backed AVX2 test passed 1/1 in
+300.83 seconds with 1,284,288 KiB peak command-tree RSS and zero swaps; it covers the complete valid
+claim set plus wrong root/leaf/key/signer-set and deterministic mixed-request ordering. Direct
+`state_processing` feature tests are not an isolation signal because its unconditional dev
+dependencies feature-unify the BLS graph; use the `pq_devnet` normal-dependency harness and
+`cargo check --lib`/normal-edge graph checks for this profile.
+
+Review follow-up RED/GREEN evidence: an absent dedicated proposal-epoch variant failed to compile,
+then production preparation mapped it peer-invalid; absent evidence-work and error-mapper seams
+failed to compile, then whole-object preflight reported zero evidence work and the real mapper
+covered every backend class. Temporary RANDAO-first and outer-first mutations failed the real AVX2
+precedence assertions with the wrong components; restored proposal/RANDAO/attestation and
+selection/inner/outer order passed. The test-only seams require the separate
+`pq-verification-testing` harness feature and cannot construct jobs or tokens.
+
+Final preflight RED/GREEN: once the counter included `BeaconState::is_aggregator`'s PQ selection
+proof SSZ serialization, the malformed-inner test failed with one evidence touch. Moving
+eligibility/hash after the independent inner and outer structural preflights restored zero without
+adding a borrowed public signature accessor.
+
+Final quality RED/GREEN split proposal structural validation from its complete-block tree hash: the
+malformed-final-attestation case first observed one evidence-work unit and now observes zero. It
+also moved the outer aggregate root behind selection eligibility: a structurally valid unselected
+aggregate first observed two units and now observes exactly one selection-proof serialization.
+`PqConsensusError::source` now exposes direct and attestation-nested `SigningIdError` and
+`AggregationError` causes, while peer-invalid and plain local terminal errors have no source; its
+RED first returned `None` for `SlotOutOfRange`. The all-features library and compile-fail privacy
+audits retain private constructors, fields, and evidence replacement.
+
 Run the isolated AVX2 harness, default BLS state-processing regressions, Rust 1.88, warnings-denied
 Clippy, graph isolation, formatting/sorting/diff, and the mandatory workspace check.
 

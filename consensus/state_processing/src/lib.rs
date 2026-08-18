@@ -40,6 +40,10 @@ pub mod per_epoch_processing;
 pub mod per_slot_processing;
 #[cfg(feature = "pq-attestation")]
 mod pq_attestation;
+#[cfg(feature = "pq-attestation")]
+mod pq_profile;
+#[cfg(feature = "pq-verification")]
+mod pq_verification;
 #[cfg(not(any(feature = "pq-genesis", feature = "pq-attestation")))]
 pub mod state_advance;
 #[cfg(any(feature = "pq-genesis", not(feature = "pq-attestation")))]
@@ -75,8 +79,22 @@ pub use per_slot_processing::{Error as SlotProcessingError, per_slot_processing}
 pub use pq_attestation::{
     PqAttestationCacheError, PqAttestationContribution, PqAttestationError, PqAttestationInvalid,
     PqAttestationLocalError, PqValidatorKeyCache, PreparedPqAttestation, VerifiedPqAttestation,
-    build_pq_attestation_job, build_pq_single_attestation_job, prepare_pq_attestation,
-    prepare_pq_attestation_aggregate, verify_pq_attestation_job,
+    aggregate_pq_attestation_job, build_pq_attestation_job, build_pq_single_attestation_job,
+    prepare_pq_attestation, prepare_pq_attestation_aggregate, verify_pq_attestation_job,
+};
+#[cfg(feature = "pq-verification")]
+pub use pq_verification::{
+    PqConsensusComponent, PqConsensusError, PqConsensusInvalid, PqConsensusLocalError,
+    PreparedPqAggregateAndProof, PreparedPqBlock, PreparedPqBlockProposal,
+    VerifiedPqAggregateAndProof, VerifiedPqBlock, VerifiedPqBlockProposal,
+    prepare_pq_aggregate_and_proof, prepare_pq_block, prepare_pq_block_proposal,
+};
+#[cfg(feature = "pq-verification-testing")]
+#[doc(hidden)]
+pub use pq_verification::{
+    classify_pq_consensus_aggregation_error,
+    prepare_pq_aggregate_and_proof_with_evidence_work_count,
+    prepare_pq_block_with_evidence_work_count,
 };
 #[cfg(not(any(feature = "pq-genesis", feature = "pq-attestation")))]
 pub use types::{EpochCache, EpochCacheError, EpochCacheKey};

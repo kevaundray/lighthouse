@@ -697,7 +697,7 @@ impl<E: EthSpec> PreparedAggregate<E> {
         };
         let service = Arc::clone(&self.inner.service);
         let future = async move {
-            request.verify(&service).await.map(|aggregate| {
+            request.aggregate(&service).await.map(|aggregate| {
                 let signer_indices = aggregate.signer_indices().to_vec();
                 let evidence_bytes = aggregate.attestation().signature().as_bytes().len();
                 (signer_indices, aggregate, evidence_bytes)
