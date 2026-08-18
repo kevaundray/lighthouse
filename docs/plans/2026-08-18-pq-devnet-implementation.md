@@ -1338,6 +1338,98 @@ git add crypto/consensus_signature docs/plans/2026-08-18-pq-devnet-implementatio
 git commit -m "feat: add signature aggregation jobs"
 ```
 
+### Task 5.1a: Build the PQ attestation key/request prerequisite
+
+**Prerequisites:** Tasks 4.2 and 5.1.
+
+**Files:**
+
+- Modify: `consensus/state_processing/Cargo.toml`
+- Modify: `consensus/state_processing/src/lib.rs`
+- Create: `consensus/state_processing/src/pq_attestation.rs`
+- Modify: `testing/pq_devnet/Cargo.toml`
+- Create: `testing/pq_devnet/tests/pq_attestation.rs`
+- Modify: `docs/pq-devnet-findings.md`
+
+**Step 1: Write failing isolated cache/request tests**
+
+Use an isolated normal-dependency PQ harness, not the root `state_processing` dev-dependency graph.
+Cover deterministic cache construction from the validator registry, index/key lookup, duplicate
+key and out-of-range rejection, exact signing-root/leaf derivation, a valid promoted raw single,
+valid one- and two-participant same-message evidence, and wrong root/leaf/key/participant bits.
+
+Reject nonzero Electra `AttestationData.index`, claimed signer slices that differ from a well-formed
+participant bitfield, cross-contribution signer overlap, over-16 contributions, and empty,
+duplicate, unordered, out-of-range, or over-16 signer indices before allocation, evidence clone, or
+backend work. A `SingleAttestation` must contain individual/raw evidence; a one-signer recursive
+proof is not valid in that field. Pin local-versus-peer error classification and prove structural
+failures never submit to the aggregation worker.
+
+**Step 2: Verify RED on the minimal feature surface**
+
+Add a `state_processing/pq-attestation` feature that compiles only the new module and its minimal
+dependencies. Expected: no PQ registry cache or scheme-neutral attestation job builder exists. Do
+not enable the full BLS-only per-block, deposit, sync, or Gloas module graph.
+
+**Step 3: Implement the compile-time PQ cache and request builder**
+
+Keep the default `ValidatorPubkeyCache`, parallel BLS decompression, and persisted `pkc` database
+bytes completely unchanged. For the frozen 16-validator, deposit-disabled V1 profile, add a
+concrete `PqValidatorKeyCache` containing the registry-order `Vec<PqPublicKey>` plus a reverse map.
+Rebuild it from the head-state registry on startup; do not write PQ keys to `pkc`. If persistence is
+ever required, it must use a distinct column/profile marker rather than reinterpret BLS records.
+
+Before cloning evidence or submitting work:
+
+- require the Electra V1 profile and `AttestationData.index == 0`;
+- require at most sixteen contributions before reserving or iterating contribution-owned vectors;
+- checked-convert attacker-controlled indices and validate registry/cache bounds;
+- locally derive committees and validate committee/aggregation bit lengths and membership;
+- require one through sixteen strictly increasing unique validator indices with no overlap across
+  contributions;
+- resolve exact keys and treat duplicate registry keys/cache incompleteness as local state errors;
+- derive `DOMAIN_BEACON_ATTESTER` at `data.target.epoch`; and
+- derive the XMSS ID from `data.slot` and `SigningDuty::Attestation` (never the target epoch,
+  inclusion slot, or aggregate-and-proof slot).
+
+For aggregate inputs, use a borrowed contribution view pairing each Electra attestation with the
+caller's reconstructed signer-index slice. Validate each supplied slice first, then independently
+derive the indices from state committees and participant bits and require exact equality. This
+keeps large evidence borrowed until every structural, bounds, membership, and cache check passes.
+
+Build one owned `AggregationJob`. For verification, a single contribution must be contextually
+verified by `AggregationService` and returned byte-identically without proving. Keep signer lists
+ordered by validator index; the service separately sorts keys for leanMultisig. Release state,
+cache, and shuffling locks before awaiting the worker.
+
+Map malformed bitfields/indices and invalid evidence to peer/consensus invalid. Map an
+`InvalidJob` after local construction, cache invariant failures, queue exhaustion, unavailable or
+poisoned worker, output overflow, and internal backend failure to local errors. Do not mutate
+observed-attester or pool state until verification succeeds.
+
+**Step 4: Verify the isolated PQ and unchanged BLS paths**
+
+```bash
+cargo check -p state_processing --lib --features pq-attestation
+cargo check -p state_processing --lib --features pq-genesis,pq-attestation
+RUSTFLAGS='-C target-feature=+avx2' cargo test -p pq_devnet --features pq-devnet \
+  --test pq_attestation -- --test-threads=1
+cargo check -p types --lib --no-default-features --features pq-devnet
+cargo check
+```
+
+Confirm the `types/pq-devnet` graph remains free of leanMultisig/futures. Preserve default BLS cache
+and attestation tests. Verify Rust 1.88, clippy with warnings denied, formatting, dependency sorting,
+diff checks, and the mandatory full workspace check.
+
+**Step 5: Commit**
+
+```bash
+git add Cargo.lock consensus/state_processing testing/pq_devnet \
+  docs/plans/2026-08-18-pq-devnet-implementation.md docs/pq-devnet-findings.md
+git commit -m "feat: verify PQ attestation evidence"
+```
+
 ### Task 5.2: Replace attestation point mutation with aggregation jobs
 
 **Files:**

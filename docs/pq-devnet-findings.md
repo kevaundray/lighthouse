@@ -859,3 +859,42 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   bytes; child+child took 76.112 s and produced 159,551 bytes. The test completed in 206.10 s; the
   timed command tree peaked at 2,663,836 KiB RSS and reported zero swaps. These are host/debug-build
   measurements, not production latency claims.
+
+### 2026-08-18: PQ attestation cache and owned request prerequisite implemented
+
+- `state_processing/pq-attestation` is a deliberately narrow compile profile. It contains only the
+  PQ attestation cache/request boundary and composes with `pq-genesis`; it does not feature-unify
+  the existing BLS per-block, deposit, sync-committee, epoch-processing, or Gloas graph. The
+  default `ValidatorPubkeyCache`, its parallel BLS decompression, and persisted `pkc` bytes are
+  unchanged.
+- `PqValidatorKeyCache` is rebuilt deterministically from registry order on startup, keeps a
+  registry vector plus reverse map, rechecks the Lean-free KoalaBear canonical encoding, and
+  rejects empty, duplicate, or greater-than-16 registries. It has no serialization or database
+  path; rebuilding it leaves the state SSZ bytes unchanged. The real backend-generated keys used
+  by the integration test pass the same wire canonicality boundary.
+- The pure Electra V1 builders validate the deposit-disabled/future-fork-disabled profile, checked
+  validator indices, exact cache/state keys, committee membership, committee and aggregation bit
+  lengths, `AttestationData.index == 0`, and one through sixteen signer indices before cloning
+  evidence. The aggregate contribution count is capped at sixteen before reserving or iterating
+  internal contribution vectors. Aggregate callers pass borrowed `(attestation, signer_indices)`
+  views: each index list must be non-empty, strictly increasing, unique, in bounds, and exactly
+  equal to the independently committee-derived list. Cross-contribution signer overlap is also
+  rejected by the builder. The output is one fully owned `AggregationJob`, allowing state, cache,
+  and shuffling locks to be released before any asynchronous worker wait.
+- The attester domain is derived at `AttestationData.target.epoch`; the signing root covers the
+  complete attestation data, and the XMSS leaf is derived only from `AttestationData.slot` plus
+  `SigningDuty::Attestation`. No outer aggregate-and-proof slot or duty enters the inner claim.
+  `SingleAttestation` accepts only the promotable raw envelope. Even a valid one-child recursive
+  proof is rejected in that field.
+- Every request, including a single contribution, is contextually verified by
+  `AggregationService`. A valid singleton is returned byte-for-byte without proving. Bad evidence
+  is peer/consensus-invalid; a post-construction `InvalidJob`, cache invariant, queue/resource
+  limit, unavailable or poisoned worker, output overflow, and internal prover failure remain local.
+  This boundary does not mutate observed-attester or pool state.
+- The isolated real-key AVX2 test uses journal-backed authority signatures. It verifies raw
+  pass-through, produces and then verifies a two-signer recursive proof as a single child without
+  reproving, and rejects wrong signing root, XMSS leaf, key, participant bits, and recursive
+  evidence in `SingleAttestation`. The final focused real-key run completed in 135.62 seconds on
+  this host; a malformed-single contextual verification run completed in 23.89 seconds. After
+  adding direct nonzero-data-index, bitfield/claimed-signer mismatch, and cross-contribution overlap
+  regressions, the final serialized isolated suite passed 13/13 in 138.00 seconds.

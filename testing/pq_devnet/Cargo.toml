@@ -15,12 +15,14 @@ pq-devnet = [
     "dep:clap",
     "dep:consensus_signature",
     "dep:ethereum_ssz",
+    "dep:futures",
     "dep:hex",
     "dep:pq_signing",
     "dep:rustix",
     "dep:serde",
     "dep:serde_json",
     "dep:sha2",
+    "dep:ssz_types",
     "dep:state_processing",
     "dep:types",
     "dep:validator_dir",
@@ -29,15 +31,17 @@ pq-devnet = [
 
 [dependencies]
 clap = { workspace = true, features = ["derive"], optional = true }
-consensus_signature = { workspace = true, optional = true, features = ["pq-wire"] }
+consensus_signature = { workspace = true, optional = true, features = ["pq-devnet"] }
 ethereum_ssz = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
 pq_signing = { workspace = true, optional = true, features = ["pq-devnet"] }
 rustix = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
-state_processing = { workspace = true, optional = true, features = ["pq-genesis"] }
+ssz_types = { workspace = true, optional = true }
+state_processing = { workspace = true, optional = true, features = ["pq-genesis", "pq-attestation"] }
 types = { workspace = true, optional = true, features = ["pq-devnet"] }
 validator_dir = { workspace = true, optional = true, features = ["pq-devnet"] }
 zeroize = { workspace = true, optional = true }
@@ -53,4 +57,9 @@ required-features = ["pq-devnet"]
 [[test]]
 name = "provision"
 path = "tests/provision.rs"
+required-features = ["pq-devnet"]
+
+[[test]]
+name = "pq_attestation"
+path = "tests/pq_attestation.rs"
 required-features = ["pq-devnet"]
