@@ -1,14 +1,13 @@
-use eth2_keystore::{
-    MAX_PQ_ONE_TIME_USE_IDS, MAX_PQ_PASSWORD_BYTES, PqKeystore, PqKeystoreBuilder, PqKeystoreError,
-};
 use fs2::FileExt;
-use lean_multisig::SecretKey;
+use pq_signing::{
+    MAX_PQ_KEYSTORE_JSON_BYTES, MAX_PQ_ONE_TIME_USE_IDS, MAX_PQ_PASSWORD_BYTES, PqKeystore,
+    PqKeystoreError,
+};
 use serde_json::{Value, json};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Cursor, Read};
 use std::sync::OnceLock;
 use std::time::Instant;
-use zeroize::Zeroizing;
 
 const PASSWORD: &[u8] = b"correct horse battery staple";
 const PUBLIC_KEY_LEN: usize = 32;
@@ -30,13 +29,7 @@ fn pq_work_lock() -> File {
 fn valid_keystore() -> PqKeystore {
     static KEYSTORE: OnceLock<PqKeystore> = OnceLock::new();
     KEYSTORE
-        .get_or_init(|| {
-            let key = SecretKey::from_seed([42; 32], 100..=115).expect("small key");
-            PqKeystoreBuilder::new(&key, PASSWORD)
-                .expect("builder")
-                .build()
-                .expect("keystore")
-        })
+        .get_or_init(|| PqKeystore::from_seed([42; 32], 100..=115, PASSWORD).expect("keystore"))
         .clone()
 }
 
@@ -234,10 +227,7 @@ fn public_key_json_requires_canonical_lowercase_hex() {
 fn public_json_ingress_is_bounded_before_parsing() {
     let _work_lock = pq_work_lock();
     let mut oversized = valid_keystore().to_json_string().expect("JSON");
-    oversized.extend(std::iter::repeat_n(
-        ' ',
-        eth2_keystore::MAX_PQ_KEYSTORE_JSON_BYTES,
-    ));
+    oversized.extend(std::iter::repeat_n(' ', MAX_PQ_KEYSTORE_JSON_BYTES));
     assert!(matches!(
         PqKeystore::from_json_str(&oversized),
         Err(PqKeystoreError::InputTooLarge)
@@ -309,6 +299,15 @@ fn oversized_password_is_rejected_before_crypto() {
 }
 
 #[test]
+fn authenticated_metadata_rejects_oversized_password_before_crypto() {
+    let _work_lock = pq_work_lock();
+    assert!(matches!(
+        valid_keystore().authenticate(&vec![0; MAX_PQ_PASSWORD_BYTES + 1]),
+        Err(PqKeystoreError::PasswordTooLong)
+    ));
+}
+
+#[test]
 fn password_with_stripped_controls_encrypts_and_decrypts_consistently() {
     let _work_lock = pq_work_lock();
     let keystore = PqKeystore::from_seed(
@@ -327,17 +326,9 @@ fn password_with_stripped_controls_encrypts_and_decrypts_consistently() {
 #[ignore = "manual performance measurement; runs real sequential XMSS keygen and scrypt"]
 fn measure_eight_leaf_key_storage() {
     let _work_lock = pq_work_lock();
-    let keygen_started = Instant::now();
-    let key = SecretKey::from_seed([0x5a; 32], 0..=7).expect("small key");
-    let keygen_elapsed = keygen_started.elapsed();
-    let upstream_bytes = Zeroizing::new(key.to_bytes());
-
-    let encryption_started = Instant::now();
-    let keystore = PqKeystoreBuilder::new(&key, PASSWORD)
-        .expect("builder")
-        .build()
-        .expect("keystore");
-    let encryption_elapsed = encryption_started.elapsed();
+    let storage_started = Instant::now();
+    let keystore = PqKeystore::from_seed([0x5a; 32], 0..=7, PASSWORD).expect("keystore");
+    let storage_elapsed = storage_started.elapsed();
     let json = keystore.to_json_string().expect("JSON");
 
     let load_started = Instant::now();
@@ -345,8 +336,7 @@ fn measure_eight_leaf_key_storage() {
     let load_elapsed = load_started.elapsed();
 
     eprintln!(
-        "8-leaf upstream_bytes={} json_bytes={} keygen={keygen_elapsed:?} encryption={encryption_elapsed:?} load={load_elapsed:?}",
-        upstream_bytes.len(),
+        "8-leaf json_bytes={} storage={storage_elapsed:?} load={load_elapsed:?}",
         json.len(),
     );
 }
@@ -355,17 +345,9 @@ fn measure_eight_leaf_key_storage() {
 #[ignore = "manual real-range measurement; generates 1,120 XMSS leaves and runs real scrypt"]
 fn measure_full_1120_leaf_key_storage() {
     let _work_lock = pq_work_lock();
-    let keygen_started = Instant::now();
-    let key = SecretKey::from_seed([0x6b; 32], 0..=1119).expect("real-range key");
-    let keygen_elapsed = keygen_started.elapsed();
-    let upstream_bytes = Zeroizing::new(key.to_bytes());
-
-    let encryption_started = Instant::now();
-    let keystore = PqKeystoreBuilder::new(&key, PASSWORD)
-        .expect("builder")
-        .build()
-        .expect("keystore");
-    let encryption_elapsed = encryption_started.elapsed();
+    let storage_started = Instant::now();
+    let keystore = PqKeystore::from_seed([0x6b; 32], 0..=1119, PASSWORD).expect("keystore");
+    let storage_elapsed = storage_started.elapsed();
     let json = keystore.to_json_string().expect("JSON");
 
     let load_started = Instant::now();
@@ -373,8 +355,7 @@ fn measure_full_1120_leaf_key_storage() {
     let load_elapsed = load_started.elapsed();
 
     eprintln!(
-        "1,120-leaf upstream_bytes={} json_bytes={} keygen={keygen_elapsed:?} encryption={encryption_elapsed:?} load={load_elapsed:?}",
-        upstream_bytes.len(),
+        "1,120-leaf json_bytes={} storage={storage_elapsed:?} load={load_elapsed:?}",
         json.len(),
     );
 }

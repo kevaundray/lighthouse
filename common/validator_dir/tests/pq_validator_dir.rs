@@ -1,7 +1,7 @@
 #[cfg(unix)]
-use eth2_keystore::PqKeystore;
-#[cfg(unix)]
 use fs2::FileExt;
+#[cfg(unix)]
+use pq_signing::PqKeystore;
 #[cfg(unix)]
 use std::fs::{self, File, OpenOptions};
 #[cfg(unix)]

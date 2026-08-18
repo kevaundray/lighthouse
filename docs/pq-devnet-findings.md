@@ -196,6 +196,15 @@ RANDAO and blocks, attestation data slot, selection slot, aggregate data slot, s
 and contribution slot plus subcommittee. RANDAO therefore needs its containing proposal slot added
 to the local signing request even though its BLS signing root contains only the epoch.
 
+A hash-chain (historically, "hash onion") RANDAO reveal is a relevant alternative for a future PQ
+profile. It could replace the signature-derived RANDAO contribution and therefore remove RANDAO
+from the XMSS duty table, saving one one-time-use leaf and avoiding a large PQ signature in every
+proposed block. It also introduces its own stateful commitment, backup/rollback, migration, and
+distributed-validator constraints. `LeanPqDevnetV1` deliberately keeps the current signature-shaped
+RANDAO rule for the first controlled devnet. Adopting a hash chain must create a new versioned
+profile and genesis/wire transition; it must not change the frozen 14-leaf stride in place, because
+that would remap every later XMSS leaf for existing keys.
+
 The journal provides fail-closed at-most-one-publication semantics per duty instance. An identical
 root may be retried; a different root for the same duty and slot is refused. Supporting multiple
 aggregate attempts would require an explicit protocol attempt identifier and is outside V1.
@@ -597,3 +606,45 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   the journal. The journal uses the validators root, never the state or block root. Staging output is
   published atomically without cleanup; public artifacts are deterministic, while encrypted
   keystore JSON intentionally differs because salts and IVs use fresh entropy.
+
+### 2026-08-18: Task 3.3a signing-authority implementation findings
+
+- Co-locating the encrypted key and SQLite journal was necessary in practice, not only in the
+  design: Rust sibling crates cannot share a sign-capable value without making the bypass public.
+  The new `pq_signing` crate keeps `SecretKey`, decryption, raw reservation, reservation outcomes,
+  and backend-envelope conversion below `authority`; only authenticated public metadata,
+  provision/validate operations returning `()`, authority construction, bound signer lookup, and
+  `PqSigner::sign` cross the public boundary.
+- Startup can reject unsupported profiles, duplicate public keys, missing/locked journals,
+  genesis-root mismatches, and range/binding mismatches before scrypt. Only after one existing
+  journal is locked and all candidate bindings validate are passwords processed and live keys
+  reconstructed sequentially.
+- The lock order uses one per-key operation gate across poison check, journal reservation, and
+  backend completion. The journal mutex is acquired and released under that gate; only afterward
+  is the separate live-key mutex acquired, so SQLite and live-key mutexes never overlap. A caught
+  backend panic returns `BackendPanicked`, permanently poisons that in-memory key, and causes later
+  calls to return `SignerPoisoned` before reservation. The operation gate prevents concurrent calls
+  from passing the poison check while a backend call is in flight. Private injection tests prove
+  panic containment, durable leaf burning, restart recovery, and concurrent no-reservation after
+  poison. Subprocess tests cover rollback before commit, abort after commit/before signing, and
+  abort after a real backend signature/before return.
+- The leanMultisig raw encoding is not exposed through `consensus_signature`. The authority checks
+  the pinned `LMSI` raw header, replaces it with the frozen `LHPQ` V1 raw header, and reparses via
+  `PqRawSignature::from_bytes` before returning. The end-to-end test verifies that result through
+  `consensus_signature::pq::verify_raw`, including byte-identical same-root retry and restart.
+- `eth2_keystore` is lean-free again. Its only new shared surface is the exact zeroizing EIP-2335
+  NFKD/control-removal helper already used by its own encrypt/decrypt paths. `validator_dir` now
+  stores `pq_signing::PqKeystore`; `signing_method` no longer owns SQLite, filesystem locking, or
+  XMSS reservation code.
+- Because `pq_signing/pq-devnet` activates `consensus_signature/pq-devnet`, every dependent crate
+  that also contains `types` must forward `types/pq-devnet`. The migrated `validator_dir` feature
+  now does so, just like `signing_method`; otherwise Cargo feature unification selects PQ signature
+  aliases inside a BLS-profile `types` build.
+- The migrated full-feature `pq_signing` suite currently contains 55 runnable tests plus two
+  ignored manual measurements; an independent run took about 463 seconds on this host because
+  real-key cases intentionally retain fixed-profile scrypt and XMSS work.
+- The `pq_signing` facade is deliberately synchronous and explicitly documents its blocking
+  contract. Key generation, KDF authentication, durable journal operations, authority startup,
+  and signing must not run on Tokio async workers. Task 3.3b must dispatch each complete authority
+  operation through Lighthouse's scoped blocking executor, keeping reservation and backend signing
+  in the same dispatched call.

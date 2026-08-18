@@ -1,0 +1,43 @@
+[package]
+name = "pq_signing"
+version = "0.1.0"
+edition = { workspace = true }
+autotests = false
+
+[features]
+default = []
+pq-devnet = [
+    "consensus_signature/pq-devnet",
+    "dep:fs2",
+    "dep:libc",
+    "dep:lean-multisig",
+    "dep:rusqlite",
+]
+
+[dependencies]
+consensus_signature = { workspace = true }
+eth2_keystore = { workspace = true }
+fs2 = { workspace = true, optional = true }
+hex = { workspace = true }
+lean-multisig = { workspace = true, optional = true }
+libc = { version = "0.2", optional = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+rusqlite = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+fs2 = { workspace = true }
+tempfile = { workspace = true }
+
+[[test]]
+name = "authority"
+path = "tests/authority.rs"
+required-features = ["pq-devnet"]
+
+[[test]]
+name = "keystore"
+path = "tests/keystore.rs"
+required-features = ["pq-devnet"]

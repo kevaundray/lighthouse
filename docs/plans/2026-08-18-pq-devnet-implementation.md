@@ -364,6 +364,8 @@ Implement the versioned Electra V1 table from `docs/pq-devnet-findings.md` with
 `LEAVES_PER_SLOT = 14` and checked `slot * 14 + duty_offset` arithmetic. Keep every assigned duty
 tag explicit; do not hash duty names or cast unchecked enum discriminants into leaf IDs. Add the
 containing proposal slot to RANDAO signing intent even though its signing root is epoch-bound.
+Record hash-chain/hash-onion RANDAO as a future profile option that could eliminate this signature
+duty, but do not alter the frozen V1 allocation or first-devnet consensus rules in this task.
 
 **Step 4: Verify GREEN**
 
@@ -622,10 +624,16 @@ validator set exist.
 
 **Prerequisites:** Tasks 3.1, 3.2, and 4.1.
 
+**Implementation status (2026-08-18):** implemented and under final workspace verification. The
+concrete private layout is `crypto/pq_signing/src/authority/{mod,keystore,journal}.rs`, with
+external keystore/authority coverage in `crypto/pq_signing/tests/`. The old
+`eth2_keystore::pq_keystore` and `signing_method::xmss_journal` modules are removed. The public
+facade has no live-key, raw-reservation, callback, or unreserved-signing escape hatch.
+
 **Files:**
 
 - Create: `crypto/pq_signing/Cargo.toml`
-- Create: private authority modules under `crypto/pq_signing/src/`
+- Create: `crypto/pq_signing/src/authority/{mod,keystore,journal}.rs`
 - Move/adapt: PQ keystore code/tests from `crypto/eth2_keystore/`
 - Move/adapt: XMSS journal code/tests from `validator_client/signing_method/`
 - Modify: `crypto/eth2_keystore/` to expose only reusable encryption/password-normalization
@@ -633,7 +641,8 @@ validator set exist.
 - Modify: `common/validator_dir/` to use `pq_signing::PqKeystore`
 - Modify: `validator_client/signing_method/` to depend on the new facade but not own SQLite/XMSS
   internals
-- Create: authority, provisioning, privacy, and crash integration tests
+- Create: `crypto/pq_signing/tests/{authority,keystore}.rs` plus private authority/journal unit and
+  subprocess crash tests
 - Modify: `docs/pq-devnet-findings.md`
 
 **Step 1: Write failing authority/privacy tests**
@@ -680,15 +689,19 @@ envelope internally and validate it through `PqRawSignature` before return.
 The authority is synchronous and explicitly blocking. Startup acquires the one global journal,
 validates all bindings, then decrypts/reconstructs keys sequentially. Each signing operation:
 
-1. validates the bound key/profile/range;
-2. commits `(key, one_time_use_id, signing_root)` durably and releases the DB mutex;
-3. acquires a per-key signing mutex;
-4. produces the deterministic raw signature.
+1. acquires the per-key operation gate and rejects a previously poisoned signer;
+2. validates the bound key/profile/range;
+3. commits `(key, one_time_use_id, signing_root)` durably and releases the DB mutex;
+4. acquires a separate live-key mutex;
+5. contains any backend unwind, permanently poisoning that in-memory key on panic, or produces the
+   deterministic raw signature.
 
-Never hold the SQLite and key mutexes together. Any error, panic, cancellation, or abort after
-commit burns the leaf; same-root retry remains valid and different-root retry never calls the
-backend. Task 3.3b, not this crate, dispatches the entire blocking operation through Lighthouse's
-scoped executor.
+The operation gate spans the poison check, reservation, and backend operation to prevent an
+in-flight call from racing a poison check. It is not the live-key mutex: never hold the SQLite and
+live-key mutexes together. Any error, contained panic, cancellation, or abort after commit burns
+the leaf; same-root retry remains valid and different-root retry never calls the backend. Task
+3.3b, not this crate, dispatches the entire blocking operation through Lighthouse's scoped
+executor.
 
 Change `validator_dir/pq-devnet` and `signing_method/pq-devnet` to depend on `pq_signing`; remove
 their direct PQ SQLite/lean ownership. Keep `types/pq-devnet` dependent only on

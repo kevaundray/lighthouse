@@ -3,12 +3,15 @@
 //! This format reuses the encryption primitives from EIP-2335, but is not an EIP-2335 keystore:
 //! its plaintext is a versioned XMSS-key envelope rather than an EIP-2333 BLS scalar.
 
-use crate::json_keystore::{
+use consensus_signature::PqPublicKey;
+use eth2_keystore::json_keystore::{
     Aes128Ctr, ChecksumModule, Cipher, CipherModule, Crypto, EmptyMap, EmptyString, Kdf, KdfModule,
     Sha256Checksum,
 };
-use crate::keystore::normalize_password;
-use crate::{Error as CryptoError, IV_SIZE, SALT_SIZE, decrypt, default_kdf, encrypt};
+use eth2_keystore::{
+    DKLEN, Error as CryptoError, HASH_SIZE, IV_SIZE, SALT_SIZE, decrypt, default_kdf, encrypt,
+    normalize_eip2335_password,
+};
 use lean_multisig::SecretKey;
 use rand::{TryRngCore, rngs::OsRng};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -116,8 +119,8 @@ pub fn validate_pq_password(password: &[u8]) -> Result<(), PqKeystoreError> {
     if password.len() > MAX_PQ_PASSWORD_BYTES {
         return Err(PqKeystoreError::PasswordTooLong);
     }
-    let effective =
-        normalize_password(password).map_err(|_| PqKeystoreError::InvalidPasswordEncoding)?;
+    let effective = normalize_eip2335_password(password)
+        .map_err(|_| PqKeystoreError::InvalidPasswordEncoding)?;
     if effective.is_empty() {
         return Err(PqKeystoreError::EmptyEffectivePassword);
     }
@@ -210,7 +213,7 @@ impl OneTimeUseRange {
 /// The type intentionally has no public unbounded `Deserialize` implementation:
 ///
 /// ```compile_fail
-/// use eth2_keystore::PqKeystore;
+/// use pq_signing::PqKeystore;
 /// use serde::Deserialize;
 ///
 /// fn requires_deserialize<T: for<'de> Deserialize<'de>>() {}
@@ -228,6 +231,25 @@ pub struct PqKeystore {
     backend_revision: String,
     public_key: PublicKeyBytes,
     one_time_use_range: OneTimeUseRange,
+}
+
+/// Public key metadata whose encrypted copy and reconstructed key have been authenticated.
+///
+/// Fields are intentionally private so callers cannot manufacture journal bindings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthenticatedPqKeyMetadata {
+    public_key: PqPublicKey,
+    one_time_use_range: RangeInclusive<u32>,
+}
+
+impl AuthenticatedPqKeyMetadata {
+    pub const fn public_key(&self) -> &PqPublicKey {
+        &self.public_key
+    }
+
+    pub fn one_time_use_range(&self) -> RangeInclusive<u32> {
+        self.one_time_use_range.clone()
+    }
 }
 
 #[derive(Deserialize)]
@@ -260,27 +282,14 @@ impl From<PqKeystoreJson> for PqKeystore {
     }
 }
 
-/// Builder that encrypts one already-generated leanMultisig key.
-pub struct PqKeystoreBuilder<'a> {
-    secret_key: &'a SecretKey,
-    password: &'a [u8],
-}
-
-impl<'a> PqKeystoreBuilder<'a> {
-    pub fn new(secret_key: &'a SecretKey, password: &'a [u8]) -> Result<Self, PqKeystoreError> {
-        validate_key_inputs(&secret_key.slots(), password)?;
-        Ok(Self {
-            secret_key,
-            password,
-        })
-    }
-
-    pub fn build(self) -> Result<PqKeystore, PqKeystoreError> {
-        PqKeystore::encrypt_key(self.secret_key, self.password)
-    }
-}
-
 impl PqKeystore {
+    /// Generates a fresh upstream key and encrypts it with the fixed keystore profile.
+    ///
+    /// # Blocking
+    ///
+    /// This performs synchronous PQ key generation and the password KDF. It must not run directly
+    /// on a Tokio async worker. Validator-client code must dispatch the complete call through
+    /// Lighthouse's scoped blocking executor.
     pub fn generate(
         one_time_use_range: RangeInclusive<u32>,
         password: &[u8],
@@ -293,9 +302,16 @@ impl PqKeystore {
             SecretKey::from_seed(*seed, range)
                 .map_err(|error| PqKeystoreError::KeyConstruction(error.to_string()))
         })?;
-        PqKeystoreBuilder::new(&key, password)?.build()
+        Self::encrypt_key(&key, password)
     }
 
+    /// Deterministically generates an upstream key and encrypts it with the fixed keystore profile.
+    ///
+    /// # Blocking
+    ///
+    /// This performs synchronous PQ key generation and the password KDF. It must not run directly
+    /// on a Tokio async worker. Validator-client code must dispatch the complete call through
+    /// Lighthouse's scoped blocking executor.
     pub fn from_seed(
         seed: [u8; 32],
         one_time_use_range: RangeInclusive<u32>,
@@ -305,7 +321,7 @@ impl PqKeystore {
             SecretKey::from_seed(seed, range)
                 .map_err(|error| PqKeystoreError::KeyConstruction(error.to_string()))
         })?;
-        PqKeystoreBuilder::new(&key, password)?.build()
+        Self::encrypt_key(&key, password)
     }
 
     fn encrypt_key(secret_key: &SecretKey, password: &[u8]) -> Result<Self, PqKeystoreError> {
@@ -382,16 +398,47 @@ impl PqKeystore {
         }
     }
 
-    fn decrypt_secret_key(&self, password: &[u8]) -> Result<SecretKey, PqKeystoreError> {
+    pub(in crate::authority) fn decrypt_secret_key(
+        &self,
+        password: &[u8],
+    ) -> Result<SecretKey, PqKeystoreError> {
         self.validate_profile()?;
         let plaintext = decrypt(password, &self.crypto)?;
         validate_plaintext(plaintext.as_bytes(), &self.outer_metadata())
     }
 
     /// Decrypts and fully validates the key without exposing a live sign-capable handle.
+    ///
+    /// # Blocking
+    ///
+    /// This runs the password KDF and reconstructs the upstream PQ key synchronously. It must not
+    /// run directly on a Tokio async worker. Validator-client code must dispatch the complete call
+    /// through Lighthouse's scoped blocking executor.
     pub fn validate_password(&self, password: &[u8]) -> Result<(), PqKeystoreError> {
         validate_pq_password(password)?;
         self.decrypt_secret_key(password).map(drop)
+    }
+
+    /// Authenticates the encrypted key and returns only non-secret validated metadata.
+    ///
+    /// # Blocking
+    ///
+    /// This runs the password KDF and reconstructs the upstream PQ key synchronously. It must not
+    /// run directly on a Tokio async worker. Validator-client code must dispatch the complete call
+    /// through Lighthouse's scoped blocking executor.
+    pub fn authenticate(
+        &self,
+        password: &[u8],
+    ) -> Result<AuthenticatedPqKeyMetadata, PqKeystoreError> {
+        validate_pq_password(password)?;
+        let key = self.decrypt_secret_key(password)?;
+        let metadata = AuthenticatedPqKeyMetadata {
+            public_key: PqPublicKey::deserialize(&key.public_key())
+                .map_err(|_| PqKeystoreError::MalformedSecretKey)?,
+            one_time_use_range: key.slots(),
+        };
+        drop(key);
+        Ok(metadata)
     }
 
     /// Validates all non-secret metadata and bounded crypto parameters without running the KDF.
@@ -425,7 +472,7 @@ impl PqKeystore {
         };
         let Cipher::Aes128Ctr(cipher) = &self.crypto.cipher.params;
         if self.crypto.kdf.function != self.crypto.kdf.params.function()
-            || scrypt.dklen != crate::DKLEN
+            || scrypt.dklen != DKLEN
             || scrypt.n != FIXED_SCRYPT_N
             || scrypt.r != FIXED_SCRYPT_R
             || scrypt.p != FIXED_SCRYPT_P
@@ -433,7 +480,7 @@ impl PqKeystore {
             || self.crypto.cipher.function != self.crypto.cipher.params.function()
             || cipher.iv.len() != IV_SIZE
             || self.crypto.checksum.function != Sha256Checksum::function()
-            || self.crypto.checksum.message.len() != crate::HASH_SIZE
+            || self.crypto.checksum.message.len() != HASH_SIZE
             || self.crypto.cipher.message.len() > MAX_PQ_CIPHERTEXT_BYTES
         {
             return Err(PqKeystoreError::UnsupportedCryptoProfile);
@@ -746,10 +793,10 @@ mod tests {
     }
 
     #[test]
-    fn builder_rejects_oversized_password_without_encryption() {
+    fn encryption_rejects_oversized_password_without_kdf() {
         let key = SecretKey::from_seed([0x10; 32], 0..=7).expect("small key");
         assert!(matches!(
-            PqKeystoreBuilder::new(&key, &vec![0; MAX_PQ_PASSWORD_BYTES + 1]),
+            PqKeystore::encrypt_key(&key, &vec![0; MAX_PQ_PASSWORD_BYTES + 1]),
             Err(PqKeystoreError::PasswordTooLong)
         ));
     }
@@ -813,10 +860,7 @@ mod tests {
             .expect("open PQ test lock");
         work_lock.lock_exclusive().expect("lock PQ test work");
         let original = SecretKey::from_seed([0x31; 32], 400..=407).expect("small key");
-        let keystore = PqKeystoreBuilder::new(&original, b"password")
-            .expect("builder")
-            .build()
-            .expect("keystore");
+        let keystore = PqKeystore::encrypt_key(&original, b"password").expect("keystore");
         let restored = keystore.decrypt_secret_key(b"password").expect("decrypt");
         assert_eq!(restored.public_key(), original.public_key());
         assert_eq!(restored.slots(), original.slots());

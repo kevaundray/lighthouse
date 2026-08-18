@@ -8,9 +8,7 @@ authors = ["Sigma Prime <contact@sigmaprime.io>"]
 default = []
 pq-devnet = [
     "consensus_signature/pq-devnet",
-    "dep:fs2",
-    "dep:libc",
-    "dep:rusqlite",
+    "pq_signing/pq-devnet",
     "types/pq-devnet",
 ]
 
@@ -19,18 +17,13 @@ bls = { workspace = true }
 consensus_signature = { workspace = true }
 eth2_keystore = { workspace = true }
 ethereum_serde_utils = { workspace = true }
-fs2 = { workspace = true, optional = true }
-libc = { version = "0.2", optional = true }
 lockfile = { workspace = true }
 parking_lot = { workspace = true }
+pq_signing = { workspace = true, optional = true }
 reqwest = { workspace = true }
-rusqlite = { workspace = true, optional = true }
 serde = { workspace = true }
 task_executor = { workspace = true }
 tracing = { workspace = true }
 types = { workspace = true }
 url = { workspace = true }
 validator_metrics = { workspace = true }
-
-[dev-dependencies]
-tempfile = { workspace = true }

@@ -1,9 +1,8 @@
 //! Filesystem boundary for experimental PQ validator keystores.
 
 use crate::VOTING_KEYSTORE_FILE;
-use eth2_keystore::{
-    MAX_PQ_PASSWORD_BYTES, PlainText, PqKeystore, PqKeystoreError, validate_pq_password,
-};
+use eth2_keystore::PlainText;
+use pq_signing::{MAX_PQ_PASSWORD_BYTES, PqKeystore, PqKeystoreError, validate_pq_password};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Read};

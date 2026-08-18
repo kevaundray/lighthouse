@@ -252,7 +252,10 @@ slashing protection.
   limits, the verifier facade, and private backend adapters.
 - `consensus/state_processing` owns domain request construction and signer resolution.
 - `beacon_chain` owns the asynchronous aggregation service and pool finalization policy.
-- `validator_client/signing_method` owns local keys and the crash-safe one-time-use journal.
+- `crypto/pq_signing` owns encrypted PQ keys, live XMSS keys, and the crash-safe one-time-use
+  journal behind a non-bypassable synchronous authority. `validator_client/signing_method` owns
+  semantic duty routing and dispatches each complete reserve-and-sign call through Lighthouse's
+  scoped blocking executor.
 - `consensus/types` depends only on active wire types; it must not depend on leanVM or a prover.
 
 PQ verification remains in-process. PQ proving begins in-process on a dedicated bounded executor,

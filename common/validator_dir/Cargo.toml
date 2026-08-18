@@ -6,7 +6,12 @@ edition = { workspace = true }
 
 [features]
 insecure_keys = []
-pq-devnet = ["eth2_keystore/pq-devnet", "dep:rustix", "dep:zeroize"]
+pq-devnet = [
+    "pq_signing/pq-devnet",
+    "types/pq-devnet",
+    "dep:rustix",
+    "dep:zeroize",
+]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
@@ -17,6 +22,7 @@ eth2_keystore = { workspace = true }
 filesystem = { workspace = true }
 hex = { workspace = true }
 lockfile = { workspace = true }
+pq_signing = { workspace = true, optional = true }
 rand = { workspace = true }
 rustix = { workspace = true, optional = true }
 tree_hash = { workspace = true }

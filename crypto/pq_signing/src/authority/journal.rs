@@ -3,7 +3,7 @@
 //! Reservation is deliberately not a public API:
 //!
 //! ```compile_fail
-//! use signing_method::xmss_journal::XmssUsageJournal;
+//! use pq_signing::journal::XmssUsageJournal;
 //! ```
 
 use consensus_signature::OneTimeUseId;
@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
-pub(crate) const XMSS_USAGE_FILENAME: &str = "xmss_usage.sqlite";
+pub const XMSS_USAGE_FILENAME: &str = "xmss_usage.sqlite";
 const APPLICATION_ID: i32 = 0x4c48_5051;
 const SCHEMA_VERSION: i32 = 1;
 const LEAN_PQ_DEVNET_V1_PROFILE_ID: [u8; 32] = *b"lighthouse/lean-pq-devnet/v1\0\0\0\0";
@@ -41,7 +41,7 @@ const RESERVATIONS_SCHEMA: &str = "CREATE TABLE reservations (
             ) WITHOUT ROWID, STRICT";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct XmssKeyBinding {
+pub(in crate::authority) struct XmssKeyBinding {
     stable_key_id: [u8; 32],
     profile_id: [u8; 32],
     allocation_version: u32,
@@ -52,7 +52,8 @@ pub(crate) struct XmssKeyBinding {
 }
 
 impl XmssKeyBinding {
-    pub(crate) fn lean_pq_devnet_v1(
+    #[cfg(test)]
+    pub(in crate::authority) fn lean_pq_devnet_v1(
         public_key: [u8; 32],
         genesis_validators_root: [u8; 32],
         one_time_use_range: std::ops::RangeInclusive<OneTimeUseId>,
@@ -73,10 +74,31 @@ impl XmssKeyBinding {
             last_leaf,
         })
     }
+
+    pub(in crate::authority) fn from_raw_range(
+        public_key: [u8; 32],
+        genesis_validators_root: [u8; 32],
+        one_time_use_range: std::ops::RangeInclusive<u32>,
+    ) -> Result<Self, XmssJournalError> {
+        let first_leaf = *one_time_use_range.start();
+        let last_leaf = *one_time_use_range.end();
+        if first_leaf > last_leaf {
+            return Err(XmssJournalError::InvalidLeafRange);
+        }
+        Ok(Self {
+            stable_key_id: public_key,
+            profile_id: LEAN_PQ_DEVNET_V1_PROFILE_ID,
+            allocation_version: LEAN_PQ_DEVNET_V1_ALLOCATION,
+            genesis_validators_root,
+            public_key,
+            first_leaf,
+            last_leaf,
+        })
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum XmssJournalError {
+pub enum XmssJournalError {
     AlreadyExists(PathBuf),
     MissingJournal(PathBuf),
     MissingLockfile(PathBuf),
@@ -197,25 +219,26 @@ fn filesystem_error(path: &Path, error: std::io::Error) -> XmssJournalError {
 ///
 /// Field order is intentional: Rust drops the SQLite connection before `_lockfile`, so the
 /// persistent process lock remains held until all database locks have been released.
-pub(crate) struct XmssUsageJournal {
+pub(in crate::authority) struct XmssUsageJournal {
     connection: Mutex<Connection>,
     _lockfile: JournalLock,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Reservation {
+pub(in crate::authority) enum Reservation {
     Fresh,
     SameRoot,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ReserveAndThenError<CallbackError> {
+#[cfg(test)]
+pub(in crate::authority) enum ReserveAndThenError<CallbackError> {
     Journal(XmssJournalError),
     Callback(CallbackError),
 }
 
 impl XmssUsageJournal {
-    pub(crate) fn provision<'a>(
+    pub(in crate::authority) fn provision<'a>(
         path: &Path,
         bindings: impl IntoIterator<Item = &'a XmssKeyBinding>,
     ) -> Result<Self, XmssJournalError> {
@@ -234,7 +257,7 @@ impl XmssUsageJournal {
         })
     }
 
-    pub(crate) fn open<'a>(
+    pub(in crate::authority) fn open<'a>(
         path: &Path,
         active_bindings: impl IntoIterator<Item = &'a XmssKeyBinding>,
     ) -> Result<Self, XmssJournalError> {
@@ -255,7 +278,7 @@ impl XmssUsageJournal {
         })
     }
 
-    pub(crate) fn validate_binding(
+    pub(in crate::authority) fn validate_binding(
         &self,
         expected: &XmssKeyBinding,
     ) -> Result<(), XmssJournalError> {
@@ -267,7 +290,7 @@ impl XmssUsageJournal {
     ///
     /// This remains private so sibling modules can only use the combined journal-owning signing
     /// authority operation.
-    fn reserve(
+    pub(in crate::authority) fn reserve(
         &self,
         expected: &XmssKeyBinding,
         one_time_use_id: OneTimeUseId,
@@ -276,7 +299,8 @@ impl XmssUsageJournal {
         self.reserve_with_commit_hook(expected, one_time_use_id, signing_root, || Ok(()))
     }
 
-    pub(crate) fn reserve_and_then<T, CallbackError>(
+    #[cfg(test)]
+    pub(in crate::authority) fn reserve_and_then<T, CallbackError>(
         &self,
         expected: &XmssKeyBinding,
         one_time_use_id: OneTimeUseId,
@@ -290,7 +314,7 @@ impl XmssUsageJournal {
     }
 
     #[cfg(test)]
-    fn reserve_and_then_with_commit_hook<T, CallbackError>(
+    pub(in crate::authority) fn reserve_and_then_with_commit_hook<T, CallbackError>(
         &self,
         expected: &XmssKeyBinding,
         one_time_use_id: OneTimeUseId,
@@ -1533,7 +1557,7 @@ mod tests {
             );
             command
                 .arg("--exact")
-                .arg("xmss_journal::tests::xmss_journal_subprocess_helper")
+                .arg("authority::journal::tests::xmss_journal_subprocess_helper")
                 .arg("--nocapture")
                 .env(SUBPROCESS_DATABASE_ENV, path)
                 .env(SUBPROCESS_MODE_ENV, mode);

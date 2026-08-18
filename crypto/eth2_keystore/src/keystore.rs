@@ -335,7 +335,7 @@ pub fn encrypt(
     cipher: &Cipher,
 ) -> Result<(Vec<u8>, [u8; HASH_SIZE]), Error> {
     validate_parameters(kdf)?;
-    let password = normalize_password(password).map_err(|_| Error::InvalidPasswordBytes)?;
+    let password = normalize_eip2335_password(password).map_err(|_| Error::InvalidPasswordBytes)?;
 
     let derived_key = derive_key(password.as_ref(), kdf)?;
 
@@ -368,7 +368,7 @@ pub fn encrypt(
 /// - The provided password is incorrect.
 /// - The `crypto.kdf` is badly formed (e.g., has some values set to zero).
 pub fn decrypt(password: &[u8], crypto: &Crypto) -> Result<PlainText, Error> {
-    let password = normalize_password(password).map_err(|_| Error::InvalidPasswordBytes)?;
+    let password = normalize_eip2335_password(password).map_err(|_| Error::InvalidPasswordBytes)?;
 
     validate_parameters(&crypto.kdf.params)?;
 
@@ -410,7 +410,7 @@ fn is_control_character(c: char) -> bool {
 /// Takes password bytes, applies NFKD normalization, and removes Unicode control characters.
 ///
 /// Returns an error if the bytes are not valid utf8.
-pub(crate) fn normalize_password(bytes: &[u8]) -> Result<Zeroizing<String>, str::Utf8Error> {
+pub fn normalize_eip2335_password(bytes: &[u8]) -> Result<Zeroizing<String>, str::Utf8Error> {
     let mut password: Zeroizing<String> = str::from_utf8(bytes)?.nfkd().collect::<String>().into();
     password.retain(|c| !is_control_character(c));
     Ok(password)
