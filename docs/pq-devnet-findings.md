@@ -165,6 +165,10 @@ must classify decode/invalid-proof errors separately from local setup/prover fai
    use PQ evidence; they are not silently skipped or signed with BLS.
 9. Use the versioned `LeanPqDevnetV1` one-time-use layout below. Any added duty creates a new
    profile and regenerated validator keys rather than silently changing offsets.
+10. Store permanent XMSS-use tombstones in a separate global
+    `validators_dir/xmss_usage.sqlite`, not in validator key directories or the EIP-3076 slashing
+    database. A key, its XMSS journal, and ordinary slashing state form one non-rollbackable backup
+    unit.
 
 ## LeanPqDevnetV1 Signing-Duty Layout
 
@@ -198,6 +202,40 @@ aggregate attempts would require an explicit protocol attempt identifier and is 
 
 No one-time-use leaf is allocated for an empty sync aggregate or a Gloas self-build placeholder.
 Those require explicit absent/empty evidence rules rather than fake infinity signatures in PQ.
+
+## XMSS Usage Journal
+
+The journal is owned by the local signing authority and uses SQLite rollback-journal mode with
+`synchronous=FULL`, exclusive process locking, one serialized connection, explicit application and
+schema versions, and fail-closed integrity checks. Provisioning alone creates it with restrictive
+permissions; normal validator startup opens an existing journal and refuses missing, corrupt,
+truncated, newer-schema, or mismatched state.
+
+The logical tables bind each stable XMSS key identity to the profile, allocation version, genesis
+validators root, public key, and inclusive leaf range, then store permanent
+`(key_id, one_time_use_id) -> signing_root` reservations. Profile changes do not create a namespace
+escape: one underlying XMSS key can never reuse the same leaf under another profile. Reservations
+are never pruned and survive validator deletion/reimport.
+
+Reservation runs in an exclusive transaction and commits before signing. It returns `Fresh` for a
+new row, `SameRoot` for an identical retry, and `ConflictingRoot` otherwise. A signer failure or
+cancellation after commit leaves the leaf burned. The database transaction and mutex are released
+before entering the upstream secret-key cache or expensive signing code.
+
+This state does not belong in `slashing_protection.sqlite`: EIP-3076 import/export and pruning know
+only block and attestation records, existing slashing operations commit in separate transactions,
+and placing the tables together would not make the two safety checks atomic. For PQ attestations,
+Lighthouse's current sign-before-batch-slashing-check order must be reversed. The safe sequence is
+ordinary slashing-protection commit, XMSS reservation commit, then signature generation. Exact-data
+retries must remain eligible so crashes between these steps can recover deterministically.
+
+An append-only flat file is rejected because torn-record recovery, fsync, interprocess locking, and
+compaction duplicate SQLite functionality. Journal rows must not live in the recoverable validator
+cache or per-validator directory because current key deletion removes those paths.
+
+EIP-3076 interchange alone is not a safe PQ migration or backup. A stopped-validator backup must
+bundle immutable encrypted key material, this journal, and ordinary slashing state. Restoring a
+stale journal after later signatures is unsafe; key rotation is the safe recovery boundary.
 
 ## Open Questions
 
@@ -291,3 +329,14 @@ Those require explicit absent/empty evidence rules rather than fake infinity sig
   The same fork should implement the representation-specific decoding, bounded inputs, leaf-ID
   naming, and worker/setup contract listed above; license provenance must be resolved and tracked
   before binaries are distributed outside the experiment.
+
+### 2026-08-18: XMSS journal architecture
+
+- Chose a separate global SQLite journal with permanent per-key leaf tombstones and strict startup
+  validation.
+- Confirmed journal durability must precede signing and ordinary slashing protection must precede
+  journal reservation.
+- Confirmed current concurrent attestation signing happens before its batch slashing check and must
+  be reordered for PQ.
+- Confirmed validator deletion, EIP-3076 export, and recoverable-cache repair cannot delete,
+  recreate, or substitute for XMSS usage state.

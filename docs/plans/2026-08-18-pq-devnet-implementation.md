@@ -433,9 +433,15 @@ Use a temporary directory and test:
 - identical retry succeeds;
 - different root at the same leaf fails;
 - restart preserves reservations;
-- truncated/corrupt journal fails closed;
+- committed reservation is reopenably durable before the signing callback runs;
+- failure after insert but before commit persists no row and invokes no signer;
+- failure after commit but before/during sign leaves the row burned and permits only same-root
+  retry;
+- truncated/corrupt/missing/wrong-version journal fails closed without recreation;
+- key/profile/genesis/allocation/range mismatch fails startup and reservation;
 - concurrent attempts cannot reserve conflicting roots;
-- reservation is durable before the signing callback returns.
+- a second process cannot acquire the journal lock;
+- validator key-file bytes and permissions are unchanged by journal activity.
 
 **Step 2: Verify RED**
 
@@ -447,8 +453,13 @@ Expected: compilation fails because the journal does not exist.
 
 **Step 3: Implement the minimal durable journal**
 
-Use an atomic, recoverable local persistence strategy and avoid runtime panics. Document lock
-ordering and durability assumptions.
+Create the separate global `validators_dir/xmss_usage.sqlite` design recorded in
+`docs/pq-devnet-findings.md`. Use SQLite rollback-journal mode, `synchronous=FULL`, exclusive
+locking, one serialized connection, fixed application/schema versions, and an OS lockfile. Normal
+startup opens and validates; only provisioning may create. Enforce uniqueness by stable key ID and
+one-time-use ID across profiles, never prune rows, and release the transaction/DB mutex before the
+signing callback. Keep `reserve` crate-private so production callers can only use the combined
+durable signing-authority operation.
 
 **Step 4: Verify GREEN**
 
