@@ -1,3 +1,4 @@
+#[cfg(not(feature = "pq-devnet"))]
 use bls::SecretKey;
 use consensus_signature::IndividualSignature;
 use context_deserialize::context_deserialize;
@@ -5,10 +6,12 @@ use serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
 use tree_hash_derive::TreeHash;
 
+use crate::{core::EthSpec, fork::ForkName, sync_committee::ContributionAndProof};
+#[cfg(not(feature = "pq-devnet"))]
 use crate::{
-    core::{ChainSpec, Domain, EthSpec, Hash256, SignedRoot},
-    fork::{Fork, ForkName},
-    sync_committee::{ContributionAndProof, SyncCommitteeContribution, SyncSelectionProof},
+    core::{ChainSpec, Domain, Hash256, SignedRoot},
+    fork::Fork,
+    sync_committee::{SyncCommitteeContribution, SyncSelectionProof},
 };
 
 /// A Validators signed contribution proof to publish on the `sync_committee_contribution_and_proof`
@@ -33,6 +36,7 @@ impl<E: EthSpec> SignedContributionAndProof<E> {
     /// `aggregate.data.slot` with `secret_key`.
     ///
     /// If `selection_proof.is_none()` it will be computed locally.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn from_aggregate(
         aggregator_index: u64,
         contribution: SyncCommitteeContribution<E>,

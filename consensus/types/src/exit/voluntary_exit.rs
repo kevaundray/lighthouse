@@ -1,12 +1,14 @@
+#[cfg(not(feature = "pq-devnet"))]
 use bls::SecretKey;
 use context_deserialize::context_deserialize;
 use serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
 use tree_hash_derive::TreeHash;
 
+#[cfg(not(feature = "pq-devnet"))]
+use crate::exit::SignedVoluntaryExit;
 use crate::{
     core::{ChainSpec, Domain, Epoch, Hash256, SignedRoot},
-    exit::SignedVoluntaryExit,
     fork::ForkName,
 };
 
@@ -26,6 +28,7 @@ pub struct VoluntaryExit {
 impl SignedRoot for VoluntaryExit {}
 
 impl VoluntaryExit {
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn sign(
         self,
         secret_key: &SecretKey,

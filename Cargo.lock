@@ -2070,8 +2070,15 @@ dependencies = [
 name = "consensus_signature"
 version = "0.1.0"
 dependencies = [
+ "arbitrary",
  "bls",
+ "ethereum_serde_utils",
+ "ethereum_ssz",
+ "hex",
  "lean-multisig",
+ "serde",
+ "serde_json",
+ "tree_hash",
 ]
 
 [[package]]

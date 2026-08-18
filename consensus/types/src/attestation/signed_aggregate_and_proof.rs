@@ -1,3 +1,4 @@
+#[cfg(not(feature = "pq-devnet"))]
 use bls::SecretKey;
 use consensus_signature::IndividualSignature;
 use context_deserialize::context_deserialize;
@@ -9,10 +10,16 @@ use tree_hash_derive::TreeHash;
 use crate::{
     attestation::{
         AggregateAndProof, AggregateAndProofBase, AggregateAndProofElectra, AggregateAndProofRef,
-        Attestation, AttestationRef, SelectionProof,
+        Attestation,
     },
-    core::{ChainSpec, Domain, EthSpec, Hash256, SignedRoot},
-    fork::{Fork, ForkName},
+    core::EthSpec,
+    fork::ForkName,
+};
+#[cfg(not(feature = "pq-devnet"))]
+use crate::{
+    attestation::{AttestationRef, SelectionProof},
+    core::{ChainSpec, Domain, Hash256, SignedRoot},
+    fork::Fork,
 };
 
 /// A Validators signed aggregate proof to publish on the `beacon_aggregate_and_proof`
@@ -66,6 +73,7 @@ impl<E: EthSpec> SignedAggregateAndProof<E> {
     /// `aggregate.data.slot` with `secret_key`.
     ///
     /// If `selection_proof.is_none()` it will be computed locally.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn from_aggregate(
         aggregator_index: u64,
         aggregate: AttestationRef<'_, E>,

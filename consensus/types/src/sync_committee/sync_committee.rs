@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use bls::PublicKeyBytes;
+use consensus_signature::ValidatorPublicKeyBytes;
 use context_deserialize::context_deserialize;
 use safe_arith::{ArithError, SafeArith};
 use serde::{Deserialize, Serialize};
@@ -35,16 +35,16 @@ impl From<ArithError> for Error {
 #[serde(bound = "E: EthSpec")]
 #[context_deserialize(ForkName)]
 pub struct SyncCommittee<E: EthSpec> {
-    pub pubkeys: FixedVector<PublicKeyBytes, E::SyncCommitteeSize>,
-    pub aggregate_pubkey: PublicKeyBytes,
+    pub pubkeys: FixedVector<ValidatorPublicKeyBytes, E::SyncCommitteeSize>,
+    pub aggregate_pubkey: ValidatorPublicKeyBytes,
 }
 
 impl<E: EthSpec> SyncCommittee<E> {
     /// Create a temporary sync committee that should *never* be included in a legitimate consensus object.
     pub fn temporary() -> Self {
         Self {
-            pubkeys: FixedVector::from_elem(PublicKeyBytes::empty()),
-            aggregate_pubkey: PublicKeyBytes::empty(),
+            pubkeys: FixedVector::from_elem(ValidatorPublicKeyBytes::empty()),
+            aggregate_pubkey: ValidatorPublicKeyBytes::empty(),
         }
     }
 
@@ -52,7 +52,7 @@ impl<E: EthSpec> SyncCommittee<E> {
     pub fn get_subcommittee_pubkeys(
         &self,
         subcommittee_index: usize,
-    ) -> Result<Vec<PublicKeyBytes>, Error> {
+    ) -> Result<Vec<ValidatorPublicKeyBytes>, Error> {
         let start_subcommittee_index = subcommittee_index.safe_mul(E::sync_subcommittee_size())?;
         let end_subcommittee_index =
             start_subcommittee_index.safe_add(E::sync_subcommittee_size())?;
@@ -71,7 +71,7 @@ impl<E: EthSpec> SyncCommittee<E> {
     /// with within the subcommittee.
     pub fn subcommittee_positions_for_public_key(
         &self,
-        pubkey: &PublicKeyBytes,
+        pubkey: &ValidatorPublicKeyBytes,
     ) -> Result<HashMap<SyncSubnetId, Vec<usize>>, Error> {
         let mut subnet_positions = HashMap::new();
         for (committee_index, validator_pubkey) in self.pubkeys.iter().enumerate() {
@@ -89,7 +89,7 @@ impl<E: EthSpec> SyncCommittee<E> {
     }
 
     /// Returns `true` if the pubkey exists in the `SyncCommittee`.
-    pub fn contains(&self, pubkey: &PublicKeyBytes) -> bool {
+    pub fn contains(&self, pubkey: &ValidatorPublicKeyBytes) -> bool {
         self.pubkeys.contains(pubkey)
     }
 }

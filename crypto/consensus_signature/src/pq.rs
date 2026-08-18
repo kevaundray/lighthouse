@@ -12,9 +12,10 @@
 //! ```
 
 mod backend;
-mod wire;
-
-pub use wire::{PQ_RAW_SIGNATURE_LEN, PqRawSignature, PqWireError};
+pub use crate::{
+    PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN, PQ_PUBLIC_KEY_LEN, PQ_RAW_SIGNATURE_LEN, PqPublicKey,
+    PqRawSignature, PqSameMessageEvidence, PqWireError,
+};
 
 use crate::OneTimeUseId;
 use backend::BackendSignature;
@@ -50,16 +51,6 @@ impl PqSigningClaim {
     }
 }
 
-/// A canonically encoded public key for the pinned V1 PQ parameter set.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PqPublicKey([u8; 32]);
-
-impl PqPublicKey {
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
-
 /// A low-level live-key handle that does not reserve one-time-use identifiers.
 ///
 /// This primitive exists for provisioning, tests, and the journal-owning signing authority that
@@ -89,7 +80,7 @@ impl PqUnreservedSigningKey {
     }
 
     pub(crate) fn public_key(&self) -> PqPublicKey {
-        PqPublicKey(backend::public_key(&self.backend))
+        PqPublicKey::from_backend_bytes(backend::public_key(&self.backend))
     }
 
     pub(crate) fn sign(&self, claim: &PqSigningClaim) -> Result<PqRawSignature, PqSignError> {
@@ -228,8 +219,12 @@ pub fn verify_raw(
     public_key: &PqPublicKey,
     claim: &PqSigningClaim,
 ) -> Result<(), PqVerifyError> {
-    backend::verify_raw(signature.backend_payload(), public_key.0, claim)
-        .map_err(PqVerifyError::from_backend)
+    backend::verify_raw(
+        signature.backend_payload(),
+        public_key.backend_bytes(),
+        claim,
+    )
+    .map_err(PqVerifyError::from_backend)
 }
 
 /// One strict raw signature paired with the public key needed to reconstruct backend context.
@@ -249,8 +244,12 @@ impl PqRawContribution {
 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     fn decode(&self, claim: &PqSigningClaim) -> Result<BackendSignature, AggregateError> {
-        backend::decode_aggregate_input(self.signature.backend_payload(), self.public_key.0, claim)
-            .map_err(AggregateError::from_backend_failure)
+        backend::decode_aggregate_input(
+            self.signature.backend_payload(),
+            self.public_key.backend_bytes(),
+            claim,
+        )
+        .map_err(AggregateError::from_backend_failure)
     }
 }
 
@@ -268,7 +267,10 @@ pub fn verify_aggregate(
     claim: &PqSigningClaim,
 ) -> Result<(), PqVerifyError> {
     validate_aggregate_signer_count(public_keys.len())?;
-    let public_keys = public_keys.iter().map(|key| key.0).collect::<Vec<_>>();
+    let public_keys = public_keys
+        .iter()
+        .map(PqPublicKey::backend_bytes)
+        .collect::<Vec<_>>();
     backend::verify_signature(&signature.0, &public_keys, claim)
         .map_err(PqVerifyError::from_backend)
 }

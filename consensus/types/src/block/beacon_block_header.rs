@@ -1,3 +1,4 @@
+#[cfg(not(feature = "pq-devnet"))]
 use bls::SecretKey;
 use context_deserialize::context_deserialize;
 use serde::{Deserialize, Serialize};
@@ -5,10 +6,15 @@ use ssz_derive::{Decode, Encode};
 use tree_hash::TreeHash;
 use tree_hash_derive::TreeHash;
 
+#[cfg(not(feature = "pq-devnet"))]
 use crate::{
     block::SignedBeaconBlockHeader,
-    core::{ChainSpec, Domain, EthSpec, Hash256, SignedRoot, Slot},
-    fork::{Fork, ForkName},
+    core::{ChainSpec, Domain, EthSpec},
+    fork::Fork,
+};
+use crate::{
+    core::{Hash256, SignedRoot, Slot},
+    fork::ForkName,
 };
 
 /// A header of a `BeaconBlock`.
@@ -37,6 +43,7 @@ impl BeaconBlockHeader {
     }
 
     /// Signs `self`, producing a `SignedBeaconBlockHeader`.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn sign<E: EthSpec>(
         self,
         secret_key: &SecretKey,

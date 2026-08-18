@@ -1,7 +1,7 @@
 //! Exact-pin bridge to leanMultisig's private envelope conventions.
 
 use super::PqSigningClaim;
-use super::wire::RAW_PAYLOAD_LEN;
+use crate::pq_wire::RAW_PAYLOAD_LEN;
 #[cfg(test)]
 use std::ops::RangeInclusive;
 

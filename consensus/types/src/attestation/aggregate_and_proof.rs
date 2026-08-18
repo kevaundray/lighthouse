@@ -1,3 +1,4 @@
+#[cfg(not(feature = "pq-devnet"))]
 use bls::{PublicKey, SecretKey};
 use consensus_signature::IndividualSignature;
 use context_deserialize::context_deserialize;
@@ -10,8 +11,13 @@ use crate::{
     attestation::{
         Attestation, AttestationBase, AttestationElectra, AttestationRef, SelectionProof,
     },
-    core::{ChainSpec, Domain, EthSpec, Hash256, SignedRoot},
-    fork::{Fork, ForkName},
+    core::{EthSpec, SignedRoot},
+    fork::ForkName,
+};
+#[cfg(not(feature = "pq-devnet"))]
+use crate::{
+    core::{ChainSpec, Domain, Hash256},
+    fork::Fork,
 };
 
 #[superstruct(
@@ -87,6 +93,7 @@ impl<E: EthSpec> AggregateAndProof<E> {
     /// `aggregate.data.slot` with `secret_key`.
     ///
     /// If `selection_proof.is_none()` it will be computed locally.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn from_aggregate(
         aggregator_index: u64,
         aggregate: AttestationRef<'_, E>,
@@ -134,6 +141,7 @@ impl<E: EthSpec> AggregateAndProof<E> {
     }
 
     /// Returns `true` if `validator_pubkey` signed over `self.aggregate.data.slot`.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn is_valid_selection_proof(
         &self,
         validator_pubkey: &PublicKey,

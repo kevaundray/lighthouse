@@ -1,0 +1,20 @@
+[package]
+name = "types-pq-schema"
+version = "0.0.0"
+edition = "2024"
+publish = false
+rust-version = "1.88"
+
+[workspace]
+
+[features]
+default = ["pq-devnet"]
+pq-devnet = []
+
+[dependencies]
+bls = { path = "../../../../crypto/bls" }
+consensus_signature = { path = "../../../../crypto/consensus_signature", features = ["pq-wire"] }
+ethereum_ssz = "0.10.0"
+hex = "0.4.3"
+tree_hash = "0.12.0"
+types = { path = "../..", features = ["pq-devnet"] }

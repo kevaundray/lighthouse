@@ -3,8 +3,11 @@ use std::{
     hash::{Hash, Hasher},
 };
 
+#[cfg(not(feature = "pq-devnet"))]
 use bls::SecretKey;
-use consensus_signature::{IndividualSignature, SameMessageEvidence};
+#[cfg(not(feature = "pq-devnet"))]
+use consensus_signature::IndividualSignature;
+use consensus_signature::SameMessageEvidence;
 use context_deserialize::{ContextDeserialize, context_deserialize};
 use educe::Educe;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -18,8 +21,13 @@ use crate::{
         AttestationData, Checkpoint, IndexedAttestation, IndexedAttestationBase,
         IndexedAttestationElectra,
     },
-    core::{ChainSpec, Domain, EthSpec, Hash256, SignedRoot, Slot, SlotData},
-    fork::{Fork, ForkName},
+    core::{ChainSpec, EthSpec, Hash256, Slot, SlotData},
+    fork::ForkName,
+};
+#[cfg(not(feature = "pq-devnet"))]
+use crate::{
+    core::{Domain, SignedRoot},
+    fork::Fork,
 };
 
 #[derive(Debug, PartialEq, Clone)]
@@ -134,7 +142,16 @@ impl<E: EthSpec> Attestation<E> {
                     target,
                 },
                 committee_bits,
-                signature: SameMessageEvidence::infinity(),
+                signature: {
+                    #[cfg(not(feature = "pq-devnet"))]
+                    {
+                        SameMessageEvidence::infinity()
+                    }
+                    #[cfg(feature = "pq-devnet")]
+                    {
+                        SameMessageEvidence::empty()
+                    }
+                },
             }))
         } else {
             Ok(Attestation::Base(AttestationBase {
@@ -147,7 +164,16 @@ impl<E: EthSpec> Attestation<E> {
                     source,
                     target,
                 },
-                signature: SameMessageEvidence::infinity(),
+                signature: {
+                    #[cfg(not(feature = "pq-devnet"))]
+                    {
+                        SameMessageEvidence::infinity()
+                    }
+                    #[cfg(feature = "pq-devnet")]
+                    {
+                        SameMessageEvidence::empty()
+                    }
+                },
             }))
         }
     }
@@ -155,6 +181,7 @@ impl<E: EthSpec> Attestation<E> {
     /// Aggregate another Attestation into this one.
     ///
     /// The aggregation bitfields must be disjoint, and the data must be the same.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn aggregate(&mut self, other: AttestationRef<E>) {
         match self {
             Attestation::Base(att) => match other {
@@ -179,6 +206,7 @@ impl<E: EthSpec> Attestation<E> {
     /// Signs `self`, setting the `committee_position`'th bit of `aggregation_bits` to `true`.
     ///
     /// Returns an `AlreadySigned` error if the `committee_position`'th bit is already `true`.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn sign(
         &mut self,
         secret_key: &SecretKey,
@@ -206,6 +234,7 @@ impl<E: EthSpec> Attestation<E> {
     }
 
     /// Returns an `AlreadySigned` error if the `committee_position`'th bit is already `true`.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn add_signature(
         &mut self,
         signature: &IndividualSignature,
@@ -347,6 +376,7 @@ impl<E: EthSpec> AttestationElectra<E> {
     /// Aggregate another Attestation into this one.
     ///
     /// The aggregation bitfields must be disjoint, and the data must be the same.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn aggregate(&mut self, other: &Self) {
         debug_assert_eq!(self.data, other.data);
         self.aggregation_bits = self.aggregation_bits.union(&other.aggregation_bits);
@@ -356,6 +386,7 @@ impl<E: EthSpec> AttestationElectra<E> {
     /// Signs `self`, setting the `committee_position`'th bit of `aggregation_bits` to `true`.
     ///
     /// Returns an `AlreadySigned` error if the `committee_position`'th bit is already `true`.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn sign(
         &mut self,
         secret_key: &SecretKey,
@@ -378,6 +409,7 @@ impl<E: EthSpec> AttestationElectra<E> {
     /// Adds `signature` to `self` and sets the `committee_position`'th bit of `aggregation_bits` to `true`.
     ///
     /// Returns an `AlreadySigned` error if the `committee_position`'th bit is already `true`.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn add_signature(
         &mut self,
         signature: &IndividualSignature,
@@ -421,6 +453,7 @@ impl<E: EthSpec> AttestationBase<E> {
     /// Aggregate another Attestation into this one.
     ///
     /// The aggregation bitfields must be disjoint, and the data must be the same.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn aggregate(&mut self, other: &Self) {
         debug_assert_eq!(self.data, other.data);
         self.aggregation_bits = self.aggregation_bits.union(&other.aggregation_bits);
@@ -430,6 +463,7 @@ impl<E: EthSpec> AttestationBase<E> {
     /// Signs `self`, setting the `committee_position`'th bit of `aggregation_bits` to `true`.
     ///
     /// Returns an `AlreadySigned` error if the `committee_position`'th bit is already `true`.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn sign(
         &mut self,
         secret_key: &SecretKey,
@@ -452,6 +486,7 @@ impl<E: EthSpec> AttestationBase<E> {
     /// Adds `signature` to `self` and sets the `committee_position`'th bit of `aggregation_bits` to `true`.
     ///
     /// Returns an `AlreadySigned` error if the `committee_position`'th bit is already `true`.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn add_signature(
         &mut self,
         signature: &IndividualSignature,

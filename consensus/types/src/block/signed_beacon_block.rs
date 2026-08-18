@@ -1,5 +1,6 @@
 use std::fmt;
 
+#[cfg(not(feature = "pq-devnet"))]
 use bls::PublicKey;
 use consensus_signature::IndividualSignature;
 use context_deserialize::ContextDeserialize;
@@ -22,7 +23,7 @@ use crate::{
         BeaconBlockDeneb, BeaconBlockElectra, BeaconBlockFulu, BeaconBlockGloas, BeaconBlockHeader,
         BeaconBlockRef, BeaconBlockRefMut, SignedBeaconBlockHeader,
     },
-    core::{ChainSpec, Domain, Epoch, EthSpec, Hash256, SignedRoot, SigningData, Slot},
+    core::{ChainSpec, Epoch, EthSpec, Hash256, Slot},
     execution::{
         AbstractExecPayload, BlindedPayload, BlindedPayloadBellatrix, BlindedPayloadCapella,
         BlindedPayloadDeneb, BlindedPayloadElectra, BlindedPayloadFulu, ExecutionPayload,
@@ -30,9 +31,14 @@ use crate::{
         ExecutionPayloadElectra, ExecutionPayloadFulu, FullPayload, FullPayloadBellatrix,
         FullPayloadCapella, FullPayloadDeneb, FullPayloadElectra, FullPayloadFulu,
     },
-    fork::{Fork, ForkName, ForkVersionDecode, InconsistentFork, map_fork_name},
+    fork::{ForkName, ForkVersionDecode, InconsistentFork, map_fork_name},
     kzg_ext::format_kzg_commitments,
     state::BeaconStateError,
+};
+#[cfg(not(feature = "pq-devnet"))]
+use crate::{
+    core::{Domain, SignedRoot, SigningData},
+    fork::Fork,
 };
 
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
@@ -241,6 +247,7 @@ impl<E: EthSpec, Payload: AbstractExecPayload<E>> SignedBeaconBlock<E, Payload> 
     ///
     /// If the root of `block.message` is already known it can be passed in via `object_root_opt`.
     /// Otherwise, it will be computed locally.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn verify_signature(
         &self,
         object_root_opt: Option<Hash256>,

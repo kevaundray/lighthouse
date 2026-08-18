@@ -1,16 +1,18 @@
 use consensus_signature::SameMessageEvidence;
 use context_deserialize::context_deserialize;
 use educe::Educe;
-use safe_arith::{ArithError, SafeArith};
+use safe_arith::ArithError;
+#[cfg(not(feature = "pq-devnet"))]
+use safe_arith::SafeArith;
 use serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
 use ssz_types::BitVector;
 use tree_hash_derive::TreeHash;
 
+use crate::{core::EthSpec, fork::ForkName};
+#[cfg(not(feature = "pq-devnet"))]
 use crate::{
-    core::{EthSpec, consts::altair::SYNC_COMMITTEE_SUBNET_COUNT},
-    fork::ForkName,
-    sync_committee::SyncCommitteeContribution,
+    core::consts::altair::SYNC_COMMITTEE_SUBNET_COUNT, sync_committee::SyncCommitteeContribution,
 };
 
 #[derive(Debug, PartialEq)]
@@ -42,6 +44,7 @@ pub struct SyncAggregate<E: EthSpec> {
 impl<E: EthSpec> SyncAggregate<E> {
     /// New aggregate to be used as the seed for aggregating other signatures.
     #[allow(clippy::new_without_default)]
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn new() -> Self {
         Self {
             sync_committee_bits: BitVector::default(),
@@ -52,6 +55,7 @@ impl<E: EthSpec> SyncAggregate<E> {
     /// Create a `SyncAggregate` from a slice of `SyncCommitteeContribution`s.
     ///
     /// Equivalent to `process_sync_committee_contributions` from the spec.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn from_contributions(
         contributions: &[SyncCommitteeContribution<E>],
     ) -> Result<SyncAggregate<E>, Error> {

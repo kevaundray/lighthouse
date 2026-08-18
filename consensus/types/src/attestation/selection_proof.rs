@@ -1,5 +1,6 @@
 use std::cmp;
 
+#[cfg(not(feature = "pq-devnet"))]
 use bls::{PublicKey, SecretKey};
 use consensus_signature::IndividualSignature;
 use ethereum_hashing::hash;
@@ -7,8 +8,10 @@ use safe_arith::{ArithError, SafeArith};
 use serde::{Deserialize, Serialize};
 use ssz::Encode;
 
+use crate::core::ChainSpec;
+#[cfg(not(feature = "pq-devnet"))]
 use crate::{
-    core::{ChainSpec, Domain, EthSpec, Hash256, SignedRoot, Slot},
+    core::{Domain, EthSpec, Hash256, SignedRoot, Slot},
     fork::Fork,
 };
 
@@ -18,6 +21,7 @@ use crate::{
 pub struct SelectionProof(IndividualSignature);
 
 impl SelectionProof {
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn new<E: EthSpec>(
         slot: Slot,
         secret_key: &SecretKey,
@@ -65,6 +69,7 @@ impl SelectionProof {
         signature_hash_int.safe_rem(modulo).map(|rem| rem == 0)
     }
 
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn verify<E: EthSpec>(
         &self,
         slot: Slot,

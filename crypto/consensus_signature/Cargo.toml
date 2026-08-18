@@ -5,8 +5,19 @@ edition = { workspace = true }
 
 [features]
 default = []
-pq-devnet = ["dep:lean-multisig"]
+arbitrary = ["dep:arbitrary"]
+pq-wire = []
+pq-devnet = ["pq-wire", "dep:lean-multisig"]
 
 [dependencies]
+arbitrary = { workspace = true, features = ["derive"], optional = true }
 bls = { workspace = true }
+ethereum_serde_utils = { workspace = true }
+ethereum_ssz = { workspace = true }
+hex = { workspace = true }
 lean-multisig = { workspace = true, optional = true }
+serde = { workspace = true }
+tree_hash = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -67,7 +67,7 @@ fn raw_signature_rejects_unknown_evidence_kind() {
 }
 
 #[test]
-fn individual_field_rejects_aggregate_and_absent_evidence() {
+fn individual_field_rejects_aggregate_kind_and_absent_length() {
     let mut aggregate = raw_bytes();
     aggregate[6] = 1;
     let absent = b"LHPQ\x01\x01\x02";
@@ -78,7 +78,10 @@ fn individual_field_rejects_aggregate_and_absent_evidence() {
     );
     assert_eq!(
         PqRawSignature::from_bytes(absent),
-        Err(PqWireError::WrongEvidenceKind(2))
+        Err(PqWireError::InvalidLength {
+            actual: 7,
+            expected: PQ_RAW_SIGNATURE_LEN,
+        })
     );
 }
 

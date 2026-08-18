@@ -1,4 +1,4 @@
-use bls::PublicKeyBytes;
+use consensus_signature::ValidatorPublicKeyBytes;
 use context_deserialize::context_deserialize;
 use fixed_bytes::FixedBytesExtended;
 use serde::{Deserialize, Serialize};
@@ -19,7 +19,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, TreeHash)]
 #[context_deserialize(ForkName)]
 pub struct Validator {
-    pub pubkey: PublicKeyBytes,
+    pub pubkey: ValidatorPublicKeyBytes,
     pub withdrawal_credentials: Hash256,
     #[serde(with = "serde_utils::quoted_u64")]
     pub effective_balance: u64,
@@ -33,7 +33,7 @@ pub struct Validator {
 impl Validator {
     #[allow(clippy::arithmetic_side_effects)]
     pub fn from_deposit(
-        pubkey: PublicKeyBytes,
+        pubkey: ValidatorPublicKeyBytes,
         withdrawal_credentials: Hash256,
         amount: u64,
         fork_name: ForkName,
@@ -292,7 +292,7 @@ impl Default for Validator {
     /// Yields a "default" `Validator`. Primarily used for testing.
     fn default() -> Self {
         Self {
-            pubkey: PublicKeyBytes::empty(),
+            pubkey: ValidatorPublicKeyBytes::empty(),
             withdrawal_credentials: Hash256::zero(),
             activation_eligibility_epoch: Epoch::from(u64::MAX),
             activation_epoch: Epoch::from(u64::MAX),

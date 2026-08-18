@@ -1,3 +1,4 @@
+#[cfg(not(feature = "pq-devnet"))]
 use bls::PublicKey;
 use consensus_signature::IndividualSignature;
 use context_deserialize::context_deserialize;
@@ -5,10 +6,11 @@ use serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
 use tree_hash_derive::TreeHash;
 
+use crate::{block::BeaconBlockHeader, fork::ForkName};
+#[cfg(not(feature = "pq-devnet"))]
 use crate::{
-    block::BeaconBlockHeader,
     core::{ChainSpec, Domain, EthSpec, Hash256, SignedRoot},
-    fork::{Fork, ForkName},
+    fork::Fork,
 };
 
 /// A signed header of a `BeaconBlock`.
@@ -24,6 +26,7 @@ pub struct SignedBeaconBlockHeader {
 
 impl SignedBeaconBlockHeader {
     /// Verify that this block header was signed by `pubkey`.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn verify_signature<E: EthSpec>(
         &self,
         pubkey: &PublicKey,

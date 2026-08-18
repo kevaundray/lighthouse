@@ -1,3 +1,5 @@
+#![cfg(not(feature = "pq-wire"))]
+
 use bls::SecretKey;
 use consensus_signature::{
     AggregateSignature, AggregateVerificationRequest, Hash256, RawVerificationRequest,

@@ -1,4 +1,4 @@
-use bls::PublicKeyBytes;
+use consensus_signature::ValidatorPublicKeyBytes;
 use context_deserialize::context_deserialize;
 use serde::{Deserialize, Serialize};
 use ssz::Encode;
@@ -13,7 +13,7 @@ use crate::{core::Address, fork::ForkName};
 pub struct WithdrawalRequest {
     #[serde(with = "serde_utils::address_hex")]
     pub source_address: Address,
-    pub validator_pubkey: PublicKeyBytes,
+    pub validator_pubkey: ValidatorPublicKeyBytes,
     #[serde(with = "serde_utils::quoted_u64")]
     pub amount: u64,
 }
@@ -22,7 +22,7 @@ impl WithdrawalRequest {
     pub fn max_size() -> usize {
         Self {
             source_address: Address::repeat_byte(0),
-            validator_pubkey: PublicKeyBytes::empty(),
+            validator_pubkey: ValidatorPublicKeyBytes::empty(),
             amount: 0,
         }
         .as_ssz_bytes()

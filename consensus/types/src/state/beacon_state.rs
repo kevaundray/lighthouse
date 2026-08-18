@@ -1,8 +1,10 @@
 use std::{fmt, hash::Hash, mem, sync::Arc};
 
-use bls::{AggregatePublicKey, PublicKeyBytes, Signature};
+#[cfg(not(feature = "pq-devnet"))]
+use bls::AggregatePublicKey;
+use bls::{PublicKeyBytes as BlsPublicKeyBytes, Signature};
 use compare_fields::CompareFields;
-use consensus_signature::IndividualSignature;
+use consensus_signature::{IndividualSignature, ValidatorPublicKeyBytes};
 use context_deserialize::ContextDeserialize;
 use educe::Educe;
 use ethereum_hashing::hash;
@@ -835,7 +837,7 @@ impl<E: EthSpec> BeaconState<E> {
     /// otherwise returns `None`.
     pub fn get_validator_index(
         &mut self,
-        pubkey: &PublicKeyBytes,
+        pubkey: &ValidatorPublicKeyBytes,
     ) -> Result<Option<usize>, BeaconStateError> {
         self.update_pubkey_cache()?;
         Ok(self.pubkey_cache().get(pubkey))
@@ -1547,15 +1549,22 @@ impl<E: EthSpec> BeaconState<E> {
                     .ok_or(BeaconStateError::UnknownValidator(index))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let decompressed_pubkeys = pubkeys
-            .iter()
-            .map(|pk| pk.decompress())
-            .collect::<Result<Vec<_>, _>>()?;
-        let aggregate_pubkey = AggregatePublicKey::aggregate(&decompressed_pubkeys)?;
+        #[cfg(not(feature = "pq-devnet"))]
+        let aggregate_pubkey = {
+            let decompressed_pubkeys = pubkeys
+                .iter()
+                .map(|pk| pk.decompress())
+                .collect::<Result<Vec<_>, _>>()?;
+            AggregatePublicKey::aggregate(&decompressed_pubkeys)?
+                .to_public_key()
+                .compress()
+        };
+        #[cfg(feature = "pq-devnet")]
+        let aggregate_pubkey = ValidatorPublicKeyBytes::empty();
 
         Ok(SyncCommittee {
             pubkeys: FixedVector::new(pubkeys)?,
-            aggregate_pubkey: aggregate_pubkey.to_public_key().compress(),
+            aggregate_pubkey,
         })
     }
 
@@ -2015,7 +2024,7 @@ impl<E: EthSpec> BeaconState<E> {
     /// Add a validator to the registry and return the validator index that was allocated for it.
     pub fn add_validator_to_registry(
         &mut self,
-        pubkey: PublicKeyBytes,
+        pubkey: ValidatorPublicKeyBytes,
         withdrawal_credentials: Hash256,
         amount: u64,
         spec: &ChainSpec,
@@ -2061,7 +2070,7 @@ impl<E: EthSpec> BeaconState<E> {
     /// Add a builder to the registry and return the builder index that was allocated for it.
     pub fn add_builder_to_registry(
         &mut self,
-        pubkey: PublicKeyBytes,
+        pubkey: BlsPublicKeyBytes,
         withdrawal_credentials: Hash256,
         amount: u64,
         slot: Slot,

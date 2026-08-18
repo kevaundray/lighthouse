@@ -1,4 +1,4 @@
-use bls::PublicKeyBytes;
+use consensus_signature::ValidatorPublicKeyBytes;
 use context_deserialize::context_deserialize;
 use serde::{Deserialize, Serialize};
 use ssz::Encode;
@@ -15,16 +15,16 @@ use crate::{
 #[context_deserialize(ForkName)]
 pub struct ConsolidationRequest {
     pub source_address: Address,
-    pub source_pubkey: PublicKeyBytes,
-    pub target_pubkey: PublicKeyBytes,
+    pub source_pubkey: ValidatorPublicKeyBytes,
+    pub target_pubkey: ValidatorPublicKeyBytes,
 }
 
 impl ConsolidationRequest {
     pub fn max_size() -> usize {
         Self {
             source_address: Address::repeat_byte(0),
-            source_pubkey: PublicKeyBytes::empty(),
-            target_pubkey: PublicKeyBytes::empty(),
+            source_pubkey: ValidatorPublicKeyBytes::empty(),
+            target_pubkey: ValidatorPublicKeyBytes::empty(),
         }
         .as_ssz_bytes()
         .len()

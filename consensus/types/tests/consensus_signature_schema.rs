@@ -1,5 +1,11 @@
-use bls::{AggregateSignature, SecretKey, Signature};
-use consensus_signature::{IndividualSignature, SameMessageEvidence};
+use bls::{
+    AggregateSignature as BlsAggregateSignature, PublicKey as BlsPublicKey,
+    PublicKeyBytes as BlsPublicKeyBytes, SecretKey, Signature as BlsSignature,
+};
+use consensus_signature::{
+    AggregateSignature, IndividualSignature, RawSignature, SameMessageEvidence,
+    ValidatorPublicKeyBytes, VerificationKey,
+};
 use ssz::Encode;
 use tree_hash::TreeHash;
 use types::{
@@ -112,11 +118,65 @@ fn single_attestation_promotes_same_message_evidence_without_reencoding() {
 
 #[test]
 fn semantic_aliases_retain_the_exact_bls_types() {
-    fn accepts_individual(_: &IndividualSignature) {}
-    fn accepts_same_message(_: &SameMessageEvidence) {}
+    const EXPECTED_PUBLIC_KEY_JSON: &str = concat!(
+        "\"0x89ece308f9d1f0131765212deca99697b112d61f9be9a5f1f3780a51335b3ff9",
+        "81747a0b2ca2179b96d2c0c9024e5224\"",
+    );
+    const EXPECTED_SIGNATURE_JSON: &str = concat!(
+        "\"0xb3b4cd91fca6390da9e32c6fefccd3f3f874da4c117d2ac9199e8d325540f1b7",
+        "ddcdaf54db2dca22d2b8d59f4ea4a93f0b178c9c2144eebddd6325b4bb5bc693",
+        "6f695ab8564506f98d3b8a7c43b80f539ee0a31a2152b693bdd4f3a5737947fc\"",
+    );
 
-    let signature = Signature::empty();
-    let aggregate = AggregateSignature::empty();
-    accepts_individual(&signature);
-    accepts_same_message(&aggregate);
+    fn accepts_exact_bls_types(
+        _: BlsPublicKeyBytes,
+        _: BlsPublicKey,
+        _: BlsSignature,
+        _: BlsSignature,
+        _: BlsAggregateSignature,
+        _: BlsAggregateSignature,
+    ) {
+    }
+
+    let secret_key = deterministic_secret_key(3);
+    let verification_key: VerificationKey = secret_key.public_key();
+    let validator_key: ValidatorPublicKeyBytes = verification_key.compress();
+    let individual: IndividualSignature = secret_key.sign(Hash256::repeat_byte(0xa5));
+    let raw: RawSignature = individual.clone();
+    let same_message = SameMessageEvidence::from(&individual);
+    let aggregate: AggregateSignature = same_message.clone();
+
+    accepts_exact_bls_types(
+        validator_key.clone(),
+        verification_key.clone(),
+        individual.clone(),
+        raw.clone(),
+        same_message.clone(),
+        aggregate.clone(),
+    );
+
+    assert_eq!(
+        serde_json::to_string(&validator_key).expect("serialize validator public key bytes"),
+        EXPECTED_PUBLIC_KEY_JSON
+    );
+    assert_eq!(
+        serde_json::to_string(&verification_key).expect("serialize verification key"),
+        EXPECTED_PUBLIC_KEY_JSON
+    );
+    assert_eq!(
+        serde_json::to_string(&individual).expect("serialize individual signature"),
+        EXPECTED_SIGNATURE_JSON
+    );
+    assert_eq!(
+        serde_json::to_string(&raw).expect("serialize raw signature"),
+        EXPECTED_SIGNATURE_JSON
+    );
+    assert_eq!(
+        serde_json::to_string(&same_message).expect("serialize same-message evidence"),
+        EXPECTED_SIGNATURE_JSON
+    );
+    assert_eq!(
+        serde_json::to_string(&aggregate).expect("serialize aggregate signature"),
+        EXPECTED_SIGNATURE_JSON
+    );
 }

@@ -674,7 +674,9 @@ git commit -m "feat: sign validator duties with PQ keys"
   `state/`, `sync_committee/`, `withdrawal/`, `consolidation/`, and `deposit/pending_deposit.rs`
 - Gate BLS-only signing, point-mutation, and direct-verification helpers under
   `consensus/types/src/attestation/`, `block/`, `exit/`, and `sync_committee/`
-- Create: focused PQ schema tests under `consensus/types/tests/`
+- Create: focused PQ schema tests under `consensus/types/tests/`, including the isolated
+  `pq_schema_harness/Cargo.toml` and committed `pq_schema_harness/Cargo.lock`
+- Modify: `validator_client/signing_method/Cargo.toml` to forward both PQ feature halves
 - Modify: `docs/pq-devnet-findings.md`
 
 **Step 1: Write failing PQ schema tests**
@@ -718,6 +720,12 @@ pq-devnet = ["pq-wire", "dep:lean-multisig"]
 pq-devnet = ["consensus_signature/pq-wire"]
 ```
 
+Cargo feature unification requires every PQ entry-point package that contains both `types` and
+`consensus_signature` to select both halves of the profile. Such a package must forward
+`types/pq-devnet` whenever it enables either `consensus_signature/pq-devnet` or
+`consensus_signature/pq-wire`; enabling only the signature crate leaves `types` compiling BLS-only
+helpers against PQ aliases.
+
 Keep the wire implementation in `pq_wire.rs`, with no leanMultisig dependency. The backend-heavy
 `pq` module remains gated by `pq-devnet` and reuses/re-exports those wire types. Use additive,
 all-features-safe selection: `feature = "pq-wire"` selects PQ aliases, while its absence selects
@@ -749,11 +757,16 @@ promotion must remain a cheap raw-envelope conversion and never invoke proving.
 cargo nextest run -p consensus_signature --test bls_compatibility
 cargo nextest run -p consensus_signature --no-default-features --features pq-wire \
   --test pq_wire_schema
+cargo test -p consensus_signature --all-features --all-targets --no-run
 cargo check -p consensus_signature
 cargo check -p consensus_signature --no-default-features --features pq-wire
 cargo check -p consensus_signature --all-features
 
+cargo check -p signing_method
+cargo check -p signing_method --features pq-devnet
+
 cargo nextest run -p types --test consensus_signature_schema
+cargo test --manifest-path consensus/types/tests/pq_schema_harness/Cargo.toml --locked --lib
 cargo check -p types --lib
 cargo check -p types --lib --no-default-features --features pq-devnet
 cargo check -p types --lib --all-features
@@ -762,7 +775,9 @@ cargo tree -p types --no-default-features --features pq-devnet -e normal,build |
   rg 'lean-multisig|lean_multisig_api|lean_vm|rec_aggregation'
 ```
 
-The final graph command must produce no matches. Confirm separately that
+The standalone schema-harness command and its committed `Cargo.lock` are mandatory because its
+nested workspace intentionally prevents root-workspace dev-dependencies from enabling BLS-only
+downstream crates. The final graph command must produce no matches. Confirm separately that
 `consensus_signature --features pq-devnet` still resolves the exact pinned backend.
 
 Do **not** use the old full `cargo nextest run -p types --features pq-devnet` as the Task 4.1 gate.
@@ -782,7 +797,8 @@ compiles without leanMultisig in its normal/build graph, and the default workspa
 **Step 5: Commit**
 
 ```bash
-git add Cargo.lock crypto/consensus_signature consensus/types \
+git add Cargo.lock consensus/types/tests/pq_schema_harness/Cargo.lock \
+  crypto/consensus_signature consensus/types validator_client/signing_method/Cargo.toml \
   docs/plans/2026-08-18-pq-devnet-implementation.md docs/pq-devnet-findings.md
 git commit -m "feat: add PQ consensus wire types"
 ```

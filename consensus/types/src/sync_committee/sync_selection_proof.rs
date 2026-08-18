@@ -1,5 +1,6 @@
 use std::cmp;
 
+#[cfg(not(feature = "pq-devnet"))]
 use bls::{PublicKey, SecretKey};
 use consensus_signature::IndividualSignature;
 use ethereum_hashing::hash;
@@ -8,11 +9,13 @@ use serde::{Deserialize, Serialize};
 use ssz::Encode;
 use typenum::Unsigned;
 
+use crate::core::{
+    EthSpec,
+    consts::altair::{SYNC_COMMITTEE_SUBNET_COUNT, TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE},
+};
+#[cfg(not(feature = "pq-devnet"))]
 use crate::{
-    core::{
-        ChainSpec, Domain, EthSpec, Hash256, SignedRoot, Slot,
-        consts::altair::{SYNC_COMMITTEE_SUBNET_COUNT, TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE},
-    },
+    core::{ChainSpec, Domain, Hash256, SignedRoot, Slot},
     fork::Fork,
     sync_committee::SyncAggregatorSelectionData,
 };
@@ -23,6 +26,7 @@ use crate::{
 pub struct SyncSelectionProof(IndividualSignature);
 
 impl SyncSelectionProof {
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn new<E: EthSpec>(
         slot: Slot,
         subcommittee_index: u64,
@@ -73,6 +77,7 @@ impl SyncSelectionProof {
         signature_hash_int.safe_rem(modulo).map(|rem| rem == 0)
     }
 
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn verify<E: EthSpec>(
         &self,
         slot: Slot,

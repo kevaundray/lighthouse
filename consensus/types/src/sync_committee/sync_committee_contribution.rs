@@ -64,6 +64,7 @@ impl<E: EthSpec> SyncCommitteeContribution<E> {
     /// Aggregate another `SyncCommitteeContribution` into this one.
     ///
     /// The aggregation bitfields must be disjoint, and the data must be the same.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn aggregate(&mut self, other: &Self) {
         debug_assert_eq!(self.slot, other.slot);
         debug_assert_eq!(self.beacon_block_root, other.beacon_block_root);

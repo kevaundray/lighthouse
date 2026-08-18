@@ -1,6 +1,8 @@
 use std::{fmt, marker::PhantomData};
 
-use bls::{PublicKeyBytes, SecretKey, SignatureBytes};
+#[cfg(not(feature = "pq-devnet"))]
+use bls::SecretKey;
+use bls::{PublicKeyBytes, SignatureBytes};
 use consensus_signature::{IndividualSignature, SameMessageEvidence};
 use context_deserialize::ContextDeserialize;
 use educe::Educe;
@@ -21,20 +23,22 @@ use crate::{
         BeaconBlockBodyAltair, BeaconBlockBodyBase, BeaconBlockBodyBellatrix,
         BeaconBlockBodyCapella, BeaconBlockBodyDeneb, BeaconBlockBodyElectra, BeaconBlockBodyFulu,
         BeaconBlockBodyGloas, BeaconBlockBodyRef, BeaconBlockBodyRefMut, BeaconBlockHeader,
-        SignedBeaconBlock, SignedBeaconBlockHeader,
+        SignedBeaconBlockHeader,
     },
-    core::{ChainSpec, Domain, Epoch, EthSpec, Graffiti, Hash256, SignedRoot, Slot},
+    core::{ChainSpec, Epoch, EthSpec, Graffiti, Hash256, SignedRoot, Slot},
     deposit::{Deposit, DepositData},
     execution::{
         AbstractExecPayload, BlindedPayload, Eth1Data, ExecutionPayload, ExecutionRequests,
         FullPayload,
     },
     exit::{SignedVoluntaryExit, VoluntaryExit},
-    fork::{Fork, ForkName, InconsistentFork, map_fork_name},
+    fork::{ForkName, InconsistentFork, map_fork_name},
     slashing::{AttesterSlashingBase, ProposerSlashing},
     state::BeaconStateError,
     sync_committee::SyncAggregate,
 };
+#[cfg(not(feature = "pq-devnet"))]
+use crate::{block::SignedBeaconBlock, core::Domain, fork::Fork};
 
 /// A block of the `BeaconChain`.
 #[superstruct(
@@ -209,6 +213,7 @@ impl<E: EthSpec, Payload: AbstractExecPayload<E>> BeaconBlock<E, Payload> {
     }
 
     /// Signs `self`, producing a `SignedBeaconBlock`.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn sign(
         self,
         secret_key: &SecretKey,

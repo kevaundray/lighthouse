@@ -1,4 +1,4 @@
-use bls::PublicKeyBytes;
+use consensus_signature::ValidatorPublicKeyBytes;
 use rpds::HashTrieMapSync as HashTrieMap;
 
 type ValidatorIndex = usize;
@@ -10,7 +10,7 @@ pub struct PubkeyCache {
     /// HashTrieMap len, as it does not increase when duplicate keys are added. Duplicate keys are
     /// used during testing.
     len: usize,
-    map: HashTrieMap<PublicKeyBytes, ValidatorIndex>,
+    map: HashTrieMap<ValidatorPublicKeyBytes, ValidatorIndex>,
 }
 
 impl PubkeyCache {
@@ -24,7 +24,7 @@ impl PubkeyCache {
     ///
     /// The added index must equal the number of validators already added to the map. This ensures
     /// that an index is never skipped.
-    pub fn insert(&mut self, pubkey: PublicKeyBytes, index: ValidatorIndex) -> bool {
+    pub fn insert(&mut self, pubkey: ValidatorPublicKeyBytes, index: ValidatorIndex) -> bool {
         if index == self.len {
             self.map.insert_mut(pubkey, index);
             self.len = self
@@ -38,7 +38,7 @@ impl PubkeyCache {
     }
 
     /// Looks up a validator index's by their public key.
-    pub fn get(&self, pubkey: &PublicKeyBytes) -> Option<ValidatorIndex> {
+    pub fn get(&self, pubkey: &ValidatorPublicKeyBytes) -> Option<ValidatorIndex> {
         self.map.get(pubkey).copied()
     }
 }

@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use bls::PublicKeyBytes;
+use consensus_signature::ValidatorPublicKeyBytes;
 use safe_arith::ArithError;
 use serde::{Deserialize, Serialize};
 
@@ -11,7 +11,7 @@ use crate::{
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SyncDuty {
-    pub pubkey: PublicKeyBytes,
+    pub pubkey: ValidatorPublicKeyBytes,
     #[serde(with = "serde_utils::quoted_u64")]
     pub validator_index: u64,
     #[serde(with = "serde_utils::quoted_u64_vec")]
@@ -22,7 +22,7 @@ impl SyncDuty {
     /// Create a new `SyncDuty` from the list of validator indices in a sync committee.
     pub fn from_sync_committee_indices(
         validator_index: u64,
-        pubkey: PublicKeyBytes,
+        pubkey: ValidatorPublicKeyBytes,
         sync_committee_indices: &[usize],
     ) -> Option<Self> {
         // Positions of the `validator_index` within the committee.
@@ -44,7 +44,7 @@ impl SyncDuty {
     /// indices.
     pub fn from_sync_committee<E: EthSpec>(
         validator_index: u64,
-        pubkey: PublicKeyBytes,
+        pubkey: ValidatorPublicKeyBytes,
         sync_committee: &SyncCommittee<E>,
     ) -> Option<Self> {
         let validator_sync_committee_indices = sync_committee
@@ -65,7 +65,7 @@ impl SyncDuty {
     /// Create a duty if the `validator_sync_committee_indices` is non-empty.
     fn new(
         validator_index: u64,
-        pubkey: PublicKeyBytes,
+        pubkey: ValidatorPublicKeyBytes,
         validator_sync_committee_indices: Vec<u64>,
     ) -> Option<Self> {
         if !validator_sync_committee_indices.is_empty() {

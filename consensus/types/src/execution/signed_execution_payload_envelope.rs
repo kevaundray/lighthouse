@@ -1,7 +1,8 @@
+#[cfg(not(feature = "pq-devnet"))]
+use crate::{BeaconState, BeaconStateError, consts::gloas::BUILDER_INDEX_SELF_BUILD};
 use crate::{
-    BeaconState, BeaconStateError, ChainSpec, Domain, Epoch, EthSpec, ExecutionBlockHash,
-    ExecutionPayloadEnvelope, Fork, ForkName, Hash256, SignedRoot, Slot,
-    consts::gloas::BUILDER_INDEX_SELF_BUILD,
+    ChainSpec, Domain, Epoch, EthSpec, ExecutionBlockHash, ExecutionPayloadEnvelope, Fork,
+    ForkName, Hash256, SignedRoot, Slot,
 };
 use bls::{PublicKey, Signature};
 use context_deserialize::context_deserialize;
@@ -83,6 +84,7 @@ impl<E: EthSpec> SignedExecutionPayloadEnvelope<E> {
     }
 
     /// Verify `self.signature` using keys drawn from the beacon state.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn verify_signature_with_state(
         &self,
         state: &BeaconState<E>,

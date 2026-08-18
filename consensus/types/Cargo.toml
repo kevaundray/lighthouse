@@ -13,12 +13,14 @@ sqlite = ["dep:rusqlite"]
 arbitrary = [
     "dep:arbitrary",
     "bls/arbitrary",
+    "consensus_signature/arbitrary",
     "kzg/arbitrary",
     "ethereum_ssz/arbitrary",
     "milhouse/arbitrary",
     "ssz_types/arbitrary",
     "swap_or_not_shuffle/arbitrary",
 ]
+pq-devnet = ["consensus_signature/pq-wire"]
 portable = ["bls/supranational-portable"]
 
 [dependencies]

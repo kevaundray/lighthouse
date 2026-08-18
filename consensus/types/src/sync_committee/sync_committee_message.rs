@@ -1,3 +1,4 @@
+#[cfg(not(feature = "pq-devnet"))]
 use bls::SecretKey;
 use consensus_signature::IndividualSignature;
 use context_deserialize::context_deserialize;
@@ -5,9 +6,14 @@ use serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
 use tree_hash_derive::TreeHash;
 
+#[cfg(not(feature = "pq-devnet"))]
 use crate::{
-    core::{ChainSpec, Domain, EthSpec, Hash256, SignedRoot, Slot, SlotData},
-    fork::{Fork, ForkName},
+    core::{ChainSpec, Domain, EthSpec, SignedRoot},
+    fork::Fork,
+};
+use crate::{
+    core::{Hash256, Slot, SlotData},
+    fork::ForkName,
 };
 
 /// The data upon which a `SyncCommitteeContribution` is based.
@@ -25,6 +31,7 @@ pub struct SyncCommitteeMessage {
 
 impl SyncCommitteeMessage {
     /// Equivalent to `get_sync_committee_message` from the spec.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn new<E: EthSpec>(
         slot: Slot,
         beacon_block_root: Hash256,

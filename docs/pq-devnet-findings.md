@@ -527,3 +527,43 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   state-processing code. Task 4.1 uses focused wire/schema tests and PQ `types --lib` checks, while
   preserving the complete default BLS suite. Full PQ downstream checks become mandatory as those
   callers migrate.
+
+### 2026-08-18: PQ wire schema implemented
+
+- Implemented `consensus_signature/pq-wire` as a serialization-only feature and made
+  `pq-devnet` add the exact-pinned backend on top. The 32-byte public key, 1,215-byte raw envelope,
+  and bounded same-message type implement canonical lowercase `0x` JSON, SSZ, tree hash, and
+  optional arbitrary construction without importing leanMultisig. Package `--all-features`
+  deterministically selects the PQ aliases.
+- The raw parser checks the exact 1,215-byte length before examining attacker-controlled header
+  fields, then requires `LHPQ`, wire version 1, parameter set 1, and evidence kind 0. Its all-zero
+  backend payload is a structurally canonical construction placeholder, not valid evidence.
+  Public-key strings reject uppercase/non-canonical hex.
+- `PqSameMessageEvidence` is variable-size SSZ from its first release and uses the list limit in
+  its tree root. Raw promotion only copies the frozen raw envelope. Absent evidence is exactly
+  `LHPQ/v1/parameter1/kind2` (seven bytes). Aggregate evidence is structurally framed as
+  `LHPQ/v1/parameter1/kind1` plus at least one opaque payload byte and is capped at 512 KiB;
+  contextual proof parsing remains Task 4.2.
+- Active validator identity now covers `Validator`, the state pubkey cache and registry APIs, sync
+  committees/duties, withdrawal and consolidation requests, and `PendingDeposit`. Deposit ingress,
+  builders/relays, validator registration, and BLS-to-execution objects retain explicit BLS keys.
+  The PQ sync-committee aggregate-key field is always the canonical zero key. No PQ code consumes
+  it as a verification input.
+- BLS-only point aggregation, infinity seeding, decompression, direct verification, and
+  `SecretKey` convenience constructors in `types` are compile-time absent in the PQ profile.
+  Data-only construction and raw-to-same-message promotion remain available. The Gloas helper that
+  chooses between a self-build validator key and a builder BLS key is also absent because those
+  key types intentionally differ.
+- The isolated normal-dependency schema harness under `consensus/types/tests/pq_schema_harness`
+  avoids `types` dev-dependency feature unification and pins PQ registry/request/pending-deposit,
+  signed-header, and `SingleAttestation` sizes, offsets, and roots. Invoking a PQ integration test
+  through the `types` package itself still reaches the expected later-milestone blockers in
+  `state_processing` and `slasher`, including BLS deposit ingress conversion and BLS batch
+  verification. This is not a Task 4.1 `types --lib` failure. Run its mandatory entry point with
+  `cargo test --manifest-path consensus/types/tests/pq_schema_harness/Cargo.toml --locked --lib`;
+  its lockfile is committed for reproducibility, while normal root workspace test commands
+  intentionally cannot discover the nested harness.
+- Cargo feature unification makes PQ selection a two-part invariant for packages containing
+  `types`: they must forward the matching `types/pq-devnet` profile whenever they directly enable
+  `consensus_signature/pq-devnet` or `pq-wire`. `signing_method/pq-devnet` therefore selects both
+  crates; selecting only the signature crate mixes PQ aliases with BLS-only `types` helpers.

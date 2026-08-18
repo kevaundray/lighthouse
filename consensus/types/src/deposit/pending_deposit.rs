@@ -1,4 +1,5 @@
-use bls::{PublicKeyBytes, SignatureBytes};
+use bls::SignatureBytes;
+use consensus_signature::ValidatorPublicKeyBytes;
 use context_deserialize::context_deserialize;
 use serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
@@ -13,7 +14,7 @@ use crate::{
 #[derive(Debug, PartialEq, Hash, Clone, Serialize, Deserialize, Encode, Decode, TreeHash)]
 #[context_deserialize(ForkName)]
 pub struct PendingDeposit {
-    pub pubkey: PublicKeyBytes,
+    pub pubkey: ValidatorPublicKeyBytes,
     pub withdrawal_credentials: Hash256,
     #[serde(with = "serde_utils::quoted_u64")]
     pub amount: u64,
