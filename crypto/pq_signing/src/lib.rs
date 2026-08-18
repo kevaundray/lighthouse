@@ -47,3 +47,5 @@ pub use authority::{
     PqKeyUnlock, PqSigner, PqSigningAuthority, PqSigningError, PqUsageJournalError,
     XMSS_USAGE_FILENAME, provision_usage_journal, validate_usage_journal,
 };
+#[cfg(all(feature = "pq-devnet", target_os = "linux"))]
+pub use authority::{provision_usage_journal_anchored, validate_usage_journal_anchored};

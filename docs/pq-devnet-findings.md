@@ -648,3 +648,63 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   and signing must not run on Tokio async workers. Task 3.3b must dispatch each complete authority
   operation through Lighthouse's scoped blocking executor, keeping reservation and backend signing
   in the same dispatched call.
+
+### 2026-08-18: Direct PQ genesis and provisioning implemented
+
+- Added the feature-isolated `testing/pq_devnet` package and `lcli-pq-devnet` binary instead of
+  extending dependency-heavy `lcli`. Its default feature set is empty. The production command
+  accepts only output, master-seed-file, password-file, and Eth1 timestamp paths/metadata; secret
+  bytes are never command-line arguments. The frozen production constructor selects the minimal
+  preset, 16 validators, and inclusive range `0..=1119`; its expensive end-to-end test is ignored.
+- `state_processing/pq-genesis` compiles only genesis and the Base-to-Electra upgrade modules. The
+  deposit initializer and direct-registry initializer share the same post-registry upgrade/cache/
+  validators-root tail. The direct entry point fails closed unless Base, Altair, Bellatrix,
+  Capella, Deneb, and Electra are all configured at epoch zero and neither Fulu nor Gloas is also at
+  epoch zero. It creates no deposits, deposit signatures, pending deposits, or BLS shadow keys.
+  Validators are active at genesis and the PQ sync-committee aggregate-key placeholder is the
+  canonical zero key.
+- The genesis-only Altair transform skips pending-attestation translation because a new genesis
+  state has none. It also skips the progressive-balances cache helper to avoid pulling metrics and
+  per-block modules into the narrow surface. That cache is explicitly excluded from SSZ and tree
+  hashing, so state bytes/roots are unchanged; normal per-block processing initializes it before
+  processing the first block.
+- Validator seeds are exactly
+  `SHA256("lighthouse/pq-devnet/validator-seed/v1" || master_seed || index_be_u64)`.
+  Execution withdrawal credentials are `0x01 || 11 zero bytes || digest[12..32]`, where the digest
+  is `SHA256("lighthouse/pq-devnet/withdrawal-credentials/v1" || master_seed || index_be_u64)`.
+  Registry order follows the derivation index even though directory discovery remains lexical by
+  public key. The manifest records and revalidates its format/version, preset/fork, validator
+  count, range, Eth1 timestamp, validators root, every derivation index, every public key, and
+  every withdrawal credential.
+- Configuration, including Eth1 timestamp/genesis-delay overflow, final-path, and deterministic
+  sibling-staging collisions are rejected before secret reads or KDF work. Validator count is
+  capped at 16 and the key range at 1,120 IDs before key generation. The master seed must be an
+  exact 32-byte private regular file; the password is a
+  private regular file capped at 4,096 bytes. Both require mode 0600 and no-follow opens. Each
+  secret reader makes one `maximum + 1` allocation inside `Zeroizing`; public genesis/manifest
+  reads use a separate actual-length allocation and never reserve the 128 MiB bound eagerly.
+- Provisioning retains the destination parent and staging directory descriptors. Staging creation,
+  child-directory creation, validator/password writes, public-file writes, collision checks,
+  no-replace publication, parent `fsync`, and final inode checks are descriptor-relative.
+  `PqValidatorDirBuilder` now accepts held private-directory anchors; a path-swap regression proves
+  writes remain in the held directories and never reach replacements. The journal remains behind
+  non-signing `pq_signing` provision/validate facades; its Linux anchored variants derive the only
+  SQLite path from the held staging descriptor. Because SQLite rejects `SQLITE_OPEN_NOFOLLOW` when
+  an intermediate `/proc/self/fd` component is used, only this validated 0700-directory facade
+  omits that SQLite flag; exclusive 0600 database/lock creation and the public reservation boundary
+  are unchanged. Provisioning validation requires the exact registered-key set and zero existing
+  reservations; the ordinary authority-open path still permits valid historical keys as designed.
+- Files are durable before publication, publication is `RENAME_NOREPLACE`, and the destination
+  parent is synced afterward. No failure path removes output. A pre-rename failure leaves the named
+  `.pq-staging` tombstone. An injected post-rename parent-sync failure leaves the final directory as
+  a tombstone and returns an error; operators must inspect/remove it explicitly rather than retrying
+  or cleaning automatically. The provisioning command is Linux-only and rejects other platforms
+  before opening secret files or doing KDF work.
+- The deterministic one-validator `0..=3` test provisions two destinations, authenticates every
+  reopened keystore, compares registry order/state bytes/public manifest data, checks both journal
+  bindings before and after publication, and confirms fresh salt/IV make encrypted keystore JSON
+  differ. One debug-profile run completed in 275.19 seconds on the existing development host. The
+  full 16-validator `0..=1119` production run remains unmeasured/manual because its sequential KDF
+  and linear XMSS construction cost is intentionally outside ordinary tests.
+- The previously recorded hash-chain/hash-onion RANDAO proposal remains a future profile option.
+  Task 4.1b does not change the V1 duty layout or replace signature-derived RANDAO.

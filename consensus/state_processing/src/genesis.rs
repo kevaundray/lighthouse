@@ -1,19 +1,26 @@
+#[cfg(not(feature = "pq-genesis"))]
 use super::per_block_processing::{
     errors::BlockProcessingError, process_operations::apply_deposit,
 };
+#[cfg(not(feature = "pq-genesis"))]
 use crate::common::DepositDataTree;
+#[cfg(feature = "pq-genesis")]
+use crate::upgrade::altair::upgrade_to_altair_at_genesis;
 use crate::upgrade::electra::upgrade_state_to_electra;
-use crate::upgrade::{
-    upgrade_to_altair, upgrade_to_bellatrix, upgrade_to_capella, upgrade_to_deneb, upgrade_to_fulu,
-    upgrade_to_gloas,
-};
+#[cfg(not(feature = "pq-genesis"))]
+use crate::upgrade::{upgrade_to_altair, upgrade_to_fulu, upgrade_to_gloas};
+use crate::upgrade::{upgrade_to_bellatrix, upgrade_to_capella, upgrade_to_deneb};
+#[cfg(feature = "pq-genesis")]
+use consensus_signature::PqPublicKey;
 use fixed_bytes::FixedBytesExtended;
 use safe_arith::{ArithError, SafeArith};
 use std::sync::Arc;
+#[cfg(not(feature = "pq-genesis"))]
 use tree_hash::TreeHash;
 use types::*;
 
 /// Initialize a `BeaconState` from genesis data.
+#[cfg(not(feature = "pq-genesis"))]
 pub fn initialize_beacon_state_from_eth1<E: EthSpec>(
     eth1_block_hash: Hash256,
     eth1_timestamp: u64,
@@ -45,7 +52,71 @@ pub fn initialize_beacon_state_from_eth1<E: EthSpec>(
     }
 
     process_activations(&mut state, spec)?;
+    complete_genesis_state(state, execution_payload_header, spec).map_err(Into::into)
+}
 
+/// One validator inserted directly into the experimental PQ genesis registry.
+#[cfg(feature = "pq-genesis")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectGenesisValidator {
+    pub public_key: PqPublicKey,
+    pub withdrawal_credentials: Hash256,
+}
+
+/// Construct an experimental PQ genesis without deposits, signatures, or BLS shadow keys.
+#[cfg(feature = "pq-genesis")]
+pub fn initialize_beacon_state_from_validators<E: EthSpec>(
+    eth1_block_hash: Hash256,
+    eth1_timestamp: u64,
+    validators: Vec<DirectGenesisValidator>,
+    execution_payload_header: Option<ExecutionPayloadHeader<E>>,
+    spec: &ChainSpec,
+) -> Result<BeaconState<E>, BeaconStateError> {
+    validate_pq_genesis_spec::<E>(spec)?;
+    let genesis_time = eth2_genesis_time(eth1_timestamp, spec)?;
+    let eth1_data = Eth1Data {
+        deposit_root: Hash256::zero(),
+        deposit_count: 0,
+        block_hash: eth1_block_hash,
+    };
+    let mut state = BeaconState::new(genesis_time, eth1_data, spec);
+    state.fill_randao_mixes_with(eth1_block_hash)?;
+
+    for validator in validators {
+        state.add_validator_to_registry(
+            validator.public_key,
+            validator.withdrawal_credentials,
+            spec.max_effective_balance,
+            spec,
+        )?;
+    }
+
+    process_activations(&mut state, spec)?;
+    complete_genesis_state(state, execution_payload_header, spec)
+}
+
+#[cfg(feature = "pq-genesis")]
+fn validate_pq_genesis_spec<E: EthSpec>(spec: &ChainSpec) -> Result<(), BeaconStateError> {
+    let genesis_epoch = E::genesis_epoch();
+    let is_electra_at_genesis = spec.altair_fork_epoch == Some(genesis_epoch)
+        && spec.bellatrix_fork_epoch == Some(genesis_epoch)
+        && spec.capella_fork_epoch == Some(genesis_epoch)
+        && spec.deneb_fork_epoch == Some(genesis_epoch)
+        && spec.electra_fork_epoch == Some(genesis_epoch)
+        && spec.fulu_fork_epoch != Some(genesis_epoch)
+        && spec.gloas_fork_epoch != Some(genesis_epoch);
+    if is_electra_at_genesis {
+        Ok(())
+    } else {
+        Err(BeaconStateError::IncorrectStateVariant)
+    }
+}
+
+fn complete_genesis_state<E: EthSpec>(
+    mut state: BeaconState<E>,
+    execution_payload_header: Option<ExecutionPayloadHeader<E>>,
+    spec: &ChainSpec,
+) -> Result<BeaconState<E>, BeaconStateError> {
     // To support testnets with Altair enabled from genesis, perform a possible state upgrade here.
     // This must happen *after* deposits and activations are processed or the calculation of sync
     // committees during the upgrade will fail. It's a bit cheeky to do this instead of having
@@ -57,7 +128,10 @@ pub fn initialize_beacon_state_from_eth1<E: EthSpec>(
         .altair_fork_epoch
         .is_some_and(|fork_epoch| fork_epoch == E::genesis_epoch())
     {
+        #[cfg(not(feature = "pq-genesis"))]
         upgrade_to_altair(&mut state, spec)?;
+        #[cfg(feature = "pq-genesis")]
+        upgrade_to_altair_at_genesis(&mut state, spec)?;
 
         state.fork_mut().previous_version = spec.altair_fork_version;
     }
@@ -142,6 +216,7 @@ pub fn initialize_beacon_state_from_eth1<E: EthSpec>(
     }
 
     // Upgrade to fulu if configured from genesis.
+    #[cfg(not(feature = "pq-genesis"))]
     if spec
         .fulu_fork_epoch
         .is_some_and(|fork_epoch| fork_epoch == E::genesis_epoch())
@@ -158,6 +233,7 @@ pub fn initialize_beacon_state_from_eth1<E: EthSpec>(
     }
 
     // Upgrade to gloas if configured from genesis.
+    #[cfg(not(feature = "pq-genesis"))]
     if spec
         .gloas_fork_epoch
         .is_some_and(|fork_epoch| fork_epoch == E::genesis_epoch())

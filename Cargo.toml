@@ -70,6 +70,7 @@ members = [
     "testing/ef_tests",
     "testing/execution_engine_integration",
     "testing/node_test_rig",
+    "testing/pq_devnet",
     "testing/simulator",
     "testing/state_transition_vectors",
     "testing/validator_test_rig",
@@ -195,6 +196,7 @@ opentelemetry_sdk = "0.30.0"
 operation_pool = { path = "beacon_node/operation_pool" }
 parking_lot = "0.12"
 paste = "1"
+pq_devnet = { path = "testing/pq_devnet" }
 pq_signing = { path = "crypto/pq_signing" }
 pretty_reqwest_error = { path = "common/pretty_reqwest_error" }
 prometheus = { version = "0.13", default-features = false }

@@ -3,13 +3,19 @@ pub mod bellatrix;
 pub mod capella;
 pub mod deneb;
 pub mod electra;
+#[cfg(not(feature = "pq-genesis"))]
 pub mod fulu;
+#[cfg(not(feature = "pq-genesis"))]
 pub mod gloas;
 
+#[cfg(not(feature = "pq-genesis"))]
 pub use altair::upgrade_to_altair;
 pub use bellatrix::upgrade_to_bellatrix;
 pub use capella::upgrade_to_capella;
 pub use deneb::upgrade_to_deneb;
+#[cfg(not(feature = "pq-genesis"))]
 pub use electra::upgrade_to_electra;
+#[cfg(not(feature = "pq-genesis"))]
 pub use fulu::upgrade_to_fulu;
+#[cfg(not(feature = "pq-genesis"))]
 pub use gloas::upgrade_to_gloas;

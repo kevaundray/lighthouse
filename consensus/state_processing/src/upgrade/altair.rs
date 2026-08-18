@@ -1,4 +1,6 @@
+#[cfg(not(feature = "pq-genesis"))]
 use crate::common::update_progressive_balances_cache::initialize_progressive_balances_cache;
+#[cfg(not(feature = "pq-genesis"))]
 use crate::common::{
     attesting_indices_base::get_attesting_indices, get_attestation_participation_flag_indices,
 };
@@ -7,10 +9,13 @@ use std::mem;
 use std::sync::Arc;
 use types::{
     BeaconState, BeaconStateAltair, BeaconStateError as Error, ChainSpec, EpochCache, EthSpec,
-    Fork, ParticipationFlags, PendingAttestation, RelativeEpoch, SyncCommittee,
+    Fork, ParticipationFlags, SyncCommittee,
 };
+#[cfg(not(feature = "pq-genesis"))]
+use types::{PendingAttestation, RelativeEpoch};
 
 /// Translate the participation information from the epoch prior to the fork into Altair's format.
+#[cfg(not(feature = "pq-genesis"))]
 pub fn translate_participation<E: EthSpec>(
     state: &mut BeaconState<E>,
     pending_attestations: &List<PendingAttestation<E>, E::MaxPendingAttestations>,
@@ -46,7 +51,36 @@ pub fn translate_participation<E: EthSpec>(
 }
 
 /// Transform a `Base` state into an `Altair` state.
+#[cfg(not(feature = "pq-genesis"))]
 pub fn upgrade_to_altair<E: EthSpec>(
+    pre_state: &mut BeaconState<E>,
+    spec: &ChainSpec,
+) -> Result<(), Error> {
+    let previous_epoch_attestations = pre_state.as_base()?.previous_epoch_attestations.clone();
+    upgrade_state_to_altair(pre_state, spec)?;
+
+    translate_participation(pre_state, &previous_epoch_attestations, spec)?;
+
+    initialize_progressive_balances_cache(pre_state, spec)?;
+
+    fill_sync_committees(pre_state, spec)
+}
+
+/// Transform a genesis `Base` state into `Altair` without importing per-block processing.
+///
+/// A newly constructed genesis state has no pending attestations. The progressive-balance cache is
+/// excluded from SSZ and tree hashing, and normal per-block processing initializes it before the
+/// first block mutates state, so the genesis-only surface does not need metrics/common modules.
+#[cfg(feature = "pq-genesis")]
+pub(crate) fn upgrade_to_altair_at_genesis<E: EthSpec>(
+    pre_state: &mut BeaconState<E>,
+    spec: &ChainSpec,
+) -> Result<(), Error> {
+    upgrade_state_to_altair(pre_state, spec)?;
+    fill_sync_committees(pre_state, spec)
+}
+
+fn upgrade_state_to_altair<E: EthSpec>(
     pre_state: &mut BeaconState<E>,
     spec: &ChainSpec,
 ) -> Result<(), Error> {
@@ -64,7 +98,7 @@ pub fn upgrade_to_altair<E: EthSpec>(
     //
     // Fixed size vectors get cloned because replacing them would require the same size
     // allocation as cloning.
-    let mut post = BeaconState::Altair(BeaconStateAltair {
+    let post = BeaconState::Altair(BeaconStateAltair {
         // Versioning
         genesis_time: pre.genesis_time,
         genesis_validators_root: pre.genesis_validators_root,
@@ -113,19 +147,18 @@ pub fn upgrade_to_altair<E: EthSpec>(
         epoch_cache: EpochCache::default(),
     });
 
-    // Fill in previous epoch participation from the pre state's pending attestations.
-    translate_participation(&mut post, &pre.previous_epoch_attestations, spec)?;
-
-    initialize_progressive_balances_cache(&mut post, spec)?;
-
-    // Fill in sync committees
-    // Note: A duplicate committee is assigned for the current and next committee at the fork
-    // boundary
-    let sync_committee = Arc::new(post.get_next_sync_committee(spec)?);
-    *post.current_sync_committee_mut()? = sync_committee.clone();
-    *post.next_sync_committee_mut()? = sync_committee;
-
     *pre_state = post;
 
+    Ok(())
+}
+
+fn fill_sync_committees<E: EthSpec>(
+    state: &mut BeaconState<E>,
+    spec: &ChainSpec,
+) -> Result<(), Error> {
+    // A duplicate committee is assigned for the current and next committee at the fork boundary.
+    let sync_committee = Arc::new(state.get_next_sync_committee(spec)?);
+    *state.current_sync_committee_mut()? = sync_committee.clone();
+    *state.next_sync_committee_mut()? = sync_committee;
     Ok(())
 }

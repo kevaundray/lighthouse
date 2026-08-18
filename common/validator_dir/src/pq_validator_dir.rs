@@ -205,7 +205,11 @@ impl PqValidatorDir {
 /// Builder for the separate PQ directory layout.
 pub struct PqValidatorDirBuilder {
     base_validators_dir: PathBuf,
+    #[cfg(unix)]
+    base_validators_anchor: Option<File>,
     password_dir: Option<PathBuf>,
+    #[cfg(unix)]
+    password_anchor: Option<File>,
     voting_keystore: Option<(PqKeystore, PlainText)>,
 }
 
@@ -247,14 +251,58 @@ impl PqValidatorDirBuilder {
     pub fn new(base_validators_dir: PathBuf) -> Self {
         Self {
             base_validators_dir,
+            #[cfg(unix)]
+            base_validators_anchor: None,
             password_dir: None,
+            #[cfg(unix)]
+            password_anchor: None,
             voting_keystore: None,
         }
     }
 
+    /// Bind provisioning to an already-open private validator directory.
+    #[cfg(unix)]
+    pub fn new_anchored(
+        base_validators_dir: PathBuf,
+        directory: &File,
+    ) -> Result<Self, PqValidatorDirError> {
+        let file = directory.try_clone().map_err(|error| {
+            PqValidatorDirError::UnableToOpenFile(base_validators_dir.clone(), error)
+        })?;
+        validate_open_directory(&file, &base_validators_dir, true)?;
+        Ok(Self {
+            base_validators_dir,
+            base_validators_anchor: Some(file),
+            password_dir: None,
+            password_anchor: None,
+            voting_keystore: None,
+        })
+    }
+
     pub fn password_dir(mut self, password_dir: impl Into<PathBuf>) -> Self {
         self.password_dir = Some(password_dir.into());
+        #[cfg(unix)]
+        {
+            self.password_anchor = None;
+        }
         self
+    }
+
+    /// Bind password-file provisioning to an already-open private directory.
+    #[cfg(unix)]
+    pub fn password_dir_anchored(
+        mut self,
+        password_dir: impl Into<PathBuf>,
+        directory: &File,
+    ) -> Result<Self, PqValidatorDirError> {
+        let password_dir = password_dir.into();
+        let file = directory
+            .try_clone()
+            .map_err(|error| PqValidatorDirError::UnableToOpenFile(password_dir.clone(), error))?;
+        validate_open_directory(&file, &password_dir, true)?;
+        self.password_dir = Some(password_dir);
+        self.password_anchor = Some(file);
+        Ok(self)
     }
 
     pub fn voting_keystore(mut self, keystore: PqKeystore, password: &[u8]) -> Self {
@@ -283,30 +331,48 @@ impl PqValidatorDirBuilder {
         V: FnOnce(&PqKeystore, &[u8]) -> Result<(), PqKeystoreError>,
     {
         require_unix()?;
-        let (keystore, password) =
-            self.voting_keystore
-                .ok_or(PqValidatorDirError::PartialDirectory(
-                    self.base_validators_dir.clone(),
-                ))?;
+        let Self {
+            base_validators_dir,
+            base_validators_anchor,
+            password_dir,
+            password_anchor,
+            voting_keystore,
+        } = self;
+        let (keystore, password) = voting_keystore.ok_or(PqValidatorDirError::PartialDirectory(
+            base_validators_dir.clone(),
+        ))?;
         validate_pq_password(password.as_bytes())?;
         keystore.validate_metadata()?;
 
         let component = canonical_directory_name(keystore.public_key());
-        let dir = self.base_validators_dir.join(&component);
-        let password_target = self
-            .password_dir
+        let dir = base_validators_dir.join(&component);
+        let password_target = password_dir
             .as_ref()
             .map(|directory| directory.join(&component));
-        let prepared_validators = PreparedDirectory::prepare(&self.base_validators_dir, false)?;
+        let prepared_validators = match base_validators_anchor {
+            Some(file) => PreparedDirectory::Existing(AnchoredDirectory {
+                path: base_validators_dir.clone(),
+                file,
+                follow_path_binding: true,
+            }),
+            None => PreparedDirectory::prepare(&base_validators_dir, false)?,
+        };
         prepared_validators.refuse_child_collision(
             &component,
             PqValidatorDirError::DirectoryAlreadyExists(dir.clone()),
         )?;
-        let prepared_passwords = self
-            .password_dir
-            .as_ref()
-            .map(|path| PreparedDirectory::prepare(path, false))
-            .transpose()?;
+        let prepared_passwords = match (password_dir.as_ref(), password_anchor) {
+            (Some(path), Some(file)) => Some(PreparedDirectory::Existing(AnchoredDirectory {
+                path: path.clone(),
+                file,
+                follow_path_binding: true,
+            })),
+            (Some(path), None) => Some(PreparedDirectory::prepare(path, false)?),
+            (None, None) => None,
+            (None, Some(_)) => {
+                return Err(PqValidatorDirError::PartialDirectory(base_validators_dir));
+            }
+        };
         if let (Some(passwords), Some(target)) = (&prepared_passwords, &password_target) {
             passwords.refuse_child_collision(
                 &component,
@@ -314,8 +380,7 @@ impl PqValidatorDirBuilder {
             )?;
         }
 
-        hooks
-            .after_parent_handles_opened(&self.base_validators_dir, self.password_dir.as_deref())?;
+        hooks.after_parent_handles_opened(&base_validators_dir, password_dir.as_deref())?;
         validate_password(&keystore, password.as_bytes())?;
 
         let validators = prepared_validators.materialize()?;
@@ -347,7 +412,7 @@ impl PqValidatorDirBuilder {
         };
 
         sync_open_directory(&validator_dir, &dir)?;
-        sync_open_directory(&validators, &self.base_validators_dir)?;
+        sync_open_directory(&validators, &base_validators_dir)?;
         let restored = read_keystore_at(&validator_dir, PQ_VOTING_KEYSTORE_FILE, &keystore_path)?;
         if restored != keystore {
             return Err(PqValidatorDirError::KeystoreIdentityMismatch(keystore_path));
@@ -477,6 +542,7 @@ fn create_private_directory(_path: &Path) -> Result<(), PqValidatorDirError> {
 struct AnchoredDirectory {
     path: PathBuf,
     file: File,
+    follow_path_binding: bool,
 }
 
 #[cfg(unix)]
@@ -554,14 +620,15 @@ impl PreparedDirectory {
 #[cfg(unix)]
 impl AnchoredDirectory {
     fn verify_path_binding(&self) -> Result<(), PqValidatorDirError> {
-        let path_stat = rustix::fs::statat(
-            rustix::fs::CWD,
-            &self.path,
-            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-        )
-        .map_err(|error| {
-            PqValidatorDirError::UnsafeDirectoryTarget(self.path.clone()).with_io(error)
-        })?;
+        let flags = if self.follow_path_binding {
+            rustix::fs::AtFlags::empty()
+        } else {
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW
+        };
+        let path_stat =
+            rustix::fs::statat(rustix::fs::CWD, &self.path, flags).map_err(|error| {
+                PqValidatorDirError::UnsafeDirectoryTarget(self.path.clone()).with_io(error)
+            })?;
         let fd_stat = rustix::fs::fstat(&self.file).map_err(|error| {
             PqValidatorDirError::UnableToReadDirectory(self.path.clone(), io::Error::from(error))
         })?;
@@ -616,6 +683,7 @@ fn open_directory_path(
     Ok(AnchoredDirectory {
         path: path.into(),
         file,
+        follow_path_binding: false,
     })
 }
 
@@ -644,6 +712,7 @@ fn open_directory_at(
     Ok(AnchoredDirectory {
         path: path.into(),
         file,
+        follow_path_binding: false,
     })
 }
 

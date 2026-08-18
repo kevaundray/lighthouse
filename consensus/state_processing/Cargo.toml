@@ -6,6 +6,7 @@ edition = { workspace = true }
 
 [features]
 default = []
+pq-genesis = ["consensus_signature/pq-wire", "types/pq-devnet"]
 fake_crypto = ["bls/fake_crypto"]
 arbitrary = [
     "dep:arbitrary",

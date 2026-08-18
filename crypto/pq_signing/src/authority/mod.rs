@@ -13,6 +13,8 @@ use std::path::Path;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "linux")]
+use std::{fs::File, os::fd::AsRawFd};
 use zeroize::Zeroizing;
 
 pub use journal::{XMSS_USAGE_FILENAME, XmssJournalError as PqUsageJournalError};
@@ -139,6 +141,66 @@ pub fn validate_usage_journal(
     let journal = XmssUsageJournal::open(path, &bindings)?;
     journal.validate_all(&bindings)?;
     Ok(())
+}
+
+/// Creates and validates the journal relative to a held Linux directory descriptor.
+///
+/// The descriptor anchor prevents a concurrent parent-path replacement from redirecting journal
+/// creation. This remains a non-signing facade and exposes no reservation handle.
+#[cfg(target_os = "linux")]
+pub fn provision_usage_journal_anchored(
+    directory: &File,
+    genesis_validators_root: [u8; 32],
+    metadata: &[AuthenticatedPqKeyMetadata],
+) -> Result<(), PqSigningError> {
+    validate_anchor(directory)?;
+    let path = anchored_journal_path(directory);
+    let bindings = bindings_from_authenticated_metadata(genesis_validators_root, metadata)?;
+    XmssUsageJournal::provision_anchored(&path, &bindings)?
+        .validate_fresh_provisioning(&bindings)?;
+    Ok(())
+}
+
+/// Validates the journal relative to a held Linux directory descriptor.
+#[cfg(target_os = "linux")]
+pub fn validate_usage_journal_anchored(
+    directory: &File,
+    genesis_validators_root: [u8; 32],
+    metadata: &[AuthenticatedPqKeyMetadata],
+) -> Result<(), PqSigningError> {
+    validate_anchor(directory)?;
+    let path = anchored_journal_path(directory);
+    let bindings = bindings_from_authenticated_metadata(genesis_validators_root, metadata)?;
+    XmssUsageJournal::open_anchored(&path, &bindings)?.validate_fresh_provisioning(&bindings)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn anchored_journal_path(directory: &File) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!(
+        "/proc/self/fd/{}/{}",
+        directory.as_raw_fd(),
+        XMSS_USAGE_FILENAME
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn validate_anchor(directory: &File) -> Result<(), PqSigningError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = directory.metadata().map_err(|error| {
+        PqSigningError::Journal(XmssJournalError::Filesystem(
+            std::path::PathBuf::from("<directory-fd>"),
+            error.to_string(),
+        ))
+    })?;
+    if metadata.is_dir() && metadata.permissions().mode() & 0o777 == 0o700 {
+        Ok(())
+    } else {
+        Err(PqSigningError::Journal(
+            XmssJournalError::InsecurePermissions(std::path::PathBuf::from("<directory-fd>")),
+        ))
+    }
 }
 
 fn bindings_from_authenticated_metadata(

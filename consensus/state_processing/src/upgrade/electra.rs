@@ -1,13 +1,19 @@
+#[cfg(not(feature = "pq-genesis"))]
 use bls::Signature;
+#[cfg(not(feature = "pq-genesis"))]
 use itertools::Itertools;
+#[cfg(not(feature = "pq-genesis"))]
 use safe_arith::SafeArith;
 use std::mem;
+#[cfg(not(feature = "pq-genesis"))]
+use types::PendingDeposit;
 use types::{
     BeaconState, BeaconStateElectra, BeaconStateError as Error, ChainSpec, Epoch, EpochCache,
-    EthSpec, Fork, PendingDeposit,
+    EthSpec, Fork,
 };
 
 /// Transform a `Deneb` state into an `Electra` state.
+#[cfg(not(feature = "pq-genesis"))]
 pub fn upgrade_to_electra<E: EthSpec>(
     pre_state: &mut BeaconState<E>,
     spec: &ChainSpec,

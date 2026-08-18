@@ -242,13 +242,29 @@ impl XmssUsageJournal {
         path: &Path,
         bindings: impl IntoIterator<Item = &'a XmssKeyBinding>,
     ) -> Result<Self, XmssJournalError> {
+        Self::provision_with_nofollow(path, bindings, true)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(in crate::authority) fn provision_anchored<'a>(
+        path: &Path,
+        bindings: impl IntoIterator<Item = &'a XmssKeyBinding>,
+    ) -> Result<Self, XmssJournalError> {
+        Self::provision_with_nofollow(path, bindings, false)
+    }
+
+    fn provision_with_nofollow<'a>(
+        path: &Path,
+        bindings: impl IntoIterator<Item = &'a XmssKeyBinding>,
+        nofollow: bool,
+    ) -> Result<Self, XmssJournalError> {
         ensure_supported_platform()?;
         if path.exists() {
             return Err(XmssJournalError::AlreadyExists(path.to_path_buf()));
         }
         let lockfile = create_lockfile(path)?;
         create_restricted_file(path)?;
-        let mut connection = open_connection(path, true)?;
+        let mut connection = open_connection(path, true, nofollow)?;
         initialize_schema(&mut connection, bindings)?;
         sync_provisioned_files(path)?;
         Ok(Self {
@@ -261,13 +277,29 @@ impl XmssUsageJournal {
         path: &Path,
         active_bindings: impl IntoIterator<Item = &'a XmssKeyBinding>,
     ) -> Result<Self, XmssJournalError> {
+        Self::open_with_nofollow(path, active_bindings, true)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(in crate::authority) fn open_anchored<'a>(
+        path: &Path,
+        active_bindings: impl IntoIterator<Item = &'a XmssKeyBinding>,
+    ) -> Result<Self, XmssJournalError> {
+        Self::open_with_nofollow(path, active_bindings, false)
+    }
+
+    fn open_with_nofollow<'a>(
+        path: &Path,
+        active_bindings: impl IntoIterator<Item = &'a XmssKeyBinding>,
+        nofollow: bool,
+    ) -> Result<Self, XmssJournalError> {
         ensure_supported_platform()?;
         if !path.is_file() {
             return Err(XmssJournalError::MissingJournal(path.to_path_buf()));
         }
         validate_restrictive_permissions(path)?;
         let lockfile = open_lockfile(path)?;
-        let connection = open_connection(path, false)?;
+        let connection = open_connection(path, false, nofollow)?;
         validate_database(&connection)?;
         for binding in active_bindings {
             validate_binding_on_connection(&connection, binding)?;
@@ -284,6 +316,30 @@ impl XmssUsageJournal {
     ) -> Result<(), XmssJournalError> {
         let connection = self.connection.lock();
         validate_binding_on_connection(&connection, expected)
+    }
+
+    /// Validate the exact contents expected from a newly provisioned, unused journal.
+    pub(in crate::authority) fn validate_fresh_provisioning(
+        &self,
+        bindings: &[XmssKeyBinding],
+    ) -> Result<(), XmssJournalError> {
+        let connection = self.connection.lock();
+        for binding in bindings {
+            validate_binding_on_connection(&connection, binding)?;
+        }
+        let registered_keys: i64 = connection
+            .query_row("SELECT count(*) FROM xmss_keys", [], |row| row.get(0))
+            .map_err(database_error)?;
+        let reservations: i64 = connection
+            .query_row("SELECT count(*) FROM reservations", [], |row| row.get(0))
+            .map_err(database_error)?;
+        let expected_keys = i64::try_from(bindings.len())
+            .map_err(|_| database_invariant("too many expected XMSS key bindings"))?;
+        if registered_keys == expected_keys && reservations == 0 {
+            Ok(())
+        } else {
+            Err(XmssJournalError::BindingMismatch)
+        }
     }
 
     /// Permanently reserve one one-time-use leaf before any signature bytes are produced.
@@ -524,14 +580,16 @@ fn create_restricted_file(path: &Path) -> Result<(), XmssJournalError> {
         .map_err(|error| filesystem_error(path, error))
 }
 
-fn open_connection(path: &Path, provisioning: bool) -> Result<Connection, XmssJournalError> {
-    let connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    )
-    .map_err(database_error)?;
+fn open_connection(
+    path: &Path,
+    provisioning: bool,
+    nofollow: bool,
+) -> Result<Connection, XmssJournalError> {
+    let mut flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    if nofollow {
+        flags |= OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    }
+    let connection = Connection::open_with_flags(path, flags).map_err(database_error)?;
     apply_pragmas(&connection, provisioning)?;
     Ok(connection)
 }
@@ -874,6 +932,42 @@ mod tests {
         reopened
             .validate_binding(&expected_binding)
             .expect("reopened binding must validate");
+    }
+
+    #[test]
+    fn fresh_provisioning_validation_rejects_extra_keys_and_reservations() {
+        let extra_keys_dir = tempdir().expect("temporary directory must be created");
+        let extra_keys_path = extra_keys_dir.path().join(XMSS_USAGE_FILENAME);
+        let expected_binding = binding();
+        let extra_binding = XmssKeyBinding::lean_pq_devnet_v1(
+            [8; 32],
+            [3; 32],
+            leaf(0, SigningDuty::RandaoReveal)..=leaf(1, SigningDuty::BeaconBlockProposal),
+        )
+        .expect("extra binding must be valid");
+        let journal =
+            XmssUsageJournal::provision(&extra_keys_path, [&expected_binding, &extra_binding])
+                .expect("journal provisioning must succeed");
+        assert!(matches!(
+            journal.validate_fresh_provisioning(std::slice::from_ref(&expected_binding)),
+            Err(XmssJournalError::BindingMismatch)
+        ));
+
+        let reservation_dir = tempdir().expect("temporary directory must be created");
+        let reservation_path = reservation_dir.path().join(XMSS_USAGE_FILENAME);
+        let journal = XmssUsageJournal::provision(&reservation_path, [&expected_binding])
+            .expect("journal provisioning must succeed");
+        journal
+            .reserve(
+                &expected_binding,
+                leaf(0, SigningDuty::RandaoReveal),
+                [4; 32],
+            )
+            .expect("reservation must succeed");
+        assert!(matches!(
+            journal.validate_fresh_provisioning(&[expected_binding]),
+            Err(XmssJournalError::BindingMismatch)
+        ));
     }
 
     #[test]

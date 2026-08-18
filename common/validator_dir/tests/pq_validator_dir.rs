@@ -277,6 +277,48 @@ fn reread_rejects_keystore_replacement_with_another_identity() {
 
 #[cfg(unix)]
 #[test]
+fn anchored_builder_never_redirects_writes_after_parent_path_swap() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _work_lock = pq_work_lock();
+    let root = tempdir().expect("root");
+    let validators = root.path().join("validators");
+    let passwords = root.path().join("passwords");
+    fs::create_dir(&validators).expect("validators");
+    fs::create_dir(&passwords).expect("passwords");
+    fs::set_permissions(&validators, fs::Permissions::from_mode(0o700)).expect("private");
+    fs::set_permissions(&passwords, fs::Permissions::from_mode(0o700)).expect("private");
+    let validators_anchor = fs::File::open(&validators).expect("validators anchor");
+    let passwords_anchor = fs::File::open(&passwords).expect("passwords anchor");
+
+    let held_validators = root.path().join("held-validators");
+    let held_passwords = root.path().join("held-passwords");
+    fs::rename(&validators, &held_validators).expect("move validators");
+    fs::rename(&passwords, &held_passwords).expect("move passwords");
+    fs::create_dir(&validators).expect("replacement validators");
+    fs::create_dir(&passwords).expect("replacement passwords");
+    fs::set_permissions(&validators, fs::Permissions::from_mode(0o700)).expect("private");
+    fs::set_permissions(&passwords, fs::Permissions::from_mode(0o700)).expect("private");
+
+    let result = PqValidatorDirBuilder::new_anchored(validators.clone(), &validators_anchor)
+        .expect("anchored builder")
+        .password_dir_anchored(passwords.clone(), &passwords_anchor)
+        .expect("anchored passwords")
+        .voting_keystore(keystore(), PASSWORD)
+        .build();
+
+    assert!(matches!(
+        result,
+        Err(PqValidatorDirError::UnsafeDirectoryTarget(_))
+    ));
+    assert_eq!(fs::read_dir(&validators).expect("replacement").count(), 0);
+    assert_eq!(fs::read_dir(&passwords).expect("replacement").count(), 0);
+    assert_eq!(fs::read_dir(&held_validators).expect("held").count(), 1);
+    assert_eq!(fs::read_dir(&held_passwords).expect("held").count(), 1);
+}
+
+#[cfg(unix)]
+#[test]
 fn open_rejects_noncanonical_directory_identity() {
     let _work_lock = pq_work_lock();
     let validators = tempdir().expect("validators");

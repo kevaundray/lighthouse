@@ -1,0 +1,56 @@
+[package]
+name = "pq_devnet"
+version = "0.1.0"
+edition = { workspace = true }
+autotests = false
+
+[[bin]]
+name = "lcli-pq-devnet"
+path = "src/main.rs"
+required-features = ["pq-devnet"]
+
+[features]
+default = []
+pq-devnet = [
+    "dep:clap",
+    "dep:consensus_signature",
+    "dep:ethereum_ssz",
+    "dep:hex",
+    "dep:pq_signing",
+    "dep:rustix",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:sha2",
+    "dep:state_processing",
+    "dep:types",
+    "dep:validator_dir",
+    "dep:zeroize",
+]
+
+[dependencies]
+clap = { workspace = true, features = ["derive"], optional = true }
+consensus_signature = { workspace = true, optional = true, features = ["pq-wire"] }
+ethereum_ssz = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+pq_signing = { workspace = true, optional = true, features = ["pq-devnet"] }
+rustix = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+state_processing = { workspace = true, optional = true, features = ["pq-genesis"] }
+types = { workspace = true, optional = true, features = ["pq-devnet"] }
+validator_dir = { workspace = true, optional = true, features = ["pq-devnet"] }
+zeroize = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[test]]
+name = "direct_genesis"
+path = "tests/direct_genesis.rs"
+required-features = ["pq-devnet"]
+
+[[test]]
+name = "provision"
+path = "tests/provision.rs"
+required-features = ["pq-devnet"]

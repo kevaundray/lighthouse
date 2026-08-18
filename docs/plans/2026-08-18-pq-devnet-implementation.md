@@ -921,6 +921,13 @@ git commit -m "feat: add PQ consensus wire types"
 
 **Prerequisites:** Tasks 4.1 and 3.3a.
 
+**Implementation status (2026-08-18):** implemented and locally verified; pending maintainer review. The
+feature-isolated `lcli-pq-devnet` package, narrow `state_processing/pq-genesis` surface,
+direct-registry Electra constructor, anchored staging publisher, validator provisioning, and bound
+journal cross-check are present. The production `16 × 0..=1119` path remains an ignored/manual
+measurement, as required; ordinary coverage uses synthetic genesis keys and a one-validator small
+range.
+
 **Files:**
 
 - Create: a feature-isolated minimal package/binary such as `testing/pq_devnet/` with binary name
