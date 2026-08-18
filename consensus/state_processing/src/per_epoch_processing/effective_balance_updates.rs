@@ -1,4 +1,5 @@
 use super::errors::EpochProcessingError;
+#[cfg(not(feature = "pq-transition"))]
 use crate::per_epoch_processing::single_pass::{SinglePassConfig, process_epoch_single_pass};
 use safe_arith::SafeArith;
 use types::core::ChainSpec;
@@ -56,6 +57,7 @@ pub fn process_effective_balance_updates<E: EthSpec>(
 }
 
 /// Only used to test the effective balance part of single-pass in isolation.
+#[cfg(not(feature = "pq-transition"))]
 pub fn process_effective_balance_updates_slow<E: EthSpec>(
     state: &mut BeaconState<E>,
     spec: &ChainSpec,

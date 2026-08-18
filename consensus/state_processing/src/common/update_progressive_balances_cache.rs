@@ -108,6 +108,7 @@ pub fn update_progressive_balances_on_attestation<E: EthSpec>(
 }
 
 /// Updates the `ProgressiveBalancesCache` when a target attester has been slashed.
+#[cfg(not(feature = "pq-transition"))]
 pub fn update_progressive_balances_on_slashing<E: EthSpec>(
     state: &mut BeaconState<E>,
     validator_index: usize,

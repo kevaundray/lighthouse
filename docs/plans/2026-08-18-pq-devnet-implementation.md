@@ -1744,6 +1744,56 @@ zero bits with raw/aggregate evidence and any set bit with absent/raw/aggregate 
 the ordinary sync reward/penalty accounting for all false positions without invoking PQ crypto or
 consuming a leaf.
 
+Implemented behind `pq-transition`, which strictly depends on `pq-verification`. The public block
+entry point consumes `VerifiedPqBlock` and accepts no raw block, caller spec, block-root switch, or
+consensus context. Full-block preparation first rejects the frozen-profile and unsupported body
+shapes, then binds the capability to a canonical pre-state root and an owned clone of the exact
+`ChainSpec` before materializing evidence. Transition recomputes the state root, repeats preflight,
+constructs a fresh context, and hardcodes parent-root verification before entering the private
+shared unsigned block core. The ordinary BLS wrapper and its public strategies are unchanged; PQ
+does not compile or re-export the BLS block verifier, signature-set modules, or a public
+`NoVerification` route.
+
+The shared profile now requires exactly 16 validators, Electra at genesis, no Fulu/Gloas schedule,
+zero deposit root/count/index, and empty Electra pending deposit/partial-withdrawal/consolidation
+queues. Peer-controlled unsupported body fields and every noncanonical sync bit/evidence pairing
+are rejected before evidence work. A profile-checked PQ slot wrapper reuses normal slot and epoch
+processing; the PQ epoch branch makes the impossible pending-deposit path fail before mutation but
+retains ordinary justification/finalization, rewards, resets, cache rotation, and sync committee
+rotation. Canonical empty sync input reaches the ordinary accounting function with all false
+positions and no sync verification job.
+
+TDD began with an unresolved `per_block_processing_pq` import. Scalar tests cover exact-slot and
+16-validator bounds, Fulu/Gloas schedules, every unsupported operation, all sync pairings, all
+zero-deposit/pending-state invariants, and epoch-boundary processing. Compile-fail tests prove that
+raw blocks, BLS `NoVerification`, and caller-substituted spec/root/context inputs cannot cross the
+boundary. The real AVX2 test binds a token to its exact same-slot state, rejects a changed RANDAO
+pre-state before mutation, preserves the typed wrong-parent and invalid-timestamp errors, applies a
+valid timely attestation, installs the ordinary temporary block header, and charges every false
+sync position including duplicates and the proposer. An early execution RED
+(`expected: 324, found: 24`) confirmed that the reused payload timestamp check was active before
+the fixture added genesis time. A spec-binding sensitivity mutation then replaced the sealed
+17-second-slot spec with a fresh default Electra spec and failed the otherwise-valid transition
+with `expected: 324, found: 368`; restoring the token-owned spec accepted that block and preserved
+the later typed `expected: 385, found: 384` mismatch. The final expanded run passed 1/1 in 462.75
+seconds (7:43.06 command wall), peaked at 789,688 KiB RSS, and used no swap.
+
+This slice preserves the existing in-state execution payload checks (parent hash, `prev_randao`,
+timestamp, withdrawals, and blob limits). Calling Engine API `newPayload` remains Task 5.3e. The
+hash-chain/hash-onion RANDAO remains a future versioned profile proposal; V1 still authenticates
+the frozen signature-derived RANDAO duty and leaf.
+
+Final review hardening removed the crate-wide PQ `dead_code` exemption. Default-only, Gloas-only,
+and slow test helpers are now cfg-scoped individually, while the supported `pq-attestation`-only
+feature omits `pq_pre_state_root` until `pq-verification` enables its consumers. Warning-denied
+Rust 1.88 checks cover attestation-only, verification, transition, genesis, and all-feature builds.
+
+```bash
+git add consensus/state_processing testing/pq_devnet \
+  docs/plans/2026-08-18-pq-devnet-implementation.md docs/pq-devnet-findings.md
+git commit -m "feat: process sealed PQ blocks"
+```
+
 ### Task 5.3d: Migrate RANDAO HTTP transport to the active individual signature
 
 **Prerequisites:** Tasks 5.3b and 5.3c.

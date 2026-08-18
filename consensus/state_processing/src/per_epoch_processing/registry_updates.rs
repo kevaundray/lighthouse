@@ -1,3 +1,4 @@
+#[cfg(not(feature = "pq-transition"))]
 use crate::per_epoch_processing::single_pass::{SinglePassConfig, process_epoch_single_pass};
 use crate::{common::initiate_validator_exit, per_epoch_processing::Error};
 use safe_arith::SafeArith;
@@ -57,6 +58,7 @@ pub fn process_registry_updates<E: EthSpec>(
     Ok(())
 }
 
+#[cfg(not(feature = "pq-transition"))]
 pub fn process_registry_updates_slow<E: EthSpec>(
     state: &mut BeaconState<E>,
     spec: &ChainSpec,

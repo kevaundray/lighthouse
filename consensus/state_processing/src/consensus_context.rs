@@ -1,16 +1,18 @@
 use crate::EpochCacheError;
-use crate::common::{
-    attesting_indices_base, attesting_indices_electra, get_indexed_payload_attestation,
-};
-use crate::per_block_processing::errors::{
-    AttestationInvalid, BlockOperationError, PayloadAttestationInvalid,
-};
+#[cfg(not(feature = "pq-transition"))]
+use crate::common::get_indexed_payload_attestation;
+use crate::common::{attesting_indices_base, attesting_indices_electra};
+#[cfg(not(feature = "pq-transition"))]
+use crate::per_block_processing::errors::PayloadAttestationInvalid;
+use crate::per_block_processing::errors::{AttestationInvalid, BlockOperationError};
 use std::collections::{HashMap, hash_map::Entry};
 use tree_hash::TreeHash;
+#[cfg(not(feature = "pq-transition"))]
+use types::PayloadAttestation;
 use types::{
     AbstractExecPayload, AttestationRef, BeaconState, BeaconStateError, ChainSpec, Epoch, EthSpec,
     Hash256, IndexedAttestation, IndexedAttestationRef, IndexedPayloadAttestation,
-    PayloadAttestation, SignedBeaconBlock, Slot,
+    SignedBeaconBlock, Slot,
 };
 
 #[derive(Debug, PartialEq, Clone)]
@@ -185,6 +187,7 @@ impl<E: EthSpec> ConsensusContext<E> {
         .map(|indexed_attestation| (*indexed_attestation).to_ref())
     }
 
+    #[cfg(not(feature = "pq-transition"))]
     pub fn get_indexed_payload_attestation<'a>(
         &'a mut self,
         state: &BeaconState<E>,

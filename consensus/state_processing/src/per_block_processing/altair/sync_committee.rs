@@ -1,8 +1,14 @@
 use crate::common::{altair::BaseRewardPerIncrement, decrease_balance, increase_balance};
-use crate::per_block_processing::errors::{BlockProcessingError, SyncAggregateInvalid};
-use crate::{VerifySignatures, signature_sets::sync_aggregate_signature_set};
+use crate::per_block_processing::VerifySignatures;
+use crate::per_block_processing::errors::BlockProcessingError;
+#[cfg(not(feature = "pq-transition"))]
+use crate::per_block_processing::errors::SyncAggregateInvalid;
+#[cfg(not(feature = "pq-transition"))]
+use crate::per_block_processing::signature_sets::sync_aggregate_signature_set;
+#[cfg(not(feature = "pq-transition"))]
 use bls::PublicKeyBytes;
 use safe_arith::SafeArith;
+#[cfg(not(feature = "pq-transition"))]
 use std::borrow::Cow;
 use typenum::Unsigned;
 use types::consts::altair::{PROPOSER_WEIGHT, SYNC_REWARD_WEIGHT, WEIGHT_DENOMINATOR};
@@ -18,6 +24,7 @@ pub fn process_sync_aggregate<E: EthSpec>(
     let current_sync_committee = state.current_sync_committee()?.clone();
 
     // Verify sync committee aggregate signature signing over the previous slot block root
+    #[cfg(not(feature = "pq-transition"))]
     if verify_signatures.is_true() {
         // This decompression could be avoided with a cache, but we're not likely
         // to encounter this case in practice due to the use of pre-emptive signature
@@ -42,6 +49,9 @@ pub fn process_sync_aggregate<E: EthSpec>(
             return Err(SyncAggregateInvalid::SignatureInvalid.into());
         }
     }
+
+    #[cfg(feature = "pq-transition")]
+    let _ = verify_signatures;
 
     // Compute participant and proposer rewards
     let (participant_reward, proposer_reward) = compute_sync_aggregate_rewards(state, spec)?;

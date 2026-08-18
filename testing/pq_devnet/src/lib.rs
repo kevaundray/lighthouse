@@ -22,6 +22,45 @@
 //!     token.inner_attestation = todo!();
 //! }
 //! ```
+//!
+//! The PQ state transition accepts only the sealed token, never an unverified block handle:
+//!
+//! ```compile_fail
+//! use state_processing::per_block_processing_pq;
+//! use std::sync::Arc;
+//! use types::{BeaconState, MinimalEthSpec, SignedBeaconBlock};
+//!
+//! fn bypass(
+//!     state: &mut BeaconState<MinimalEthSpec>,
+//!     block: Arc<SignedBeaconBlock<MinimalEthSpec>>,
+//! ) {
+//!     per_block_processing_pq(state, block).unwrap();
+//! }
+//! ```
+//!
+//! The BLS signature-skipping strategy is not exposed in a PQ build:
+//!
+//! ```compile_fail
+//! use state_processing::{BlockSignatureStrategy, per_block_processing};
+//! let _ = BlockSignatureStrategy::NoVerification;
+//! let _ = per_block_processing;
+//! ```
+//!
+//! A sealed transition does not accept substitutable spec, block-root, or context inputs:
+//!
+//! ```compile_fail
+//! use state_processing::{ConsensusContext, VerifiedPqBlock, per_block_processing_pq};
+//! use types::{BeaconState, ChainSpec, MinimalEthSpec};
+//!
+//! fn substitute_transition_inputs(
+//!     state: &mut BeaconState<MinimalEthSpec>,
+//!     token: VerifiedPqBlock<MinimalEthSpec>,
+//!     spec: &ChainSpec,
+//!     context: &mut ConsensusContext<MinimalEthSpec>,
+//! ) {
+//!     per_block_processing_pq(state, token, spec, false, context).unwrap();
+//! }
+//! ```
 
 #![cfg_attr(not(feature = "pq-devnet"), allow(dead_code))]
 

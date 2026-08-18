@@ -1,9 +1,14 @@
+#[cfg(not(feature = "pq-transition"))]
 use super::{
     block_signature_verifier::Error as BlockSignatureVerifierError,
     signature_sets::Error as SignatureSetError,
 };
 use crate::ContextError;
+#[cfg(not(feature = "pq-transition"))]
 use consensus_signature::VerifyError as ConsensusSignatureVerifyError;
+#[cfg(feature = "pq-transition")]
+#[derive(Debug, PartialEq, Clone)]
+pub enum SignatureSetError {}
 use merkle_proof::MerkleTreeError;
 use safe_arith::ArithError;
 use ssz::DecodeError;
@@ -22,6 +27,7 @@ pub enum BlockProcessingError {
     RandaoSignatureInvalid,
     BulkSignatureVerificationFailed,
     /// Consensus-signature verification failed locally, so block validity was not determined.
+    #[cfg(not(feature = "pq-transition"))]
     ConsensusSignatureVerificationFailed(ConsensusSignatureVerifyError),
     StateRootMismatch,
     DepositCountInvalid {
@@ -129,12 +135,14 @@ impl From<BeaconStateError> for BlockProcessingError {
     }
 }
 
+#[cfg(not(feature = "pq-transition"))]
 impl From<SignatureSetError> for BlockProcessingError {
     fn from(e: SignatureSetError) -> Self {
         BlockProcessingError::SignatureSetError(e)
     }
 }
 
+#[cfg(not(feature = "pq-transition"))]
 impl From<BlockSignatureVerifierError> for BlockProcessingError {
     fn from(error: BlockSignatureVerifierError) -> Self {
         match error {
@@ -257,13 +265,21 @@ impl_into_block_processing_error_with_index!(
     BlsExecutionChangeInvalid
 );
 
+#[cfg(not(feature = "pq-transition"))]
 pub type HeaderValidationError = BlockOperationError<HeaderInvalid>;
+#[cfg(not(feature = "pq-transition"))]
 pub type AttesterSlashingValidationError = BlockOperationError<AttesterSlashingInvalid>;
+#[cfg(not(feature = "pq-transition"))]
 pub type ProposerSlashingValidationError = BlockOperationError<ProposerSlashingInvalid>;
+#[cfg(not(feature = "pq-transition"))]
 pub type AttestationValidationError = BlockOperationError<AttestationInvalid>;
+#[cfg(not(feature = "pq-transition"))]
 pub type SyncCommitteeMessageValidationError = BlockOperationError<SyncAggregateInvalid>;
+#[cfg(not(feature = "pq-transition"))]
 pub type DepositValidationError = BlockOperationError<DepositInvalid>;
+#[cfg(not(feature = "pq-transition"))]
 pub type ExitValidationError = BlockOperationError<ExitInvalid>;
+#[cfg(not(feature = "pq-transition"))]
 pub type BlsExecutionChangeValidationError = BlockOperationError<BlsExecutionChangeInvalid>;
 
 #[derive(Debug, PartialEq, Clone)]

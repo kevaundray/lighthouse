@@ -18,10 +18,15 @@ use state_processing::{
 };
 #[cfg(target_feature = "avx2")]
 use state_processing::{
-    PqAttestationContribution, aggregate_pq_attestation_job, build_pq_attestation_job,
+    PqAttestationContribution, PqTransitionError, aggregate_pq_attestation_job,
+    build_pq_attestation_job, per_block_processing_pq, per_slot_processing_pq,
 };
+#[cfg(target_feature = "avx2")]
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::{error::Error as _, fmt::Debug};
+#[cfg(target_feature = "avx2")]
+use types::consts::altair::{PARTICIPATION_FLAG_WEIGHTS, PROPOSER_WEIGHT, WEIGHT_DENOMINATOR};
 use types::{
     AggregateAndProof, Attestation, AttestationBase, AttestationData, BeaconBlock, ChainSpec,
     Checkpoint, EthSpec, ForkName, Hash256, MinimalEthSpec, RelativeEpoch, SelectionProof,
@@ -703,7 +708,8 @@ fn structural_failure_precedes_an_unavailable_backend() {
 fn journal_backed_consensus_requests_verify_and_fail_in_component_order() {
     let temporary_directory = tempfile::TempDir::new().expect("temporary directory");
     let journal_path = temporary_directory.path().join("xmss_usage.sqlite");
-    let spec = electra_spec();
+    let spec = electra_spec().set_slot_duration_ms::<MinimalEthSpec>(17_000);
+    assert_eq!(spec.get_slot_duration().as_secs(), 17);
     let mut state = initialize_beacon_state_from_validators::<MinimalEthSpec>(
         Hash256::ZERO,
         0,
@@ -733,16 +739,41 @@ fn journal_backed_consensus_requests_verify_and_fail_in_component_order() {
     let proposer_two = state
         .get_beacon_proposer_index(Slot::new(2), &spec)
         .expect("slot-two proposer");
+    let proposer_three = state
+        .get_beacon_proposer_index(Slot::new(3), &spec)
+        .expect("slot-three proposer");
+    let proposer_four = state
+        .get_beacon_proposer_index(Slot::new(4), &spec)
+        .expect("slot-four proposer");
+    let proposer_five = state
+        .get_beacon_proposer_index(Slot::new(5), &spec)
+        .expect("slot-five proposer");
+    let committee_three = state
+        .get_beacon_committee(Slot::new(3), 0)
+        .expect("slot-three committee")
+        .committee
+        .to_vec();
+    let attester_three = *committee_three
+        .first()
+        .expect("nonempty slot-three committee");
     let mut required_indices = participants.clone();
-    required_indices.extend([proposer_zero, proposer_one, proposer_two]);
+    required_indices.extend([
+        proposer_zero,
+        proposer_one,
+        proposer_two,
+        proposer_three,
+        proposer_four,
+        proposer_five,
+        attester_three,
+    ]);
     required_indices.sort_unstable();
     required_indices.dedup();
 
     let maximum_leaf = OneTimeUseId::for_lean_pq_devnet_v1(
-        Slot::new(2).as_u64(),
+        Slot::new(5).as_u64(),
         SigningDuty::BeaconBlockProposal,
     )
-    .expect("slot-two proposal leaf")
+    .expect("slot-five proposal leaf")
     .as_u32();
     let mut metadata = Vec::new();
     let mut unlocks = Vec::new();
@@ -1048,9 +1079,11 @@ fn journal_backed_consensus_requests_verify_and_fail_in_component_order() {
         SigningDuty::BeaconBlockProposal,
         mixed_root,
     );
+    let mut slot_one_state = state.clone();
+    per_slot_processing_pq(&mut slot_one_state, &spec).expect("advance to slot one");
     let mixed_result = block_on(
         prepare_pq_block(
-            &state,
+            &slot_one_state,
             &key_cache,
             Arc::new(SignedBeaconBlock::from_block(
                 mixed_block.clone(),
@@ -1071,7 +1104,7 @@ fn journal_backed_consensus_requests_verify_and_fail_in_component_order() {
     );
     let both_invalid_block = block_on(
         prepare_pq_block(
-            &state,
+            &slot_one_state,
             &key_cache,
             Arc::new(SignedBeaconBlock::from_block(
                 mixed_block,
@@ -1088,6 +1121,367 @@ fn journal_backed_consensus_requests_verify_and_fail_in_component_order() {
             PqConsensusInvalid::InvalidEvidence(
                 state_processing::PqConsensusComponent::BlockProposal,
             ),
+        ))
+    );
+
+    let mut slot_three_state = state.clone();
+    for _ in 0..3 {
+        per_slot_processing_pq(&mut slot_three_state, &spec).expect("advance to slot three");
+    }
+    let mut wrong_parent_block: BeaconBlock<MinimalEthSpec> = BeaconBlock::empty(&spec);
+    let BeaconBlock::Electra(wrong_parent_electra) = &mut wrong_parent_block else {
+        unreachable!("Electra genesis spec constructs an Electra block");
+    };
+    wrong_parent_electra.slot = Slot::new(3);
+    wrong_parent_electra.proposer_index = proposer_three as u64;
+    wrong_parent_electra.parent_root = Hash256::repeat_byte(0x73);
+    wrong_parent_electra
+        .body
+        .execution_payload
+        .execution_payload
+        .timestamp = spec
+        .get_slot_duration()
+        .as_secs()
+        .checked_mul(3)
+        .and_then(|slot_offset| slot_three_state.genesis_time().checked_add(slot_offset))
+        .expect("fixture timestamp");
+    wrong_parent_electra
+        .body
+        .execution_payload
+        .execution_payload
+        .prev_randao = *slot_three_state
+        .get_randao_mix(types::Epoch::new(0))
+        .expect("current randao mix");
+    let transition_randao_root = types::Epoch::new(0).signing_root(randao_domain).0;
+    wrong_parent_electra.body.randao_reveal = sign(
+        proposer_three,
+        Slot::new(3),
+        SigningDuty::RandaoReveal,
+        transition_randao_root,
+    );
+    let wrong_parent_root = wrong_parent_block.signing_root(proposal_domain).0;
+    let wrong_parent_proposal = sign(
+        proposer_three,
+        Slot::new(3),
+        SigningDuty::BeaconBlockProposal,
+        wrong_parent_root,
+    );
+    let wrong_parent_block = Arc::new(SignedBeaconBlock::from_block(
+        wrong_parent_block,
+        wrong_parent_proposal,
+    ));
+    let mismatch_token = block_on(
+        prepare_pq_block(
+            &slot_three_state,
+            &key_cache,
+            Arc::clone(&wrong_parent_block),
+            &spec,
+        )
+        .expect("prepared state-bound block")
+        .verify(&service),
+    )
+    .expect("valid PQ signatures");
+    let mut changed_same_slot_state = slot_three_state.clone();
+    changed_same_slot_state
+        .update_randao_mix(types::Epoch::new(0), &PqRawSignature::empty())
+        .expect("change claim-critical RANDAO context");
+    let changed_state_before = changed_same_slot_state.clone();
+    assert!(matches!(
+        per_block_processing_pq(&mut changed_same_slot_state, mismatch_token),
+        Err(PqTransitionError::PreStateMismatch { .. })
+    ));
+    assert_eq!(changed_same_slot_state, changed_state_before);
+
+    let wrong_parent_token = block_on(
+        prepare_pq_block(
+            &slot_three_state,
+            &key_cache,
+            Arc::clone(&wrong_parent_block),
+            &spec,
+        )
+        .expect("prepared wrong-parent block")
+        .verify(&service),
+    )
+    .expect("wrong parent is signed but not linked to state");
+    assert!(matches!(
+        per_block_processing_pq(&mut slot_three_state, wrong_parent_token),
+        Err(PqTransitionError::BlockProcessing(
+            state_processing::BlockProcessingError::HeaderInvalid {
+                reason: state_processing::HeaderInvalid::ParentBlockRootMismatch { .. }
+            }
+        ))
+    ));
+
+    let mut slot_four_state = state.clone();
+    for _ in 0..4 {
+        per_slot_processing_pq(&mut slot_four_state, &spec).expect("advance to slot four");
+    }
+    let sync_committee = slot_four_state
+        .current_sync_committee()
+        .expect("current sync committee")
+        .clone();
+    let sync_indices = slot_four_state
+        .get_sync_committee_indices(&sync_committee)
+        .expect("sync committee indices");
+    let mut sync_occurrences = BTreeMap::<usize, usize>::new();
+    for validator_index in sync_indices {
+        let count = sync_occurrences.entry(validator_index).or_default();
+        *count = count.checked_add(1).expect("bounded committee count");
+    }
+    assert!(
+        sync_occurrences.values().any(|count| *count > 1),
+        "16-validator V1 committee contains duplicate positions"
+    );
+    let balances_before = slot_four_state.balances().to_vec();
+
+    let mut valid_transition_block: BeaconBlock<MinimalEthSpec> = BeaconBlock::empty(&spec);
+    let BeaconBlock::Electra(valid_transition_electra) = &mut valid_transition_block else {
+        unreachable!("Electra genesis spec constructs an Electra block");
+    };
+    valid_transition_electra.slot = Slot::new(4);
+    valid_transition_electra.proposer_index = proposer_four as u64;
+    valid_transition_electra.parent_root = slot_four_state.latest_block_header().canonical_root();
+    valid_transition_electra.state_root = Hash256::repeat_byte(0x44);
+    valid_transition_electra
+        .body
+        .execution_payload
+        .execution_payload
+        .timestamp = spec
+        .get_slot_duration()
+        .as_secs()
+        .checked_mul(4)
+        .and_then(|slot_offset| slot_four_state.genesis_time().checked_add(slot_offset))
+        .expect("fixture timestamp");
+    valid_transition_electra
+        .body
+        .execution_payload
+        .execution_payload
+        .prev_randao = *slot_four_state
+        .get_randao_mix(types::Epoch::new(0))
+        .expect("current randao mix");
+    valid_transition_electra.body.randao_reveal = sign(
+        proposer_four,
+        Slot::new(4),
+        SigningDuty::RandaoReveal,
+        transition_randao_root,
+    );
+    let transition_attestation_data = AttestationData {
+        slot: Slot::new(3),
+        index: 0,
+        beacon_block_root: *slot_four_state
+            .get_block_root(Slot::new(3))
+            .expect("slot-three block root"),
+        source: slot_four_state.current_justified_checkpoint(),
+        target: Checkpoint {
+            epoch: types::Epoch::new(0),
+            root: *slot_four_state
+                .get_block_root_at_epoch(types::Epoch::new(0))
+                .expect("epoch-zero target root"),
+        },
+    };
+    let transition_attestation_domain = spec.get_domain(
+        types::Epoch::new(0),
+        Domain::BeaconAttester,
+        &slot_four_state.fork(),
+        slot_four_state.genesis_validators_root(),
+    );
+    let transition_attestation_signature = sign(
+        attester_three,
+        Slot::new(3),
+        SigningDuty::Attestation,
+        transition_attestation_data
+            .signing_root(transition_attestation_domain)
+            .0,
+    );
+    let attester_three_position = committee_three
+        .iter()
+        .position(|validator_index| *validator_index == attester_three)
+        .expect("attester is in its committee");
+    let Attestation::Electra(valid_transition_attestation) = electra_attestation(
+        transition_attestation_data,
+        committee_three.len(),
+        &[attester_three_position],
+        PqSameMessageEvidence::from(&transition_attestation_signature),
+    ) else {
+        unreachable!("fixture creates Electra attestations");
+    };
+    valid_transition_electra
+        .body
+        .attestations
+        .push(valid_transition_attestation)
+        .expect("one transition attestation");
+    let valid_transition_root = valid_transition_block.signing_root(proposal_domain).0;
+    let valid_transition_proposal = sign(
+        proposer_four,
+        Slot::new(4),
+        SigningDuty::BeaconBlockProposal,
+        valid_transition_root,
+    );
+    let valid_transition_block = Arc::new(SignedBeaconBlock::from_block(
+        valid_transition_block,
+        valid_transition_proposal,
+    ));
+    let valid_transition_token = block_on(
+        prepare_pq_block(
+            &slot_four_state,
+            &key_cache,
+            Arc::clone(&valid_transition_block),
+            &spec,
+        )
+        .expect("prepared valid transition block")
+        .verify(&service),
+    )
+    .expect("valid transition signatures");
+    let transition_context = per_block_processing_pq(&mut slot_four_state, valid_transition_token)
+        .expect("valid sealed PQ transition");
+    assert_eq!(transition_context.slot, Slot::new(4));
+    assert_eq!(
+        transition_context.proposer_index,
+        Some(proposer_four as u64)
+    );
+    assert_eq!(transition_context.current_block_root, None);
+    assert_eq!(slot_four_state.latest_block_header().slot, Slot::new(4));
+    assert_eq!(
+        slot_four_state.latest_block_header().state_root,
+        Hash256::ZERO,
+        "ordinary processing installs a temporary header until the post-state root is known"
+    );
+    assert_eq!(
+        slot_four_state.latest_block_header().body_root,
+        valid_transition_block.message().body_root()
+    );
+    let attester_flags = *slot_four_state
+        .current_epoch_participation()
+        .expect("Electra participation")
+        .get(attester_three)
+        .expect("attesting validator");
+    assert!(
+        attester_flags.into_u8() > 0,
+        "ordinary attestation processing updates participation"
+    );
+    let mut attestation_weight = 0u64;
+    for (flag_index, weight) in PARTICIPATION_FLAG_WEIGHTS.iter().enumerate() {
+        if attester_flags
+            .has_flag(flag_index)
+            .expect("known flag index")
+        {
+            attestation_weight = attestation_weight
+                .checked_add(*weight)
+                .expect("bounded attestation weight");
+        }
+    }
+    let attestation_proposer_reward = slot_four_state
+        .get_base_reward(attester_three)
+        .expect("attester base reward")
+        .checked_mul(attestation_weight)
+        .and_then(|numerator| {
+            WEIGHT_DENOMINATOR
+                .checked_sub(PROPOSER_WEIGHT)
+                .and_then(|difference| difference.checked_mul(WEIGHT_DENOMINATOR))
+                .and_then(|product| product.checked_div(PROPOSER_WEIGHT))
+                .and_then(|denominator| numerator.checked_div(denominator))
+        })
+        .expect("ordinary proposer reward arithmetic");
+
+    let mut penalty_per_position = None;
+    for (validator_index, occurrence_count) in sync_occurrences {
+        let before = *balances_before
+            .get(validator_index)
+            .expect("pre-transition balance");
+        let after = *slot_four_state
+            .balances()
+            .get(validator_index)
+            .expect("post-transition balance");
+        let balance_before_sync = if validator_index == proposer_four {
+            before
+                .checked_add(attestation_proposer_reward)
+                .expect("bounded proposer reward")
+        } else {
+            before
+        };
+        let total_penalty = balance_before_sync
+            .checked_sub(after)
+            .expect("all-false sync penalty");
+        let per_position = total_penalty
+            .checked_div(occurrence_count as u64)
+            .expect("nonzero occurrence count");
+        assert_eq!(
+            total_penalty,
+            per_position
+                .checked_mul(occurrence_count as u64)
+                .expect("bounded penalty"),
+            "duplicate committee positions each receive the ordinary false-position penalty"
+        );
+        if let Some(expected) = penalty_per_position {
+            assert_eq!(per_position, expected);
+        } else {
+            assert!(per_position > 0);
+            penalty_per_position = Some(per_position);
+        }
+    }
+
+    let mut slot_five_state = state.clone();
+    for _ in 0..5 {
+        per_slot_processing_pq(&mut slot_five_state, &spec).expect("advance to slot five");
+    }
+    let expected_timestamp = spec
+        .get_slot_duration()
+        .as_secs()
+        .checked_mul(5)
+        .and_then(|slot_offset| slot_five_state.genesis_time().checked_add(slot_offset))
+        .expect("fixture timestamp");
+    let invalid_timestamp = expected_timestamp
+        .checked_sub(1)
+        .expect("nonzero expected timestamp");
+    let mut invalid_execution_block: BeaconBlock<MinimalEthSpec> = BeaconBlock::empty(&spec);
+    let BeaconBlock::Electra(invalid_execution_electra) = &mut invalid_execution_block else {
+        unreachable!("Electra genesis spec constructs an Electra block");
+    };
+    invalid_execution_electra.slot = Slot::new(5);
+    invalid_execution_electra.proposer_index = proposer_five as u64;
+    invalid_execution_electra.parent_root = slot_five_state.latest_block_header().canonical_root();
+    invalid_execution_electra
+        .body
+        .execution_payload
+        .execution_payload
+        .timestamp = invalid_timestamp;
+    invalid_execution_electra
+        .body
+        .execution_payload
+        .execution_payload
+        .prev_randao = *slot_five_state
+        .get_randao_mix(types::Epoch::new(0))
+        .expect("current randao mix");
+    invalid_execution_electra.body.randao_reveal = sign(
+        proposer_five,
+        Slot::new(5),
+        SigningDuty::RandaoReveal,
+        transition_randao_root,
+    );
+    let invalid_execution_root = invalid_execution_block.signing_root(proposal_domain).0;
+    let invalid_execution_proposal = sign(
+        proposer_five,
+        Slot::new(5),
+        SigningDuty::BeaconBlockProposal,
+        invalid_execution_root,
+    );
+    let invalid_execution_block = Arc::new(SignedBeaconBlock::from_block(
+        invalid_execution_block,
+        invalid_execution_proposal,
+    ));
+    let invalid_execution_token = block_on(
+        prepare_pq_block(&slot_five_state, &key_cache, invalid_execution_block, &spec)
+            .expect("prepared invalid-execution block")
+            .verify(&service),
+    )
+    .expect("valid PQ signatures do not imply a valid execution payload");
+    assert_eq!(
+        per_block_processing_pq(&mut slot_five_state, invalid_execution_token),
+        Err(PqTransitionError::BlockProcessing(
+            state_processing::BlockProcessingError::ExecutionInvalidTimestamp {
+                expected: expected_timestamp,
+                found: invalid_timestamp,
+            }
         ))
     );
 

@@ -1,24 +1,31 @@
+#[cfg(not(feature = "pq-transition"))]
+use crate::per_block_processing::is_valid_deposit_signature;
 use crate::{
     common::{
         decrease_balance, increase_balance,
         update_progressive_balances_cache::initialize_progressive_balances_cache,
     },
     epoch_cache::{PreEpochCache, initialize_epoch_cache},
-    per_block_processing::is_valid_deposit_signature,
     per_epoch_processing::{Delta, Error, ParticipationEpochSummary},
 };
 use itertools::izip;
 use milhouse::{Cow, List, Vector};
 use safe_arith::{SafeArith, SafeArithIter};
 use std::cmp::{max, min};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+#[cfg(not(feature = "pq-transition"))]
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::instrument;
 use typenum::Unsigned;
+#[cfg(not(feature = "pq-transition"))]
+use types::DepositData;
+#[cfg(not(feature = "pq-transition"))]
+use types::PendingDeposit;
 use types::{
     ActivationQueue, BeaconState, BeaconStateError, BuilderPendingPayment, ChainSpec, Checkpoint,
-    CommitteeCache, DepositData, Epoch, EthSpec, ExitCache, ForkName, ParticipationFlags,
-    PendingDeposit, ProgressiveBalancesCache, RelativeEpoch, Validator,
+    CommitteeCache, Epoch, EthSpec, ExitCache, ForkName, ParticipationFlags,
+    ProgressiveBalancesCache, RelativeEpoch, Validator,
     consts::altair::{
         NUM_FLAG_INDICES, PARTICIPATION_FLAG_WEIGHTS, TIMELY_HEAD_FLAG_INDEX,
         TIMELY_TARGET_FLAG_INDEX, WEIGHT_DENOMINATOR,
@@ -30,6 +37,7 @@ pub struct SinglePassConfig {
     pub rewards_and_penalties: bool,
     pub registry_updates: bool,
     pub slashings: bool,
+    #[cfg(not(feature = "pq-transition"))]
     pub pending_deposits: bool,
     pub pending_consolidations: bool,
     pub effective_balance_updates: bool,
@@ -51,6 +59,7 @@ impl SinglePassConfig {
             rewards_and_penalties: true,
             registry_updates: true,
             slashings: true,
+            #[cfg(not(feature = "pq-transition"))]
             pending_deposits: true,
             pending_consolidations: true,
             effective_balance_updates: true,
@@ -60,6 +69,7 @@ impl SinglePassConfig {
         }
     }
 
+    #[cfg(not(feature = "pq-transition"))]
     pub fn disable_all() -> SinglePassConfig {
         SinglePassConfig {
             inactivity_updates: false,
@@ -98,6 +108,7 @@ struct SlashingsContext {
     penalty_per_effective_balance_increment: u64,
 }
 
+#[cfg(not(feature = "pq-transition"))]
 struct PendingDepositsContext {
     /// The value to set `next_deposit_index` to *after* processing completes.
     next_deposit_index: usize,
@@ -157,6 +168,13 @@ pub fn process_epoch_single_pass<E: EthSpec>(
     spec: &ChainSpec,
     conf: SinglePassConfig,
 ) -> Result<SinglePassEpochResult<E>, Error> {
+    #[cfg(feature = "pq-transition")]
+    if !state.pending_deposits()?.is_empty()
+        || !state.pending_consolidations()?.is_empty()
+        || !state.pending_partial_withdrawals()?.is_empty()
+    {
+        return Err(Error::PqUnsupportedPendingState);
+    }
     initialize_epoch_cache(state, spec)?;
     initialize_progressive_balances_cache(state, spec)?;
     state.build_exit_cache(spec)?;
@@ -188,12 +206,12 @@ pub fn process_epoch_single_pass<E: EthSpec>(
     let slashings_ctxt = &SlashingsContext::new(state, state_ctxt, spec)?;
     let mut next_epoch_cache = PreEpochCache::new_for_next_epoch(state)?;
 
+    #[cfg(not(feature = "pq-transition"))]
     let pending_deposits_ctxt = if fork_name.electra_enabled() && conf.pending_deposits {
         Some(PendingDepositsContext::new(state, spec, &conf)?)
     } else {
         None
     };
-
     let mut earliest_exit_epoch = state.earliest_exit_epoch().ok();
     let mut exit_balance_to_consume = state.exit_balance_to_consume().ok();
     let validators_in_consolidations = get_validators_in_consolidations(state);
@@ -329,6 +347,7 @@ pub fn process_epoch_single_pass<E: EthSpec>(
         }
 
         // `process_pending_deposits`
+        #[cfg(not(feature = "pq-transition"))]
         if let Some(pending_balance_deposits_ctxt) = &pending_deposits_ctxt {
             process_pending_deposits_for_validator(
                 &mut balance,
@@ -378,6 +397,7 @@ pub fn process_epoch_single_pass<E: EthSpec>(
     // This *could* be reordered after `process_pending_consolidations` which pushes only to the end
     // of the `pending_deposits` list. But we may as well preserve the write ordering used
     // by the spec and do this first.
+    #[cfg(not(feature = "pq-transition"))]
     if let Some(ctxt) = pending_deposits_ctxt {
         let mut new_balance_deposits = List::try_from_iter(
             state
@@ -1080,6 +1100,7 @@ fn process_single_slashing(
     Ok(())
 }
 
+#[cfg(not(feature = "pq-transition"))]
 impl PendingDepositsContext {
     fn new<E: EthSpec>(
         state: &BeaconState<E>,
@@ -1208,6 +1229,7 @@ impl PendingDepositsContext {
     }
 }
 
+#[cfg(not(feature = "pq-transition"))]
 fn process_pending_deposits_for_validator(
     balance: &mut Cow<u64>,
     validator_info: &ValidatorInfo,

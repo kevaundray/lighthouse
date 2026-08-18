@@ -1,53 +1,80 @@
 use crate::consensus_context::ConsensusContext;
-use errors::{
-    BlockOperationError, BlockProcessingError, ExecutionPayloadBidInvalid, HeaderInvalid,
-};
+#[cfg(not(feature = "pq-transition"))]
+use errors::ExecutionPayloadBidInvalid;
+use errors::{BlockOperationError, BlockProcessingError, HeaderInvalid};
+#[cfg(not(feature = "pq-transition"))]
 use rayon::prelude::*;
 use safe_arith::{ArithError, SafeArith};
+#[cfg(not(feature = "pq-transition"))]
 use signature_sets::{
     block_proposal_signature_set, execution_payload_bid_signature_set,
     get_builder_pubkey_from_state, get_pubkey_from_state, randao_signature_set,
 };
+#[cfg(not(feature = "pq-transition"))]
 use std::borrow::Cow;
 use tree_hash::TreeHash;
 use typenum::Unsigned;
-use types::{consts::gloas::BUILDER_INDEX_SELF_BUILD, *};
+#[cfg(not(feature = "pq-transition"))]
+use types::consts::gloas::BUILDER_INDEX_SELF_BUILD;
+use types::*;
 
+#[cfg(not(feature = "pq-transition"))]
 pub use self::verify_attester_slashing::{
     get_slashable_indices, get_slashable_indices_modular, verify_attester_slashing,
 };
+#[cfg(not(feature = "pq-transition"))]
 pub use self::verify_proposer_slashing::verify_proposer_slashing;
 pub use altair::sync_committee::process_sync_aggregate;
+#[cfg(not(feature = "pq-transition"))]
 pub use block_signature_verifier::{BlockSignatureVerifier, ParallelSignatureSets};
 pub use is_valid_indexed_attestation::is_valid_indexed_attestation;
+#[cfg(not(feature = "pq-transition"))]
 pub use is_valid_indexed_payload_attestation::is_valid_indexed_payload_attestation;
 pub use process_operations::process_operations;
-pub use verify_attestation::{
-    verify_attestation_for_block_inclusion, verify_attestation_for_state,
-};
+pub use verify_attestation::verify_attestation_for_block_inclusion;
+#[cfg(not(feature = "pq-transition"))]
+pub use verify_attestation::verify_attestation_for_state;
+#[cfg(not(feature = "pq-transition"))]
 pub use verify_bls_to_execution_change::verify_bls_to_execution_change;
+#[cfg(not(feature = "pq-transition"))]
 pub use verify_deposit::{
     get_existing_validator_index, is_valid_deposit_signature, verify_deposit_merkle_proof,
 };
+#[cfg(not(feature = "pq-transition"))]
 pub use verify_exit::verify_exit;
+#[cfg(not(feature = "pq-transition"))]
 pub use withdrawals::get_expected_withdrawals;
 
 pub mod altair;
+#[cfg(not(feature = "pq-transition"))]
 pub mod block_signature_verifier;
 pub mod builder;
+#[cfg(not(feature = "pq-transition"))]
 pub mod deneb;
 pub mod errors;
 mod is_valid_indexed_attestation;
+#[cfg(not(feature = "pq-transition"))]
 mod is_valid_indexed_payload_attestation;
+#[cfg(not(feature = "pq-transition"))]
 pub mod process_operations;
+#[cfg(feature = "pq-transition")]
+#[path = "per_block_processing/process_operations_pq.rs"]
+pub mod process_operations;
+#[cfg(not(feature = "pq-transition"))]
 pub mod signature_sets;
 pub mod tests;
 mod verify_attestation;
+#[cfg(not(feature = "pq-transition"))]
 mod verify_attester_slashing;
+#[cfg(not(feature = "pq-transition"))]
 mod verify_bls_to_execution_change;
+#[cfg(not(feature = "pq-transition"))]
 mod verify_deposit;
+#[cfg(not(feature = "pq-transition"))]
 mod verify_exit;
+#[cfg(not(feature = "pq-transition"))]
 mod verify_payload_attestation;
+#[cfg(not(feature = "pq-transition"))]
 mod verify_proposer_slashing;
 pub mod withdrawals;
 
@@ -60,6 +87,7 @@ use arbitrary::Arbitrary;
 use tracing::instrument;
 
 /// The strategy to be used when validating the block's signatures.
+#[cfg(not(feature = "pq-transition"))]
 #[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
 #[derive(PartialEq, Clone, Copy, Debug)]
 pub enum BlockSignatureStrategy {
@@ -78,12 +106,14 @@ pub enum BlockSignatureStrategy {
 #[derive(PartialEq, Clone, Copy)]
 pub enum VerifySignatures {
     /// Validate all signatures encountered.
+    #[cfg(not(feature = "pq-transition"))]
     True,
     /// Do not validate any signature. Use with caution.
     False,
 }
 
 impl VerifySignatures {
+    #[cfg(not(feature = "pq-transition"))]
     pub fn is_true(self) -> bool {
         self == VerifySignatures::True
     }
@@ -94,6 +124,7 @@ impl VerifySignatures {
 #[derive(PartialEq, Clone, Copy)]
 pub enum VerifyBlockRoot {
     True,
+    #[cfg(not(feature = "pq-transition"))]
     False,
 }
 
@@ -109,10 +140,38 @@ pub enum VerifyBlockRoot {
 /// tree hash root of the block, NOT the signing root of the block. This function takes
 /// care of mixing in the domain.
 #[instrument(skip_all)]
+#[cfg(not(feature = "pq-transition"))]
 pub fn per_block_processing<E: EthSpec, Payload: AbstractExecPayload<E>>(
     state: &mut BeaconState<E>,
     signed_block: &SignedBeaconBlock<E, Payload>,
     block_signature_strategy: BlockSignatureStrategy,
+    verify_block_root: VerifyBlockRoot,
+    ctxt: &mut ConsensusContext<E>,
+    spec: &ChainSpec,
+) -> Result<(), BlockProcessingError> {
+    per_block_processing_core(
+        state,
+        signed_block,
+        CoreSignatureMode::Bls(block_signature_strategy),
+        verify_block_root,
+        ctxt,
+        spec,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum CoreSignatureMode {
+    #[cfg(not(feature = "pq-transition"))]
+    Bls(BlockSignatureStrategy),
+    #[cfg(feature = "pq-transition")]
+    PqVerified,
+}
+
+#[cfg_attr(feature = "pq-transition", instrument(skip_all))]
+fn per_block_processing_core<E: EthSpec, Payload: AbstractExecPayload<E>>(
+    state: &mut BeaconState<E>,
+    signed_block: &SignedBeaconBlock<E, Payload>,
+    signature_mode: CoreSignatureMode,
     verify_block_root: VerifyBlockRoot,
     ctxt: &mut ConsensusContext<E>,
     spec: &ChainSpec,
@@ -130,17 +189,22 @@ pub fn per_block_processing<E: EthSpec, Payload: AbstractExecPayload<E>>(
         .map_err(BlockProcessingError::InconsistentStateFork)?;
 
     // Process deferred execution requests from the parent's envelope.
+    #[cfg(not(feature = "pq-transition"))]
     if fork_name.gloas_enabled() {
         process_parent_execution_payload(state, block, spec)?;
     }
+
+    #[cfg(feature = "pq-transition")]
+    let _ = fork_name;
 
     // Build epoch cache if it hasn't already been built, or if it is no longer valid
     initialize_epoch_cache(state, spec)?;
     initialize_progressive_balances_cache(state, spec)?;
     state.build_slashings_cache()?;
 
-    let verify_signatures = match block_signature_strategy {
-        BlockSignatureStrategy::VerifyBulk => {
+    let verify_signatures = match signature_mode {
+        #[cfg(not(feature = "pq-transition"))]
+        CoreSignatureMode::Bls(BlockSignatureStrategy::VerifyBulk) => {
             // Verify all signatures in the block at once.
             BlockSignatureVerifier::verify_entire_block(
                 state,
@@ -152,9 +216,14 @@ pub fn per_block_processing<E: EthSpec, Payload: AbstractExecPayload<E>>(
             )?;
             VerifySignatures::False
         }
-        BlockSignatureStrategy::VerifyIndividual => VerifySignatures::True,
-        BlockSignatureStrategy::NoVerification => VerifySignatures::False,
-        BlockSignatureStrategy::VerifyRandao => VerifySignatures::False,
+        #[cfg(not(feature = "pq-transition"))]
+        CoreSignatureMode::Bls(BlockSignatureStrategy::VerifyIndividual) => VerifySignatures::True,
+        #[cfg(not(feature = "pq-transition"))]
+        CoreSignatureMode::Bls(BlockSignatureStrategy::NoVerification) => VerifySignatures::False,
+        #[cfg(not(feature = "pq-transition"))]
+        CoreSignatureMode::Bls(BlockSignatureStrategy::VerifyRandao) => VerifySignatures::False,
+        #[cfg(feature = "pq-transition")]
+        CoreSignatureMode::PqVerified => VerifySignatures::False,
     };
 
     let proposer_index = process_block_header(
@@ -165,14 +234,18 @@ pub fn per_block_processing<E: EthSpec, Payload: AbstractExecPayload<E>>(
         spec,
     )?;
 
+    #[cfg(not(feature = "pq-transition"))]
     if verify_signatures.is_true() {
         verify_block_signature(state, signed_block, ctxt, spec)?;
     }
 
-    let verify_randao = if let BlockSignatureStrategy::VerifyRandao = block_signature_strategy {
-        VerifySignatures::True
-    } else {
-        verify_signatures
+    let verify_randao = match signature_mode {
+        #[cfg(not(feature = "pq-transition"))]
+        CoreSignatureMode::Bls(BlockSignatureStrategy::VerifyRandao) => VerifySignatures::True,
+        #[cfg(not(feature = "pq-transition"))]
+        CoreSignatureMode::Bls(_) => verify_signatures,
+        #[cfg(feature = "pq-transition")]
+        CoreSignatureMode::PqVerified => VerifySignatures::False,
     };
     // Ensure the current and previous epoch committee caches are built.
     state.build_committee_cache(RelativeEpoch::Previous, spec)?;
@@ -183,10 +256,22 @@ pub fn per_block_processing<E: EthSpec, Payload: AbstractExecPayload<E>>(
     // previous block.
     if is_execution_enabled(state, block.body()) {
         let body = block.body();
+        #[cfg(not(feature = "pq-transition"))]
         if state.fork_name_unchecked().gloas_enabled() {
             withdrawals::gloas::process_withdrawals::<E>(state, spec)?;
             process_execution_payload_bid(state, block, verify_signatures, spec)?;
         } else {
+            if state.fork_name_unchecked().capella_enabled() {
+                withdrawals::capella_electra::process_withdrawals::<E, Payload>(
+                    state,
+                    body.execution_payload()?,
+                    spec,
+                )?;
+            }
+            process_execution_payload::<E, Payload>(state, body, spec)?;
+        }
+        #[cfg(feature = "pq-transition")]
+        {
             if state.fork_name_unchecked().capella_enabled() {
                 withdrawals::capella_electra::process_withdrawals::<E, Payload>(
                     state,
@@ -217,6 +302,23 @@ pub fn per_block_processing<E: EthSpec, Payload: AbstractExecPayload<E>>(
     }
 
     Ok(())
+}
+
+#[cfg(feature = "pq-transition")]
+pub(crate) fn process_verified_pq_block<E: EthSpec>(
+    state: &mut BeaconState<E>,
+    signed_block: &SignedBeaconBlock<E>,
+    context: &mut ConsensusContext<E>,
+    spec: &ChainSpec,
+) -> Result<(), BlockProcessingError> {
+    per_block_processing_core(
+        state,
+        signed_block,
+        CoreSignatureMode::PqVerified,
+        VerifyBlockRoot::True,
+        context,
+        spec,
+    )
 }
 
 /// Processes the block header, returning the proposer index.
@@ -281,6 +383,7 @@ pub fn process_block_header<E: EthSpec>(
 /// Verifies the signature of a block.
 ///
 /// Spec v0.12.1
+#[cfg(not(feature = "pq-transition"))]
 pub fn verify_block_signature<E: EthSpec, Payload: AbstractExecPayload<E>>(
     state: &BeaconState<E>,
     block: &SignedBeaconBlock<E, Payload>,
@@ -314,6 +417,7 @@ pub fn process_randao<E: EthSpec, Payload: AbstractExecPayload<E>>(
     ctxt: &mut ConsensusContext<E>,
     spec: &ChainSpec,
 ) -> Result<(), BlockProcessingError> {
+    #[cfg(not(feature = "pq-transition"))]
     if verify_signatures.is_true() {
         // Verify RANDAO reveal signature.
         let proposer_index = ctxt.get_proposer_index(state, spec)?;
@@ -329,6 +433,9 @@ pub fn process_randao<E: EthSpec, Payload: AbstractExecPayload<E>>(
             BlockProcessingError::RandaoSignatureInvalid
         );
     }
+
+    #[cfg(feature = "pq-transition")]
+    let _ = (verify_signatures, ctxt, spec);
 
     // Update the current epoch RANDAO mix.
     state.update_randao_mix(state.current_epoch(), block.body().randao_reveal())?;
@@ -541,6 +648,7 @@ pub fn compute_timestamp_at_slot<E: EthSpec>(
 ///
 /// `process_parent_execution_payload` must be called before `process_execution_payload_bid`
 /// (which overwrites `state.latest_execution_payload_bid`).
+#[cfg(not(feature = "pq-transition"))]
 pub fn process_parent_execution_payload<E: EthSpec, Payload: AbstractExecPayload<E>>(
     state: &mut BeaconState<E>,
     block: BeaconBlockRef<'_, E, Payload>,
@@ -582,6 +690,7 @@ pub fn process_parent_execution_payload<E: EthSpec, Payload: AbstractExecPayload
 /// 1. Processes deposits, withdrawals, and consolidations from execution requests
 /// 2. Queues the builder pending payment from the parent's committed bid
 /// 3. Updates `execution_payload_availability` and `latest_block_hash`
+#[cfg(not(feature = "pq-transition"))]
 pub fn apply_parent_execution_payload<E: EthSpec>(
     state: &mut BeaconState<E>,
     requests: &ExecutionRequests<E>,
@@ -638,6 +747,7 @@ pub fn apply_parent_execution_payload<E: EthSpec>(
 ///
 /// Moves a pending payment from `builder_pending_payments[payment_index]` into
 /// `builder_pending_withdrawals`, then clears the slot.
+#[cfg(not(feature = "pq-transition"))]
 pub fn settle_builder_payment<E: EthSpec>(
     state: &mut BeaconState<E>,
     payment_index: usize,
@@ -662,6 +772,7 @@ pub fn settle_builder_payment<E: EthSpec>(
     Ok(())
 }
 
+#[cfg(not(feature = "pq-transition"))]
 pub fn process_execution_payload_bid<E: EthSpec, Payload: AbstractExecPayload<E>>(
     state: &mut BeaconState<E>,
     block: BeaconBlockRef<'_, E, Payload>,

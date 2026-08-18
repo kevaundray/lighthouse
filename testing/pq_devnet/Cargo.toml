@@ -30,6 +30,7 @@ pq-devnet = [
     "dep:zeroize",
 ]
 pq-verification-testing = ["pq-devnet", "state_processing/pq-verification-testing"]
+pq-transition-testing = ["pq-verification-testing", "state_processing/pq-transition"]
 
 [dependencies]
 attestation_aggregation = { workspace = true, optional = true, features = ["pq-attestation"] }
@@ -76,3 +77,8 @@ required-features = ["pq-devnet"]
 name = "pq_consensus_verification"
 path = "tests/pq_consensus_verification.rs"
 required-features = ["pq-verification-testing"]
+
+[[test]]
+name = "pq_transition"
+path = "tests/pq_transition.rs"
+required-features = ["pq-transition-testing"]

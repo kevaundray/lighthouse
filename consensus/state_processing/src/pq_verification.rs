@@ -30,7 +30,7 @@ use crate::{
         materialize_pq_attestation_verification_job, materialize_prepared_pq_attestation,
         preflight_pq_attestation_from_bits, preflight_pq_attestation_verification_job,
     },
-    pq_profile::is_lean_pq_devnet_v1,
+    pq_profile::{is_lean_pq_devnet_v1, pq_pre_state_root},
 };
 use consensus_signature::{
     AggregationContribution, AggregationError, AggregationJob, AggregationService,
@@ -40,7 +40,7 @@ use consensus_signature::{
 use std::sync::Arc;
 use types::{
     BeaconState, BeaconStateError, ChainSpec, Domain, EthSpec, ForkName, SignedAggregateAndProof,
-    SignedBeaconBlock, SignedRoot,
+    SignedBeaconBlock, SignedRoot, Slot,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,6 +73,24 @@ pub enum PqConsensusInvalid {
         error: PqAttestationInvalid,
     },
     InvalidEvidence(PqConsensusComponent),
+    UnsupportedBlock(PqUnsupportedBlock),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PqUnsupportedBlock {
+    StateSlotMismatch { state: Slot, block: Slot },
+    Deposits,
+    DepositRequests,
+    ProposerSlashings,
+    AttesterSlashings,
+    VoluntaryExits,
+    BlsToExecutionChanges,
+    WithdrawalRequests,
+    ConsolidationRequests,
+    BlobKzgCommitments,
+    Eth1DataChanged,
+    SyncCommitteeParticipants,
+    SyncCommitteeEvidence,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,6 +152,8 @@ pub struct VerifiedPqBlockProposal<E: EthSpec> {
 
 pub struct PreparedPqBlock<E: EthSpec> {
     block: Arc<SignedBeaconBlock<E>>,
+    pre_state_root: types::Hash256,
+    spec: Arc<ChainSpec>,
     proposal_job: AggregationJob,
     randao_job: AggregationJob,
     attestation_jobs: Vec<AggregationJob>,
@@ -141,6 +161,10 @@ pub struct PreparedPqBlock<E: EthSpec> {
 
 pub struct VerifiedPqBlock<E: EthSpec> {
     block: Arc<SignedBeaconBlock<E>>,
+    #[cfg_attr(not(feature = "pq-transition"), allow(dead_code))]
+    pre_state_root: types::Hash256,
+    #[cfg_attr(not(feature = "pq-transition"), allow(dead_code))]
+    spec: Arc<ChainSpec>,
 }
 
 pub struct PreparedPqAggregateAndProof<E: EthSpec> {
@@ -217,7 +241,11 @@ impl<E: EthSpec> PreparedPqBlock<E> {
             )
             .await?;
         }
-        Ok(VerifiedPqBlock { block: self.block })
+        Ok(VerifiedPqBlock {
+            block: self.block,
+            pre_state_root: self.pre_state_root,
+            spec: self.spec,
+        })
     }
 }
 
@@ -228,6 +256,13 @@ impl<E: EthSpec> VerifiedPqBlock<E> {
 
     pub fn into_block(self) -> Arc<SignedBeaconBlock<E>> {
         self.block
+    }
+
+    #[cfg(feature = "pq-transition")]
+    pub(crate) fn into_transition_parts(
+        self,
+    ) -> (Arc<SignedBeaconBlock<E>>, types::Hash256, Arc<ChainSpec>) {
+        (self.block, self.pre_state_root, self.spec)
     }
 }
 
@@ -325,6 +360,7 @@ fn prepare_pq_block_inner<E: EthSpec>(
     spec: &ChainSpec,
     evidence_work: &mut usize,
 ) -> Result<PreparedPqBlock<E>, PqConsensusError> {
+    preflight_pq_transition_block(state, &block, spec)?;
     let proposal_structure = preflight_proposal_structure(state, key_cache, &block, spec)?;
     let proposer_index = block.message().proposer_index();
     let randao_domain = spec.get_domain(
@@ -352,6 +388,11 @@ fn prepare_pq_block_inner<E: EthSpec>(
                 })?;
         attestation_preflights.push(preflight);
     }
+
+    // Bind the capability to the exact claim-producing state only after all hostile block
+    // structure has passed preflight, but before any evidence is copied or backend work exists.
+    let pre_state_root = pq_pre_state_root(state)
+        .map_err(|_| PqConsensusError::Local(PqConsensusLocalError::StateUnavailable))?;
 
     // The proposal claim tree-hashes the complete block, including every attestation, only after
     // every attacker-controlled included attestation has passed structural preflight.
@@ -381,10 +422,70 @@ fn prepare_pq_block_inner<E: EthSpec>(
     }
     Ok(PreparedPqBlock {
         block,
+        pre_state_root,
+        spec: Arc::new(spec.clone()),
         proposal_job,
         randao_job,
         attestation_jobs,
     })
+}
+
+pub(crate) fn preflight_pq_transition_block<E: EthSpec>(
+    state: &BeaconState<E>,
+    block: &SignedBeaconBlock<E>,
+    spec: &ChainSpec,
+) -> Result<(), PqConsensusError> {
+    validate_v1_profile(state, spec, block.slot())?;
+    if state.slot() != block.slot() {
+        return Err(PqConsensusError::Invalid(
+            PqConsensusInvalid::UnsupportedBlock(PqUnsupportedBlock::StateSlotMismatch {
+                state: state.slot(),
+                block: block.slot(),
+            }),
+        ));
+    }
+
+    let types::BeaconBlockRef::Electra(electra) = block.message() else {
+        return Err(PqConsensusError::Invalid(
+            PqConsensusInvalid::InconsistentBlockFork,
+        ));
+    };
+    let body = &electra.body;
+    let unsupported = if !body.deposits.is_empty() {
+        Some(PqUnsupportedBlock::Deposits)
+    } else if !body.execution_requests.deposits.is_empty() {
+        Some(PqUnsupportedBlock::DepositRequests)
+    } else if !body.proposer_slashings.is_empty() {
+        Some(PqUnsupportedBlock::ProposerSlashings)
+    } else if !body.attester_slashings.is_empty() {
+        Some(PqUnsupportedBlock::AttesterSlashings)
+    } else if !body.voluntary_exits.is_empty() {
+        Some(PqUnsupportedBlock::VoluntaryExits)
+    } else if !body.bls_to_execution_changes.is_empty() {
+        Some(PqUnsupportedBlock::BlsToExecutionChanges)
+    } else if !body.execution_requests.withdrawals.is_empty() {
+        Some(PqUnsupportedBlock::WithdrawalRequests)
+    } else if !body.execution_requests.consolidations.is_empty() {
+        Some(PqUnsupportedBlock::ConsolidationRequests)
+    } else if !body.blob_kzg_commitments.is_empty() {
+        Some(PqUnsupportedBlock::BlobKzgCommitments)
+    } else if body.eth1_data != *state.eth1_data() || body.eth1_data.deposit_count != 0 {
+        Some(PqUnsupportedBlock::Eth1DataChanged)
+    } else if body.sync_aggregate.sync_committee_bits.num_set_bits() != 0 {
+        Some(PqUnsupportedBlock::SyncCommitteeParticipants)
+    } else if !body.sync_aggregate.sync_committee_signature.is_empty() {
+        Some(PqUnsupportedBlock::SyncCommitteeEvidence)
+    } else {
+        None
+    };
+
+    if let Some(unsupported) = unsupported {
+        Err(PqConsensusError::Invalid(
+            PqConsensusInvalid::UnsupportedBlock(unsupported),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 pub fn prepare_pq_aggregate_and_proof<E: EthSpec>(

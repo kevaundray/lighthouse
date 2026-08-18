@@ -48,6 +48,7 @@ impl AttestationDelta {
 #[derive(Debug)]
 pub enum ProposerRewardCalculation {
     Include,
+    #[cfg_attr(feature = "pq-transition", allow(dead_code))]
     Exclude,
 }
 
@@ -98,6 +99,7 @@ pub fn get_attestation_deltas_all<E: EthSpec>(
 
 /// Apply rewards for participation in attestations during the previous epoch, and only compute
 /// rewards for a subset of validators.
+#[cfg(not(feature = "pq-transition"))]
 pub fn get_attestation_deltas_subset<E: EthSpec>(
     state: &BeaconState<E>,
     validator_statuses: &ValidatorStatuses,

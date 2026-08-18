@@ -1,8 +1,9 @@
+#[cfg(not(feature = "pq-transition"))]
 use crate::upgrade::{
     upgrade_to_altair, upgrade_to_bellatrix, upgrade_to_capella, upgrade_to_deneb,
     upgrade_to_electra, upgrade_to_fulu, upgrade_to_gloas,
 };
-use crate::{per_epoch_processing::EpochProcessingSummary, *};
+use crate::{EpochProcessingError, per_epoch_processing::EpochProcessingSummary};
 use fixed_bytes::FixedBytesExtended;
 use safe_arith::{ArithError, SafeArith};
 use tracing::instrument;
@@ -50,7 +51,7 @@ pub fn per_slot_processing<E: EthSpec>(
     let summary = if state.slot() > spec.genesis_slot
         && state.slot().safe_add(1)?.safe_rem(E::slots_per_epoch())? == 0
     {
-        Some(per_epoch_processing(state, spec)?)
+        Some(crate::per_epoch_processing::process_epoch(state, spec)?)
     } else {
         None
     };
@@ -71,6 +72,7 @@ pub fn per_slot_processing<E: EthSpec>(
 
     // Process fork upgrades here. Note that multiple upgrades can potentially run
     // in sequence if they are scheduled in the same Epoch (common in testnets)
+    #[cfg(not(feature = "pq-transition"))]
     if state.slot().safe_rem(E::slots_per_epoch())? == 0 {
         // If the Altair fork epoch is reached, perform an irregular state upgrade.
         if spec.altair_fork_epoch == Some(state.current_epoch()) {
@@ -106,6 +108,11 @@ pub fn per_slot_processing<E: EthSpec>(
         // Additionally build all caches so that all valid states that are advanced always have
         // committee caches built, and we don't have to worry about initialising them at higher
         // layers.
+        state.build_caches(spec)?;
+    }
+
+    #[cfg(feature = "pq-transition")]
+    if state.slot().safe_rem(E::slots_per_epoch())? == 0 {
         state.build_caches(spec)?;
     }
 

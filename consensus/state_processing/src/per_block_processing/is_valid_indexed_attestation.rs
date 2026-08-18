@@ -1,6 +1,7 @@
+use super::VerifySignatures;
 use super::errors::{BlockOperationError, IndexedAttestationInvalid as Invalid};
+#[cfg(not(feature = "pq-transition"))]
 use super::signature_sets::{get_pubkey_from_state, indexed_attestation_signature_set};
-use crate::VerifySignatures;
 use itertools::Itertools;
 use types::*;
 
@@ -38,6 +39,7 @@ pub fn is_valid_indexed_attestation<E: EthSpec>(
     };
     check_sorted(&indices)?;
 
+    #[cfg(not(feature = "pq-transition"))]
     if verify_signatures.is_true() {
         verify!(
             indexed_attestation_signature_set(
@@ -51,6 +53,9 @@ pub fn is_valid_indexed_attestation<E: EthSpec>(
             Invalid::BadSignature
         );
     }
+
+    #[cfg(feature = "pq-transition")]
+    let _ = (state, verify_signatures, spec);
 
     Ok(())
 }

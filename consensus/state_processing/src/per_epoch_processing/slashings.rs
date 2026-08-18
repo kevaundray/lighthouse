@@ -1,8 +1,7 @@
 use crate::common::decrease_balance;
-use crate::per_epoch_processing::{
-    Error,
-    single_pass::{SinglePassConfig, process_epoch_single_pass},
-};
+use crate::per_epoch_processing::Error;
+#[cfg(not(feature = "pq-transition"))]
+use crate::per_epoch_processing::single_pass::{SinglePassConfig, process_epoch_single_pass};
 use safe_arith::{SafeArith, SafeArithIter};
 use typenum::Unsigned;
 use types::{BeaconState, ChainSpec, EthSpec};
@@ -48,6 +47,7 @@ pub fn process_slashings<E: EthSpec>(
     Ok(())
 }
 
+#[cfg(not(feature = "pq-transition"))]
 pub fn process_slashings_slow<E: EthSpec>(
     state: &mut BeaconState<E>,
     spec: &ChainSpec,

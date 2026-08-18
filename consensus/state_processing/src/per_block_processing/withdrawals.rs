@@ -4,6 +4,7 @@ use crate::per_block_processing::builder::{
     is_builder_index,
 };
 use crate::per_block_processing::errors::BlockProcessingError;
+#[cfg(not(feature = "pq-transition"))]
 use milhouse::List;
 use safe_arith::{SafeArith, SafeArithIter};
 use tree_hash::TreeHash;
@@ -350,6 +351,7 @@ fn update_next_withdrawal_index<E: EthSpec>(
     Ok(())
 }
 
+#[cfg(not(feature = "pq-transition"))]
 fn update_payload_expected_withdrawals<E: EthSpec>(
     state: &mut BeaconState<E>,
     withdrawals: &Withdrawals<E>,
@@ -358,6 +360,7 @@ fn update_payload_expected_withdrawals<E: EthSpec>(
     Ok(())
 }
 
+#[cfg(not(feature = "pq-transition"))]
 fn update_builder_pending_withdrawals<E: EthSpec>(
     state: &mut BeaconState<E>,
     processed_builder_withdrawals_count: u64,
@@ -378,6 +381,7 @@ fn update_pending_partial_withdrawals<E: EthSpec>(
     Ok(())
 }
 
+#[cfg(not(feature = "pq-transition"))]
 fn update_next_withdrawal_builder_index<E: EthSpec>(
     state: &mut BeaconState<E>,
     processed_builders_sweep_count: u64,
@@ -486,6 +490,7 @@ pub mod capella_electra {
     }
 }
 
+#[cfg(not(feature = "pq-transition"))]
 pub mod gloas {
     use super::*;
 

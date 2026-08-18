@@ -98,6 +98,7 @@ impl<E: EthSpec> JustificationAndFinalizationState<E> {
         self.current_justified_checkpoint
     }
 
+    #[cfg(not(feature = "pq-transition"))]
     pub fn finalized_checkpoint(&self) -> Checkpoint {
         self.finalized_checkpoint
     }

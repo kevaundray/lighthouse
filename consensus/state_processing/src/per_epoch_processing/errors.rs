@@ -31,6 +31,8 @@ pub enum EpochProcessingError {
     MissingEarliestExitEpoch,
     MissingExitBalanceToConsume,
     PendingDepositsLogicError,
+    #[cfg(feature = "pq-transition")]
+    PqUnsupportedPendingState,
     ProposerLookaheadOutOfBounds(usize),
 }
 

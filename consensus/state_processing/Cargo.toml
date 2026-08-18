@@ -10,6 +10,7 @@ pq-genesis = ["consensus_signature/pq-wire", "types/pq-devnet"]
 pq-attestation = ["consensus_signature/pq-devnet", "types/pq-devnet"]
 pq-verification = ["pq-attestation"]
 pq-verification-testing = ["pq-verification"]
+pq-transition = ["pq-verification"]
 fake_crypto = ["bls/fake_crypto"]
 arbitrary = [
     "dep:arbitrary",

@@ -1,3 +1,4 @@
+#[cfg(not(feature = "pq-transition"))]
 use types::*;
 
 pub mod attesting_indices_base {
@@ -80,6 +81,7 @@ pub mod attesting_indices_electra {
     }
 
     /// Shortcut for getting the attesting indices while fetching the committee from the state's cache.
+    #[cfg(not(feature = "pq-transition"))]
     pub fn get_attesting_indices_from_state<E: EthSpec>(
         state: &BeaconState<E>,
         att: &AttestationElectra<E>,
@@ -160,6 +162,7 @@ pub mod attesting_indices_electra {
 }
 
 /// Shortcut for getting the attesting indices while fetching the committee from the state's cache.
+#[cfg(not(feature = "pq-transition"))]
 pub fn get_attesting_indices_from_state<E: EthSpec>(
     state: &BeaconState<E>,
     att: AttestationRef<E>,

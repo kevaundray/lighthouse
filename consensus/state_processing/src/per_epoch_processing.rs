@@ -8,8 +8,12 @@ use safe_arith::SafeArith;
 use tracing::instrument;
 use types::{BeaconState, ChainSpec, EthSpec};
 
-pub use registry_updates::{process_registry_updates, process_registry_updates_slow};
-pub use slashings::{process_slashings, process_slashings_slow};
+pub use registry_updates::process_registry_updates;
+#[cfg(not(feature = "pq-transition"))]
+pub use registry_updates::process_registry_updates_slow;
+pub use slashings::process_slashings;
+#[cfg(not(feature = "pq-transition"))]
+pub use slashings::process_slashings_slow;
 pub use weigh_justification_and_finalization::weigh_justification_and_finalization;
 
 pub mod altair;

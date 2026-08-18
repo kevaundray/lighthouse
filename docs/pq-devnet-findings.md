@@ -1073,3 +1073,47 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   (direct or attestation-nested signing-ID and aggregation failures); its peer-invalid and plain
   local terminal variants deliberately return no source. The source test's RED was `None` instead
   of the expected `SlotOutOfRange` cause.
+
+### 2026-08-18: Sealed PQ state transition implemented
+
+- `state_processing/pq-transition` reuses the ordinary unsigned block-processing core through one
+  consumed `VerifiedPqBlock`; it exposes no raw-block transition and no PQ signature-skipping
+  strategy. The token privately owns the exact preparation `ChainSpec` and a canonical pre-state
+  root. Transition recomputes that root before mutation, repeats the frozen-profile/body preflight,
+  creates a fresh `ConsensusContext`, and always verifies the parent root. Compile-fail tests pin
+  the two-argument API and reject raw blocks, legacy BLS `NoVerification`, and substituted
+  spec/root/context arguments.
+- Full-block preparation rejects hostile unsupported structure before any evidence copy, claim
+  hash, or backend work. V1 is exactly 16 validators and Electra from genesis, with no Fulu/Gloas,
+  zero `eth1_data.deposit_root`, deposit count and deposit index, and empty pending deposit,
+  partial-withdrawal, and consolidation queues. Deposits and execution deposit requests,
+  slashings, exits, BLS changes, withdrawal/consolidation requests, blob commitments, eth1 drift,
+  and every sync shape except zero bits plus absent evidence are rejected explicitly. Block fields
+  are peer-invalid; unsupported local state/schedule remains local.
+- The PQ block adapter compiles only the supported Electra operation path and the shared ordinary
+  attestation, header, execution payload, RANDAO, eth1 vote, and sync accounting code. BLS
+  `SignatureSet`, `BlockSignatureVerifier`, deposit/exit/slashing verification, and Gloas paths stay
+  outside the PQ transition graph. Default BLS APIs and behavior remain unchanged. The PQ slot
+  wrapper keeps ordinary slot/epoch processing and cache rotation; its epoch path defensively
+  rejects impossible pending state before mutation while retaining justification/finalization,
+  rewards, resets, and committee rotation.
+- Canonical empty sync input creates no sync crypto job and consumes no signing leaf, but still
+  calls ordinary sync accounting with every bit false. The real transition test confirms the same
+  per-position penalty for repeated committee indices and accounts for the proposer position
+  normally. A real slot-3 PQ attestation included at slot 4 also updates the ordinary Electra
+  participation flags, while the returned fresh context contains only values derived during this
+  transition and the state receives the standard temporary header/body root.
+- The initial API RED was an unresolved `per_block_processing_pq` import. A later real-transition
+  RED returned typed `ExecutionInvalidTimestamp { expected: 324, found: 24 }`, proving ordinary
+  payload checks were active before the test fixture included genesis time. Scalar transition
+  tests pass 9/9, misuse doctests pass 5/5, default BLS state-processing tests pass 2/2, and Rust
+  1.88 warnings-denied Clippy passes through the isolated normal-dependency harness. A strict
+  spec-binding sensitivity mutation replaced the token's distinctive 17-second-slot spec with a
+  fresh default Electra spec and failed with `ExecutionInvalidTimestamp { expected: 324, found:
+  368 }`. Restoring the token-owned spec accepted the same valid block and retained the later typed
+  `expected: 385, found: 384` invalid-payload check. The final AVX2 test passed 1/1 in 462.75
+  seconds (7:43.06 wall), peaked at 789,688 KiB RSS, and used no swap. It preserves typed pre-state
+  mismatch, wrong-parent, and invalid execution timestamp errors after genuine PQ verification.
+- This task retains the existing in-state execution payload checks only. Engine API `newPayload`
+  is deliberately deferred to Task 5.3e. Hash-chain/hash-onion RANDAO remains a future versioned
+  proposal; frozen V1 continues to use the signature-derived RANDAO claim and leaf.
