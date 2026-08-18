@@ -244,40 +244,81 @@ git commit -m "refactor: name consensus signing evidence semantically"
 - Modify: `Cargo.toml`
 - Modify: `Cargo.lock`
 - Create or modify: `crypto/consensus_signature/src/pq.rs`
+- Create: `crypto/consensus_signature/tests/pq_dependency_smoke.rs`
+- Create: `crypto/consensus_signature/tests/pq_error_classification.rs`
+- Create: `crypto/consensus_signature/tests/pq_prover_guard.rs`
+- Modify: `docs/plans/2026-08-18-pq-devnet-implementation.md`
 - Modify: `docs/pq-devnet-findings.md`
 
 **Step 1: Add a failing dependency smoke test**
 
-The test imports only the stable API surface required by Lighthouse: setup, deterministic key
-creation, raw sign, raw verify, aggregate, aggregate decode, and aggregate verify.
+The heavy smoke imports only the stable API surface required by Lighthouse: guarded setup, two
+deterministic keys, raw sign, raw verify, guarded aggregate, contextual aggregate decode, and
+aggregate verify. It must prove the exact two-signer set and reject missing, extra, wrong, and
+wrong-claim contexts. The test constructs one owned `PqProver`; that object must run all setup and
+proving inside its own named, serial-command `std::thread` with an explicit 512 MiB stack. A second
+live prover in the process must be rejected.
+
+Separate fast tests require a scalar build to reject prover construction without invoking the
+backend and classify known upstream evidence/request failures separately from local/internal
+failures. Unknown variants of the non-exhaustive upstream error must default to local/internal.
 
 **Step 2: Verify RED**
 
 ```bash
-cargo nextest run -p consensus_signature --features pq-devnet pq_dependency_smoke
+cargo nextest run -p consensus_signature --features pq-devnet --test pq_prover_guard
+cargo nextest run -p consensus_signature --features pq-devnet --test pq_error_classification
+RUSTFLAGS='-C target-feature=+avx2' cargo nextest run -p consensus_signature \
+  --features pq-devnet pq_dependency_smoke
 ```
 
-Expected: failure because the pinned dependency and feature are absent.
+Expected: compilation fails because the pinned dependency, feature, guarded adapter errors, and
+operations are absent.
 
 **Step 3: Pin exact commits and expose a minimal adapter**
 
-Pin both the binding and its leanVM/API dependency. If the upstream facade cannot express the
-required leaf identifier, bounded decoding, or fallible setup, fork it and record the fork commit
-in `docs/pq-devnet-findings.md`.
+Pin both the binding and its leanVM/API dependency. Do not publicly re-export upstream `setup` or
+`aggregate`. An owned process-singleton `PqProver` is the only proving entry point. Its constructor
+starts one named 512 MiB-stack OS worker, initializes upstream setup there, and then services owned
+aggregate jobs through one serial command queue. Report spawn, setup panic, worker stop, worker
+panic, peer-invalid evidence, invalid request/limit, and internal backend errors distinctly.
+Track the process-global backend lifecycle as idle, active, or poisoned. A caught setup or
+aggregation panic permanently poisons the process: dropping the worker must not reopen upstream
+state, and later constructors must distinguish poison from an already-active worker.
+
+The experimental PQ binary is x86-64 AVX2-only. A global `-C target-feature=+avx2` binary cannot
+safely perform its own host compatibility test after startup, so the launcher must preflight AVX2
+before executing it. Ordinary scalar `pq-devnet` and package `--all-features` builds must compile,
+but `PqProver::new` returns compile-time-mode unavailable without invoking upstream code. A later
+prover sidecar can keep the main Lighthouse binary portable.
+
+This task pins and probes the dependency and enforces the worker/AVX availability boundary only.
+The semantic `OneTimeUseId` mapping remains Task 2.2; representation-specific raw/aggregate
+evidence wrappers and bounded contextual decoding remain Task 2.3. A narrow binding fork is not
+required for this internal smoke, but is required before external binary distribution to resolve
+license files and harden those later evidence boundaries.
 
 **Step 4: Verify GREEN**
 
 ```bash
-cargo nextest run -p consensus_signature --features pq-devnet pq_dependency_smoke
-cargo check -p consensus_signature --no-default-features --features pq-devnet
+cargo nextest run -p consensus_signature --features pq-devnet --test pq_prover_guard
+cargo nextest run -p consensus_signature --features pq-devnet --test pq_error_classification
+RUSTFLAGS='-C target-feature=+avx2' cargo nextest run -p consensus_signature \
+  --features pq-devnet pq_dependency_smoke
+RUSTFLAGS='-C target-feature=+avx2' cargo check -p consensus_signature \
+  --no-default-features --features pq-devnet
+RUSTFLAGS='-C target-feature=+avx2' cargo check -p consensus_signature --all-features
 ```
 
-Expected: smoke test and PQ-only check pass.
+Expected: the fast refusal and error-classification tests, two-signer smoke, PQ-only check, and
+package all-feature check pass. Run the default BLS facade tests and full default workspace
+`cargo check` as regressions.
 
 **Step 5: Commit**
 
 ```bash
-git add Cargo.toml Cargo.lock crypto/consensus_signature docs/pq-devnet-findings.md
+git add Cargo.toml Cargo.lock crypto/consensus_signature \
+  docs/plans/2026-08-18-pq-devnet-implementation.md docs/pq-devnet-findings.md
 git commit -m "build: pin lean multisig backend"
 ```
 

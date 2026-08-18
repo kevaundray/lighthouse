@@ -3,5 +3,10 @@ name = "consensus_signature"
 version = "0.1.0"
 edition = { workspace = true }
 
+[features]
+default = []
+pq-devnet = ["dep:lean-multisig"]
+
 [dependencies]
 bls = { workspace = true }
+lean-multisig = { workspace = true, optional = true }

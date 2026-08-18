@@ -94,8 +94,10 @@ An exact-pin local dependency probe on 2026-08-18 added stronger operational evi
   aggregate.
 - Dependency-local `.cargo/config.toml` settings are not inherited by Lighthouse. The binding
   requests AVX2 on x86 because its scalar fallback is documented as silently breaking
-  aggregation. The first devnet must require and validate AVX2, or use a fork that supplies a
-  correct portable/runtime-dispatched path.
+  aggregation. The first devnet launcher must validate host AVX2 before starting the globally
+  AVX2-compiled experimental binary. In-binary runtime detection is too late because compiler-
+  generated AVX2 may execute before the check. A later prover sidecar can keep the main binary
+  portable, or a fork can supply a correct runtime-dispatched path.
 
 Initial implementation consequence: use one long-lived dedicated PQ worker with an explicitly
 large stack, initialize it before networking, and serialize setup/proving jobs. Do not set a large
@@ -241,3 +243,51 @@ Those require explicit absent/empty evidence rules rather than fake infinity sig
 - Chose the dense 14-leaf `LeanPqDevnetV1` Electra layout and explicit initial exclusions above.
 - Confirmed validator registrations have no consensus slot and remote/distributed signers cannot
   own the required local XMSS journal; PQ startup must reject those configurations.
+
+### 2026-08-18: Lighthouse exact-pin dependency integration
+
+- Added `ethereum/lean-multisig-bindings` commit
+  `c0ef8e621556581b2beb0c4f72f99c001a026fe6` as the optional `pq-devnet` dependency of
+  `consensus_signature`. `Cargo.lock` confirms its transitive leanVM/API source is exactly
+  `aed646200cf5ae3199c25c61f2bfe094582678ae`.
+- The RED command
+  `cargo nextest run -p consensus_signature --features pq-devnet pq_dependency_smoke` failed in
+  0.39 seconds because the feature and dependency did not yet exist.
+- Integrating the exact graph required two patch-only lockfile updates compatible with existing
+  Lighthouse constraints: `objc2` 0.6.3 to 0.6.4 and `tracing-subscriber` 0.3.22 to 0.3.23.
+- The GREEN command used the upstream-required x86 setting:
+  `RUSTFLAGS='-C target-feature=+avx2' cargo nextest run -p consensus_signature --features
+  pq-devnet pq_dependency_smoke`. The one test passed in 33.206 seconds; the timed command took
+  45.93 seconds including incremental compilation and peaked at 802,648 KiB RSS.
+- A post-format repeat passed in 32.929 seconds; the command took 34.18 seconds and peaked at
+  771,424 KiB RSS. The default BLS compatibility test, default package check, PQ-only package
+  check, package `--all-features` check, and full default workspace `cargo check` also passed.
+- The owned-worker two-signer smoke passed in 36.838 seconds; the timed command took 37.98
+  seconds and peaked at 787,380 KiB RSS. It verifies the exact two-key set and rejects missing,
+  extra, substituted, and wrong-claim signer contexts during contextual decode/verification.
+- `cargo check --workspace --all-features` is not a valid Lighthouse baseline: independently of
+  this adapter, it enables both existing `bls` features `supranational-portable` and
+  `supranational-force-adx`, and BLST rejects the mutually exclusive `portable` and `force-adx`
+  combination in its build script. All-feature evidence for this task is therefore scoped to
+  `cargo check -p consensus_signature --all-features`.
+- The smoke runs deterministic key generation, raw encoding/contextual decoding/verification,
+  setup, two-signer proving, aggregate contextual decoding/verification, and signer-context
+  rejection through one process-singleton `PqProver`. That object alone invokes upstream setup
+  and aggregation on its named 512 MiB-stack worker and serial command queue; the test no longer
+  supplies its own thread or mutex.
+- The adapter does not re-export upstream `setup` or `aggregate`. A normal scalar `pq-devnet`
+  build compiles, but `PqProver::new` returns compile-time-mode unavailable without invoking the
+  backend. The working experimental binary is wholly AVX2-only and relies on launcher preflight.
+- Aggregate errors classify invalid raw/child evidence, message mismatch, malformed signer
+  context, empty/over-limit requests, stopped or panicked workers, and local/internal backend
+  failures separately. Because the upstream error is non-exhaustive, unknown future variants
+  default to internal and must never trigger peer penalties.
+- The singleton lifecycle is explicit: idle, active, or permanently poisoned. A caught setup or
+  aggregation panic poisons the process-global upstream state; dropping that worker cannot change
+  poisoned back to idle, and later construction reports poison separately from an active worker.
+- No fork was needed to compile and exercise this smoke boundary. A binding fork remains required
+  before treating the dependency as distributable devnet infrastructure: the bindings manifest
+  declares `MIT OR Apache-2.0` but the pinned repository contains no corresponding license files.
+  The same fork should implement the representation-specific decoding, bounded inputs, leaf-ID
+  naming, and worker/setup contract listed above; license provenance must be resolved and tracked
+  before binaries are distributed outside the experiment.

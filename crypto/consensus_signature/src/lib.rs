@@ -5,6 +5,9 @@
 
 mod bls;
 
+#[cfg(feature = "pq-devnet")]
+pub mod pq;
+
 pub use bls::{
     AggregateSignature, AggregateVerificationRequest, BatchVerificationRequest, Hash256,
     IndividualSignature, RawSignature, RawVerificationRequest, SameMessageEvidence, SigningClaim,

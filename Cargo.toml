@@ -163,6 +163,7 @@ initialized_validators = { path = "validator_client/initialized_validators" }
 int_to_bytes = { path = "consensus/int_to_bytes" }
 itertools = "0.14"
 kzg = { path = "crypto/kzg" }
+lean-multisig = { git = "https://github.com/ethereum/lean-multisig-bindings", rev = "c0ef8e621556581b2beb0c4f72f99c001a026fe6" }
 libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", default-features = false, features = ["identify", "yamux", "noise", "dns", "tcp", "tokio", "secp256k1", "macros", "metrics", "quic", "upnp", "gossipsub", "gossipsub-partial-messages"] }
 libsecp256k1 = "0.7"
 lighthouse_network = { path = "beacon_node/lighthouse_network" }

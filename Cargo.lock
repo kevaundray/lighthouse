@@ -100,6 +100,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "air"
+version = "0.1.0"
+source = "git+https://github.com/kevaundray/leanVM.git?rev=aed646200cf5ae3199c25c61f2bfe094582678ae#aed646200cf5ae3199c25c61f2bfe094582678ae"
+dependencies = [
+ "field",
+ "koala-bear",
+ "poly",
+]
+
+[[package]]
 name = "alloca"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -648,6 +658,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b46cbb362ab8752921c97e041f5e366ee6297bd428a31275b9fcf1e380f7299"
 
 [[package]]
+name = "ansi_term"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d52a9bb7ec0cf484c551830a7ce27bd20d67eac647e1befb56b0be4ee39a55d2"
+dependencies = [
+ "winapi",
+]
+
+[[package]]
 name = "anstream"
 version = "0.6.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1080,6 +1099,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "atomic-polyfill"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8cf2bce30dfe09ef0bfaef228b9d414faaf7e563035494d7fe092dba54b300f4"
+dependencies = [
+ "critical-section",
+]
+
+[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1159,6 +1187,24 @@ dependencies = [
  "sync_wrapper",
  "tower-layer",
  "tower-service",
+]
+
+[[package]]
+name = "backend"
+version = "0.1.0"
+source = "git+https://github.com/kevaundray/leanVM.git?rev=aed646200cf5ae3199c25c61f2bfe094582678ae#aed646200cf5ae3199c25c61f2bfe094582678ae"
+dependencies = [
+ "air",
+ "fiat-shamir",
+ "field",
+ "koala-bear",
+ "parallel",
+ "poly",
+ "sumcheck",
+ "symetric",
+ "utils",
+ "whir",
+ "zk-alloc",
 ]
 
 [[package]]
@@ -1958,6 +2004,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cobs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fa961b519f0b462e3a3b4a34b64d119eeaca1d59af726fe450bbba07a9fc0a1"
+dependencies = [
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2016,6 +2071,7 @@ name = "consensus_signature"
 version = "0.1.0"
 dependencies = [
  "bls",
+ "lean-multisig",
 ]
 
 [[package]]
@@ -2482,7 +2538,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ab67060fc6b8ef687992d439ca0fa36e7ed17e9a0b16b25b601e8757df720de"
 dependencies = [
  "data-encoding",
- "syn 2.0.117",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -3039,6 +3095,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "embedded-io"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef1a6892d9eef45c8fa6b9e0086428a2cca8491aca8f787c534a3d6d0bcb3ced"
+
+[[package]]
+name = "embedded-io"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3121,7 +3189,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3520,6 +3588,30 @@ name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
+
+[[package]]
+name = "fiat-shamir"
+version = "0.1.0"
+source = "git+https://github.com/kevaundray/leanVM.git?rev=aed646200cf5ae3199c25c61f2bfe094582678ae#aed646200cf5ae3199c25c61f2bfe094582678ae"
+dependencies = [
+ "field",
+ "koala-bear",
+ "parallel",
+ "serde",
+ "symetric",
+ "utils",
+]
+
+[[package]]
+name = "field"
+version = "0.1.0"
+source = "git+https://github.com/kevaundray/leanVM.git?rev=aed646200cf5ae3199c25c61f2bfe094582678ae#aed646200cf5ae3199c25c61f2bfe094582678ae"
+dependencies = [
+ "paste",
+ "rand 0.10.1",
+ "serde",
+ "utils",
+]
 
 [[package]]
 name = "field-offset"
@@ -3975,6 +4067,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hash32"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0c35f58762feb77d74ebe43bdbc3210f09be9fe6742234d573bacc26ed92b67"
+dependencies = [
+ "byteorder",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4062,6 +4163,20 @@ dependencies = [
  "metrics",
  "procfs",
  "psutil",
+]
+
+[[package]]
+name = "heapless"
+version = "0.7.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cdc6457c0eb62c71aac4bc17216026d8410337c4126773b9c5daba343f17964f"
+dependencies = [
+ "atomic-polyfill",
+ "hash32",
+ "rustc_version 0.4.1",
+ "serde",
+ "spin",
+ "stable_deref_trait",
 ]
 
 [[package]]
@@ -4677,6 +4792,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "include_dir"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "923d117408f1e49d914f1a379a309cffe4f18c05cf4e3d12e613a15fc81bd0dd"
+dependencies = [
+ "include_dir_macros",
+]
+
+[[package]]
+name = "include_dir_macros"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cab85a7ed0bd5f0e76d93846e0147172bed2e2d3f859bcc33a8d9699cad1a75"
+dependencies = [
+ "proc-macro2",
+ "quote",
+]
+
+[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4955,6 +5089,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "koala-bear"
+version = "0.1.0"
+source = "git+https://github.com/kevaundray/leanVM.git?rev=aed646200cf5ae3199c25c61f2bfe094582678ae#aed646200cf5ae3199c25c61f2bfe094582678ae"
+dependencies = [
+ "field",
+ "paste",
+ "rand 0.10.1",
+ "serde",
+ "utils",
+]
+
+[[package]]
 name = "kzg"
 version = "0.1.0"
 dependencies = [
@@ -5025,6 +5171,68 @@ dependencies = [
  "types",
  "validator_dir",
  "yaml_serde",
+]
+
+[[package]]
+name = "lean-multisig"
+version = "0.1.0"
+source = "git+https://github.com/ethereum/lean-multisig-bindings?rev=c0ef8e621556581b2beb0c4f72f99c001a026fe6#c0ef8e621556581b2beb0c4f72f99c001a026fe6"
+dependencies = [
+ "lean_multisig_api",
+]
+
+[[package]]
+name = "lean_compiler"
+version = "0.1.0"
+source = "git+https://github.com/kevaundray/leanVM.git?rev=aed646200cf5ae3199c25c61f2bfe094582678ae#aed646200cf5ae3199c25c61f2bfe094582678ae"
+dependencies = [
+ "backend",
+ "include_dir",
+ "lean_vm",
+ "pest",
+ "pest_derive",
+ "sub_protocols",
+ "xmss",
+]
+
+[[package]]
+name = "lean_multisig_api"
+version = "0.1.0"
+source = "git+https://github.com/kevaundray/leanVM.git?rev=aed646200cf5ae3199c25c61f2bfe094582678ae#aed646200cf5ae3199c25c61f2bfe094582678ae"
+dependencies = [
+ "backend",
+ "ethereum_ssz",
+ "lean_vm",
+ "postcard",
+ "rand 0.10.1",
+ "rec_aggregation",
+ "sha2",
+ "xmss",
+]
+
+[[package]]
+name = "lean_prover"
+version = "0.1.0"
+source = "git+https://github.com/kevaundray/leanVM.git?rev=aed646200cf5ae3199c25c61f2bfe094582678ae#aed646200cf5ae3199c25c61f2bfe094582678ae"
+dependencies = [
+ "backend",
+ "lean_compiler",
+ "lean_vm",
+ "rand 0.10.1",
+ "serde",
+ "sub_protocols",
+ "tracing",
+ "xmss",
+]
+
+[[package]]
+name = "lean_vm"
+version = "0.1.0"
+source = "git+https://github.com/kevaundray/leanVM.git?rev=aed646200cf5ae3199c25c61f2bfe094582678ae#aed646200cf5ae3199c25c61f2bfe094582678ae"
+dependencies = [
+ "backend",
+ "tracing",
+ "xmss",
 ]
 
 [[package]]
@@ -6305,7 +6513,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -6418,9 +6626,9 @@ dependencies = [
 
 [[package]]
 name = "objc2"
-version = "0.6.3"
+version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7c2599ce0ec54857b29ce62166b0ed9b4f6f1a70ccc9a71165b6154caca8c05"
+checksum = "3a12a8ed07aefc768292f076dc3ac8c48f3781c8f2d5851dd3d98950e8c5a89f"
 dependencies = [
  "objc2-encode",
 ]
@@ -6430,6 +6638,16 @@ name = "objc2-encode"
 version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef25abbcd74fb2609453eb695bd2f860d389e457f67dc17cafc8b8cbc89d0c33"
+
+[[package]]
+name = "objc2-foundation"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
+dependencies = [
+ "bitflags 2.10.0",
+ "objc2",
+]
 
 [[package]]
 name = "oid-registry"
@@ -6624,6 +6842,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "parallel"
+version = "0.1.0"
+source = "git+https://github.com/kevaundray/leanVM.git?rev=aed646200cf5ae3199c25c61f2bfe094582678ae#aed646200cf5ae3199c25c61f2bfe094582678ae"
+dependencies = [
+ "system-info",
+]
+
+[[package]]
 name = "parity-scale-codec"
 version = "3.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6729,6 +6955,39 @@ checksum = "cbcfd20a6d4eeba40179f05735784ad32bdaef05ce8e8af05f180d45bb3e7e22"
 dependencies = [
  "memchr",
  "ucd-trie",
+]
+
+[[package]]
+name = "pest_derive"
+version = "2.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51f72981ade67b1ca6adc26ec221be9f463f2b5839c7508998daa17c23d94d7f"
+dependencies = [
+ "pest",
+ "pest_generator",
+]
+
+[[package]]
+name = "pest_generator"
+version = "2.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dee9efd8cdb50d719a80088b76f81aec7c41ed6d522ee750178f83883d271625"
+dependencies = [
+ "pest",
+ "pest_meta",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "pest_meta"
+version = "2.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf1d70880e76bdc13ba52eafa6239ce793d85c8e43896507e43dd8984ff05b82"
+dependencies = [
+ "pest",
+ "sha2",
 ]
 
 [[package]]
@@ -6858,6 +7117,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "poly"
+version = "0.1.0"
+source = "git+https://github.com/kevaundray/leanVM.git?rev=aed646200cf5ae3199c25c61f2bfe094582678ae#aed646200cf5ae3199c25c61f2bfe094582678ae"
+dependencies = [
+ "field",
+ "koala-bear",
+ "parallel",
+ "rand 0.10.1",
+ "serde",
+ "system-info",
+ "utils",
+ "zk-alloc",
+]
+
+[[package]]
 name = "poly1305"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6885,6 +7159,19 @@ name = "portable-atomic"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
+
+[[package]]
+name = "postcard"
+version = "1.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6764c3b5dd454e283a30e6dfe78e9b31096d9e32036b5d1eaac7a6119ccb9a24"
+dependencies = [
+ "cobs",
+ "embedded-io 0.4.0",
+ "embedded-io 0.6.1",
+ "heapless",
+ "serde",
+]
 
 [[package]]
 name = "potential_utf"
@@ -7268,7 +7555,7 @@ dependencies = [
  "once_cell",
  "socket2 0.5.10",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7475,6 +7762,26 @@ dependencies = [
  "rustls-pki-types",
  "time",
  "yasna 0.5.2",
+]
+
+[[package]]
+name = "rec_aggregation"
+version = "0.1.0"
+source = "git+https://github.com/kevaundray/leanVM.git?rev=aed646200cf5ae3199c25c61f2bfe094582678ae#aed646200cf5ae3199c25c61f2bfe094582678ae"
+dependencies = [
+ "backend",
+ "include_dir",
+ "lean_compiler",
+ "lean_prover",
+ "lean_vm",
+ "objc2",
+ "objc2-foundation",
+ "parallel",
+ "postcard",
+ "serde",
+ "sub_protocols",
+ "tracing",
+ "xmss",
 ]
 
 [[package]]
@@ -7822,7 +8129,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8559,6 +8866,9 @@ name = "spin"
 version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
+dependencies = [
+ "lock_api",
+]
 
 [[package]]
 name = "spki"
@@ -8723,10 +9033,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "sub_protocols"
+version = "0.1.0"
+source = "git+https://github.com/kevaundray/leanVM.git?rev=aed646200cf5ae3199c25c61f2bfe094582678ae#aed646200cf5ae3199c25c61f2bfe094582678ae"
+dependencies = [
+ "backend",
+ "lean_vm",
+ "tracing",
+]
+
+[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "sumcheck"
+version = "0.1.0"
+source = "git+https://github.com/kevaundray/leanVM.git?rev=aed646200cf5ae3199c25c61f2bfe094582678ae#aed646200cf5ae3199c25c61f2bfe094582678ae"
+dependencies = [
+ "air",
+ "fiat-shamir",
+ "field",
+ "koala-bear",
+ "parallel",
+ "poly",
+ "tracing",
+ "zk-alloc",
+]
 
 [[package]]
 name = "superstruct"
@@ -8750,6 +9085,17 @@ dependencies = [
  "criterion",
  "ethereum_hashing",
  "fixed_bytes",
+]
+
+[[package]]
+name = "symetric"
+version = "0.1.0"
+source = "git+https://github.com/kevaundray/leanVM.git?rev=aed646200cf5ae3199c25c61f2bfe094582678ae#aed646200cf5ae3199c25c61f2bfe094582678ae"
+dependencies = [
+ "field",
+ "koala-bear",
+ "parallel",
+ "zk-alloc",
 ]
 
 [[package]]
@@ -8843,6 +9189,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "system-info"
+version = "0.1.0"
+source = "git+https://github.com/kevaundray/leanVM.git?rev=aed646200cf5ae3199c25c61f2bfe094582678ae#aed646200cf5ae3199c25c61f2bfe094582678ae"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "system_health"
 version = "0.1.0"
 dependencies = [
@@ -8897,7 +9251,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -9388,6 +9742,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-forest"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f09cb459317a3811f76644334473239d696cd8efc606963ae7d1c308cead3b74"
+dependencies = [
+ "ansi_term",
+ "smallvec",
+ "thiserror 2.0.17",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "tracing-log"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9428,9 +9795,9 @@ dependencies = [
 
 [[package]]
 name = "tracing-subscriber"
-version = "0.3.22"
+version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f30143827ddab0d256fd843b7a66d164e9f271cfa0dde49142c5ca0ca291f1e"
+checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
 dependencies = [
  "matchers",
  "nu-ansi-term",
@@ -9691,6 +10058,17 @@ name = "utf8parse"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
+
+[[package]]
+name = "utils"
+version = "0.1.0"
+source = "git+https://github.com/kevaundray/leanVM.git?rev=aed646200cf5ae3199c25c61f2bfe094582678ae#aed646200cf5ae3199c25c61f2bfe094582678ae"
+dependencies = [
+ "parallel",
+ "serde",
+ "tracing-forest",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "uuid"
@@ -10226,6 +10604,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2878ef029c47c6e8cf779119f20fcf52bde7ad42a731b2a304bc221df17571e"
 dependencies = [
  "rustls-pki-types",
+]
+
+[[package]]
+name = "whir"
+version = "0.1.0"
+source = "git+https://github.com/kevaundray/leanVM.git?rev=aed646200cf5ae3199c25c61f2bfe094582678ae#aed646200cf5ae3199c25c61f2bfe094582678ae"
+dependencies = [
+ "fiat-shamir",
+ "field",
+ "koala-bear",
+ "parallel",
+ "poly",
+ "rand 0.10.1",
+ "sumcheck",
+ "symetric",
+ "system-info",
+ "tracing",
+ "utils",
+ "zk-alloc",
 ]
 
 [[package]]
@@ -10847,6 +11244,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "xmss"
+version = "0.1.0"
+source = "git+https://github.com/kevaundray/leanVM.git?rev=aed646200cf5ae3199c25c61f2bfe094582678ae#aed646200cf5ae3199c25c61f2bfe094582678ae"
+dependencies = [
+ "backend",
+ "ethereum_ssz",
+ "postcard",
+ "rand 0.10.1",
+ "serde",
+]
+
+[[package]]
 name = "yaml-rust2"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11030,6 +11439,16 @@ dependencies = [
  "indexmap 2.12.1",
  "memchr",
  "zopfli",
+]
+
+[[package]]
+name = "zk-alloc"
+version = "0.1.0"
+source = "git+https://github.com/kevaundray/leanVM.git?rev=aed646200cf5ae3199c25c61f2bfe094582678ae#aed646200cf5ae3199c25c61f2bfe094582678ae"
+dependencies = [
+ "libc",
+ "parallel",
+ "system-info",
 ]
 
 [[package]]
