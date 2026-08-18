@@ -1,5 +1,9 @@
-use super::signature_sets::Error as SignatureSetError;
+use super::{
+    block_signature_verifier::Error as BlockSignatureVerifierError,
+    signature_sets::Error as SignatureSetError,
+};
 use crate::ContextError;
+use consensus_signature::VerifyError as ConsensusSignatureVerifyError;
 use merkle_proof::MerkleTreeError;
 use safe_arith::ArithError;
 use ssz::DecodeError;
@@ -17,6 +21,8 @@ pub enum BlockProcessingError {
     IncorrectStateType,
     RandaoSignatureInvalid,
     BulkSignatureVerificationFailed,
+    /// Consensus-signature verification failed locally, so block validity was not determined.
+    ConsensusSignatureVerificationFailed(ConsensusSignatureVerifyError),
     StateRootMismatch,
     DepositCountInvalid {
         expected: usize,
@@ -126,6 +132,23 @@ impl From<BeaconStateError> for BlockProcessingError {
 impl From<SignatureSetError> for BlockProcessingError {
     fn from(e: SignatureSetError) -> Self {
         BlockProcessingError::SignatureSetError(e)
+    }
+}
+
+impl From<BlockSignatureVerifierError> for BlockProcessingError {
+    fn from(error: BlockSignatureVerifierError) -> Self {
+        match error {
+            BlockSignatureVerifierError::ConsensusSignatureVerificationFailed(error) => {
+                Self::ConsensusSignatureVerificationFailed(error)
+            }
+            BlockSignatureVerifierError::SignatureInvalid
+            | BlockSignatureVerifierError::AttestationValidationError(_)
+            | BlockSignatureVerifierError::PayloadAttestationValidationError(_)
+            | BlockSignatureVerifierError::BeaconStateError(_)
+            | BlockSignatureVerifierError::IncorrectBlockProposer { .. }
+            | BlockSignatureVerifierError::SignatureSetError(_)
+            | BlockSignatureVerifierError::ContextError(_) => Self::BulkSignatureVerificationFailed,
+        }
     }
 }
 

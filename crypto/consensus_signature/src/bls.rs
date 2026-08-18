@@ -14,6 +14,12 @@ pub type RawSignature = bls::Signature;
 /// Evidence produced by multiple validators for the same signing claim.
 pub type AggregateSignature = bls::AggregateSignature;
 
+/// A backend-owned request used while state-processing callers migrate to semantic requests.
+///
+/// This keeps the BLS `SignatureSet` construction API stable while ensuring that backend batch
+/// selection and invocation occur inside this crate.
+pub type BatchVerificationRequest<'a> = bls::SignatureSet<'a>;
+
 /// A consensus-signature verification failure.
 ///
 /// Only [`Self::InvalidEvidence`] indicates peer-provided evidence is invalid. The other variants
@@ -154,6 +160,17 @@ pub fn verify_all<'a>(
 ) -> Result<(), VerifyError> {
     let signature_sets = requests.into_iter().map(signature_set).collect::<Vec<_>>();
     if bls::verify_signature_sets(signature_sets.iter()) {
+        Ok(())
+    } else {
+        Err(VerifyError::InvalidEvidence)
+    }
+}
+
+/// Batch-verifies backend-owned requests using the active consensus-signature backend.
+pub fn verify_batch<'a>(
+    requests: impl ExactSizeIterator<Item = &'a BatchVerificationRequest<'a>>,
+) -> Result<(), VerifyError> {
+    if bls::verify_signature_sets(requests) {
         Ok(())
     } else {
         Err(VerifyError::InvalidEvidence)

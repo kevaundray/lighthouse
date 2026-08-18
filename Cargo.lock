@@ -8614,6 +8614,7 @@ dependencies = [
  "arbitrary",
  "beacon_chain",
  "bls",
+ "consensus_signature",
  "educe",
  "ethereum_hashing",
  "ethereum_ssz",

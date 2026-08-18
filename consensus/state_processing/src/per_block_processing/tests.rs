@@ -1,5 +1,6 @@
 #![cfg(all(test, not(feature = "fake_crypto"), not(debug_assertions)))]
 
+use crate::per_block_processing::block_signature_verifier::Error as BlockSignatureVerifierError;
 use crate::per_block_processing::errors::{
     AttestationInvalid, AttesterSlashingInvalid, BlockOperationError, BlockProcessingError,
     DepositInvalid, HeaderInvalid, IndexedAttestationInvalid, IntoWithIndex,
@@ -7,14 +8,19 @@ use crate::per_block_processing::errors::{
 };
 use crate::{BlockReplayError, BlockReplayer, per_block_processing};
 use crate::{
-    BlockSignatureStrategy, ConsensusContext, VerifyBlockRoot, VerifySignatures,
-    per_block_processing::process_operations,
+    BlockSignatureStrategy, BlockSignatureVerifier, ConsensusContext, VerifyBlockRoot,
+    VerifySignatures,
+    per_block_processing::{ParallelSignatureSets, process_operations},
 };
 use beacon_chain::test_utils::{BeaconChainHarness, EphemeralHarnessType};
 use bls::{AggregateSignature, Keypair, PublicKeyBytes, Signature, SignatureBytes};
+use consensus_signature::VerifyError as ConsensusSignatureVerifyError;
 use ssz_types::Bitfield;
 use ssz_types::VariableList;
-use std::sync::{Arc, LazyLock};
+use std::{
+    borrow::Cow,
+    sync::{Arc, LazyLock},
+};
 use test_utils::generate_deterministic_keypairs;
 use types::*;
 
@@ -84,6 +90,75 @@ async fn valid_block_ok() {
     );
 
     assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn bulk_signature_verification_uses_consensus_signature_boundary() {
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
+    let spec = harness.spec.clone();
+    let state = harness.get_current_state();
+    let slot = state.slot();
+    let ((signed_block, _), state) = harness
+        .make_block_return_pre_state(state, slot + Slot::new(1))
+        .await;
+
+    let verify = |block: &SignedBeaconBlock<MainnetEthSpec>| {
+        let mut ctxt = ConsensusContext::new(block.slot());
+        BlockSignatureVerifier::verify_entire_block(
+            &state,
+            |validator_index| crate::signature_sets::get_pubkey_from_state(&state, validator_index),
+            |public_key_bytes| public_key_bytes.decompress().ok().map(Cow::Owned),
+            block,
+            &mut ctxt,
+            &spec,
+        )
+    };
+
+    let valid_proposal_set = crate::signature_sets::block_proposal_signature_set(
+        &state,
+        |validator_index| crate::signature_sets::get_pubkey_from_state(&state, validator_index),
+        &signed_block,
+        None,
+        None,
+        &spec,
+    )
+    .expect("valid block should produce a proposal verification request");
+    assert_eq!(
+        ParallelSignatureSets::from(vec![valid_proposal_set]).verify_result(),
+        Ok(())
+    );
+    assert_eq!(verify(&signed_block), Ok(()));
+
+    let (block, _) = (*signed_block).clone().deconstruct();
+    let invalid_block = SignedBeaconBlock::from_block(block, Signature::empty());
+    let invalid_proposal_set = crate::signature_sets::block_proposal_signature_set(
+        &state,
+        |validator_index| crate::signature_sets::get_pubkey_from_state(&state, validator_index),
+        &invalid_block,
+        None,
+        None,
+        &spec,
+    )
+    .expect("well-formed block should produce a proposal verification request");
+    assert_eq!(
+        ParallelSignatureSets::from(vec![invalid_proposal_set]).verify_result(),
+        Err(ConsensusSignatureVerifyError::InvalidEvidence)
+    );
+    assert_eq!(
+        verify(&invalid_block),
+        Err(BlockSignatureVerifierError::SignatureInvalid)
+    );
+
+    for local_error in [
+        ConsensusSignatureVerifyError::LocalUnavailable,
+        ConsensusSignatureVerifyError::ResourceExhausted,
+        ConsensusSignatureVerifyError::Internal,
+    ] {
+        assert_eq!(
+            BlockProcessingError::from(BlockSignatureVerifierError::from(local_error)),
+            BlockProcessingError::ConsensusSignatureVerificationFailed(local_error)
+        );
+    }
 }
 
 #[tokio::test]

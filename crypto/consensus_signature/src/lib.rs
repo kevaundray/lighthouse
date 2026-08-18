@@ -6,7 +6,7 @@
 mod bls;
 
 pub use bls::{
-    AggregateSignature, AggregateVerificationRequest, Hash256, RawSignature,
-    RawVerificationRequest, SigningClaim, ValidatorPublicKeyBytes, VerificationKey,
-    VerificationRequest, VerifyError, verify, verify_all,
+    AggregateSignature, AggregateVerificationRequest, BatchVerificationRequest, Hash256,
+    RawSignature, RawVerificationRequest, SigningClaim, ValidatorPublicKeyBytes, VerificationKey,
+    VerificationRequest, VerifyError, verify, verify_all, verify_batch,
 };

@@ -3,7 +3,8 @@
 //!
 //! This module exposes one function to extract each type of `SignatureSet` from a `BeaconBlock`.
 use super::builder::{convert_validator_index_to_builder_index, is_builder_index};
-use bls::{AggregateSignature, PublicKey, PublicKeyBytes, Signature, SignatureSet};
+use bls::{AggregateSignature, PublicKey, PublicKeyBytes, Signature};
+use consensus_signature::BatchVerificationRequest as SignatureSet;
 use ssz::DecodeError;
 use std::borrow::Cow;
 use tree_hash::TreeHash;

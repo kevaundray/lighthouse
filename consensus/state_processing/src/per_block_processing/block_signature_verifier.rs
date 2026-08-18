@@ -5,7 +5,8 @@ use crate::per_block_processing::errors::{
     AttestationInvalid, BlockOperationError, PayloadAttestationInvalid,
 };
 use crate::{ConsensusContext, ContextError};
-use bls::{PublicKey, PublicKeyBytes, SignatureSet, verify_signature_sets};
+use bls::{PublicKey, PublicKeyBytes};
+use consensus_signature::{BatchVerificationRequest as SignatureSet, VerifyError, verify_batch};
 use std::borrow::Cow;
 use types::{
     AbstractExecPayload, BeaconState, BeaconStateError, ChainSpec, EthSpec, Hash256,
@@ -18,6 +19,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     /// All public keys were found but signature verification failed. The block is invalid.
     SignatureInvalid,
+    /// Signature verification failed locally, so block validity was not determined.
+    ConsensusSignatureVerificationFailed(VerifyError),
     /// An attestation in the block was invalid. The block is invalid.
     AttestationValidationError(BlockOperationError<AttestationInvalid>),
     /// A payload attestation in the block was invalid. The block is invalid.
@@ -44,6 +47,15 @@ impl From<BeaconStateError> for Error {
 impl From<ContextError> for Error {
     fn from(e: ContextError) -> Error {
         Error::ContextError(e)
+    }
+}
+
+impl From<VerifyError> for Error {
+    fn from(error: VerifyError) -> Self {
+        match error {
+            VerifyError::InvalidEvidence => Self::SignatureInvalid,
+            local_error => Self::ConsensusSignatureVerificationFailed(local_error),
+        }
     }
 }
 
@@ -423,16 +435,11 @@ where
         Ok(())
     }
 
-    /// Verify all the signatures that have been included in `self`, returning `true` if and only if
-    /// all the signatures are valid.
+    /// Verify all signatures included in `self`, returning `Ok(())` if and only if they are valid.
     ///
     /// See `ParallelSignatureSets::verify` for more info.
     pub fn verify(self) -> Result<()> {
-        if self.sets.verify() {
-            Ok(())
-        } else {
-            Err(Error::SignatureInvalid)
-        }
+        self.sets.verify_result().map_err(Into::into)
     }
 }
 
@@ -457,6 +464,12 @@ impl<'a> ParallelSignatureSets<'a> {
     /// this function is already parallelized.
     #[must_use]
     pub fn verify(self) -> bool {
-        verify_signature_sets(self.sets.iter())
+        self.verify_result().is_ok()
+    }
+
+    /// Verify all included signatures while preserving invalid-evidence and local failures.
+    #[must_use]
+    pub fn verify_result(self) -> std::result::Result<(), VerifyError> {
+        verify_batch(self.sets.iter())
     }
 }
