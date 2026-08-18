@@ -27,3 +27,7 @@ tracing = { workspace = true }
 types = { workspace = true }
 url = { workspace = true }
 validator_metrics = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }

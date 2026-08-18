@@ -1,0 +1,23 @@
+[package]
+name = "lighthouse-validator-store-pq-tests"
+version = "0.0.0"
+edition = "2024"
+publish = false
+rust-version = "1.88"
+
+[workspace]
+
+[dependencies]
+futures = "0.3"
+initialized_validators = { path = "../../../initialized_validators", features = ["pq-devnet"] }
+lighthouse_validator_store = { path = "../..", features = ["pq-devnet"] }
+pq_devnet = { path = "../../../../testing/pq_devnet", features = ["pq-devnet"] }
+rusqlite = "0.38"
+slashing_protection = { path = "../../../slashing_protection", features = ["pq-devnet"] }
+slot_clock = { path = "../../../../common/slot_clock" }
+task_executor = { path = "../../../../common/task_executor" }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+types = { path = "../../../../consensus/types", features = ["pq-devnet"] }
+validator_metrics = { path = "../../../validator_metrics" }
+validator_store = { path = "../../../validator_store", features = ["pq-devnet"] }

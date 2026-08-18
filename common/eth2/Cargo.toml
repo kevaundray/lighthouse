@@ -9,9 +9,11 @@ default = []
 lighthouse = ["proto_array", "eth2_keystore", "eip_3076", "zeroize"]
 events = ["reqwest-eventsource", "futures", "futures-util"]
 network = ["libp2p-identity", "enr", "multiaddr"]
+pq-devnet = ["types/pq-devnet"]
 
 [dependencies]
 bls = { workspace = true }
+consensus_signature = { workspace = true }
 context_deserialize = { workspace = true }
 educe = { workspace = true }
 eip_3076 = { workspace = true, optional = true }

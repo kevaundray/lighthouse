@@ -1,25 +1,34 @@
+#[cfg(not(feature = "pq-devnet"))]
 mod attestation_tests;
+#[cfg(not(feature = "pq-devnet"))]
 mod block_tests;
+#[cfg(not(feature = "pq-devnet"))]
 mod extra_interchange_tests;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod interchange_test;
+#[cfg(not(feature = "pq-devnet"))]
 mod parallel_tests;
+#[cfg(not(feature = "pq-devnet"))]
 mod registration_tests;
 mod signed_attestation;
 mod signed_block;
 mod slashing_database;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod test_utils;
 
+#[cfg(not(feature = "pq-devnet"))]
 pub mod interchange {
     pub use eip_3076::{Interchange, InterchangeMetadata};
 }
 
 pub use crate::signed_attestation::{InvalidAttestation, SignedAttestation};
 pub use crate::signed_block::{InvalidBlock, SignedBlock};
+pub use crate::slashing_database::{CheckSlashability, SlashingDatabase};
+#[cfg(not(feature = "pq-devnet"))]
 pub use crate::slashing_database::{
-    CheckSlashability, InterchangeError, InterchangeImportOutcome,
-    SUPPORTED_INTERCHANGE_FORMAT_VERSION, SlashingDatabase,
+    InterchangeError, InterchangeImportOutcome, SUPPORTED_INTERCHANGE_FORMAT_VERSION,
 };
-use bls::PublicKeyBytes;
+use consensus_signature::ValidatorPublicKeyBytes as PublicKeyBytes;
 use rusqlite::Error as SQLError;
 use std::fmt::Display;
 use std::io::{Error as IOError, ErrorKind};
@@ -86,6 +95,7 @@ impl SigningRoot {
         self.into()
     }
 
+    #[cfg(not(feature = "pq-devnet"))]
     fn to_hash256(self) -> Option<Hash256> {
         (!self.is_null()).then_some(self.0)
     }

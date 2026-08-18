@@ -1,4 +1,6 @@
-use bls::{PublicKeyBytes, Signature};
+use consensus_signature::{
+    IndividualSignature as Signature, ValidatorPublicKeyBytes as PublicKeyBytes,
+};
 use eth2::types::{FullBlockContents, PublishBlockRequest};
 use futures::Stream;
 use slashing_protection::NotSafe;

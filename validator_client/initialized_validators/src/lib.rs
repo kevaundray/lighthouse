@@ -8,43 +8,72 @@
 
 pub mod key_cache;
 
-use account_utils::{
-    read_password, read_password_from_user, read_password_string,
-    validator_definitions::{
-        self, CONFIG_FILENAME, SigningDefinition, ValidatorDefinition, ValidatorDefinitions,
-        Web3SignerDefinition,
-    },
+use account_utils::validator_definitions;
+#[cfg(not(feature = "pq-devnet"))]
+use account_utils::validator_definitions::{
+    CONFIG_FILENAME, SigningDefinition, ValidatorDefinition, ValidatorDefinitions,
+    Web3SignerDefinition,
 };
-use bls::{Keypair, PublicKey, PublicKeyBytes};
+#[cfg(not(feature = "pq-devnet"))]
+use account_utils::{read_password, read_password_from_user, read_password_string};
+#[cfg(not(feature = "pq-devnet"))]
+use bls::Keypair;
+use bls::PublicKey;
+#[cfg(not(feature = "pq-devnet"))]
+use bls::PublicKeyBytes;
+#[cfg(feature = "pq-devnet")]
+use consensus_signature::PqPublicKey as PublicKeyBytes;
 use eth2_keystore::Keystore;
 use lockfile::{Lockfile, LockfileError};
+#[cfg(not(feature = "pq-devnet"))]
 use metrics::set_gauge;
-use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
-use reqwest::{Certificate, Client, Error as ReqwestError, Identity};
+use parking_lot::MappedMutexGuard;
+#[cfg(not(feature = "pq-devnet"))]
+use parking_lot::{Mutex, MutexGuard};
+#[cfg(feature = "pq-devnet")]
+use pq_signing::{PqSigningAuthority, PqSigningError};
+#[cfg(not(feature = "pq-devnet"))]
+use reqwest::Client;
+use reqwest::{Certificate, Error as ReqwestError, Identity};
 use serde::{Deserialize, Serialize};
 use signing_method::SigningMethod;
-use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
+use std::collections::HashMap;
+#[cfg(not(feature = "pq-devnet"))]
+use std::collections::HashSet;
+#[cfg(not(feature = "pq-devnet"))]
+use std::fs;
+use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(feature = "pq-devnet")]
+use task_executor::{RayonPoolType, TaskExecutor};
+#[cfg(not(feature = "pq-devnet"))]
 use tracing::{debug, error, info, warn};
+#[cfg(not(feature = "pq-devnet"))]
 use types::graffiti::GraffitiString;
 use types::{Address, Graffiti};
+#[cfg(not(feature = "pq-devnet"))]
 use url::{ParseError, Url};
+#[cfg(not(feature = "pq-devnet"))]
 use validator_dir::Builder as ValidatorDirBuilder;
+#[cfg(feature = "pq-devnet")]
+use validator_dir::{PqDevnetBundle, PqDevnetBundleError};
 use zeroize::Zeroizing;
 
+#[cfg(not(feature = "pq-devnet"))]
 use key_cache::KeyCache;
 
 /// Default timeout for a request to a remote signer for a signature.
 ///
 /// Set to 12 seconds since that's the duration of a slot. A remote signer that cannot sign within
 /// that time is outside the synchronous assumptions of Eth2.
+#[cfg(not(feature = "pq-devnet"))]
 const DEFAULT_REMOTE_SIGNER_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 
 // Use TTY instead of stdin to capture passwords from users.
+#[cfg(not(feature = "pq-devnet"))]
 const USE_STDIN: bool = false;
 
 pub const DEFAULT_WEB3SIGNER_KEEP_ALIVE: Option<Duration> = Some(Duration::from_secs(20));
@@ -137,6 +166,44 @@ pub enum Error {
     UnableToSaveKeyCache(key_cache::Error),
     UnableToDecryptKeyCache(key_cache::Error),
     UnableToDeletePasswordFile(PathBuf, io::Error),
+    #[cfg(feature = "pq-devnet")]
+    PqBundle(PqDevnetBundleError),
+    #[cfg(feature = "pq-devnet")]
+    PqSigning(PqSigningError),
+    #[cfg(feature = "pq-devnet")]
+    ShuttingDown,
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            #[cfg(feature = "pq-devnet")]
+            Self::PqBundle(error) => Some(error),
+            #[cfg(feature = "pq-devnet")]
+            Self::PqSigning(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "pq-devnet")]
+impl From<PqDevnetBundleError> for Error {
+    fn from(error: PqDevnetBundleError) -> Self {
+        Self::PqBundle(error)
+    }
+}
+
+#[cfg(feature = "pq-devnet")]
+impl From<PqSigningError> for Error {
+    fn from(error: PqSigningError) -> Self {
+        Self::PqSigning(error)
+    }
 }
 
 impl From<LockfileError> for Error {
@@ -161,6 +228,11 @@ pub struct InitializedValidator {
 impl InitializedValidator {
     /// Return a reference to this validator's lockfile if it has one.
     pub fn keystore_lockfile(&self) -> Option<MappedMutexGuard<'_, Lockfile>> {
+        #[cfg(feature = "pq-devnet")]
+        {
+            None
+        }
+        #[cfg(not(feature = "pq-devnet"))]
         match self.signing_method.as_ref() {
             SigningMethod::LocalKeystore {
                 voting_keystore_lockfile,
@@ -203,11 +275,13 @@ impl InitializedValidator {
     }
 }
 
+#[cfg(not(feature = "pq-devnet"))]
 fn open_keystore(path: &Path) -> Result<Keystore, Error> {
     let keystore_file = File::open(path).map_err(Error::UnableToOpenVotingKeystore)?;
     Keystore::from_json_reader(keystore_file).map_err(Error::UnableToParseVotingKeystore)
 }
 
+#[cfg(not(feature = "pq-devnet"))]
 fn get_lockfile_path(file_path: &Path) -> Option<PathBuf> {
     file_path
         .file_name()
@@ -224,6 +298,7 @@ impl InitializedValidator {
     /// ## Errors
     ///
     /// If the validator is unable to be initialized for whatever reason.
+    #[cfg(not(feature = "pq-devnet"))]
     async fn from_definition(
         def: ValidatorDefinition,
         key_cache: &mut KeyCache,
@@ -378,6 +453,7 @@ impl InitializedValidator {
     }
 
     /// Returns the voting public key for this validator.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn voting_public_key(&self) -> &PublicKey {
         match self.signing_method.as_ref() {
             SigningMethod::LocalKeystore { voting_keypair, .. } => &voting_keypair.pk,
@@ -433,10 +509,12 @@ pub fn load_pkcs12_identity<P: AsRef<Path>>(
         .map_err(Error::InvalidWeb3SignerClientIdentityCertificate)
 }
 
+#[cfg(not(feature = "pq-devnet"))]
 fn build_web3_signer_url(base_url: &str, voting_public_key: &PublicKey) -> Result<Url, ParseError> {
     Url::parse(base_url)?.join(&format!("api/v1/eth2/sign/{}", voting_public_key))
 }
 
+#[cfg(not(feature = "pq-devnet"))]
 fn build_web3_signer_client(
     root_certificate_path: Option<PathBuf>,
     client_identity_path: Option<PathBuf>,
@@ -476,6 +554,7 @@ fn build_web3_signer_client(
 }
 
 /// Try to unlock `keystore` at `keystore_path` by prompting the user via `stdin`.
+#[cfg(not(feature = "pq-devnet"))]
 fn unlock_keystore_via_stdin_password(
     keystore: &Keystore,
     keystore_path: &Path,
@@ -520,18 +599,69 @@ fn unlock_keystore_via_stdin_password(
 /// Forms the fundamental list of validators that are managed by this validator client instance.
 pub struct InitializedValidators {
     /// A list of validator definitions which can be stored on-disk.
+    #[cfg(not(feature = "pq-devnet"))]
     definitions: ValidatorDefinitions,
     /// The directory that the `self.definitions` will be saved into.
+    #[cfg(not(feature = "pq-devnet"))]
     validators_dir: PathBuf,
     /// The canonical set of validators.
     validators: HashMap<PublicKeyBytes, InitializedValidator>,
     /// The clients used for communications with a remote signer.
+    #[cfg(not(feature = "pq-devnet"))]
     web3_signer_client_map: Option<HashMap<Web3SignerDefinition, Client>>,
+    #[cfg(not(feature = "pq-devnet"))]
     config: Config,
+    #[cfg(feature = "pq-devnet")]
+    _pq_authority: PqSigningAuthority,
 }
 
 impl InitializedValidators {
+    /// Loads the frozen PQ bundle only after the actual network root is available, then opens one
+    /// process-global authority and binds lightweight signer handles to every validator.
+    #[cfg(feature = "pq-devnet")]
+    pub async fn from_pq_bundle(
+        bundle_root: PathBuf,
+        network_genesis_validators_root: [u8; 32],
+        executor: TaskExecutor,
+    ) -> Result<Self, Error> {
+        let (authority, validators) = executor
+            .spawn_blocking_with_rayon_async(RayonPoolType::HighPriority, move || {
+                let bundle = PqDevnetBundle::load(&bundle_root, network_genesis_validators_root)?;
+                let expected_public_keys = bundle.public_keys().to_vec();
+                let authority = bundle.open_authority(network_genesis_validators_root)?;
+                if authority.public_keys() != expected_public_keys {
+                    return Err(Error::DuplicatePublicKey);
+                }
+                let mut validators = HashMap::with_capacity(expected_public_keys.len());
+                for public_key in expected_public_keys {
+                    let signer = authority.signer(&public_key)?;
+                    let initialized = InitializedValidator {
+                        signing_method: Arc::new(SigningMethod::pq_local(signer)),
+                        graffiti: None,
+                        suggested_fee_recipient: None,
+                        gas_limit: None,
+                        builder_proposals: Some(false),
+                        builder_boost_factor: None,
+                        prefer_builder_proposals: Some(false),
+                        index: None,
+                    };
+                    if validators.insert(public_key, initialized).is_some() {
+                        return Err(Error::DuplicatePublicKey);
+                    }
+                }
+                Ok::<_, Error>((authority, validators))
+            })
+            .await
+            .map_err(|_| Error::ShuttingDown)??;
+
+        Ok(Self {
+            validators,
+            _pq_authority: authority,
+        })
+    }
+
     /// Instantiates `Self`, initializing all validators in `definitions`.
+    #[cfg(not(feature = "pq-devnet"))]
     pub async fn from_definitions(
         definitions: ValidatorDefinitions,
         validators_dir: PathBuf,
@@ -555,7 +685,14 @@ impl InitializedValidators {
 
     /// The total count of enabled and disabled validators contained in `self`.
     pub fn num_total(&self) -> usize {
-        self.definitions.as_slice().len()
+        #[cfg(feature = "pq-devnet")]
+        {
+            self.validators.len()
+        }
+        #[cfg(not(feature = "pq-devnet"))]
+        {
+            self.definitions.as_slice().len()
+        }
     }
 
     /// Iterate through all voting public keys in `self` that should be used when querying for duties.
@@ -578,6 +715,7 @@ impl InitializedValidators {
     ///
     /// The on-disk representation of the validator definitions & the key cache will both be
     /// updated.
+    #[cfg(not(feature = "pq-devnet"))]
     pub async fn add_definition_replace_disabled(
         &mut self,
         def: ValidatorDefinition,
@@ -593,6 +731,7 @@ impl InitializedValidators {
     }
 
     /// Add a validator definition to `self`, overwriting the on-disk representation of `self`.
+    #[cfg(not(feature = "pq-devnet"))]
     pub async fn add_definition(&mut self, def: ValidatorDefinition) -> Result<(), Error> {
         if self
             .definitions
@@ -618,6 +757,7 @@ impl InitializedValidators {
     ///
     /// The delete is carried out in stages so that the filesystem is never left in an inconsistent
     /// state, even in case of errors or crashes.
+    #[cfg(not(feature = "pq-devnet"))]
     pub async fn delete_definition_and_keystore(
         &mut self,
         pubkey: &PublicKey,
@@ -737,6 +877,7 @@ impl InitializedValidators {
     ///
     /// Some parts of the VC assume the existence of a validator based on the existence of a
     /// directory in the validators dir named like a public key.
+    #[cfg(not(feature = "pq-devnet"))]
     fn delete_keystore_or_validator_dir(
         &self,
         voting_keystore_path: &Path,
@@ -760,11 +901,13 @@ impl InitializedValidators {
     }
 
     /// Returns a slice of all defined validators (regardless of their enabled state).
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn validator_definitions(&self) -> &[ValidatorDefinition] {
         self.definitions.as_slice()
     }
 
     /// Indicates if the `voting_public_key` exists in self and if it is enabled.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn is_enabled(&self, voting_public_key: &PublicKey) -> Option<bool> {
         self.definitions
             .as_slice()
@@ -786,6 +929,7 @@ impl InitializedValidators {
     /// disk.
     ///
     /// Saves the `ValidatorDefinitions` to file, even if no definitions were changed.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn set_graffiti(
         &mut self,
         voting_public_key: &PublicKey,
@@ -822,6 +966,7 @@ impl InitializedValidators {
     /// it is set.
     ///
     /// Saves the `ValidatorDefinitions` to file, even if no definitions were changed.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn delete_graffiti(&mut self, voting_public_key: &PublicKey) -> Result<(), Error> {
         if let Some(def) = self
             .definitions
@@ -914,6 +1059,7 @@ impl InitializedValidators {
     ///
     /// Saves the `ValidatorDefinitions` to file, even if no definitions were changed.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(not(feature = "pq-devnet"))]
     pub async fn set_validator_definition_fields(
         &mut self,
         voting_public_key: &PublicKey,
@@ -990,6 +1136,7 @@ impl InitializedValidators {
     /// disk.
     ///
     /// Saves the `ValidatorDefinitions` to file, even if no definitions were changed.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn set_validator_fee_recipient(
         &mut self,
         voting_public_key: &PublicKey,
@@ -1027,6 +1174,7 @@ impl InitializedValidators {
     /// it is set.
     ///
     /// Saves the `ValidatorDefinitions` to file, even if no definitions were changed.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn delete_validator_fee_recipient(
         &mut self,
         voting_public_key: &PublicKey,
@@ -1062,6 +1210,7 @@ impl InitializedValidators {
     /// disk.
     ///
     /// Saves the `ValidatorDefinitions` to file, even if no definitions were changed.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn set_validator_gas_limit(
         &mut self,
         voting_public_key: &PublicKey,
@@ -1099,6 +1248,7 @@ impl InitializedValidators {
     /// it is set.
     ///
     /// Saves the `ValidatorDefinitions` to file, even if no definitions were changed.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn delete_validator_gas_limit(
         &mut self,
         voting_public_key: &PublicKey,
@@ -1138,6 +1288,7 @@ impl InitializedValidators {
     /// filesystem accesses for keystores that are already known. In the case that a keystore
     /// from the validator definitions is not yet in this map, it will be loaded from disk and
     /// inserted into the map.
+    #[cfg(not(feature = "pq-devnet"))]
     pub async fn decrypt_key_cache(
         &self,
         mut cache: KeyCache,
@@ -1229,6 +1380,7 @@ impl InitializedValidators {
     /// A validator is considered "already known" and skipped if the public key is already known.
     /// I.e., if there are two different definitions with the same public key then the second will
     /// be ignored.
+    #[cfg(not(feature = "pq-devnet"))]
     pub async fn update_validators(&mut self) -> Result<(), Error> {
         //use key cache if available
         let mut key_stores = HashMap::new();
@@ -1428,6 +1580,7 @@ impl InitializedValidators {
     /// returns a map of pubkey to deleted password.
     ///
     /// This should only be used for testing, it's rather destructive.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn delete_passwords_from_validator_definitions(
         &mut self,
     ) -> Result<HashMap<PublicKey, Zeroizing<String>>, Error> {
@@ -1457,6 +1610,7 @@ impl InitializedValidators {
 
     /// Prefer other methods in production. Arbitrarily modifying a validator
     /// definition manually may result in inconsistencies.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn as_mut_slice_testing_only(&mut self) -> &mut [ValidatorDefinition] {
         self.definitions.as_mut_slice()
     }

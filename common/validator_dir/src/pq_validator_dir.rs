@@ -2,7 +2,10 @@
 
 use crate::VOTING_KEYSTORE_FILE;
 use eth2_keystore::PlainText;
-use pq_signing::{MAX_PQ_PASSWORD_BYTES, PqKeystore, PqKeystoreError, validate_pq_password};
+use pq_signing::{
+    MAX_PQ_PASSWORD_BYTES, PqKeyUnlock, PqKeystore, PqKeystoreError, PqSigningError,
+    validate_pq_password,
+};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -32,6 +35,7 @@ pub enum PqValidatorDirError {
     UnableToWriteFile(PathBuf, io::Error),
     UnableToSync(PathBuf, io::Error),
     Keystore(PqKeystoreError),
+    Signing(PqSigningError),
     PasswordTooLarge(PathBuf),
 }
 
@@ -41,11 +45,25 @@ impl std::fmt::Display for PqValidatorDirError {
     }
 }
 
-impl std::error::Error for PqValidatorDirError {}
+impl std::error::Error for PqValidatorDirError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Keystore(error) => Some(error),
+            Self::Signing(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl From<PqKeystoreError> for PqValidatorDirError {
     fn from(error: PqKeystoreError) -> Self {
         Self::Keystore(error)
+    }
+}
+
+impl From<PqSigningError> for PqValidatorDirError {
+    fn from(error: PqSigningError) -> Self {
+        Self::Signing(error)
     }
 }
 
@@ -199,6 +217,48 @@ impl PqValidatorDir {
         self.keystore()?
             .validate_password(password.as_slice())
             .map_err(Into::into)
+    }
+
+    /// Reads the encrypted key and its bounded password through held directory descriptors.
+    ///
+    /// This is the only validator-directory boundary used to construct a runtime PQ unlock. Both
+    /// parent directories and the validator identity are re-checked after the reads so concurrent
+    /// path replacement cannot redirect either secret input.
+    #[cfg(unix)]
+    pub fn key_unlock(
+        &self,
+        password_dir: impl AsRef<Path>,
+    ) -> Result<PqKeyUnlock, PqValidatorDirError> {
+        let validator_directory = open_directory_path(&self.dir, true)?;
+        let password_dir = password_dir.as_ref();
+        let password_directory = open_directory_path(password_dir, false)?;
+        let keystore_path = self.pq_voting_keystore_path();
+        let keystore = read_keystore_at(
+            &validator_directory,
+            PQ_VOTING_KEYSTORE_FILE,
+            &keystore_path,
+        )?;
+        if keystore.public_key() != &self.public_key {
+            return Err(PqValidatorDirError::KeystoreIdentityMismatch(keystore_path));
+        }
+        let password_path = password_path(password_dir, &self.public_key);
+        let password_component = password_path
+            .file_name()
+            .ok_or_else(|| PqValidatorDirError::UnsafeFileTarget(password_path.clone()))?;
+        let password_file =
+            open_sensitive_file_at(&password_directory, password_component, &password_path)?;
+        let password = read_bounded_secret(password_file, MAX_PASSWORD_BYTES, &password_path)?;
+        validator_directory.verify_path_binding()?;
+        password_directory.verify_path_binding()?;
+        PqKeyUnlock::new(keystore, password.as_slice()).map_err(Into::into)
+    }
+
+    #[cfg(not(unix))]
+    pub fn key_unlock(
+        &self,
+        _password_dir: impl AsRef<Path>,
+    ) -> Result<PqKeyUnlock, PqValidatorDirError> {
+        Err(PqValidatorDirError::UnsupportedPlatform)
     }
 }
 

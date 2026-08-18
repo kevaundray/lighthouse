@@ -4,10 +4,24 @@ version = "0.1.0"
 edition = { workspace = true }
 authors = ["Sigma Prime <contact@sigmaprime.io>"]
 
+[features]
+default = []
+pq-devnet = [
+    "consensus_signature/pq-wire",
+    "doppelganger_service/pq-devnet",
+    "eth2/pq-devnet",
+    "initialized_validators/pq-devnet",
+    "signing_method/pq-devnet",
+    "slashing_protection/pq-devnet",
+    "types/pq-devnet",
+    "validator_store/pq-devnet",
+]
+
 [dependencies]
 account_utils = { workspace = true }
 beacon_node_fallback = { workspace = true }
 bls = { workspace = true }
+consensus_signature = { workspace = true }
 doppelganger_service = { workspace = true }
 either = { workspace = true }
 environment = { workspace = true }

@@ -4,8 +4,18 @@ version = "0.1.0"
 edition = { workspace = true }
 authors = ["Sigma Prime <contact@sigmaprime.io>"]
 
+[features]
+default = []
+pq-devnet = [
+    "consensus_signature/pq-wire",
+    "eth2/pq-devnet",
+    "slashing_protection/pq-devnet",
+    "types/pq-devnet",
+]
+
 [dependencies]
 bls = { workspace = true }
+consensus_signature = { workspace = true }
 eth2 = { workspace = true }
 futures = { workspace = true }
 slashing_protection = { workspace = true }

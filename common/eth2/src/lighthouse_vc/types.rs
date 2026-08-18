@@ -1,7 +1,8 @@
 pub use crate::lighthouse::Health;
 pub use crate::lighthouse_vc::std_types::*;
 pub use crate::types::{GenericResponse, VersionData};
-use bls::{PublicKey, PublicKeyBytes};
+use bls::PublicKey;
+use consensus_signature::ValidatorPublicKeyBytes as PublicKeyBytes;
 use eth2_keystore::Keystore;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

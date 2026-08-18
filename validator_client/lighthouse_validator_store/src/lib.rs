@@ -1,5 +1,8 @@
+#[cfg(not(feature = "pq-devnet"))]
 use account_utils::validator_definitions::{PasswordStorage, ValidatorDefinition};
-use bls::{PublicKeyBytes, Signature};
+use consensus_signature::{
+    IndividualSignature as Signature, ValidatorPublicKeyBytes as PublicKeyBytes,
+};
 use doppelganger_service::DoppelgangerService;
 use eth2::types::PublishBlockRequest;
 use futures::{Stream, future::join_all, stream};
@@ -8,12 +11,15 @@ use logging::crit;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use signing_method::Error as SigningError;
+#[cfg(feature = "pq-devnet")]
+use signing_method::UnsupportedPqSigningDuty;
 use signing_method::{SignableMessage, SigningContext, SigningMethod};
-use slashing_protection::{
-    CheckSlashability, InterchangeError, NotSafe, Safe, SlashingDatabase, interchange::Interchange,
-};
+use slashing_protection::{CheckSlashability, NotSafe, Safe, SlashingDatabase};
+#[cfg(not(feature = "pq-devnet"))]
+use slashing_protection::{InterchangeError, interchange::Interchange};
 use slot_clock::SlotClock;
 use std::marker::PhantomData;
+#[cfg(not(feature = "pq-devnet"))]
 use std::path::Path;
 use std::sync::Arc;
 use task_executor::TaskExecutor;
@@ -21,14 +27,15 @@ use tracing::{Instrument, debug, error, info, info_span, instrument, warn};
 use types::{
     AbstractExecPayload, Address, AggregateAndProof, Attestation, BeaconBlock, BlindedPayload,
     ChainSpec, ContributionAndProof, Domain, Epoch, EthSpec, ExecutionPayloadEnvelope, Fork,
-    FullPayload, Graffiti, Hash256, PayloadAttestationData, PayloadAttestationMessage,
-    ProposerPreferences, SelectionProof, SignedAggregateAndProof, SignedBeaconBlock,
-    SignedContributionAndProof, SignedExecutionPayloadEnvelope, SignedProposerPreferences,
-    SignedRoot, SignedValidatorRegistrationData, SignedVoluntaryExit, Slot,
-    SyncAggregatorSelectionData, SyncCommitteeContribution, SyncCommitteeMessage,
-    SyncSelectionProof, SyncSubnetId, ValidatorRegistrationData, VoluntaryExit,
-    graffiti::GraffitiString,
+    Graffiti, Hash256, PayloadAttestationData, PayloadAttestationMessage, ProposerPreferences,
+    SelectionProof, SignedAggregateAndProof, SignedBeaconBlock, SignedContributionAndProof,
+    SignedExecutionPayloadEnvelope, SignedProposerPreferences, SignedValidatorRegistrationData,
+    SignedVoluntaryExit, Slot, SyncAggregatorSelectionData, SyncCommitteeContribution,
+    SyncCommitteeMessage, SyncSelectionProof, SyncSubnetId, ValidatorRegistrationData,
+    VoluntaryExit,
 };
+#[cfg(not(feature = "pq-devnet"))]
+use types::{FullPayload, SignedRoot, graffiti::GraffitiString};
 use validator_store::{
     AggregateToSign, AttestationToSign, ContributionToSign, DoppelgangerStatus,
     Error as ValidatorStoreError, ProposalData, SignedBlock, SyncMessageToSign, UnsignedBlock,
@@ -152,6 +159,7 @@ impl<T: SlotClock + 'static, E: EthSpec> LighthouseValidatorStore<T, E> {
     /// Insert a new validator to `self`, where the validator is represented by an EIP-2335
     /// keystore on the filesystem.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(not(feature = "pq-devnet"))]
     pub async fn add_validator_keystore<P: AsRef<Path>>(
         &self,
         voting_keystore_path: P,
@@ -190,6 +198,7 @@ impl<T: SlotClock + 'static, E: EthSpec> LighthouseValidatorStore<T, E> {
     /// - If `enable == true`, starting to perform duties for the validator.
     // FIXME: ignore this clippy lint until the validator store is refactored to use async locks
     #[allow(clippy::await_holding_lock)]
+    #[cfg(not(feature = "pq-devnet"))]
     pub async fn add_validator(
         &self,
         validator_def: ValidatorDefinition,
@@ -400,6 +409,7 @@ impl<T: SlotClock + 'static, E: EthSpec> LighthouseValidatorStore<T, E> {
             .unwrap_or(self.prefer_builder_proposals)
     }
 
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn import_slashing_protection(
         &self,
         interchange: Interchange,
@@ -414,6 +424,7 @@ impl<T: SlotClock + 'static, E: EthSpec> LighthouseValidatorStore<T, E> {
     /// If any key is unknown to the slashing protection database it will be silently omitted
     /// from the result. It is the caller's responsibility to check whether all keys provided
     /// had data returned for them.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn export_slashing_protection_for_keys(
         &self,
         pubkeys: &[PublicKeyBytes],
@@ -483,11 +494,6 @@ impl<T: SlotClock + 'static, E: EthSpec> LighthouseValidatorStore<T, E> {
         match slashing_status {
             // We can safely sign this block without slashing.
             Ok(Safe::Valid) => {
-                validator_metrics::inc_counter_vec(
-                    &validator_metrics::SIGNED_BLOCKS_TOTAL,
-                    &[validator_metrics::SUCCESS],
-                );
-
                 let signature = signing_method
                     .get_signature(
                         SignableMessage::BeaconBlock(&block),
@@ -496,8 +502,31 @@ impl<T: SlotClock + 'static, E: EthSpec> LighthouseValidatorStore<T, E> {
                         &self.task_executor,
                     )
                     .await?;
-                Ok(SignedBeaconBlock::from_block(block, signature))
+                let signed_block = SignedBeaconBlock::from_block(block, signature);
+                validator_metrics::inc_counter_vec(
+                    &validator_metrics::SIGNED_BLOCKS_TOTAL,
+                    &[validator_metrics::SUCCESS],
+                );
+                Ok(signed_block)
             }
+            #[cfg(feature = "pq-devnet")]
+            Ok(Safe::SameData) => {
+                let signature = signing_method
+                    .get_signature(
+                        SignableMessage::BeaconBlock(&block),
+                        signing_context,
+                        &self.spec,
+                        &self.task_executor,
+                    )
+                    .await?;
+                let signed_block = SignedBeaconBlock::from_block(block, signature);
+                validator_metrics::inc_counter_vec(
+                    &validator_metrics::SIGNED_BLOCKS_TOTAL,
+                    &[validator_metrics::SAME_DATA],
+                );
+                Ok(signed_block)
+            }
+            #[cfg(not(feature = "pq-devnet"))]
             Ok(Safe::SameData) => {
                 warn!("Skipping signing of previously signed block");
                 validator_metrics::inc_counter_vec(
@@ -590,7 +619,7 @@ impl<T: SlotClock + 'static, E: EthSpec> LighthouseValidatorStore<T, E> {
             )
             .await?;
         attestation
-            .add_signature(&signature, validator_committee_position)
+            .attach_individual_signature(&signature, validator_committee_position)
             .map_err(Error::UnableToSignAttestation)?;
 
         Ok(())
@@ -604,6 +633,7 @@ impl<T: SlotClock + 'static, E: EthSpec> LighthouseValidatorStore<T, E> {
     /// This method SKIPS slashing protection for web3signer validators that have slashing
     /// protection disabled at the Lighthouse layer. It is up to the user to ensure slashing
     /// protection is enabled in web3signer instead.
+    #[cfg(not(feature = "pq-devnet"))]
     #[instrument(level = "debug", skip_all)]
     fn slashing_protect_attestations(
         &self,
@@ -692,6 +722,73 @@ impl<T: SlotClock + 'static, E: EthSpec> LighthouseValidatorStore<T, E> {
             }
         }
 
+        Ok(safe_attestations)
+    }
+
+    /// Commits PQ attestation safety before any stateful signature reservation.
+    #[cfg(feature = "pq-devnet")]
+    fn pq_slashing_precheck_attestations(
+        &self,
+        attestations: Vec<AttestationToSign<E>>,
+    ) -> Result<Vec<(AttestationToSign<E>, Safe)>, Error> {
+        let mut attestations_to_check = Vec::with_capacity(attestations.len());
+        for attestation in &attestations {
+            let signing_method = self.doppelganger_checked_signing_method(attestation.pubkey)?;
+            let signing_epoch = attestation.attestation.data().target.epoch;
+            let signing_context = self.signing_context(Domain::BeaconAttester, signing_epoch);
+            let domain_hash = signing_context.domain_hash(&self.spec);
+            let check_slashability = if signing_method
+                .requires_local_slashing_protection(self.enable_web3signer_slashing_protection)
+            {
+                CheckSlashability::Yes
+            } else {
+                CheckSlashability::No
+            };
+            attestations_to_check.push((
+                attestation.attestation.data(),
+                &attestation.pubkey,
+                domain_hash,
+                check_slashability,
+            ));
+        }
+        let results = self
+            .slashing_protection
+            .check_and_insert_attestations(&attestations_to_check)
+            .map_err(Error::Slashable)?;
+
+        let mut safe_attestations = Vec::with_capacity(attestations.len());
+        for (attestation, slashing_status) in attestations.into_iter().zip(results) {
+            match slashing_status {
+                Ok(Safe::Valid) => {
+                    safe_attestations.push((attestation, Safe::Valid));
+                }
+                Ok(Safe::SameData) => {
+                    safe_attestations.push((attestation, Safe::SameData));
+                }
+                Err(NotSafe::UnregisteredValidator(public_key)) => {
+                    warn!(
+                        ?public_key,
+                        "PQ validator missing from slashing protection database"
+                    );
+                    validator_metrics::inc_counter_vec(
+                        &validator_metrics::SIGNED_ATTESTATIONS_TOTAL,
+                        &[validator_metrics::UNREGISTERED],
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        slot = %attestation.attestation.data().slot,
+                        public_key = ?attestation.pubkey,
+                        ?error,
+                        "Skipping slashable PQ attestation before signing"
+                    );
+                    validator_metrics::inc_counter_vec(
+                        &validator_metrics::SIGNED_ATTESTATIONS_TOTAL,
+                        &[validator_metrics::SLASHABLE],
+                    );
+                }
+            }
+        }
         Ok(safe_attestations)
     }
 
@@ -996,6 +1093,7 @@ impl<T: SlotClock + 'static, E: EthSpec> ValidatorStore for LighthouseValidatorS
         }
     }
 
+    #[cfg(not(feature = "pq-devnet"))]
     fn sign_attestations(
         self: &Arc<Self>,
         mut attestations: Vec<AttestationToSign<E>>,
@@ -1075,6 +1173,71 @@ impl<T: SlotClock + 'static, E: EthSpec> ValidatorStore for LighthouseValidatorS
         })
     }
 
+    #[cfg(feature = "pq-devnet")]
+    fn sign_attestations(
+        self: &Arc<Self>,
+        attestations: Vec<AttestationToSign<E>>,
+    ) -> impl Stream<Item = Result<Vec<(u64, Attestation<E>)>, Error>> + Send {
+        let store = self.clone();
+        stream::once(async move {
+            let validator_store = store.clone();
+            let safe_attestations = store
+                .task_executor
+                .spawn_blocking_handle(
+                    move || validator_store.pq_slashing_precheck_attestations(attestations),
+                    "pq_slashing_precheck_attestations",
+                )
+                .ok_or(Error::ExecutorError)?
+                .await
+                .map_err(|_| Error::ExecutorError)??;
+
+            let signing_futures = safe_attestations
+                .into_iter()
+                .map(|(mut attestation, status)| {
+                    let store = store.clone();
+                    async move {
+                        store
+                            .sign_attestation_no_slashing_protection(
+                                attestation.pubkey,
+                                attestation.validator_committee_index,
+                                &mut attestation.attestation,
+                            )
+                            .await?;
+                        let metric_status = match status {
+                            Safe::Valid => validator_metrics::SUCCESS,
+                            Safe::SameData => validator_metrics::SAME_DATA,
+                        };
+                        validator_metrics::inc_counter_vec(
+                            &validator_metrics::SIGNED_ATTESTATIONS_TOTAL,
+                            &[metric_status],
+                        );
+                        Ok::<_, Error>((attestation.validator_index, attestation.attestation))
+                    }
+                });
+            let mut signed = Vec::new();
+            for result in join_all(signing_futures).await {
+                match result {
+                    Ok(attestation) => signed.push(attestation),
+                    Err(error) => {
+                        crit!(?error, "Failed to sign PQ attestation");
+                    }
+                }
+            }
+            Ok(signed)
+        })
+    }
+
+    #[cfg(feature = "pq-devnet")]
+    async fn sign_validator_registration_data(
+        &self,
+        _validator_registration_data: ValidatorRegistrationData,
+    ) -> Result<SignedValidatorRegistrationData, Error> {
+        Err(Error::SpecificError(
+            SigningError::PqSigningDutyUnsupported(UnsupportedPqSigningDuty::ValidatorRegistration),
+        ))
+    }
+
+    #[cfg(not(feature = "pq-devnet"))]
     async fn sign_validator_registration_data(
         &self,
         validator_registration_data: ValidatorRegistrationData,
@@ -1423,6 +1586,18 @@ impl<T: SlotClock + 'static, E: EthSpec> ValidatorStore for LighthouseValidatorS
             })
     }
 
+    #[cfg(feature = "pq-devnet")]
+    async fn sign_payload_attestation(
+        &self,
+        _validator_pubkey: PublicKeyBytes,
+        _data: PayloadAttestationData,
+    ) -> Result<PayloadAttestationMessage, Error> {
+        Err(Error::SpecificError(
+            SigningError::PqSigningDutyUnsupported(UnsupportedPqSigningDuty::PayloadAttestation),
+        ))
+    }
+
+    #[cfg(not(feature = "pq-devnet"))]
     async fn sign_payload_attestation(
         &self,
         validator_pubkey: PublicKeyBytes,
@@ -1456,6 +1631,20 @@ impl<T: SlotClock + 'static, E: EthSpec> ValidatorStore for LighthouseValidatorS
 
     /// Sign an `ExecutionPayloadEnvelope` for Gloas (local building).
     /// The proposer acts as the builder and signs with the BeaconBuilder domain.
+    #[cfg(feature = "pq-devnet")]
+    async fn sign_execution_payload_envelope(
+        &self,
+        _validator_pubkey: PublicKeyBytes,
+        _envelope: ExecutionPayloadEnvelope<E>,
+    ) -> Result<SignedExecutionPayloadEnvelope<E>, Error> {
+        Err(Error::SpecificError(
+            SigningError::PqSigningDutyUnsupported(
+                UnsupportedPqSigningDuty::ExecutionPayloadEnvelope,
+            ),
+        ))
+    }
+
+    #[cfg(not(feature = "pq-devnet"))]
     async fn sign_execution_payload_envelope(
         &self,
         validator_pubkey: PublicKeyBytes,
@@ -1485,6 +1674,18 @@ impl<T: SlotClock + 'static, E: EthSpec> ValidatorStore for LighthouseValidatorS
         })
     }
 
+    #[cfg(feature = "pq-devnet")]
+    async fn sign_proposer_preferences(
+        &self,
+        _validator_pubkey: PublicKeyBytes,
+        _preferences: ProposerPreferences,
+    ) -> Result<SignedProposerPreferences, Error> {
+        Err(Error::SpecificError(
+            SigningError::PqSigningDutyUnsupported(UnsupportedPqSigningDuty::ProposerPreferences),
+        ))
+    }
+
+    #[cfg(not(feature = "pq-devnet"))]
     async fn sign_proposer_preferences(
         &self,
         validator_pubkey: PublicKeyBytes,

@@ -1,7 +1,7 @@
 #[cfg(unix)]
 use fs2::FileExt;
 #[cfg(unix)]
-use pq_signing::PqKeystore;
+use pq_signing::{PqKeystore, PqSigningAuthority, provision_usage_journal};
 #[cfg(unix)]
 use std::fs::{self, File, OpenOptions};
 #[cfg(unix)]
@@ -71,6 +71,32 @@ fn pq_builder_uses_distinct_definition_and_filename() {
     validator
         .validate_keystore_password(passwords.path())
         .expect("decrypt and validate");
+}
+
+#[cfg(unix)]
+#[test]
+fn key_unlock_is_bounded_and_bound_to_the_validator_identity() {
+    let _work_lock = pq_work_lock();
+    let validators = tempdir().expect("validators");
+    let passwords = tempdir().expect("passwords");
+    let journal = tempdir().expect("journal");
+    let keystore = keystore();
+    let metadata = keystore.authenticate(PASSWORD).expect("metadata");
+    let validator = PqValidatorDirBuilder::new(validators.path().into())
+        .password_dir(passwords.path())
+        .voting_keystore(keystore, PASSWORD)
+        .build()
+        .expect("build");
+    let journal_path = journal.path().join("xmss_usage.sqlite");
+    provision_usage_journal(&journal_path, [3; 32], &[metadata]).expect("journal");
+
+    let unlock = validator.key_unlock(passwords.path()).expect("key unlock");
+    let authority =
+        PqSigningAuthority::open(&journal_path, [3; 32], vec![unlock]).expect("authority");
+    assert_eq!(
+        authority.public_keys()[0].serialize(),
+        *validator.public_key()
+    );
 }
 
 #[cfg(unix)]

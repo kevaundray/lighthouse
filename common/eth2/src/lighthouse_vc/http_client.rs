@@ -1,6 +1,6 @@
 use super::types::*;
 use crate::{Error, success_or_error};
-use bls::PublicKeyBytes;
+use consensus_signature::ValidatorPublicKeyBytes as PublicKeyBytes;
 use reqwest::{
     IntoUrl,
     header::{HeaderMap, HeaderValue},

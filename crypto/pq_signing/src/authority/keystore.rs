@@ -17,7 +17,24 @@ use rand::{TryRngCore, rngs::OsRng};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::io::{Read, Write};
 use std::ops::RangeInclusive;
+#[cfg(test)]
+use std::{cell::Cell, thread_local};
 use zeroize::Zeroizing;
+
+#[cfg(test)]
+thread_local! {
+    static SECRET_KEY_DECRYPTIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_secret_key_decryptions() {
+    SECRET_KEY_DECRYPTIONS.set(0);
+}
+
+#[cfg(test)]
+pub(super) fn secret_key_decryptions() -> usize {
+    SECRET_KEY_DECRYPTIONS.get()
+}
 
 pub const PQ_FORMAT: &str = "lighthouse-pq-keystore";
 pub const PQ_FORMAT_VERSION: u32 = 1;
@@ -402,6 +419,8 @@ impl PqKeystore {
         &self,
         password: &[u8],
     ) -> Result<SecretKey, PqKeystoreError> {
+        #[cfg(test)]
+        SECRET_KEY_DECRYPTIONS.set(SECRET_KEY_DECRYPTIONS.get() + 1);
         self.validate_profile()?;
         let plaintext = decrypt(password, &self.crypto)?;
         validate_plaintext(plaintext.as_bytes(), &self.outer_metadata())

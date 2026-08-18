@@ -1,4 +1,4 @@
-use bls::PublicKeyBytes;
+use consensus_signature::ValidatorPublicKeyBytes as PublicKeyBytes;
 use eth2_keystore::Keystore;
 use serde::{Deserialize, Serialize};
 use types::{Address, Graffiti};

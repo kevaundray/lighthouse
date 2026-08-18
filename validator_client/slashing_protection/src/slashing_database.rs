@@ -1,7 +1,10 @@
 use crate::signed_attestation::InvalidAttestation;
 use crate::signed_block::InvalidBlock;
-use crate::{NotSafe, Safe, SignedAttestation, SignedBlock, SigningRoot, signing_root_from_row};
-use bls::PublicKeyBytes;
+#[cfg(not(feature = "pq-devnet"))]
+use crate::signing_root_from_row;
+use crate::{NotSafe, Safe, SignedAttestation, SignedBlock, SigningRoot};
+use consensus_signature::ValidatorPublicKeyBytes as PublicKeyBytes;
+#[cfg(not(feature = "pq-devnet"))]
 use eip_3076::{
     Interchange, InterchangeData, InterchangeMetadata, SignedAttestation as InterchangeAttestation,
     SignedBlock as InterchangeBlock,
@@ -28,6 +31,7 @@ pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Supported version of the interchange format.
+#[cfg(not(feature = "pq-devnet"))]
 pub const SUPPORTED_INTERCHANGE_FORMAT_VERSION: u64 = 5;
 
 /// Column ID of the `validators.enabled` column.
@@ -269,6 +273,7 @@ impl SlashingDatabase {
     }
 
     /// List the internal validator ID and public key of every registered validator.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn list_all_registered_validators(
         &self,
         txn: &Transaction,
@@ -804,6 +809,7 @@ impl SlashingDatabase {
     ///
     /// This function will atomically import the entire interchange, failing if *any*
     /// record cannot be imported.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn import_interchange_info(
         &self,
         interchange: Interchange,
@@ -850,6 +856,7 @@ impl SlashingDatabase {
         }
     }
 
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn import_interchange_record(
         &self,
         record: InterchangeData,
@@ -922,6 +929,7 @@ impl SlashingDatabase {
         }
     }
 
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn export_all_interchange_info(
         &self,
         genesis_validators_root: Hash256,
@@ -929,6 +937,7 @@ impl SlashingDatabase {
         self.export_interchange_info(genesis_validators_root, None)
     }
 
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn export_interchange_info(
         &self,
         genesis_validators_root: Hash256,
@@ -939,6 +948,7 @@ impl SlashingDatabase {
         self.export_interchange_info_in_txn(genesis_validators_root, selected_pubkeys, txn)
     }
 
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn export_interchange_info_in_txn(
         &self,
         genesis_validators_root: Hash256,
@@ -981,6 +991,7 @@ impl SlashingDatabase {
         Ok(Interchange { metadata, data })
     }
 
+    #[cfg(not(feature = "pq-devnet"))]
     fn export_interchange_blocks_for_validator(
         &self,
         validator_id: i64,
@@ -1000,6 +1011,7 @@ impl SlashingDatabase {
         .collect()
     }
 
+    #[cfg(not(feature = "pq-devnet"))]
     fn export_interchange_attestations_for_validator(
         &self,
         validator_id: i64,
@@ -1097,6 +1109,7 @@ impl SlashingDatabase {
     /// This function is incredibly dangerous and should be used with extreme caution. Presently
     /// we only use it one place: immediately before inserting a new maximum source/maximum target
     /// attestation. Any future use should take care to respect the database's non-emptiness.
+    #[cfg(not(feature = "pq-devnet"))]
     fn clear_signed_attestations(
         &self,
         public_key: &PublicKeyBytes,
@@ -1115,6 +1128,7 @@ impl SlashingDatabase {
     ///
     /// Dangerous, should only be used immediately before inserting a new block in the same
     /// transacation.
+    #[cfg(not(feature = "pq-devnet"))]
     fn clear_signed_blocks(
         &self,
         public_key: &PublicKeyBytes,
@@ -1203,6 +1217,7 @@ pub struct ValidatorSummary {
     pub max_attestation_target: Option<Epoch>,
 }
 
+#[cfg(not(feature = "pq-devnet"))]
 impl ValidatorSummary {
     fn check_block_consistency(&self, prev: &Self, imported_blocks: bool) -> bool {
         if imported_blocks {
@@ -1235,6 +1250,7 @@ impl ValidatorSummary {
 }
 
 /// Take the maximum of `opt_x` and `y`, returning `y` if `opt_x` is `None`.
+#[cfg(not(feature = "pq-devnet"))]
 fn max_or<T: Copy + Ord>(opt_x: Option<T>, y: T) -> T {
     opt_x.map_or(y, |x| std::cmp::max(x, y))
 }
@@ -1242,11 +1258,13 @@ fn max_or<T: Copy + Ord>(opt_x: Option<T>, y: T) -> T {
 /// Check that `new` is `Some` and greater than or equal to prev.
 ///
 /// If prev is `None` and `new` is `Some` then `true` is returned.
+#[cfg(not(feature = "pq-devnet"))]
 fn monotonic<T: PartialOrd>(new: Option<T>, prev: Option<T>) -> bool {
     new.is_some_and(|new_val| prev.is_none_or(|prev_val| new_val >= prev_val))
 }
 
 /// The result of importing a single entry from an interchange file.
+#[cfg(not(feature = "pq-devnet"))]
 #[derive(Debug)]
 pub enum InterchangeImportOutcome {
     Success {
@@ -1259,12 +1277,14 @@ pub enum InterchangeImportOutcome {
     },
 }
 
+#[cfg(not(feature = "pq-devnet"))]
 impl InterchangeImportOutcome {
     pub fn failed(&self) -> bool {
         matches!(self, InterchangeImportOutcome::Failure { .. })
     }
 }
 
+#[cfg(not(feature = "pq-devnet"))]
 #[derive(Debug)]
 pub enum InterchangeError {
     UnsupportedVersion(u64),
@@ -1282,24 +1302,28 @@ pub enum InterchangeError {
     AtomicBatchAborted(Vec<InterchangeImportOutcome>),
 }
 
+#[cfg(not(feature = "pq-devnet"))]
 impl From<NotSafe> for InterchangeError {
     fn from(error: NotSafe) -> Self {
         InterchangeError::NotSafe(error)
     }
 }
 
+#[cfg(not(feature = "pq-devnet"))]
 impl From<rusqlite::Error> for InterchangeError {
     fn from(error: rusqlite::Error) -> Self {
         Self::SQLError(error.to_string())
     }
 }
 
+#[cfg(not(feature = "pq-devnet"))]
 impl From<r2d2::Error> for InterchangeError {
     fn from(error: r2d2::Error) -> Self {
         InterchangeError::SQLPoolError(error)
     }
 }
 
+#[cfg(not(feature = "pq-devnet"))]
 impl From<serde_json::Error> for InterchangeError {
     fn from(error: serde_json::Error) -> Self {
         InterchangeError::SerdeJsonError(error)

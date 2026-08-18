@@ -732,23 +732,48 @@ git add Cargo.toml Cargo.lock crypto/pq_signing crypto/eth2_keystore common/vali
 git commit -m "feat: add journal-owned PQ signing authority"
 ```
 
-### Task 3.3b: Route validator duties through the PQ signing authority
+### Task 3.3b: Implement the validator signing/slashing core
 
 **Prerequisites:** Tasks 3.3a and 4.1b.
 
 **Files:**
 
 - Modify: `validator_client/signing_method/src/lib.rs`
+- Modify: `common/validator_dir/src/pq_validator_dir.rs`
+- Create: a bounded shared PQ-devnet bundle/manifest module under `common/validator_dir/`; the
+  runtime validator client must not depend on `testing/pq_devnet`
 - Modify: `validator_client/initialized_validators/src/lib.rs`
 - Modify: `validator_client/lighthouse_validator_store/src/lib.rs`
 - Modify: `validator_client/validator_store/src/lib.rs`
-- Create: PQ signing integration tests
+- Modify: the active validator-identity transport surface under `common/eth2/` and the required
+  feature forwarding in `validator_client/doppelganger_service/`
+- Modify: `crypto/pq_signing/` only to add the descriptor-anchored authority-open and
+  journal-before-decryption boundary used by runtime bundle startup
+- Modify: `testing/pq_devnet/` to consume the shared manifest schema instead of defining a runtime
+  schema in the provisioning package
+- Modify: `validator_client/slashing_protection/src/lib.rs` and
+  `validator_client/slashing_protection/src/slashing_database.rs`
+- Modify: `consensus/types/src/attestation/attestation.rs`
+- Modify: the relevant Cargo features for every package above
+- Create: PQ signing integration tests, including an isolated validator-store test harness whose
+  fixture dependency cannot enter the runtime feature graph
 
 **Step 1: Write failing duty-signing tests**
 
-Cover proposer and attester duties first, including identical retry and conflicting-root refusal.
-Add PQ startup tests that reject Web3Signer and any other remote/distributed signing method before
-duties begin.
+Cover the first finalizing-devnet duties: RANDAO reveal, block proposal, attestation, attestation
+selection proof, and aggregate-and-proof. Require real signatures to verify against the bound key,
+identical retries to return byte-identical evidence, and conflicting roots to fail without creating
+another journal reservation.
+
+Pin the safety ordering with tests for an unsafe attestation, concurrent same-root and conflicting
+attestations, and cancellation after the slashing-protection commit. An unsafe attestation must not
+burn an XMSS leaf. A same-data retry after either database commit must succeed deterministically.
+
+Add bundle/authority construction tests for wrong manifest/network root, journal binding mismatch,
+missing/extra/duplicate keys, a parent-directory swap, and a second journal owner. Gate EIP-3076
+import/export and remote key mutation from the compiling PQ core surface. Default BLS behavior
+remains covered by its existing tests. Actual validator-client process startup and its complete set
+of profile guards belong to Task 3.3c and are not claimed by this task.
 
 **Step 2: Verify RED**
 
@@ -756,21 +781,146 @@ Run the targeted signing-method/validator-store tests. Expected: PQ signing is u
 
 **Step 3: Implement PQ local signing**
 
-Call the authority's combined blocking reserve-and-sign operation through Lighthouse's
-blocking/scoped worker and return the explicit raw wire type.
-Accept only the local journal-owning PQ signing method in PQ mode; reject Web3Signer and other
-remote/distributed signing configurations with a clear startup error.
-Do not reintroduce an upstream-key, raw reserve, callback, or unreserved signing escape hatch.
+Keep `SignableMessage`/`SigningMethod` as the semantic abstraction; do not introduce a universal
+signature-scheme trait. In PQ mode `SigningMethod` contains a lightweight signer only behind an
+opaque holder and controlled constructor; public callers cannot extract or clone it. Before
+computing a root, validate that the supplied `SigningContext` domain and epoch match the semantic
+message. It computes the signing root and frozen V1 `OneTimeUseId`, then dispatches exactly one combined
+`PqSigner::sign` call through Lighthouse's high-priority scoped blocking/Rayon executor. Journal
+reservation and signing must remain one non-bypassable blocking operation. Preserve
+`PqSigningError` as an error source and do not reintroduce an upstream key, raw reservation,
+callback, or unreserved signing escape hatch.
+
+Own exactly one `PqSigningAuthority` per validator-client process on `InitializedValidators`, then
+place one lightweight signer handle in each initialized validator. Do not open an authority per
+validator because the journal lock and binding validation are process-global.
+
+Move the bounded PQ-devnet manifest/layout schema out of the provisioning package into a shared
+runtime module. Its authority-construction API takes the actual beacon/network
+`genesis_validators_root` as the root of trust, validates the manifest only as consistency data,
+requires an exact key set and exact per-keystore one-time-use range, and retains one root directory
+descriptor across manifest/key/secret reads and the anchored authority journal open. It returns one
+authority plus lightweight signer handles; Task 3.3c wires that API into the actual process after
+the network root is known and opens fresh slashing protection in the required order.
+
+Bundle loading performs only bounded outer-metadata validation and assembles `PqKeyUnlock` values.
+The authority must lock and validate the journal before performing exactly one authenticated
+KDF/decryption and derived-key identity/range cross-check per key. Non-Linux PQ builds must compile
+and return an explicit `UnsupportedPlatform`; the first journal-backed profile remains Linux-only.
+
+Use active `ValidatorPublicKeyBytes` in core slashing-protection APIs, but gate the BLS-shaped
+EIP-3076 interchange in PQ builds. Never create a BLS shadow identity.
+
+Blocks already commit slashing protection before signing; in PQ mode allow `Safe::SameData` to
+reach the authority for deterministic retry. Reorder attestations from
+`sign -> batch slashing check` to:
+
+```text
+batch slashing-protection transaction
+    -> retain Safe::Valid and PQ Safe::SameData
+    -> combined journal-reserve-and-sign on the scoped executor
+    -> attach/promote the individual evidence
+```
+
+Preserve successful attestation siblings when one signer fails, and record exactly one final
+`SUCCESS` or `SAME_DATA` metric only after successful evidence attachment. Likewise, block
+`SUCCESS`/`SAME_DATA` metrics are recorded only after signature production and signed-block
+construction.
+
+Add a scheme-neutral one-participant attestation attachment helper. In PQ Electra it sets the
+participant bit and cheaply promotes `PqRawSignature` to `PqSameMessageEvidence`; it must never
+prove or combine multiple signatures. Task 4.2 owns beacon-node aggregate evidence.
+
+The compiling core accepts only the local journal-owning PQ signing method and exposes explicit
+unsupported-duty errors. Task 3.3c owns process-level rejection of remote/distributed signing and
+the remaining unsupported workflows before duties begin.
+
+Keep RANDAO as a semantic duty and retain its frozen V1 leaf: its signing root is epoch-bound but
+its one-time-use ID is proposal-slot-bound. A hash-chain/hash-onion RANDAO remains a future,
+versioned profile that changes consensus/state-transition rules; it must not silently renumber or
+remove the V1 RANDAO leaf.
 
 **Step 4: Verify GREEN**
 
-Run targeted tests and `cargo check` for the changed packages.
+Run targeted signing, initialized-validator, slashing-protection, validator-store, and bundle
+construction tests in both PQ and default configurations. Prove the normal
+`lighthouse_validator_store/pq-devnet` graph excludes the fixture crate and `state_processing`.
+Verify Rust 1.88, non-Linux cfg completeness when an appropriate target is available, feature
+isolation, clippy with warnings denied, formatting, dependency sorting, and the mandatory full
+workspace `cargo check`.
+
+Also preserve the default EIP-3076 fixture-generator workflow while keeping runtime interchange
+unavailable in PQ mode:
+
+```bash
+make -C validator_client/slashing_protection generate GENERATE_DIR="$(mktemp -d)/generated-tests"
+cargo check -p slashing_protection --all-features --all-targets
+```
 
 **Step 5: Commit**
 
 ```bash
-git add validator_client docs/pq-devnet-findings.md
+git add Cargo.lock common/eth2 common/validator_dir consensus/types crypto/pq_signing \
+  testing/pq_devnet validator_client \
+  docs/plans/2026-08-18-pq-devnet-implementation.md docs/pq-devnet-findings.md
 git commit -m "feat: sign validator duties with PQ keys"
+```
+
+### Task 3.3c: Integrate PQ startup into the validator-client process
+
+**Prerequisites:** Task 3.3b and the PQ state-processing/verification feature-spine migration from
+Tasks 4.2 and 5.1-5.3. This task must not be started by feature-unifying `types/pq-devnet` into the
+current BLS-only state-processing graph.
+
+**Files:**
+
+- Modify: `validator_client/src/lib.rs`, `config.rs`, and `cli.rs`
+- Modify: the validator-client/runtime feature forwarding needed after the verification spine is PQ
+  compatible
+- Create: full-process PQ startup and unsupported-profile tests
+
+**Step 1: Write failing process-startup tests**
+
+Start the actual validator-client process far enough to obtain the beacon/network
+`genesis_validators_root`. Cover wrong manifest/network root, journal mismatch,
+missing/extra/duplicate keys, a second journal owner, and cancellation/restart after ordinary
+slashing protection commits. Require explicit startup/profile rejection of Web3Signer,
+distributed signing and distributed selections, builder registration, remote key mutation APIs,
+online voluntary exits, and EIP-3076 import/export.
+
+**Step 2: Verify RED**
+
+Run the validator-client PQ feature check and the new process tests. Until the prerequisite
+state-processing/verification feature spine lands, the expected RED is the documented BLS-shaped
+state-processing graph; do not weaken the startup contract to make it compile.
+
+**Step 3: Wire the process in the fail-closed order**
+
+After the actual network root is known:
+
+1. validate the bounded frozen-profile manifest and match it to the actual root;
+2. validate the exact directory identity set and reject mixed, missing, extra, or duplicate keys;
+3. unlock every bounded keystore and match its exact one-time-use range to the manifest;
+4. open one descriptor-anchored authority with the actual root;
+5. bind lightweight signer handles;
+6. only then create/register a fresh PQ slashing-protection database; and
+7. enable duties only after all unsupported workflows have been rejected.
+
+Do not add BLS shadow identities or expose a caller-supplied signing-root path in PQ mode.
+
+**Step 4: Verify GREEN**
+
+Run full-process PQ startup/restart tests, all unsupported-profile tests, the first useful duty
+tests through the process boundary, default BLS regressions, Rust 1.88 checks, feature graphs,
+clippy with warnings denied, formatting, dependency sorting, and the mandatory full workspace
+`cargo check`.
+
+**Step 5: Commit**
+
+```bash
+git add Cargo.toml Cargo.lock validator_client docs/plans/2026-08-18-pq-devnet-implementation.md \
+  docs/pq-devnet-findings.md
+git commit -m "feat: start the validator client with PQ signing"
 ```
 
 ## Milestone 4: PQ Consensus Wire Types

@@ -4,10 +4,21 @@ version = "0.1.0"
 edition = { workspace = true }
 authors = ["Sigma Prime <contact@sigmaprime.io>"]
 
+[features]
+default = []
+pq-devnet = [
+    "dep:consensus_signature",
+    "dep:pq_signing",
+    "signing_method/pq-devnet",
+    "types/pq-devnet",
+    "validator_dir/pq-devnet",
+]
+
 [dependencies]
 account_utils = { workspace = true }
 bincode = { workspace = true }
 bls = { workspace = true }
+consensus_signature = { workspace = true, optional = true, features = ["pq-wire"] }
 eth2_keystore = { workspace = true }
 filesystem = { workspace = true }
 lockfile = { workspace = true }
@@ -15,11 +26,13 @@ metrics = { workspace = true }
 p12-keystore = "0.2"
 parking_lot = { workspace = true }
 pem = "3"
+pq_signing = { workspace = true, optional = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 signing_method = { workspace = true }
+task_executor = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 types = { workspace = true }
@@ -27,3 +40,6 @@ url = { workspace = true }
 validator_dir = { workspace = true }
 validator_metrics = { workspace = true }
 zeroize = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

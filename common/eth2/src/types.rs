@@ -7,7 +7,9 @@ use crate::{
     CONSENSUS_BLOCK_VALUE_HEADER, CONSENSUS_VERSION_HEADER, EXECUTION_PAYLOAD_BLINDED_HEADER,
     EXECUTION_PAYLOAD_INCLUDED_HEADER, EXECUTION_PAYLOAD_VALUE_HEADER, Error as ServerError,
 };
-use bls::{PublicKeyBytes, SecretKey, Signature, SignatureBytes};
+#[cfg(not(feature = "pq-devnet"))]
+use bls::SecretKey;
+use bls::{PublicKeyBytes, Signature, SignatureBytes};
 use context_deserialize::ContextDeserialize;
 #[cfg(feature = "network")]
 use enr::{CombinedKey, Enr};
@@ -1931,6 +1933,7 @@ impl<E: EthSpec> FullBlockContents<E> {
     }
 
     /// Signs `self`, producing a `SignedBlockContents`.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn sign(
         self,
         secret_key: &SecretKey,

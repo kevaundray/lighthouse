@@ -692,7 +692,10 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   SQLite path from the held staging descriptor. Because SQLite rejects `SQLITE_OPEN_NOFOLLOW` when
   an intermediate `/proc/self/fd` component is used, only this validated 0700-directory facade
   omits that SQLite flag; exclusive 0600 database/lock creation and the public reservation boundary
-  are unchanged. Provisioning validation requires the exact registered-key set and zero existing
+  are unchanged. A malicious process running as the same UID remains outside this filesystem threat
+  model: it can mutate owner-writable directory entries despite the descriptor anchor, so operators
+  must isolate the validator client from untrusted same-UID processes. Provisioning validation
+  requires the exact registered-key set and zero existing
   reservations; the ordinary authority-open path still permits valid historical keys as designed.
 - Files are durable before publication, publication is `RENAME_NOREPLACE`, and the destination
   parent is synced afterward. No failure path removes output. A pre-rename failure leaves the named
@@ -708,3 +711,66 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   and linear XMSS construction cost is intentionally outside ordinary tests.
 - The previously recorded hash-chain/hash-onion RANDAO proposal remains a future profile option.
   Task 4.1b does not change the V1 duty layout or replace signature-derived RANDAO.
+
+### 2026-08-18: Task 3.3b validator signing/slashing core implemented
+
+- `SignableMessage` and `SigningMethod` remain the semantic boundary; no universal crypto trait was
+  added. In the PQ feature graph `SigningMethod` contains only a lightweight `PqSigner`, derives the
+  frozen V1 leaf from the semantic duty, and submits exactly one combined `PqSigner::sign` call to
+  the high-priority scoped blocking executor. RANDAO retains its epoch-bound signing root and
+  proposal-slot-bound V1 leaf so a later hash-chain profile can remain a versioned consensus change.
+  The caller-supplied signing-root helper is absent from PQ builds; PQ callers can enter only through
+  the semantic-message API that derives both the signing root and frozen signing ID internally.
+  The authority-bound signer is held behind an opaque signing-method wrapper and cannot be
+  extracted through the public enum. Domain and epoch consistency are validated before root
+  computation or reservation; wrong-context regressions subsequently sign the correct same leaves,
+  proving that rejection did not burn them.
+- The bounded manifest schema now lives in `validator_dir` and is shared by provisioning and the
+  runtime-side bundle construction boundary. Bundle loading treats the caller-provided, actual
+  network genesis validators root as the
+  authority and the manifest root as a consistency check, rejects a non-canonical profile or key
+  set, compares the manifest range to every cheaply validated outer keystore range, and reads
+  bounded keystores/passwords through one held root directory descriptor. The same descriptor
+  anchors the authority journal open, so replacing the parent path cannot redirect reservation
+  history. Only after locking and validating that journal does the authority perform exactly one
+  authenticated KDF/decryption and derived-key identity/range cross-check per key. A second
+  authority owner is rejected before any KDF. Non-Linux builds have an explicit
+  `UnsupportedPlatform` fallback; this host has no installed non-Linux Rust target with `std`, so
+  only cfg-complete structure and Linux host compilation were verified here.
+- Core slashing-protection APIs now use the active `ValidatorPublicKeyBytes`. PQ builds have no BLS
+  shadow identity and compile without EIP-3076 import/export. Blocks retain commit-before-sign and
+  allow PQ `Safe::SameData`; attestations commit their batch first, retain `Safe::Valid` plus PQ
+  `Safe::SameData`, and only then reserve/sign and attach one-participant evidence. Attachment sets
+  the participant bit and promotes the raw envelope without proving or combining it.
+- The real-PQ duty test verifies RANDAO, block proposal, attestation, selection proof, and
+  aggregate-and-proof signatures. The store integration test simulates cancellation after the
+  ordinary slashing commit, recovers the same vote, produces byte-identical concurrent same-root
+  evidence, rejects a conflicting vote, and observes exactly two journal reservations. It also
+  proves that a post-slashing signer failure increments neither success category, while successful
+  `Safe::Valid` and `Safe::SameData` outcomes increment exactly one final status after attachment;
+  unregistered and slashable prechecks retain their own counters. A mixed batch preserves its
+  successfully signed sibling when another signer fails. Block `SUCCESS` and `SAME_DATA` are also
+  delayed until signature and signed-block construction, so either signer failure increments
+  neither. The integration fixture now lives
+  in a nested, isolated Cargo test harness, and the normal
+  `lighthouse_validator_store/pq-devnet` graph contains neither `pq_devnet` nor `state_processing`.
+  Its final debug run took 148.82 seconds on this host. The poisoned-password/locked-journal startup
+  regression took 85.60 seconds and the focused authentication counter test took 34.06 seconds.
+- Default EIP-3076 APIs and the fixture generator remain available when PQ is disabled, while PQ
+  runtime interchange stays gated. The unchanged `make generate` workflow produced fixtures in a
+  temporary directory, and `cargo check -p slashing_protection --all-features --all-targets`
+  succeeds with the PQ profile selecting an explicit generator stub.
+- A runnable full `validator_client/pq-devnet` feature is blocked at the package graph, rather than
+  at the signing or slashing boundary. A temporary feature-forwarding check (removed after the
+  diagnostic) made Cargo unify `types/pq-devnet` into `state_processing` through
+  `eth2_network_config`/`environment` and produced 33 compile errors: BLS batch-verification APIs,
+  aggregate-attestation and sync-committee verification, deposit/request public keys, and Gloas
+  upgrade logic remain BLS-specific. Consequently the full-process startup ordering and startup
+  rejection of distributed selections, builder registration, HTTP key mutation, and online exit
+  cannot honestly be marked GREEN until the state-processing/network migration lands. It is now
+  tracked separately as Task 3.3c, explicitly dependent on the PQ state-processing/verification
+  feature-spine migration. Task 3.3b claims only the compiling signing/slashing and bounded
+  bundle/authority construction core. The
+  compiling boundary rejects Web3Signer by construction, gates remote mutation and EIP-3076 APIs,
+  and returns explicit errors for unsupported signing duties; it does not claim an executable PQ
+  validator client yet.

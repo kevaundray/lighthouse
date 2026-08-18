@@ -7,15 +7,19 @@ edition = { workspace = true }
 [features]
 insecure_keys = []
 pq-devnet = [
+    "dep:consensus_signature",
     "pq_signing/pq-devnet",
     "types/pq-devnet",
     "dep:rustix",
     "dep:zeroize",
+    "dep:serde",
+    "dep:serde_json",
 ]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 bls = { workspace = true }
+consensus_signature = { workspace = true, optional = true, features = ["pq-wire"] }
 deposit_contract = { workspace = true }
 educe = { workspace = true }
 eth2_keystore = { workspace = true }
@@ -25,6 +29,8 @@ lockfile = { workspace = true }
 pq_signing = { workspace = true, optional = true }
 rand = { workspace = true }
 rustix = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 tree_hash = { workspace = true }
 types = { workspace = true }
 zeroize = { workspace = true, optional = true }
@@ -37,4 +43,9 @@ tempfile = { workspace = true }
 [[test]]
 name = "pq_validator_dir"
 path = "tests/pq_validator_dir.rs"
+required-features = ["pq-devnet"]
+
+[[test]]
+name = "pq_devnet_bundle"
+path = "tests/pq_devnet_bundle.rs"
 required-features = ["pq-devnet"]

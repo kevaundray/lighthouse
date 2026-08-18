@@ -1,12 +1,10 @@
 use consensus_signature::PqPublicKey;
 use pq_signing::{
-    MAX_PQ_PASSWORD_BYTES, PqKeystore, PqKeystoreError, PqSigningError, XMSS_USAGE_FILENAME,
-    validate_pq_password,
+    MAX_PQ_PASSWORD_BYTES, PqKeystore, PqKeystoreError, PqSigningError, validate_pq_password,
 };
 #[cfg(target_os = "linux")]
 use pq_signing::{provision_usage_journal_anchored, validate_usage_journal_anchored};
 use rustix::fs::{Mode, OFlags, RenameFlags};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ssz::Encode;
 use state_processing::{DirectGenesisValidator, initialize_beacon_state_from_validators};
@@ -21,12 +19,13 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use types::{BeaconState, ChainSpec, EthSpec, ForkName, Hash256, MinimalEthSpec};
-use validator_dir::{PqValidatorDir, PqValidatorDirBuilder, PqValidatorDirError};
+use validator_dir::{
+    MAX_PQ_DEVNET_MANIFEST_BYTES, PQ_DEVNET_GENESIS_FILE, PQ_DEVNET_MANIFEST_FILE,
+    PqDevnetManifest, PqManifestValidator, PqValidatorDir, PqValidatorDirBuilder,
+    PqValidatorDirError,
+};
 use zeroize::Zeroizing;
 
-pub const PQ_DEVNET_GENESIS_FILE: &str = "genesis.ssz";
-pub const PQ_DEVNET_MANIFEST_FILE: &str = "pq-devnet.json";
-pub const PQ_DEVNET_JOURNAL_FILE: &str = XMSS_USAGE_FILENAME;
 const VALIDATORS_DIR: &str = "validators";
 const PASSWORDS_DIR: &str = "secrets";
 const PRODUCTION_VALIDATOR_COUNT: usize = 16;
@@ -35,7 +34,6 @@ const PRODUCTION_RANGE_START: u32 = 0;
 const PRODUCTION_RANGE_END: u32 = 1119;
 const MAX_INPUT_FILE_BYTES: usize = MAX_PQ_PASSWORD_BYTES;
 const MAX_GENESIS_BYTES: usize = 128 * 1024 * 1024;
-const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 const VALIDATOR_SEED_DOMAIN: &[u8] = b"lighthouse/pq-devnet/validator-seed/v1";
 const WITHDRAWAL_DOMAIN: &[u8] = b"lighthouse/pq-devnet/withdrawal-credentials/v1";
 
@@ -152,29 +150,6 @@ impl ProvisionedDevnet {
     pub const fn genesis_validators_root(&self) -> [u8; 32] {
         self.genesis_validators_root
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Manifest {
-    format: String,
-    version: u32,
-    preset: String,
-    fork: String,
-    validator_count: usize,
-    one_time_use_start: u32,
-    one_time_use_end: u32,
-    eth1_timestamp: u64,
-    genesis_validators_root: String,
-    validators: Vec<ManifestValidator>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ManifestValidator {
-    derivation_index: u64,
-    public_key: String,
-    withdrawal_credentials: String,
 }
 
 pub fn staging_path(destination: &Path) -> Result<PathBuf, ProvisionError> {
@@ -561,11 +536,11 @@ fn build_staging(
             public_key,
             withdrawal_credentials,
         });
-        manifest_validators.push(ManifestValidator {
+        manifest_validators.push(PqManifestValidator::new(
             derivation_index,
-            public_key: hex::encode(public_key.serialize()),
-            withdrawal_credentials: hex::encode(withdrawal_credentials.as_slice()),
-        });
+            public_key,
+            withdrawal_credentials.0,
+        ));
     }
 
     let spec = electra_genesis_spec();
@@ -586,18 +561,14 @@ fn build_staging(
 
     provision_usage_journal_anchored(&staging.file, genesis_validators_root, &metadata)?;
 
-    let manifest = Manifest {
-        format: "lighthouse-pq-devnet".to_owned(),
-        version: 1,
-        preset: "minimal".to_owned(),
-        fork: "electra".to_owned(),
-        validator_count: config.validator_count,
-        one_time_use_start: *config.one_time_use_range.start(),
-        one_time_use_end: *config.one_time_use_range.end(),
-        eth1_timestamp: config.eth1_timestamp,
-        genesis_validators_root: hex::encode(genesis_validators_root),
-        validators: manifest_validators,
-    };
+    let manifest = PqDevnetManifest::new(
+        config.validator_count,
+        *config.one_time_use_range.start(),
+        *config.one_time_use_range.end(),
+        config.eth1_timestamp,
+        genesis_validators_root,
+        manifest_validators,
+    );
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)
         .map_err(|error| ProvisionError::Json(error.to_string()))?;
     write_private_file_at(staging, PQ_DEVNET_GENESIS_FILE, &genesis_state_bytes)?;
@@ -769,51 +740,24 @@ fn validate_output(
     }
     validate_usage_journal_anchored(&root.file, expected.genesis_validators_root, &authenticated)?;
 
-    let manifest_bytes =
-        read_public_file(&root.path.join(PQ_DEVNET_MANIFEST_FILE), MAX_MANIFEST_BYTES)?;
-    let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
+    let manifest_bytes = read_public_file(
+        &root.path.join(PQ_DEVNET_MANIFEST_FILE),
+        MAX_PQ_DEVNET_MANIFEST_BYTES,
+    )?;
+    let manifest = PqDevnetManifest::from_json_slice(&manifest_bytes)
         .map_err(|error| ProvisionError::Json(error.to_string()))?;
-    let manifest_public_keys = manifest
-        .validators
-        .iter()
-        .map(|validator| validator.public_key.clone())
-        .collect::<Vec<_>>();
-    let expected_public_keys = expected
-        .public_keys
-        .iter()
-        .map(|key| hex::encode(key.serialize()))
-        .collect::<Vec<_>>();
+    let validated = manifest
+        .validate_for_network(expected.genesis_validators_root)
+        .map_err(|error| ProvisionError::Integrity(error.to_string()))?;
     let expected_withdrawal_credentials = registry_withdrawal_credentials
         .iter()
-        .map(|credentials| hex::encode(credentials.as_slice()))
+        .map(|credentials| credentials.0)
         .collect::<Vec<_>>();
-    let manifest_withdrawal_credentials = manifest
-        .validators
-        .iter()
-        .map(|validator| validator.withdrawal_credentials.clone())
-        .collect::<Vec<_>>();
-    let manifest_indices = manifest
-        .validators
-        .iter()
-        .map(|validator| validator.derivation_index)
-        .collect::<Vec<_>>();
-    let expected_indices = (0..config.validator_count)
-        .map(u64::try_from)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| ProvisionError::InvalidConfig)?;
-    if manifest.format != "lighthouse-pq-devnet"
-        || manifest.version != 1
-        || manifest.preset != "minimal"
-        || manifest.fork != "electra"
-        || manifest.validator_count != expected.public_keys.len()
-        || manifest.validators.len() != expected.public_keys.len()
-        || manifest.one_time_use_start != *config.one_time_use_range.start()
-        || manifest.one_time_use_end != *config.one_time_use_range.end()
-        || manifest.eth1_timestamp != config.eth1_timestamp
-        || manifest.genesis_validators_root != hex::encode(expected.genesis_validators_root)
-        || manifest_public_keys != expected_public_keys
-        || manifest_withdrawal_credentials != expected_withdrawal_credentials
-        || manifest_indices != expected_indices
+    if validated.public_keys() != expected.public_keys
+        || validated.withdrawal_credentials() != expected_withdrawal_credentials
+        || validated.one_time_use_start() != *config.one_time_use_range.start()
+        || validated.one_time_use_end() != *config.one_time_use_range.end()
+        || validated.eth1_timestamp() != config.eth1_timestamp
     {
         return Err(ProvisionError::Integrity("manifest mismatch".to_owned()));
     }

@@ -92,6 +92,14 @@ impl From<XmssJournalError> for PqSigningError {
 }
 
 /// An encrypted keystore and its password, consumed by authority startup.
+///
+/// Authentication is deliberately unavailable outside `PqSigningAuthority`, so bundle loading
+/// cannot run the KDF before the authority has locked and validated its journal.
+///
+/// ```compile_fail
+/// use pq_signing::PqKeyUnlock;
+/// let _ = PqKeyUnlock::authenticate;
+/// ```
 pub struct PqKeyUnlock {
     keystore: PqKeystore,
     password: Zeroizing<Vec<u8>>,
@@ -105,6 +113,12 @@ impl PqKeyUnlock {
             keystore,
             password: Zeroizing::new(password.to_vec()),
         })
+    }
+
+    /// Returns the bounded outer range after cheap profile/metadata validation.
+    /// The authority authenticates this range against the derived key after opening the journal.
+    pub fn one_time_use_range(&self) -> std::ops::RangeInclusive<u32> {
+        self.keystore.one_time_use_range()
     }
 }
 
@@ -268,6 +282,30 @@ impl PqSigningAuthority {
         genesis_validators_root: [u8; 32],
         unlocks: Vec<PqKeyUnlock>,
     ) -> Result<Self, PqSigningError> {
+        Self::open_with_journal(genesis_validators_root, unlocks, |bindings| {
+            XmssUsageJournal::open(journal_path, bindings)
+        })
+    }
+
+    /// Opens the authority journal relative to one already-validated bundle directory handle.
+    #[cfg(target_os = "linux")]
+    pub fn open_anchored(
+        directory: &File,
+        genesis_validators_root: [u8; 32],
+        unlocks: Vec<PqKeyUnlock>,
+    ) -> Result<Self, PqSigningError> {
+        validate_anchor(directory)?;
+        let journal_path = anchored_journal_path(directory);
+        Self::open_with_journal(genesis_validators_root, unlocks, |bindings| {
+            XmssUsageJournal::open_anchored(&journal_path, bindings)
+        })
+    }
+
+    fn open_with_journal(
+        genesis_validators_root: [u8; 32],
+        unlocks: Vec<PqKeyUnlock>,
+        open_journal: impl FnOnce(&[XmssKeyBinding]) -> Result<XmssUsageJournal, XmssJournalError>,
+    ) -> Result<Self, PqSigningError> {
         let mut seen = HashSet::with_capacity(unlocks.len());
         let mut public_keys = Vec::with_capacity(unlocks.len());
         let mut ranges = Vec::with_capacity(unlocks.len());
@@ -290,7 +328,7 @@ impl PqSigningAuthority {
                 .push(PqPublicKey::deserialize(&public_key_bytes).map_err(PqSigningError::Wire)?);
             ranges.push(range);
         }
-        let journal = XmssUsageJournal::open(journal_path, &bindings)?;
+        let journal = open_journal(&bindings)?;
 
         let mut keys = Vec::with_capacity(unlocks.len());
         for ((unlock, binding), range) in unlocks.into_iter().zip(bindings).zip(ranges) {
@@ -491,6 +529,7 @@ impl ValidateAllBindings for XmssUsageJournal {
 #[cfg(all(test, unix))]
 mod tests {
     use super::journal::Reservation;
+    use super::keystore::{reset_secret_key_decryptions, secret_key_decryptions};
     use super::*;
     use consensus_signature::{OneTimeUseId, SigningDuty};
     use fs2::FileExt;
@@ -528,6 +567,52 @@ mod tests {
             .expect("open PQ test lock");
         file.lock_exclusive().expect("lock PQ test work");
         file
+    }
+
+    #[test]
+    fn authority_locks_journal_before_one_authentication_per_key() {
+        let _work_lock = pq_work_lock();
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join(XMSS_USAGE_FILENAME);
+        let keystore = PqKeystore::from_seed([31; 32], 0..=7, b"password").expect("keystore");
+        let binding = XmssKeyBinding::from_raw_range(
+            *keystore.public_key(),
+            [3; 32],
+            keystore.one_time_use_range(),
+        )
+        .expect("binding");
+        let owner = XmssUsageJournal::provision(&path, [&binding]).expect("journal owner");
+
+        reset_secret_key_decryptions();
+        let locked = PqSigningAuthority::open(
+            &path,
+            [3; 32],
+            vec![PqKeyUnlock::new(keystore.clone(), b"wrong password").expect("unlock")],
+        );
+        assert!(matches!(
+            locked,
+            Err(PqSigningError::Journal(XmssJournalError::JournalLocked(_)))
+        ));
+        assert_eq!(
+            secret_key_decryptions(),
+            0,
+            "locked journal must precede KDF"
+        );
+
+        drop(owner);
+        reset_secret_key_decryptions();
+        let authority = PqSigningAuthority::open(
+            &path,
+            [3; 32],
+            vec![PqKeyUnlock::new(keystore, b"password").expect("unlock")],
+        )
+        .expect("authority");
+        assert_eq!(authority.public_keys().len(), 1);
+        assert_eq!(
+            secret_key_decryptions(),
+            1,
+            "one successful key startup must authenticate exactly once"
+        );
     }
 
     #[test]

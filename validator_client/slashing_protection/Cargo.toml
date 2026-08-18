@@ -4,14 +4,21 @@ version = "0.1.0"
 authors = ["Michael Sproul <michael@sigmaprime.io>", "pscott <scottpiriou@gmail.com>"]
 edition = { workspace = true }
 autotests = false
+autobins = false
+
+[[bin]]
+name = "test_generator"
+path = "src/bin/test_generator.rs"
 
 [features]
 arbitrary = ["dep:arbitrary", "types/arbitrary", "eip_3076/arbitrary"]
 portable = ["types/portable"]
+pq-devnet = ["consensus_signature/pq-wire", "types/pq-devnet"]
 
 [dependencies]
 arbitrary = { workspace = true, features = ["derive"], optional = true }
 bls = { workspace = true }
+consensus_signature = { workspace = true }
 eip_3076 = { workspace = true, features = ["json"] }
 ethereum_serde_utils = { workspace = true }
 filesystem = { workspace = true }
@@ -31,3 +38,8 @@ rayon = { workspace = true }
 [[test]]
 name = "slashing_protection_tests"
 path = "tests/main.rs"
+
+[[test]]
+name = "pq_identity"
+path = "tests/pq_identity.rs"
+required-features = ["pq-devnet"]

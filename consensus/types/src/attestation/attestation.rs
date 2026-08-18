@@ -5,7 +5,6 @@ use std::{
 
 #[cfg(not(feature = "pq-devnet"))]
 use bls::SecretKey;
-#[cfg(not(feature = "pq-devnet"))]
 use consensus_signature::IndividualSignature;
 use consensus_signature::SameMessageEvidence;
 use context_deserialize::{ContextDeserialize, context_deserialize};
@@ -243,6 +242,54 @@ impl<E: EthSpec> Attestation<E> {
         match self {
             Attestation::Base(att) => att.add_signature(signature, committee_position),
             Attestation::Electra(att) => att.add_signature(signature, committee_position),
+        }
+    }
+
+    /// Attaches evidence from exactly one participant without invoking aggregate proving.
+    ///
+    /// In the PQ profile this is a cheap raw-envelope promotion. Multi-participant combination is
+    /// deliberately owned by the beacon-node aggregate-evidence boundary.
+    pub fn attach_individual_signature(
+        &mut self,
+        signature: &IndividualSignature,
+        committee_position: usize,
+    ) -> Result<(), Error> {
+        #[cfg(not(feature = "pq-devnet"))]
+        {
+            self.add_signature(signature, committee_position)
+        }
+        #[cfg(feature = "pq-devnet")]
+        match self {
+            Attestation::Base(attestation) => {
+                if attestation
+                    .aggregation_bits
+                    .get(committee_position)
+                    .map_err(Error::BitfieldError)?
+                {
+                    return Err(Error::AlreadySigned(committee_position));
+                }
+                attestation
+                    .aggregation_bits
+                    .set(committee_position, true)
+                    .map_err(Error::BitfieldError)?;
+                attestation.signature = SameMessageEvidence::from(signature);
+                Ok(())
+            }
+            Attestation::Electra(attestation) => {
+                if attestation
+                    .aggregation_bits
+                    .get(committee_position)
+                    .map_err(Error::BitfieldError)?
+                {
+                    return Err(Error::AlreadySigned(committee_position));
+                }
+                attestation
+                    .aggregation_bits
+                    .set(committee_position, true)
+                    .map_err(Error::BitfieldError)?;
+                attestation.signature = SameMessageEvidence::from(signature);
+                Ok(())
+            }
         }
     }
 
