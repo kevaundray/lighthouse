@@ -500,3 +500,30 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   genesis, writes distinct validator directories, creates the bound XMSS journal, then reopens and
   cross-checks every key, registry entry, and journal registration. This is Task 4.1b, after Task
   4.1 replaces the BLS-sized registry/wire fields.
+
+### 2026-08-18: PQ wire-schema preflight
+
+- The wire/profile boundary is compile-time selected. `consensus_signature/pq-wire` contains only
+  serialization types; `pq-devnet` adds the pinned leanMultisig backend. `types/pq-devnet` forwards
+  only `pq-wire`, so consensus objects and schema tooling do not pull the prover, Lean VM runtime,
+  or its large setup graph into their dependency closure. With all package features enabled,
+  `pq-wire` deterministically selects the PQ aliases; mutually exclusive Cargo features are
+  avoided.
+- PQ validator public keys are fixed 32-byte values and individual signatures are fixed 1,215-byte
+  Lighthouse `LHPQ/v1/parameter1/raw` envelopes. Same-message evidence is a distinct bounded
+  variable-size SSZ byte-list from the first PQ schema, capped at 512 KiB. It supports canonical
+  raw promotion and absent evidence in Task 4.1; Task 4.2 adds hostile aggregate-proof validation
+  and construction without changing container offsets or tree roots.
+- Active validator identity fields include the registry, state pubkey cache, sync committees,
+  validator withdrawal/consolidation requests, and pending-deposit queues. Deposit ingress,
+  builder/relay messages, and BLS-to-execution changes remain explicitly BLS and are disabled or
+  kept out of the initial PQ devnet path. The legacy sync-committee aggregate-public-key field uses
+  a canonical zero PQ placeholder and is never a PQ verification input.
+- PQ types deliberately do not imitate BLS point mechanics. Point addition, infinity semantics,
+  decompression, direct BLS verification, and secret-key convenience constructors are gated out;
+  signing, verification, and aggregation remain separate deep service boundaries.
+- A full PQ-feature `types` test invocation is not a valid Task 4.1-local gate because dev-dependency
+  feature unification pulls the same PQ `types` instance into still-BLS-only beacon-chain and
+  state-processing code. Task 4.1 uses focused wire/schema tests and PQ `types --lib` checks, while
+  preserving the complete default BLS suite. Full PQ downstream checks become mandatory as those
+  callers migrate.

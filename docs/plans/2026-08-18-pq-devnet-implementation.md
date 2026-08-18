@@ -665,40 +665,125 @@ git commit -m "feat: sign validator duties with PQ keys"
 
 **Files:**
 
-- Modify: `crypto/consensus_signature/src/pq.rs`
-- Modify: `consensus/types/src/validator/validator.rs`
-- Modify: individual signed containers under `consensus/types/src/`
-- Create: PQ SSZ/tree-hash tests
-- Modify: `beacon_node/beacon_chain/tests/schema_stability.rs`
+- Modify: `crypto/consensus_signature/Cargo.toml`
+- Create: `crypto/consensus_signature/src/pq_wire.rs`
+- Modify: `crypto/consensus_signature/src/lib.rs` and `src/pq.rs`
+- Create: `crypto/consensus_signature/tests/pq_wire_schema.rs`
+- Modify: `consensus/types/Cargo.toml`
+- Modify: validator-identity fields and helpers under `consensus/types/src/validator/`,
+  `state/`, `sync_committee/`, `withdrawal/`, `consolidation/`, and `deposit/pending_deposit.rs`
+- Gate BLS-only signing, point-mutation, and direct-verification helpers under
+  `consensus/types/src/attestation/`, `block/`, `exit/`, and `sync_committee/`
+- Create: focused PQ schema tests under `consensus/types/tests/`
+- Modify: `docs/pq-devnet-findings.md`
 
 **Step 1: Write failing PQ schema tests**
 
-Pin byte lengths, JSON form, SSZ round trips, tree roots, malformed lengths, and parameter-set
-version rejection.
+In `consensus_signature`, pin the following independent wire contracts before enabling them in
+`types`:
+
+- `PqPublicKey`: exact 32-byte fixed SSZ, canonical lowercase `0x` JSON, stable tree root,
+  byte/string round trips, and exact-length rejection;
+- `PqRawSignature`: exact 1,215-byte fixed SSZ with `LHPQ`, wire version 1, parameter set 1, and raw
+  evidence kind; pin JSON/tree root and reject wrong length, magic, version, parameter set, and kind;
+- `PqSameMessageEvidence`: a distinct bounded **variable-size** SSZ byte-list from its first
+  version, capped at 512 KiB. Pin raw promotion without proving, canonical seven-byte absent
+  evidence, structurally framed aggregate evidence, variable-length SSZ offsets/tree roots, and
+  one-byte-over-cap rejection.
+
+The same-message type must use its final variable-size SSZ shape now. A temporary fixed raw-only
+type would change every containing SSZ offset and tree root when recursive proofs arrive in Task
+4.2. Generic decoding validates only the Lighthouse envelope and bound; contextual aggregate-proof
+decoding remains Task 4.2.
+
+Add default BLS regression assertions that the existing aliases, fixed bytes, JSON, SSZ, and tree
+roots remain exactly unchanged.
 
 **Step 2: Verify RED under PQ-only features**
 
-Expected: current BLS-sized fields do not satisfy the PQ schema.
+Run the narrow wire tests first. Expected: `pq-wire`, the three PQ wire types, and their trait
+implementations do not yet exist. Then add focused `types` schema tests and capture the current
+BLS-sized validator/signature fields failing those expectations.
 
 **Step 3: Implement compile-time-selected PQ types**
 
-Do not introduce runtime BLS/PQ unions. Keep default BLS schema unchanged.
+Split features so consensus serialization never pulls the prover into the types graph:
+
+```toml
+# crypto/consensus_signature
+pq-wire = []
+pq-devnet = ["pq-wire", "dep:lean-multisig"]
+
+# consensus/types
+pq-devnet = ["consensus_signature/pq-wire"]
+```
+
+Keep the wire implementation in `pq_wire.rs`, with no leanMultisig dependency. The backend-heavy
+`pq` module remains gated by `pq-devnet` and reuses/re-exports those wire types. Use additive,
+all-features-safe selection: `feature = "pq-wire"` selects PQ aliases, while its absence selects
+the exact existing BLS aliases. Do not introduce a runtime BLS/PQ union or a universal `BlsLike`
+trait. Forward the optional arbitrary feature so PQ types remain usable by derived test objects.
+
+The active aliases are:
+
+- `ValidatorPublicKeyBytes` and `VerificationKey` -> `PqPublicKey`;
+- `IndividualSignature` and `RawSignature` -> `PqRawSignature`;
+- `SameMessageEvidence` and `AggregateSignature` -> `PqSameMessageEvidence`.
+
+Migrate the validator registry, state pubkey cache, sync-committee identities/duties,
+withdrawal/consolidation request validator keys, and `PendingDeposit.pubkey` to the active validator
+identity type. Keep deposit ingress messages/signature bytes, builder/relay objects, and
+BLS-to-execution changes explicitly BLS. In PQ mode, deposit processing is disabled later; the
+pending-deposit queue still needs the active key type so state transitions remain type-coherent.
+
+For the legacy sync-committee `aggregate_pubkey` field, preserve the field in the PQ schema but use
+the canonical zero PQ key; PQ verification must never consume it. Gate BLS point aggregation,
+`infinity`, direct `.verify`, decompression, and `SecretKey` convenience constructors instead of
+emulating them on PQ types. Retain data-only constructors that accept semantic signature values.
+Use canonical absent evidence only for genuinely empty aggregate placeholders; `SingleAttestation`
+promotion must remain a cheap raw-envelope conversion and never invoke proving.
 
 **Step 4: Verify both configurations**
 
 ```bash
-cargo nextest run -p types
-cargo nextest run -p types --no-default-features --features pq-devnet
-cargo check -p types
-cargo check -p types --no-default-features --features pq-devnet
+cargo nextest run -p consensus_signature --test bls_compatibility
+cargo nextest run -p consensus_signature --no-default-features --features pq-wire \
+  --test pq_wire_schema
+cargo check -p consensus_signature
+cargo check -p consensus_signature --no-default-features --features pq-wire
+cargo check -p consensus_signature --all-features
+
+cargo nextest run -p types --test consensus_signature_schema
+cargo check -p types --lib
+cargo check -p types --lib --no-default-features --features pq-devnet
+cargo check -p types --lib --all-features
+
+cargo tree -p types --no-default-features --features pq-devnet -e normal,build | \
+  rg 'lean-multisig|lean_multisig_api|lean_vm|rec_aggregation'
 ```
 
-Expected: both suites pass with their own pinned schemas.
+The final graph command must produce no matches. Confirm separately that
+`consensus_signature --features pq-devnet` still resolves the exact pinned backend.
+
+Do **not** use the old full `cargo nextest run -p types --features pq-devnet` as the Task 4.1 gate.
+The package's dev-dependencies unify `types` into BLS-only `beacon_chain` and `state_processing`
+paths that are intentionally migrated in later verification milestones. At this slice, use focused
+normal-dependency PQ schema tests plus `types --lib` checks. Continue to run the complete default
+types suite and the mandatory default workspace check:
+
+```bash
+cargo nextest run -p types
+cargo check
+```
+
+Expected: BLS goldens are byte-for-byte unchanged, PQ wire/schema tests pass, PQ `types --lib`
+compiles without leanMultisig in its normal/build graph, and the default workspace compiles.
 
 **Step 5: Commit**
 
 ```bash
-git add crypto/consensus_signature consensus/types beacon_node/beacon_chain/tests/schema_stability.rs
+git add Cargo.lock crypto/consensus_signature consensus/types \
+  docs/plans/2026-08-18-pq-devnet-implementation.md docs/pq-devnet-findings.md
 git commit -m "feat: add PQ consensus wire types"
 ```
 
