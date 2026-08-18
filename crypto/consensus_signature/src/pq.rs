@@ -10,6 +10,32 @@
 //! ```compile_fail
 //! use consensus_signature::pq::PqUnreservedSigningKey;
 //! ```
+//!
+//! Recursive prover ownership is also crate-private so downstream code cannot reserve the
+//! process singleton outside [`crate::AggregationService`]:
+//!
+//! ```compile_fail
+//! use consensus_signature::pq::PqProver;
+//! let _prover = PqProver::new();
+//! ```
+//!
+//! The operation-level service also hides the superseded backend-specific aggregate wrapper:
+//!
+//! ```compile_fail
+//! use consensus_signature::pq::PqAggregateSignature;
+//! ```
+//!
+//! Backend-specific aggregation errors are likewise not part of the downstream contract:
+//!
+//! ```compile_fail
+//! use consensus_signature::pq::AggregateError;
+//! ```
+//!
+//! Worker lifecycle details stay behind [`crate::AggregationService`]:
+//!
+//! ```compile_fail
+//! use consensus_signature::pq::ProverUnavailable;
+//! ```
 
 mod backend;
 pub use crate::{
@@ -18,8 +44,13 @@ pub use crate::{
 };
 
 use crate::OneTimeUseId;
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+use crate::aggregation::InvalidAggregationJob;
+use crate::aggregation::{AggregationError, ValidatedAggregationJob};
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+use crate::aggregation::{AggregationResource, V1_MAX_AGGREGATION_OUTPUT_BYTES};
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 use crate::pq_wire::PQ_EVIDENCE_HEADER_LEN;
-use backend::BackendSignature;
 #[cfg(test)]
 use backend::BackendSigningKey;
 #[cfg(test)]
@@ -247,71 +278,6 @@ pub fn verify_raw(
     .map_err(PqVerifyError::from_backend)
 }
 
-/// One strict raw signature paired with the public key needed to reconstruct backend context.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PqRawContribution {
-    signature: PqRawSignature,
-    public_key: PqPublicKey,
-}
-
-impl PqRawContribution {
-    pub const fn new(signature: PqRawSignature, public_key: PqPublicKey) -> Self {
-        Self {
-            signature,
-            public_key,
-        }
-    }
-
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    fn decode(&self, claim: &PqSigningClaim) -> Result<BackendSignature, AggregateError> {
-        backend::decode_aggregate_input(
-            self.signature.backend_payload(),
-            self.public_key.backend_bytes(),
-            claim,
-        )
-        .map_err(AggregateError::from_backend_failure)
-    }
-}
-
-/// An in-memory aggregate proof produced by the owned prover.
-///
-/// Its network encoding is available only through [`Self::into_same_message_evidence`], which
-/// validates the frozen output bound before constructing same-message evidence.
-#[derive(Clone, Debug)]
-pub struct PqAggregateSignature(BackendSignature);
-
-impl PqAggregateSignature {
-    /// Converts a locally proved aggregate into bounded Lighthouse same-message evidence.
-    ///
-    /// The complete pinned upstream `LMSI` envelope is retained inside the Lighthouse aggregate
-    /// payload. No public API can construct this type from arbitrary bytes.
-    pub fn into_same_message_evidence(self) -> Result<PqSameMessageEvidence, AggregateError> {
-        let envelope = backend::encode_aggregate_signature(&self.0)
-            .map_err(|error| AggregateError::Internal(PqBackendError(error)))?;
-        let evidence_len = PQ_EVIDENCE_HEADER_LEN.saturating_add(envelope.len());
-        validate_aggregate_evidence_len(evidence_len)?;
-        Ok(PqSameMessageEvidence::from_backend_aggregate_envelope(
-            envelope,
-        ))
-    }
-}
-
-/// Verifies one in-memory aggregate against its exact claim and signer set.
-pub fn verify_aggregate(
-    signature: &PqAggregateSignature,
-    public_keys: &[PqPublicKey],
-    claim: &PqSigningClaim,
-) -> Result<(), PqVerifyError> {
-    validate_aggregate_signer_count(public_keys.len())?;
-    validate_canonical_signer_order(public_keys)?;
-    let public_keys = public_keys
-        .iter()
-        .map(PqPublicKey::backend_bytes)
-        .collect::<Vec<_>>();
-    backend::verify_signature(&signature.0, &public_keys, claim)
-        .map_err(PqVerifyError::from_backend)
-}
-
 /// Contextually decodes and verifies bounded aggregate evidence.
 ///
 /// `public_keys` must be the exact expected signer set in strictly ascending canonical byte
@@ -340,6 +306,114 @@ pub fn verify_aggregate_evidence(
         .map_err(PqVerifyError::from_aggregate_backend)
 }
 
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+fn execute_aggregation_job(
+    job: ValidatedAggregationJob,
+) -> Result<PqSameMessageEvidence, AggregationError> {
+    let claim = PqSigningClaim::new(job.claim.signing_root, job.claim.one_time_use_id);
+    let mut decoded = Vec::with_capacity(job.contributions.len());
+    for contribution in &job.contributions {
+        let mut public_keys = contribution
+            .signers
+            .iter()
+            .map(|signer| signer.public_key.backend_bytes())
+            .collect::<Vec<_>>();
+        // Domain lists remain validator-index ordered. The backend receives its own strictly
+        // key-sorted projection because upstream canonicalizes signer sets by key bytes.
+        public_keys.sort_unstable();
+        let signature = match PqRawSignature::from_bytes(contribution.evidence.as_bytes()) {
+            Ok(raw) if public_keys.len() == 1 => {
+                let public_key = public_keys
+                    .first()
+                    .copied()
+                    .ok_or(AggregationError::Internal)?;
+                backend::decode_raw_signature(raw.backend_payload(), public_key, &claim)
+                    .map_err(classify_peer_evidence_error)?
+            }
+            Ok(_) => return Err(AggregationError::InvalidEvidence),
+            Err(_) => {
+                let envelope = contribution
+                    .evidence
+                    .backend_aggregate_envelope()
+                    .map_err(|_| AggregationError::InvalidEvidence)?;
+                backend::decode_aggregate_signature(envelope, &public_keys, &claim)
+                    .map_err(classify_peer_evidence_error)?
+            }
+        };
+        backend::verify_signature(&signature, &public_keys, &claim)
+            .map_err(classify_peer_evidence_error)?;
+        decoded.push(signature);
+    }
+
+    if job.contributions.len() == 1 {
+        return job
+            .contributions
+            .into_iter()
+            .next()
+            .map(|contribution| contribution.evidence)
+            .ok_or(AggregationError::Internal);
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        let _ = decoded;
+        let _ = job.expected_signers;
+        Err(AggregationError::Unavailable)
+    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        let aggregate =
+            backend::aggregate(decoded, &claim).map_err(classify_local_backend_error)?;
+        let mut expected_public_keys = job
+            .expected_signers
+            .iter()
+            .map(|signer| signer.public_key.backend_bytes())
+            .collect::<Vec<_>>();
+        expected_public_keys.sort_unstable();
+        backend::verify_signature(&aggregate, &expected_public_keys, &claim)
+            .map_err(classify_local_backend_error)?;
+        let envelope = backend::encode_aggregate_signature(&aggregate)
+            .map_err(classify_local_backend_error)?;
+        let output_len = PQ_EVIDENCE_HEADER_LEN.saturating_add(envelope.len());
+        validate_job_output_len(output_len, V1_MAX_AGGREGATION_OUTPUT_BYTES)?;
+        Ok(PqSameMessageEvidence::from_backend_aggregate_envelope(
+            envelope,
+        ))
+    }
+}
+
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+fn validate_job_output_len(length: usize, max: usize) -> Result<(), AggregationError> {
+    if length > max {
+        Err(AggregationError::OutputTooLarge {
+            actual: length,
+            max,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+fn classify_peer_evidence_error(error: lean_multisig::Error) -> AggregationError {
+    match error {
+        lean_multisig::Error::InvalidSignature { .. }
+        | lean_multisig::Error::Proof(_)
+        | lean_multisig::Error::MalformedSignature
+        | lean_multisig::Error::MessageMismatch
+        | lean_multisig::Error::SignerSetMismatch => AggregationError::InvalidEvidence,
+        lean_multisig::Error::MalformedPublicKey => {
+            AggregationError::InvalidJob(InvalidAggregationJob::InvalidPublicKey)
+        }
+        _ => AggregationError::Internal,
+    }
+}
+
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+fn classify_local_backend_error<T>(_error: T) -> AggregationError {
+    AggregationError::Internal
+}
+
 fn validate_aggregate_signer_count(count: usize) -> Result<(), PqVerifyError> {
     if count == 0 {
         return Err(PqVerifyError::InvalidRequest(
@@ -359,7 +433,10 @@ fn validate_aggregate_signer_count(count: usize) -> Result<(), PqVerifyError> {
 
 fn validate_canonical_signer_order(public_keys: &[PqPublicKey]) -> Result<(), PqVerifyError> {
     for pair in public_keys.windows(2) {
-        match pair[0].cmp(&pair[1]) {
+        let [first, second] = pair else {
+            continue;
+        };
+        match first.cmp(second) {
             std::cmp::Ordering::Less => {}
             std::cmp::Ordering::Equal => {
                 return Err(PqVerifyError::InvalidRequest(
@@ -377,11 +454,15 @@ fn validate_canonical_signer_order(public_keys: &[PqPublicKey]) -> Result<(), Pq
 }
 
 #[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+use futures::channel::oneshot;
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
 use std::panic::{AssertUnwindSafe, catch_unwind};
 #[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
 use std::sync::atomic::{AtomicU8, Ordering};
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+use std::sync::mpsc::Receiver;
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 use std::thread::{Builder, JoinHandle};
 
@@ -392,12 +473,15 @@ static PQ_PROVER_LIFECYCLE: ProverLifecycle = ProverLifecycle::idle();
 
 /// A local build or process state that cannot provide the experimental prover.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProverUnavailable {
+pub(crate) enum ProverUnavailable {
     /// The pinned prover is currently supported only on x86-64.
+    #[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "avx2"))))]
     UnsupportedTarget,
     /// The binary was not compiled in the required AVX2-only mode.
+    #[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "avx2"))))]
     Avx2NotEnabledAtCompileTime,
     /// A prover worker already owns the process-wide upstream proving state.
+    #[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
     AlreadyActive,
     /// A caught backend panic may have poisoned process-wide upstream proving state.
     ProcessPoisoned,
@@ -406,10 +490,13 @@ pub enum ProverUnavailable {
 impl std::fmt::Display for ProverUnavailable {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message = match self {
+            #[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "avx2"))))]
             Self::UnsupportedTarget => "the PQ prover is supported only on x86-64",
+            #[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "avx2"))))]
             Self::Avx2NotEnabledAtCompileTime => {
                 "the PQ prover requires an AVX2-only binary and launcher preflight"
             }
+            #[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
             Self::AlreadyActive => "a PQ prover worker is already active in this process",
             Self::ProcessPoisoned => {
                 "the PQ prover process is poisoned after a caught backend panic"
@@ -423,14 +510,17 @@ impl std::error::Error for ProverUnavailable {}
 
 /// A failure to create and initialize the owned prover worker.
 #[derive(Debug)]
-pub enum ProverError {
+pub(crate) enum ProverError {
     /// The build or process state cannot host the prover.
     Unavailable(ProverUnavailable),
     /// The operating system refused to create the dedicated worker.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     WorkerSpawn(std::io::Error),
     /// Upstream setup panicked on the dedicated worker.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     InitializationPanicked,
     /// The worker stopped before reporting its initialization result.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     InitializationWorkerStopped,
 }
 
@@ -438,10 +528,13 @@ impl std::fmt::Display for ProverError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unavailable(error) => write!(formatter, "PQ prover unavailable: {error}"),
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
             Self::WorkerSpawn(error) => {
                 write!(formatter, "failed to spawn PQ prover worker: {error}")
             }
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
             Self::InitializationPanicked => formatter.write_str("PQ prover setup panicked"),
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
             Self::InitializationWorkerStopped => {
                 formatter.write_str("PQ prover worker stopped during setup")
             }
@@ -453,149 +546,10 @@ impl std::error::Error for ProverError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Unavailable(error) => Some(error),
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
             Self::WorkerSpawn(error) => Some(error),
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
             Self::InitializationPanicked | Self::InitializationWorkerStopped => None,
-        }
-    }
-}
-
-/// A failure to aggregate PQ evidence.
-#[derive(Debug)]
-pub enum AggregateError {
-    /// Peer-supplied evidence is malformed or does not prove the requested claim/signers.
-    InvalidEvidence(PqBackendError),
-    /// The owned job is empty or exceeds an upstream protocol limit.
-    InvalidRequest(PqAggregateRequestError),
-    /// A locally produced proof exceeds the frozen devnet resource limit.
-    Resource(PqAggregateResourceError),
-    /// The local prover is unavailable before a worker exists.
-    Unavailable(ProverUnavailable),
-    /// The worker stopped before accepting or answering this job.
-    WorkerStopped,
-    /// Upstream aggregation panicked. The worker stops after reporting this error.
-    WorkerPanicked,
-    /// An upstream failure that must not be attributed to peer evidence.
-    Internal(PqBackendError),
-}
-
-/// A backend-independent invalid aggregate-proving request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PqAggregateRequestError {
-    Empty,
-    TooManyContributions { actual: usize, max: usize },
-}
-
-/// A bounded local aggregate-output failure.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PqAggregateResourceError {
-    ProofTooLarge { actual: usize, max: usize },
-}
-
-impl std::fmt::Display for PqAggregateResourceError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ProofTooLarge { actual, max } => {
-                write!(formatter, "PQ proof length {actual} exceeds maximum {max}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for PqAggregateResourceError {}
-
-impl std::fmt::Display for PqAggregateRequestError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Empty => formatter.write_str("no PQ contributions supplied"),
-            Self::TooManyContributions { actual, max } => write!(
-                formatter,
-                "too many PQ contributions: {actual}, maximum {max}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for PqAggregateRequestError {}
-
-#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
-fn validate_aggregate_contribution_count(count: usize) -> Result<(), AggregateError> {
-    if count == 0 {
-        return Err(AggregateError::InvalidRequest(
-            PqAggregateRequestError::Empty,
-        ));
-    }
-    if count > PQ_MAX_SIGNERS {
-        return Err(AggregateError::InvalidRequest(
-            PqAggregateRequestError::TooManyContributions {
-                actual: count,
-                max: PQ_MAX_SIGNERS,
-            },
-        ));
-    }
-    Ok(())
-}
-
-fn validate_aggregate_evidence_len(length: usize) -> Result<(), AggregateError> {
-    if length > PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN {
-        return Err(AggregateError::Resource(
-            PqAggregateResourceError::ProofTooLarge {
-                actual: length,
-                max: PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN,
-            },
-        ));
-    }
-    Ok(())
-}
-
-impl AggregateError {
-    #[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
-    fn from_backend_failure(failure: backend::AggregateFailure) -> Self {
-        let category = failure.category();
-        let error = PqBackendError(failure.into_error());
-        match category {
-            backend::AggregateFailureCategory::PeerInvalidEvidence => Self::InvalidEvidence(error),
-            backend::AggregateFailureCategory::LocallyGeneratedProof
-            | backend::AggregateFailureCategory::Internal => Self::Internal(error),
-        }
-    }
-}
-
-/// Opaque diagnostic detail from the exact pinned backend.
-#[derive(Debug)]
-pub struct PqBackendError(backend::BackendError);
-
-impl std::fmt::Display for PqBackendError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-impl std::error::Error for PqBackendError {}
-
-impl std::fmt::Display for AggregateError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidEvidence(error) => write!(formatter, "invalid PQ evidence: {error}"),
-            Self::InvalidRequest(error) => {
-                write!(formatter, "invalid PQ aggregation request: {error}")
-            }
-            Self::Resource(error) => write!(formatter, "PQ aggregation resource limit: {error}"),
-            Self::Unavailable(error) => write!(formatter, "PQ prover unavailable: {error}"),
-            Self::WorkerStopped => formatter.write_str("PQ prover worker stopped"),
-            Self::WorkerPanicked => formatter.write_str("PQ prover worker panicked"),
-            Self::Internal(error) => write!(formatter, "internal PQ prover failure: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for AggregateError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InvalidEvidence(error) | Self::Internal(error) => Some(error),
-            Self::InvalidRequest(error) => Some(error),
-            Self::Resource(error) => Some(error),
-            Self::Unavailable(error) => Some(error),
-            Self::WorkerStopped | Self::WorkerPanicked => None,
         }
     }
 }
@@ -606,91 +560,100 @@ impl std::error::Error for AggregateError {
 /// state there. Every aggregate job owns its signatures and claim and is executed serially on the
 /// same worker. This type is intentionally not cloneable, and a second live instance is rejected.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-pub struct PqProver {
-    commands: SyncSender<Command>,
+pub(crate) struct PqProver {
+    commands: Option<SyncSender<Command>>,
     worker: Option<JoinHandle<()>>,
-    _active: ActiveProver,
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-pub struct PqProver {
+pub(crate) struct PqProver {
     _unavailable: (),
 }
 
 impl PqProver {
     /// Starts and initializes the singleton prover worker.
-    pub fn new() -> Result<Self, ProverError> {
+    pub(crate) fn new() -> Result<Self, ProverError> {
         start_prover()
     }
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 impl PqProver {
-    /// Runs one owned aggregate job on the serialized prover worker.
-    pub fn aggregate(
+    pub(crate) async fn aggregate_job(
         &self,
-        contributions: Vec<PqRawContribution>,
-        claim: PqSigningClaim,
-    ) -> Result<PqAggregateSignature, AggregateError> {
-        validate_aggregate_contribution_count(contributions.len())?;
-        let signatures = contributions
-            .iter()
-            .map(|contribution| contribution.decode(&claim))
-            .collect::<Result<Vec<_>, _>>()?;
-        let (response_sender, response_receiver) = sync_channel(1);
-        self.commands
-            .send(Command::Aggregate {
-                signatures,
-                claim,
-                response: response_sender,
-            })
-            .map_err(|_| AggregateError::WorkerStopped)?;
-        response_receiver
-            .recv()
-            .map_err(|_| AggregateError::WorkerStopped)?
-            .map(PqAggregateSignature)
+        job: ValidatedAggregationJob,
+    ) -> Result<PqSameMessageEvidence, AggregationError> {
+        let commands = self
+            .commands
+            .as_ref()
+            .ok_or(AggregationError::WorkerStopped)?;
+        let (response, result) = oneshot::channel();
+        commands
+            .try_send(Command { job, response })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => {
+                    AggregationError::ResourceExhausted(AggregationResource::QueueSaturated {
+                        max_queued: 1,
+                    })
+                }
+                TrySendError::Disconnected(_) => AggregationError::WorkerStopped,
+            })?;
+        result.await.map_err(|_| AggregationError::WorkerStopped)?
     }
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 impl PqProver {
-    /// Refuses proving in a build that cannot create this type through [`Self::new`].
-    pub fn aggregate(
+    pub(crate) async fn aggregate_job(
         &self,
-        _contributions: Vec<PqRawContribution>,
-        _claim: PqSigningClaim,
-    ) -> Result<PqAggregateSignature, AggregateError> {
-        Err(AggregateError::Unavailable(build_mode_unavailable()))
+        job: ValidatedAggregationJob,
+    ) -> Result<PqSameMessageEvidence, AggregationError> {
+        let ValidatedAggregationJob {
+            claim,
+            expected_signers,
+            contributions,
+        } = job;
+        drop((claim, expected_signers, contributions));
+        Err(AggregationError::Unavailable)
     }
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 impl Drop for PqProver {
     fn drop(&mut self) {
-        let _ = self.commands.send(Command::Shutdown);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        // Disconnecting drains the one admitted queued job and then stops the worker. Dropping the
+        // join handle detaches instead of blocking an async caller. The worker owns ActiveProver,
+        // so a replacement cannot start until every admitted proof has completed safely.
+        self.commands.take();
+        self.worker.take();
     }
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-enum Command {
-    Aggregate {
-        signatures: Vec<BackendSignature>,
-        claim: PqSigningClaim,
-        response: SyncSender<Result<BackendSignature, AggregateError>>,
-    },
-    Shutdown,
+type Command = WorkerCommand<ValidatedAggregationJob, PqSameMessageEvidence>;
+
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+struct WorkerCommand<Job, Output> {
+    job: Job,
+    response: oneshot::Sender<Result<Output, AggregationError>>,
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-struct ActiveProver;
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+struct ActiveProver {
+    lifecycle: &'static ProverLifecycle,
+}
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+impl ActiveProver {
+    const fn new(lifecycle: &'static ProverLifecycle) -> Self {
+        Self { lifecycle }
+    }
+}
+
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
 impl Drop for ActiveProver {
     fn drop(&mut self) {
-        PQ_PROVER_LIFECYCLE.release();
+        self.lifecycle.release();
     }
 }
 
@@ -754,12 +717,7 @@ fn catch_backend_panic<T>(
     result
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-fn start_prover() -> Result<PqProver, ProverError> {
-    Err(ProverError::Unavailable(build_mode_unavailable()))
-}
-
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 fn start_prover() -> Result<PqProver, ProverError> {
     Err(ProverError::Unavailable(build_mode_unavailable()))
 }
@@ -769,20 +727,19 @@ fn start_prover() -> Result<PqProver, ProverError> {
     PQ_PROVER_LIFECYCLE
         .try_activate()
         .map_err(ProverError::Unavailable)?;
-    let active = ActiveProver;
+    let active = ActiveProver::new(&PQ_PROVER_LIFECYCLE);
     let (command_sender, command_receiver) = sync_channel(1);
     let (initialization_sender, initialization_receiver) = sync_channel(1);
     let worker = Builder::new()
         .name("pq-prover".into())
         .stack_size(PQ_WORKER_STACK_SIZE)
-        .spawn(move || worker_main(command_receiver, initialization_sender))
+        .spawn(move || worker_main(command_receiver, initialization_sender, active))
         .map_err(ProverError::WorkerSpawn)?;
 
     match initialization_receiver.recv() {
         Ok(InitializationResult::Ready) => Ok(PqProver {
-            commands: command_sender,
+            commands: Some(command_sender),
             worker: Some(worker),
-            _active: active,
         }),
         Ok(InitializationResult::Panicked) => {
             let _ = worker.join();
@@ -806,7 +763,11 @@ enum InitializationResult {
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-fn worker_main(commands: Receiver<Command>, initialized: SyncSender<InitializationResult>) {
+fn worker_main(
+    commands: Receiver<Command>,
+    initialized: SyncSender<InitializationResult>,
+    _active: ActiveProver,
+) {
     let setup_result = catch_backend_panic(&PQ_PROVER_LIFECYCLE, backend::setup);
     if setup_result.is_err() {
         let _ = initialized.send(InitializationResult::Panicked);
@@ -816,51 +777,70 @@ fn worker_main(commands: Receiver<Command>, initialized: SyncSender<Initializati
         return;
     }
 
+    run_worker_loop(commands, &PQ_PROVER_LIFECYCLE, execute_aggregation_job);
+}
+
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+fn run_worker_loop<Job, Output>(
+    commands: Receiver<WorkerCommand<Job, Output>>,
+    lifecycle: &ProverLifecycle,
+    mut execute: impl FnMut(Job) -> Result<Output, AggregationError>,
+) {
     while let Ok(command) = commands.recv() {
-        match command {
-            Command::Aggregate {
-                signatures,
-                claim,
-                response,
-            } => {
-                let aggregate_result = catch_backend_panic(&PQ_PROVER_LIFECYCLE, || {
-                    backend::aggregate(signatures, &claim)
-                });
-                match aggregate_result {
-                    Ok(result) => {
-                        let _ = response.send(result.map_err(AggregateError::from_backend_failure));
-                    }
-                    Err(_) => {
-                        let _ = response.send(Err(AggregateError::WorkerPanicked));
-                        break;
-                    }
-                }
+        if command.response.is_canceled() {
+            // Dropping the async result receiver is cancellation. The check is deliberately at
+            // the last safe point: once recursive proving begins it must run to completion. No
+            // result is sent because the dropped receiver cannot observe one.
+            continue;
+        }
+        let result = catch_backend_panic(lifecycle, || execute(command.job));
+        match result {
+            Ok(result) => {
+                let _ = command.response.send(result);
             }
-            Command::Shutdown => break,
+            Err(_) => {
+                let _ = command.response.send(Err(AggregationError::WorkerPanicked));
+                break;
+            }
         }
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-const fn build_mode_unavailable() -> ProverUnavailable {
-    ProverUnavailable::UnsupportedTarget
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "avx2"))))]
+const fn build_mode_unavailable_for(
+    is_x86_64: bool,
+    avx2_enabled: bool,
+) -> Option<ProverUnavailable> {
+    if !is_x86_64 {
+        Some(ProverUnavailable::UnsupportedTarget)
+    } else if !avx2_enabled {
+        Some(ProverUnavailable::Avx2NotEnabledAtCompileTime)
+    } else {
+        None
+    }
 }
 
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 const fn build_mode_unavailable() -> ProverUnavailable {
-    ProverUnavailable::Avx2NotEnabledAtCompileTime
+    match build_mode_unavailable_for(cfg!(target_arch = "x86_64"), cfg!(target_feature = "avx2")) {
+        Some(error) => error,
+        // This function is compiled only for unavailable build modes. Fail closed if its cfg and
+        // the explicit target mapping ever diverge.
+        None => ProverUnavailable::ProcessPoisoned,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AggregateError, PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN, PQ_MAX_SIGNERS, PqAggregateRequestError,
-        PqAggregateResourceError, PqBackendError, PqPublicKey, PqRawSignature,
-        PqSameMessageEvidence, PqSignError, PqSigningClaim, PqUnreservedSigningKey, PqVerifyError,
-        PqVerifyRequestError, ProverLifecycle, ProverUnavailable, catch_backend_panic,
-        validate_aggregate_contribution_count, validate_aggregate_evidence_len,
-        validate_aggregate_signer_count, validate_canonical_signer_order,
-        verify_aggregate_evidence, verify_raw,
+        PQ_MAX_SIGNERS, PqPublicKey, PqRawSignature, PqSameMessageEvidence, PqSignError,
+        PqSigningClaim, PqUnreservedSigningKey, PqVerifyError, PqVerifyRequestError,
+        ProverLifecycle, ProverUnavailable, catch_backend_panic, validate_aggregate_signer_count,
+        validate_canonical_signer_order, verify_aggregate_evidence, verify_raw,
+    };
+    use crate::aggregation::{
+        AggregationContribution, AggregationError, AggregationSigner, SameMessageClaim,
+        ValidatedAggregationJob,
     };
     use crate::{OneTimeUseId, SigningDuty};
     use std::error::Error as _;
@@ -883,20 +863,259 @@ mod tests {
     }
 
     #[test]
-    fn contribution_limit_is_checked_before_backend_decoding() {
-        assert!(validate_aggregate_contribution_count(PQ_MAX_SIGNERS).is_ok());
-        assert!(matches!(
-            validate_aggregate_contribution_count(0),
-            Err(AggregateError::InvalidRequest(
-                PqAggregateRequestError::Empty
-            ))
+    fn one_raw_aggregation_job_is_verified_and_returned_without_proving() {
+        let key = signing_key(0x41);
+        let pq_claim = PqSigningClaim::new([0x42; 32], randao_id());
+        let claim = SameMessageClaim::new([0x42; 32], randao_id());
+        let raw = key.sign(&pq_claim).expect("raw signature");
+        let evidence = PqSameMessageEvidence::from(&raw);
+        let expected = evidence.as_bytes().to_vec();
+        assert!(crate::is_individual_same_message_evidence(&evidence));
+        assert!(!crate::is_individual_same_message_evidence(
+            &PqSameMessageEvidence::empty()
         ));
+        let signer = AggregationSigner {
+            validator_index: 7,
+            public_key: key.public_key(),
+        };
+        let job = ValidatedAggregationJob {
+            claim,
+            expected_signers: vec![signer.clone()],
+            contributions: vec![AggregationContribution {
+                signers: vec![signer],
+                evidence,
+            }],
+        };
+
+        let result = super::execute_aggregation_job(job)
+            .expect("a valid raw contribution is returned without recursive proving");
+        assert_eq!(result.as_bytes(), expected);
+
+        let wrong_claim_job = ValidatedAggregationJob {
+            claim: SameMessageClaim::new([0x43; 32], randao_id()),
+            expected_signers: vec![AggregationSigner {
+                validator_index: 7,
+                public_key: key.public_key(),
+            }],
+            contributions: vec![AggregationContribution {
+                signers: vec![AggregationSigner {
+                    validator_index: 7,
+                    public_key: key.public_key(),
+                }],
+                evidence: PqSameMessageEvidence::from(&raw),
+            }],
+        };
+        assert_eq!(
+            super::execute_aggregation_job(wrong_claim_job),
+            Err(AggregationError::InvalidEvidence)
+        );
+
+        let wrong_key = signing_key(0x42);
+        let wrong_key_signer = AggregationSigner {
+            validator_index: 7,
+            public_key: wrong_key.public_key(),
+        };
+        let wrong_key_job = ValidatedAggregationJob {
+            claim,
+            expected_signers: vec![wrong_key_signer.clone()],
+            contributions: vec![AggregationContribution {
+                signers: vec![wrong_key_signer],
+                evidence: PqSameMessageEvidence::from(&raw),
+            }],
+        };
+        assert_eq!(
+            super::execute_aggregation_job(wrong_key_job),
+            Err(AggregationError::InvalidEvidence)
+        );
+    }
+
+    #[test]
+    fn bounded_worker_saturates_at_one_queued_job_and_skips_cancelled_work() {
+        use futures::channel::oneshot;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc::{TrySendError, sync_channel};
+        use std::sync::{Arc, Barrier};
+
+        let lifecycle = Arc::new(ProverLifecycle::idle());
+        lifecycle.try_activate().expect("test worker activates");
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let executions = Arc::new(AtomicUsize::new(0));
+        let (commands, receiver) = sync_channel(1);
+        let worker = {
+            let lifecycle = Arc::clone(&lifecycle);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            let executions = Arc::clone(&executions);
+            std::thread::Builder::new()
+                .name("pq-prover-test".into())
+                .spawn(move || {
+                    super::run_worker_loop(receiver, &lifecycle, |job| {
+                        assert_eq!(std::thread::current().name(), Some("pq-prover-test"));
+                        executions.fetch_add(1, Ordering::SeqCst);
+                        if job == 1 {
+                            entered.wait();
+                            release.wait();
+                        }
+                        Ok(job)
+                    });
+                })
+                .expect("test worker starts")
+        };
+
+        let (first_response, first_result) = oneshot::channel();
+        commands
+            .try_send(super::WorkerCommand {
+                job: 1,
+                response: first_response,
+            })
+            .expect("active job admitted");
+        entered.wait();
+
+        let (cancelled_response, cancelled_result) = oneshot::channel();
+        commands
+            .try_send(super::WorkerCommand {
+                job: 2,
+                response: cancelled_response,
+            })
+            .expect("one queued job admitted");
+        drop(cancelled_result);
+
+        let (overflow_response, _overflow_result) = oneshot::channel();
         assert!(matches!(
-            validate_aggregate_contribution_count(PQ_MAX_SIGNERS + 1),
-            Err(AggregateError::InvalidRequest(
-                PqAggregateRequestError::TooManyContributions { actual, max }
-            )) if actual == PQ_MAX_SIGNERS + 1 && max == PQ_MAX_SIGNERS
+            commands.try_send(super::WorkerCommand {
+                job: 3,
+                response: overflow_response,
+            }),
+            Err(TrySendError::Full(_))
         ));
+
+        release.wait();
+        assert_eq!(
+            futures::executor::block_on(first_result).expect("worker responds"),
+            Ok(1)
+        );
+        drop(commands);
+        worker.join().expect("worker exits after disconnect");
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn worker_panic_poisoning_stop_and_output_error_are_classified() {
+        use futures::channel::oneshot;
+        use std::sync::Arc;
+        use std::sync::mpsc::sync_channel;
+
+        let output_lifecycle = Arc::new(ProverLifecycle::idle());
+        output_lifecycle
+            .try_activate()
+            .expect("output worker activates");
+        let (output_commands, output_receiver) = sync_channel(1);
+        let output_worker = {
+            let lifecycle = Arc::clone(&output_lifecycle);
+            std::thread::spawn(move || {
+                super::run_worker_loop(output_receiver, &lifecycle, |_job: u8| -> Result<u8, _> {
+                    Err(AggregationError::OutputTooLarge {
+                        actual: 513,
+                        max: 512,
+                    })
+                });
+            })
+        };
+        let (output_response, output_result) = oneshot::channel();
+        output_commands
+            .try_send(super::WorkerCommand {
+                job: 1,
+                response: output_response,
+            })
+            .expect("output job admitted");
+        assert_eq!(
+            futures::executor::block_on(output_result).expect("worker responds"),
+            Err(AggregationError::OutputTooLarge {
+                actual: 513,
+                max: 512,
+            })
+        );
+        drop(output_commands);
+        output_worker.join().expect("output worker stops");
+        output_lifecycle.release();
+
+        let panic_lifecycle = Arc::new(ProverLifecycle::idle());
+        panic_lifecycle
+            .try_activate()
+            .expect("panic worker activates");
+        let (panic_commands, panic_receiver) = sync_channel(1);
+        let panic_worker = {
+            let lifecycle = Arc::clone(&panic_lifecycle);
+            std::thread::spawn(move || {
+                super::run_worker_loop(panic_receiver, &lifecycle, |_job: u8| -> Result<u8, _> {
+                    panic!("injected worker panic")
+                });
+            })
+        };
+        let (panic_response, panic_result) = oneshot::channel();
+        panic_commands
+            .try_send(super::WorkerCommand {
+                job: 1,
+                response: panic_response,
+            })
+            .expect("panic job admitted");
+        assert_eq!(
+            futures::executor::block_on(panic_result).expect("panic is contained"),
+            Err(AggregationError::WorkerPanicked)
+        );
+        panic_worker.join().expect("panic is caught inside worker");
+        assert_eq!(
+            panic_lifecycle.try_activate(),
+            Err(ProverUnavailable::ProcessPoisoned)
+        );
+        let (stopped_response, _stopped_result) = oneshot::channel();
+        assert!(
+            panic_commands
+                .try_send(super::WorkerCommand {
+                    job: 2,
+                    response: stopped_response,
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn aggregation_output_cap_reports_the_exact_local_overflow() {
+        assert_eq!(super::validate_job_output_len(512, 512), Ok(()));
+        assert_eq!(
+            super::validate_job_output_len(513, 512),
+            Err(AggregationError::OutputTooLarge {
+                actual: 513,
+                max: 512,
+            })
+        );
+    }
+
+    #[test]
+    fn detached_worker_retains_lifecycle_ownership_until_it_exits() {
+        use std::sync::{Arc, Barrier};
+
+        let lifecycle = Box::leak(Box::new(ProverLifecycle::idle()));
+        lifecycle.try_activate().expect("worker activates");
+        let release = Arc::new(Barrier::new(2));
+        let worker = {
+            let release = Arc::clone(&release);
+            let active = super::ActiveProver::new(lifecycle);
+            std::thread::spawn(move || {
+                let _active = active;
+                release.wait();
+            })
+        };
+
+        assert_eq!(
+            lifecycle.try_activate(),
+            Err(ProverUnavailable::AlreadyActive)
+        );
+        release.wait();
+        worker.join().expect("worker exits");
+        assert_eq!(lifecycle.try_activate(), Ok(()));
+        lifecycle.release();
     }
 
     #[test]
@@ -921,18 +1140,6 @@ mod tests {
                 }
             ))
         );
-    }
-
-    #[test]
-    fn aggregate_evidence_size_is_checked_without_allocating_the_payload() {
-        assert!(validate_aggregate_evidence_len(PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN).is_ok());
-        assert!(matches!(
-            validate_aggregate_evidence_len(PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN + 1),
-            Err(AggregateError::Resource(
-                PqAggregateResourceError::ProofTooLarge { actual, max }
-            )) if actual == PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN + 1
-                && max == PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN
-        ));
     }
 
     #[test]
@@ -996,17 +1203,6 @@ mod tests {
             verify_aggregate_evidence(&mismatched_inner_kind, &[key.public_key()], &claim),
             Err(PqVerifyError::InvalidEvidence)
         );
-    }
-
-    #[test]
-    fn opaque_backend_error_terminates_the_public_source_chain() {
-        let range_start = 1;
-        let range_end = 0;
-        let upstream = super::backend::signing_key_from_seed([0; 32], range_start..=range_end)
-            .expect_err("reversed key range is invalid");
-        let error = PqBackendError(super::backend::BackendError::from_upstream(upstream));
-
-        assert!(error.source().is_none());
     }
 
     #[test]
@@ -1086,12 +1282,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unavailable_build_mode_distinguishes_target_from_avx2_support() {
+        assert_eq!(
+            super::build_mode_unavailable_for(false, false),
+            Some(ProverUnavailable::UnsupportedTarget)
+        );
+        assert_eq!(
+            super::build_mode_unavailable_for(false, true),
+            Some(ProverUnavailable::UnsupportedTarget)
+        );
+        assert_eq!(
+            super::build_mode_unavailable_for(true, false),
+            Some(ProverUnavailable::Avx2NotEnabledAtCompileTime)
+        );
+        assert_eq!(super::build_mode_unavailable_for(true, true), None);
+    }
+
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+    #[test]
+    fn crate_owned_prover_refuses_a_build_without_avx2() {
+        assert!(matches!(
+            super::PqProver::new(),
+            Err(super::ProverError::Unavailable(
+                ProverUnavailable::Avx2NotEnabledAtCompileTime
+            ))
+        ));
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    #[test]
+    fn crate_owned_prover_refuses_an_unsupported_target() {
+        assert!(matches!(
+            super::PqProver::new(),
+            Err(super::ProverError::Unavailable(
+                ProverUnavailable::UnsupportedTarget
+            ))
+        ));
+    }
+
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[test]
     fn pq_dependency_smoke() {
-        use super::{PqProver, PqRawContribution, ProverError};
+        use super::{PqProver, ProverError};
+        use crate::aggregation::{
+            AggregationContribution, AggregationJob, AggregationService, AggregationSigner,
+            SameMessageClaim,
+        };
+        use std::time::Instant;
 
-        let prover = PqProver::new().expect("PQ prover worker starts and initializes");
+        let service = AggregationService::new().expect("PQ prover worker starts and initializes");
         assert!(matches!(
             PqProver::new(),
             Err(ProverError::Unavailable(ProverUnavailable::AlreadyActive))
@@ -1115,24 +1355,151 @@ mod tests {
             .expect("second raw PQ signature");
         verify_raw(&first_raw, &first_public_key, &claim).expect("raw signature verifies");
 
-        assert!(matches!(
-            prover.aggregate(Vec::new(), claim),
-            Err(AggregateError::InvalidRequest(_))
-        ));
-        let aggregate = prover
-            .aggregate(
-                vec![
-                    PqRawContribution::new(first_raw, first_public_key),
-                    PqRawContribution::new(second_raw, second_public_key),
-                ],
-                claim,
-            )
-            .expect("two-signer PQ aggregate");
-        let evidence = aggregate
-            .into_same_message_evidence()
-            .expect("bounded Lighthouse aggregate evidence");
+        let common_claim = SameMessageClaim::new([0x42; 32], one_time_use_id);
+        let (first_index, second_index) = if first_public_key < second_public_key {
+            (1, 0)
+        } else {
+            (0, 1)
+        };
+        let first_signer = AggregationSigner {
+            validator_index: first_index,
+            public_key: first_public_key,
+        };
+        let second_signer = AggregationSigner {
+            validator_index: second_index,
+            public_key: second_public_key,
+        };
+        let mut pair_signers = vec![first_signer.clone(), second_signer.clone()];
+        pair_signers.sort_by_key(|signer| signer.validator_index);
+        assert!(pair_signers[0].public_key > pair_signers[1].public_key);
+        let started = Instant::now();
+        let evidence = futures::executor::block_on(service.aggregate(AggregationJob {
+            claim: common_claim,
+            expected_signers: pair_signers.clone(),
+            contributions: vec![
+                AggregationContribution {
+                    signers: vec![first_signer],
+                    evidence: PqSameMessageEvidence::from(&first_raw),
+                },
+                AggregationContribution {
+                    signers: vec![second_signer],
+                    evidence: PqSameMessageEvidence::from(&second_raw),
+                },
+            ],
+        }))
+        .expect("two-signer PQ aggregate");
+        eprintln!(
+            "PQ two-raw aggregation: elapsed={:?}, evidence_bytes={}",
+            started.elapsed(),
+            evidence.as_bytes().len()
+        );
         assert_eq!(&evidence.as_bytes()[..7], b"LHPQ\x01\x01\x01");
         assert_eq!(&evidence.as_bytes()[7..13], b"LMSI\x01\x01");
+
+        let third_signing_key = signing_key(0x44);
+        let fourth_signing_key = signing_key(0x55);
+        let third_signer = AggregationSigner {
+            validator_index: 2,
+            public_key: third_signing_key.public_key(),
+        };
+        let fourth_signer = AggregationSigner {
+            validator_index: 3,
+            public_key: fourth_signing_key.public_key(),
+        };
+        let third_raw = third_signing_key.sign(&claim).expect("third raw signature");
+        let fourth_raw = fourth_signing_key
+            .sign(&claim)
+            .expect("fourth raw signature");
+
+        let child_started = Instant::now();
+        let second_child = futures::executor::block_on(service.aggregate(AggregationJob {
+            claim: common_claim,
+            expected_signers: vec![third_signer.clone(), fourth_signer.clone()],
+            contributions: vec![
+                AggregationContribution {
+                    signers: vec![third_signer.clone()],
+                    evidence: PqSameMessageEvidence::from(&third_raw),
+                },
+                AggregationContribution {
+                    signers: vec![fourth_signer.clone()],
+                    evidence: PqSameMessageEvidence::from(&fourth_raw),
+                },
+            ],
+        }))
+        .expect("second raw child aggregate");
+        eprintln!(
+            "PQ second two-raw aggregation: elapsed={:?}, evidence_bytes={}",
+            child_started.elapsed(),
+            second_child.as_bytes().len()
+        );
+
+        let raw_child_started = Instant::now();
+        let raw_plus_child = futures::executor::block_on(
+            service.aggregate(AggregationJob {
+                claim: common_claim,
+                expected_signers: pair_signers
+                    .iter()
+                    .cloned()
+                    .chain([third_signer.clone()])
+                    .collect(),
+                contributions: vec![
+                    AggregationContribution {
+                        signers: pair_signers.clone(),
+                        evidence: evidence.clone(),
+                    },
+                    AggregationContribution {
+                        signers: vec![third_signer.clone()],
+                        evidence: PqSameMessageEvidence::from(&third_raw),
+                    },
+                ],
+            }),
+        )
+        .expect("raw plus child aggregate recurses");
+        eprintln!(
+            "PQ raw-plus-child aggregation: elapsed={:?}, evidence_bytes={}",
+            raw_child_started.elapsed(),
+            raw_plus_child.as_bytes().len()
+        );
+
+        let children_started = Instant::now();
+        let children = futures::executor::block_on(
+            service.aggregate(AggregationJob {
+                claim: common_claim,
+                expected_signers: pair_signers
+                    .iter()
+                    .cloned()
+                    .chain([third_signer.clone(), fourth_signer.clone()])
+                    .collect(),
+                contributions: vec![
+                    AggregationContribution {
+                        signers: pair_signers.clone(),
+                        evidence: evidence.clone(),
+                    },
+                    AggregationContribution {
+                        signers: vec![third_signer, fourth_signer],
+                        evidence: second_child,
+                    },
+                ],
+            }),
+        )
+        .expect("aggregate plus aggregate recurses");
+        eprintln!(
+            "PQ child-plus-child aggregation: elapsed={:?}, evidence_bytes={}",
+            children_started.elapsed(),
+            children.as_bytes().len()
+        );
+
+        assert_eq!(
+            futures::executor::block_on(service.aggregate(AggregationJob {
+                claim: SameMessageClaim::new([0x43; 32], one_time_use_id),
+                expected_signers: pair_signers.clone(),
+                contributions: vec![AggregationContribution {
+                    signers: pair_signers.clone(),
+                    evidence: evidence.clone(),
+                }],
+            })),
+            Err(AggregationError::InvalidEvidence)
+        );
 
         let mut expected_signers = [first_public_key, second_public_key];
         expected_signers.sort();
@@ -1232,31 +1599,15 @@ mod tests {
     }
 
     #[test]
-    fn semantic_local_proof_failure_maps_to_internal() {
-        let failure = super::backend::injected_aggregate_failure(
-            super::backend::AggregateFailureCategory::LocallyGeneratedProof,
+    fn post_verification_backend_failures_are_local_internal_errors() {
+        assert_eq!(
+            super::classify_local_backend_error(lean_multisig::Error::MalformedSignature),
+            AggregationError::Internal
         );
-
-        assert!(matches!(
-            AggregateError::from_backend_failure(failure),
-            AggregateError::Internal(_)
-        ));
-
-        let failure = super::backend::injected_aggregate_failure(
-            super::backend::AggregateFailureCategory::PeerInvalidEvidence,
+        assert_eq!(
+            super::classify_local_backend_error(lean_multisig::Error::NotInitialized),
+            AggregationError::Internal
         );
-        assert!(matches!(
-            AggregateError::from_backend_failure(failure),
-            AggregateError::InvalidEvidence(_)
-        ));
-
-        let failure = super::backend::injected_aggregate_failure(
-            super::backend::AggregateFailureCategory::Internal,
-        );
-        assert!(matches!(
-            AggregateError::from_backend_failure(failure),
-            AggregateError::Internal(_)
-        ));
     }
 
     #[test]

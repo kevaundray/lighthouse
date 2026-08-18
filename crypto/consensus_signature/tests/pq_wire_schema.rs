@@ -146,6 +146,30 @@ fn public_key_has_frozen_fixed_wire_schema() {
 }
 
 #[test]
+fn public_key_rejects_noncanonical_koala_bear_limbs() {
+    const KOALA_BEAR_MODULUS: u32 = 0x7f00_0001;
+    let mut largest_canonical = [0; 32];
+    largest_canonical[..4].copy_from_slice(&(KOALA_BEAR_MODULUS - 1).to_le_bytes());
+    PqPublicKey::deserialize(&largest_canonical).expect("p - 1 is canonical");
+
+    for offset in [0, 28] {
+        let mut modulus = [0; 32];
+        modulus[offset..offset + 4].copy_from_slice(&KOALA_BEAR_MODULUS.to_le_bytes());
+        assert_eq!(
+            PqPublicKey::deserialize(&modulus),
+            Err(PqWireError::NonCanonicalPublicKey)
+        );
+
+        let mut maximum = [0; 32];
+        maximum[offset..offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            PqPublicKey::deserialize(&maximum),
+            Err(PqWireError::NonCanonicalPublicKey)
+        );
+    }
+}
+
+#[test]
 fn raw_signature_has_frozen_fixed_wire_schema() {
     const EXPECTED_JSON: &str = include_str!("goldens/pq_raw_signature.json");
     const EXPECTED_TREE_ROOT: &str =

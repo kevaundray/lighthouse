@@ -2074,6 +2074,7 @@ dependencies = [
  "bls",
  "ethereum_serde_utils",
  "ethereum_ssz",
+ "futures",
  "hex",
  "lean-multisig",
  "serde",

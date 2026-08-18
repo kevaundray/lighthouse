@@ -1,5 +1,10 @@
 use std::borrow::Cow;
 
+use crate::aggregation::{
+    AggregationError, InvalidAggregationJob, V1_MAX_AGGREGATION_OUTPUT_BYTES,
+    ValidatedAggregationJob,
+};
+
 pub use bls::Hash256;
 
 /// The serialized validator public key used by the active signature backend.
@@ -205,4 +210,56 @@ fn signature_set(request: VerificationRequest<'_>) -> bls::SignatureSet<'_> {
             request.claim.signing_root(),
         ),
     }
+}
+
+pub(crate) fn aggregate_job(
+    job: ValidatedAggregationJob,
+) -> Result<SameMessageEvidence, AggregationError> {
+    for contribution in &job.contributions {
+        let public_keys = contribution
+            .signers
+            .iter()
+            .map(|signer| signer.public_key.decompress())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| AggregationError::InvalidJob(InvalidAggregationJob::InvalidPublicKey))?;
+        let public_key_refs = public_keys.iter().collect::<Vec<_>>();
+        if !contribution
+            .evidence
+            .fast_aggregate_verify(Hash256::from(job.claim.signing_root), &public_key_refs)
+        {
+            return Err(AggregationError::InvalidEvidence);
+        }
+    }
+
+    let mut contributions = job.contributions.into_iter();
+    let mut aggregate = contributions
+        .next()
+        .ok_or(AggregationError::Internal)?
+        .evidence;
+    for contribution in contributions {
+        // Point mutation remains private to the BLS backend. Consensus callers only submit an
+        // owned, fully validated operation-level job.
+        aggregate.add_assign_aggregate(&contribution.evidence);
+    }
+    let expected_public_keys = job
+        .expected_signers
+        .iter()
+        .map(|signer| signer.public_key.decompress())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| AggregationError::InvalidJob(InvalidAggregationJob::InvalidPublicKey))?;
+    let expected_public_key_refs = expected_public_keys.iter().collect::<Vec<_>>();
+    if !aggregate.fast_aggregate_verify(
+        Hash256::from(job.claim.signing_root),
+        &expected_public_key_refs,
+    ) {
+        return Err(AggregationError::Internal);
+    }
+    let output_len = aggregate.serialize().len();
+    if output_len > V1_MAX_AGGREGATION_OUTPUT_BYTES {
+        return Err(AggregationError::OutputTooLarge {
+            actual: output_len,
+            max: V1_MAX_AGGREGATION_OUTPUT_BYTES,
+        });
+    }
+    Ok(aggregate)
 }

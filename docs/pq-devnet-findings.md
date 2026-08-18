@@ -782,11 +782,13 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   aggregate, and absent framing. Task 4.2's actual RED was the missing backend-owned aggregate
   construction and contextual hostile decode/verify boundary; no `types` container or tree-root
   change was needed.
-- `PqAggregateSignature::into_same_message_evidence` is the only local aggregate-output path. The
-  type remains opaque and can be obtained only from the owned `PqProver`. Conversion retains the
-  complete pinned upstream `LMSI/version1/aggregate` envelope inside
-  `LHPQ/version1/parameter1/aggregate`, checks the full outer length against 512 KiB before
-  constructing the wire value, and reports a typed local `ProofTooLarge` resource error.
+- Task 4.2 initially made `PqAggregateSignature::into_same_message_evidence` the only local
+  aggregate-output path. Task 5.1 removed that interim wrapper, `verify_aggregate`, and their
+  backend-specific public error surface. Local construction is now confined to the crate-private
+  prover worker behind public `AggregationService`. It retains the complete pinned upstream
+  `LMSI/version1/aggregate` envelope inside `LHPQ/version1/parameter1/aggregate`, checks the full
+  outer length against 512 KiB before constructing the wire value, and reports
+  `AggregationError::OutputTooLarge` through the operation-level boundary.
 - `verify_aggregate_evidence` requires the bounded evidence, exact semantic `PqSigningClaim`, and
   expected public keys in strictly ascending canonical byte order. It rejects empty/over-limit,
   duplicate, or permuted local signer contexts before allocating the backend key vector or entering
@@ -811,3 +813,49 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   the default BLS suite passed 7/7. Scalar and AVX2 Rust 1.88 checks, scalar and AVX2 Clippy with
   warnings denied, the Lean-free `types/pq-devnet` normal dependency graph check, Cargo formatting
   and sorting, doc tests, diff checks, and the mandatory default workspace `cargo check` all passed.
+
+### 2026-08-18: Owned aggregation jobs and bounded async proving implemented
+
+- Consensus aggregation now crosses one operation-level `AggregationJob` boundary. The common
+  validator requires validator-index-ordered, unique index/key mappings; disjoint non-empty
+  contributions; an exact contribution/expected-signer union; and the V1 limits of 16 signers, 16
+  contributions, and 8 MiB total input. Participant bits remain caller-owned so a later pool
+  migration can commit bits and returned evidence atomically. BLS point addition is private to its
+  backend. A single contribution is still cryptographically verified but returned byte-for-byte
+  without aggregate work.
+- Validator-index order is deliberately independent from backend key order. The domain structures
+  remain index ordered while every PQ contribution and final signer set is separately projected to
+  strictly key-sorted bytes before entering leanMultisig. Tests force the two orders to disagree.
+  `PqPublicKey` now also enforces the pinned XMSS SSZ canonical encoding without a Lean dependency:
+  all eight little-endian `u32` limbs must be below the KoalaBear modulus `0x7f000001`. Boundary
+  tests accept `p - 1` and reject `p` and `u32::MAX` in both the first and last limb.
+- PQ raw and child-aggregate evidence is decoded and verified against its exact child signers and
+  common `(signing_root, one_time_use_id)` only on the named 512 MiB-stack prover worker. Recursive
+  input and output retain the complete upstream `LMSI/version1/aggregate` envelope. Raw+raw,
+  raw+child, and child+child jobs work; peer proof/decode mismatches are `InvalidEvidence`, while
+  structural caller errors and post-verification proving failures stay local.
+- `PqProver` and its constructor are crate-private; `AggregationService` is the sole public owner
+  that can synchronously initialize or reserve the process singleton. Submission uses non-blocking
+  `try_send` into a capacity-one queue and an async-compatible oneshot result, giving one active and
+  at most one queued proof. A dropped result receiver is checked immediately before backend entry
+  and the queued job is silently skipped because no receiver remains to observe a result; an
+  already-started proof is never cancelled mid-flight. Deterministic worker tests cover queue
+  saturation, that pre-entry skip without backend execution, execution on the named OS worker
+  rather than the awaiting thread, channel stop, output overflow, caught panic, and permanent
+  lifecycle poisoning. Wire-only `types/pq-devnet` builds do not compile this execution service or
+  its futures dependency.
+- The unavailable-build cfg now has one complete fallback for every target other than an
+  AVX2-compiled x86-64 binary. Its target mapping returns `UnsupportedTarget` on non-x86-64 and
+  `Avx2NotEnabledAtCompileTime` on scalar x86-64; host unit tests cover both mappings and the native
+  scalar path. An AArch64 Rust standard library is installed, but a direct cross-target Cargo check
+  cannot reach this crate because the environment lacks `aarch64-linux-gnu-gcc`, which `ring` and
+  `blst` require. This is an environment limitation, not a claimed cross-target pass.
+- Exact local AVX2 debug evidence used the warm-cache command
+  `RUSTFLAGS='-C target-feature=+avx2' cargo test -p consensus_signature --features pq-devnet
+  pq::tests::pq_dependency_smoke -- --exact --nocapture --test-threads=1`, wrapped in GNU
+  `/usr/bin/time -v`. There were no concurrent Lean/Lake workers; 51 GiB memory was available and
+  the run performed four serialized real proofs. Two raw+raw jobs took 7.758 s and 7.401 s and
+  produced 106,895-byte and 106,546-byte evidence. Raw+child took 85.618 s and produced 164,420
+  bytes; child+child took 76.112 s and produced 159,551 bytes. The test completed in 206.10 s; the
+  timed command tree peaked at 2,663,836 KiB RSS and reported zero swaps. These are host/debug-build
+  measurements, not production latency claims.

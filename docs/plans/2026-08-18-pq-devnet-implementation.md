@@ -1188,10 +1188,12 @@ exists. Do not describe the already-implemented generic SSZ bound as missing.
 
 **Step 3: Implement backend-owned construction and contextual verification**
 
-Only the opaque `PqAggregateSignature` returned by `PqProver` may create local aggregate evidence.
-Retain the complete pinned upstream `LMSI/version/aggregate` envelope inside the Lighthouse
-aggregate payload. Check the 512 KiB full-evidence cap before constructing the wire value and
-return a typed local `ProofTooLarge` resource error.
+Task 4.2 initially routed local construction through opaque `PqAggregateSignature`. Task 5.1
+removed that interim wrapper, its in-memory verifier, and their backend-specific public errors:
+only the crate-private prover worker behind public `AggregationService` may create local aggregate
+evidence. Retain the complete pinned upstream `LMSI/version/aggregate` envelope inside the
+Lighthouse aggregate payload. Check the 512 KiB full-evidence cap before constructing the wire
+value and report `AggregationError::OutputTooLarge` through the operation-level boundary.
 
 Generic SSZ/wire decoding continues to validate only the Lighthouse envelope, semantic kind, and
 outer byte limit. Contextual verification accepts `PqSameMessageEvidence`, `PqSigningClaim`, and
@@ -1218,7 +1220,7 @@ warnings denied, formatting, dependency sorting, diff checks, and the mandatory 
 **Step 5: Commit**
 
 ```bash
-git add crypto/consensus_signature docs/plans/2026-08-18-pq-devnet-implementation.md \
+git add Cargo.lock crypto/consensus_signature docs/plans/2026-08-18-pq-devnet-implementation.md \
   docs/pq-devnet-findings.md
 git commit -m "feat: add bounded PQ aggregate proof evidence"
 ```
@@ -1231,33 +1233,108 @@ git commit -m "feat: add bounded PQ aggregate proof evidence"
 
 - Create: `crypto/consensus_signature/src/aggregation.rs`
 - Create: `crypto/consensus_signature/tests/aggregation.rs`
+- Modify: `crypto/consensus_signature/src/lib.rs`
 - Modify: `crypto/consensus_signature/src/bls.rs`
 - Modify: `crypto/consensus_signature/src/pq.rs`
+- Modify: `crypto/consensus_signature/src/pq/backend.rs`
+- Modify: `crypto/consensus_signature/src/pq_wire.rs`
+- Modify: `crypto/consensus_signature/Cargo.toml`
+- Modify: `crypto/consensus_signature/tests/pq_wire_schema.rs`
+- Modify: `docs/pq-devnet-findings.md`
 
 **Step 1: Write failing cross-backend contract tests**
 
-The same test cases must run against both backends: one raw contribution, multiple raw
-contributions, duplicate signer handling, child aggregate reuse, wrong claim, wrong signer set,
-empty input, and size limits.
+The same structural contract must run against both backends: one raw contribution, multiple raw
+contributions, raw plus child aggregate, aggregate plus aggregate, wrong claim/evidence, empty
+input, non-canonical or duplicate signer/index mappings, overlap between contributions, expected
+signer-union mismatch, and signer/contribution/total-input/output size limits. One contribution is
+validated and returned without proving; multiple contributions use backend aggregation.
+
+Add PQ worker tests for bounded non-blocking submission, one active plus at most one queued job,
+queue saturation, cancellation before backend entry, worker shutdown/panic/poisoning, and local
+output overflow. Prove that waiting for a result is async-compatible and never performs setup,
+decode, verification, or proving on a Tokio/beacon-processor worker.
 
 **Step 2: Verify RED for both backends**
 
 Expected: the aggregation job interface does not exist.
 
-**Step 3: Implement one-shot aggregation**
+**Step 3: Implement one-shot owned aggregation**
 
-BLS uses point aggregation internally. PQ invokes the prover. Do not expose incremental mutation
-in the shared interface.
+Expose one operation-level job rather than a `BlsLike` trait or incremental mutation:
+
+```rust
+pub struct SameMessageClaim {
+    pub signing_root: [u8; 32],
+    pub one_time_use_id: OneTimeUseId,
+}
+
+pub struct AggregationSigner {
+    pub validator_index: u64,
+    pub public_key: ValidatorPublicKeyBytes,
+}
+
+pub struct AggregationContribution {
+    pub signers: Vec<AggregationSigner>,
+    pub evidence: SameMessageEvidence,
+}
+
+pub struct AggregationJob {
+    pub claim: SameMessageClaim,
+    pub expected_signers: Vec<AggregationSigner>,
+    pub contributions: Vec<AggregationContribution>,
+}
+```
+
+Require strictly increasing unique validator indices, canonically encoded unique public keys, no
+overlap between contributions, no public key mapped to multiple indices, and exact equality between the
+contribution signer union and `expected_signers`. Bound signer count, contribution count, total
+input evidence bytes, and output evidence bytes before backend work. Participant bits remain owned
+by consensus/pool callers and must be committed atomically with the returned evidence later.
+Freeze the pinned KoalaBear public-key canonicality check in the Lean-free wire layer: each of the
+eight little-endian `u32` limbs must be strictly below `0x7f000001`. Reject a malformed key before
+job construction/backend entry, and retain a local `InvalidJob` defense-in-depth classification.
+
+The domain lists remain ordered by validator index. Before entering leanMultisig, project each
+domain list to a separate public-key list sorted strictly by canonical key bytes, retaining the
+index-to-key association for union/overlap checks. Do not require validator-index order to coincide
+with public-key byte order.
+
+BLS uses point aggregation internally behind this owned job. PQ decodes and verifies every raw or
+child aggregate against the common claim and its exact child signer set, then supports raw+raw,
+raw+aggregate, and aggregate+aggregate recursion. Child aggregate payloads contain the complete
+upstream LMSI envelope defined in Task 4.2. After all inputs are verified, a backend proof failure
+is local/internal; malformed child evidence is `InvalidEvidence`. Structural caller errors are
+`InvalidJob`, not peer blame.
+
+Refactor `PqProver` submission so it remains one long-lived named 512 MiB-stack OS worker but does
+not synchronously wait on a channel from async callers. Use non-blocking bounded submission and an
+async-compatible oneshot result, with one active job and at most one queued job. Check cancellation
+before entering the backend; do not attempt unsafe mid-proof cancellation. Preserve permanent
+process poisoning after a caught backend panic. Setup may remain synchronous during builder startup
+before networking begins. Keep `PqProver` and its constructor crate-private; public downstream
+ownership and startup must go exclusively through `AggregationService`, so another caller cannot
+reserve the process singleton and starve consensus aggregation.
+
+Classify queue saturation and configured limits as `ResourceExhausted`, missing/poisoned/stopped
+workers as local unavailability, locally oversized output as `OutputTooLarge`, and unknown
+post-verification backend failures as `Internal`. Dropping an aggregation future is silent
+cancellation: the worker skips a queued job before backend entry, and no receiver remains to
+observe a result. The first V1 runtime uses a stricter 16-validator cap even though the pinned
+backend supports 32,768.
 
 **Step 4: Verify GREEN and record measurements**
 
 Run both backends. Record PQ time, proof bytes, and peak RSS for the chosen devnet committee sizes
-in `docs/pq-devnet-findings.md`.
+in `docs/pq-devnet-findings.md`. Keep the real recursive proof cases serialized under AVX2. Verify
+Rust 1.88, default BLS compatibility, types graph isolation, clippy with warnings denied,
+formatting, dependency sorting, diff checks, and the mandatory full workspace `cargo check`.
 
 **Step 5: Commit**
 
 ```bash
-git add crypto/consensus_signature docs/pq-devnet-findings.md
+git add crypto/consensus_signature docs/plans/2026-08-18-pq-devnet-implementation.md \
+  docs/pq-devnet-findings.md
 git commit -m "feat: add signature aggregation jobs"
 ```
 

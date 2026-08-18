@@ -16,84 +16,14 @@ pub(crate) type BackendSignature = lean_multisig::Signature;
 pub(crate) type BackendSigningKey = lean_multisig::SecretKey;
 
 #[derive(Debug)]
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 pub(crate) struct BackendError(lean_multisig::Error);
 
-impl BackendError {
-    #[cfg(test)]
-    pub(crate) fn from_upstream(error: lean_multisig::Error) -> Self {
-        Self(error)
-    }
-}
-
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 impl std::fmt::Display for BackendError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(formatter)
     }
-}
-
-#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AggregateFailureCategory {
-    PeerInvalidEvidence,
-    LocallyGeneratedProof,
-    Internal,
-}
-
-#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
-#[derive(Debug)]
-pub(crate) struct AggregateFailure {
-    category: AggregateFailureCategory,
-    error: BackendError,
-}
-
-#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
-impl AggregateFailure {
-    pub(crate) const fn category(&self) -> AggregateFailureCategory {
-        self.category
-    }
-
-    pub(crate) fn into_error(self) -> BackendError {
-        self.error
-    }
-
-    fn new(category: AggregateFailureCategory, error: lean_multisig::Error) -> Self {
-        Self {
-            category,
-            error: BackendError(error),
-        }
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-fn classify_aggregate_input(error: lean_multisig::Error) -> AggregateFailure {
-    let category = match &error {
-        lean_multisig::Error::MalformedSignature => AggregateFailureCategory::PeerInvalidEvidence,
-        // The public key comes from locally resolved validator state. All other variants are
-        // impossible for the exact one-key raw decoder or are conservatively local.
-        _ => AggregateFailureCategory::Internal,
-    };
-    AggregateFailure::new(category, error)
-}
-
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-fn classify_raw_only_aggregate(error: lean_multisig::Error) -> AggregateFailure {
-    let category = match &error {
-        // Raw contribution bytes can be structurally canonical but cryptographically invalid.
-        lean_multisig::Error::InvalidSignature { .. } => {
-            AggregateFailureCategory::PeerInvalidEvidence
-        }
-        // Every recursive proof on this path was generated inside the owned worker.
-        lean_multisig::Error::Proof(_) => AggregateFailureCategory::LocallyGeneratedProof,
-        // Requests were bounded before entering the backend. Unknown and impossible variants are
-        // local so a future upstream error can never become peer blame by default.
-        _ => AggregateFailureCategory::Internal,
-    };
-    AggregateFailure::new(category, error)
-}
-
-#[cfg(test)]
-pub(crate) fn injected_aggregate_failure(category: AggregateFailureCategory) -> AggregateFailure {
-    AggregateFailure::new(category, lean_multisig::Error::NotInitialized)
 }
 
 #[cfg(test)]
@@ -149,6 +79,7 @@ pub(crate) fn decode_raw_signature(
     BackendSignature::from_bytes(&upstream, &backend_claim(claim), &[public_key])
 }
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 pub(crate) fn encode_aggregate_signature(
     signature: &BackendSignature,
 ) -> Result<Vec<u8>, BackendError> {
@@ -178,20 +109,11 @@ fn has_upstream_envelope(bytes: &[u8], kind: u8) -> bool {
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-pub(crate) fn decode_aggregate_input(
-    payload: [u8; RAW_PAYLOAD_LEN],
-    public_key: [u8; 32],
-    claim: &PqSigningClaim,
-) -> Result<BackendSignature, AggregateFailure> {
-    decode_raw_signature(payload, public_key, claim).map_err(classify_aggregate_input)
-}
-
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 pub(crate) fn aggregate(
     signatures: Vec<BackendSignature>,
     claim: &PqSigningClaim,
-) -> Result<BackendSignature, AggregateFailure> {
-    lean_multisig::aggregate(signatures, &backend_claim(claim)).map_err(classify_raw_only_aggregate)
+) -> Result<BackendSignature, BackendError> {
+    lean_multisig::aggregate(signatures, &backend_claim(claim)).map_err(BackendError)
 }
 
 pub(crate) fn verify_signature(

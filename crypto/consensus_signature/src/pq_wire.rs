@@ -12,10 +12,13 @@ const ABSENT_EVIDENCE_KIND: u8 = 2;
 const HEADER_LEN: usize = MAGIC.len() + 3;
 pub(crate) const RAW_PAYLOAD_LEN: usize = 1_208;
 #[cfg(feature = "pq-devnet")]
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 pub(crate) const PQ_EVIDENCE_HEADER_LEN: usize = HEADER_LEN;
 
 /// Exact byte length of a V1 PQ validator public key.
 pub const PQ_PUBLIC_KEY_LEN: usize = 32;
+/// Prime-field modulus used by the pinned V1 XMSS public-key encoding.
+const PQ_PUBLIC_KEY_FIELD_MODULUS: u32 = 0x7f00_0001;
 /// Exact byte length of the V1 PQ individual-signature encoding.
 pub const PQ_RAW_SIGNATURE_LEN: usize = HEADER_LEN + RAW_PAYLOAD_LEN;
 /// Maximum encoded byte length of V1 same-message evidence.
@@ -38,6 +41,9 @@ impl PqPublicKey {
                 actual: bytes.len(),
                 expected: PQ_PUBLIC_KEY_LEN,
             })?;
+        if !public_key_bytes_are_canonical(&bytes) {
+            return Err(PqWireError::NonCanonicalPublicKey);
+        }
         Ok(Self(bytes))
     }
 
@@ -188,6 +194,7 @@ impl PqSameMessageEvidence {
     /// This is crate-private so locally generated aggregate evidence can only originate from the
     /// opaque backend signature returned by the owned prover.
     #[cfg(feature = "pq-devnet")]
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     pub(crate) fn from_backend_aggregate_envelope(envelope: Vec<u8>) -> Self {
         let mut bytes = Vec::with_capacity(HEADER_LEN.saturating_add(envelope.len()));
         bytes.extend_from_slice(b"LHPQ\x01\x01\x01");
@@ -232,6 +239,7 @@ pub enum PqWireError {
     InvalidAbsentLength(usize),
     MissingHexPrefix,
     NonCanonicalHex,
+    NonCanonicalPublicKey,
     InvalidHex,
 }
 
@@ -271,9 +279,20 @@ impl fmt::Display for PqWireError {
             }
             Self::MissingHexPrefix => formatter.write_str("PQ hex string must start with 0x"),
             Self::NonCanonicalHex => formatter.write_str("PQ hex string must use lowercase digits"),
+            Self::NonCanonicalPublicKey => {
+                formatter.write_str("PQ public key contains a non-canonical field element")
+            }
             Self::InvalidHex => formatter.write_str("invalid PQ hex string"),
         }
     }
+}
+
+fn public_key_bytes_are_canonical(bytes: &[u8; PQ_PUBLIC_KEY_LEN]) -> bool {
+    bytes.chunks_exact(4).all(|chunk| {
+        <[u8; 4]>::try_from(chunk)
+            .map(u32::from_le_bytes)
+            .is_ok_and(|value| value < PQ_PUBLIC_KEY_FIELD_MODULUS)
+    })
 }
 
 impl std::error::Error for PqWireError {}
@@ -559,7 +578,14 @@ impl_hex_traits!(
 #[cfg(feature = "arbitrary")]
 impl<'a> arbitrary::Arbitrary<'a> for PqPublicKey {
     fn arbitrary(unstructured: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        Ok(Self(unstructured.arbitrary()?))
+        let mut bytes: [u8; PQ_PUBLIC_KEY_LEN] = unstructured.arbitrary()?;
+        for chunk in bytes.chunks_exact_mut(4) {
+            let word = <[u8; 4]>::try_from(&*chunk)
+                .map(u32::from_le_bytes)
+                .map_err(|_| arbitrary::Error::IncorrectFormat)?;
+            chunk.copy_from_slice(&(word % PQ_PUBLIC_KEY_FIELD_MODULUS).to_le_bytes());
+        }
+        Ok(Self(bytes))
     }
 }
 

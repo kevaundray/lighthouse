@@ -7,17 +7,19 @@ edition = { workspace = true }
 default = []
 arbitrary = ["dep:arbitrary"]
 pq-wire = []
-pq-devnet = ["pq-wire", "dep:lean-multisig"]
+pq-devnet = ["pq-wire", "dep:futures", "dep:lean-multisig"]
 
 [dependencies]
 arbitrary = { workspace = true, features = ["derive"], optional = true }
 bls = { workspace = true }
 ethereum_serde_utils = { workspace = true }
 ethereum_ssz = { workspace = true }
+futures = { workspace = true, optional = true }
 hex = { workspace = true }
 lean-multisig = { workspace = true, optional = true }
 serde = { workspace = true }
 tree_hash = { workspace = true }
 
 [dev-dependencies]
+futures = { workspace = true }
 serde_json = { workspace = true }
