@@ -377,6 +377,28 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   current aggregate decoder contains nested variable-length allocations, and the pin exposes no
   public representation-specific decoder or constants. The fork must add bounded raw/aggregate
   APIs, parameter identity, one-time-use terminology, and complete license metadata.
+- The implemented raw boundary accepts exactly 1,215 bytes, checks the Lighthouse header before
+  touching the backend, and leaves the 1,208-byte payload opaque until claim and public-key context
+  are present. Scalar tests confirm deterministic same-claim retries and raw verification without
+  creating a prover; wrong root, key, or one-time-use ID, non-canonical field elements, out-of-range
+  signing, and the canonical empty raw placeholder all fail closed.
+- Upstream `Claim`, `Signature`, `SecretKey`, and `verify` are no longer re-exported. The temporary
+  `PqUnreservedSigningKey` and raw sign operation are crate-private and compiled only for unit
+  tests, with a compile-fail API regression. Task 3.3 must co-locate the upstream sign primitive
+  with the durable journal-owning authority (or provide another non-bypassable combined
+  reserve-and-sign operation); simply re-exporting the unreserved type would recreate unsafe XMSS
+  leaf reuse. `PqProver` accepts semantic raw contributions and returns an opaque in-memory
+  aggregate, leaving aggregate wire bytes and hostile bounded decoding to Task 4.1.
+- The V1 semantic signer/contribution limit is frozen at 32,768. Empty and oversized proving jobs
+  fail before contextual decode or allocation of the backend-signature vector; empty and oversized
+  expected signer sets fail before backend-key collection. Boundary errors are backend-independent. The
+  opaque backend diagnostic deliberately terminates `Error::source`, and the private bridge maps
+  raw-input failures separately from owned-prover failures. In particular, recursive proof errors
+  on the raw-only worker path are `LocallyGeneratedProof` and therefore local/internal, while
+  unknown or impossible upstream variants also default local.
+- The final refactored semantic two-signer AVX2 smoke passed in 36.604 seconds on the same development
+  host. It still verifies the exact signer set and rejects missing, extra, substituted, and
+  wrong-claim contexts. No new peak-RSS measurement was taken in this slice.
 
 ### 2026-08-18: PQ key storage and direct genesis path
 

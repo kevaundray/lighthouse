@@ -389,7 +389,9 @@ git commit -m "feat: allocate XMSS leaves by validator duty"
 - Create: `crypto/consensus_signature/src/pq/backend.rs`
 - Create: `crypto/consensus_signature/src/pq/wire.rs`
 - Create: `crypto/consensus_signature/tests/pq_wire.rs`
-- Create: `crypto/consensus_signature/tests/pq_raw.rs`
+- Modify: `crypto/consensus_signature/tests/pq_error_classification.rs`
+- Remove: `crypto/consensus_signature/tests/pq_dependency_smoke.rs` after moving it into private
+  unit coverage
 
 **Step 1: Write failing raw-signature tests**
 
@@ -406,7 +408,10 @@ that never verifies. Raw verification must not initialize the aggregate prover.
 
 ```bash
 cargo nextest run -p consensus_signature --no-default-features --features pq-devnet \
-  --test pq_raw
+  --test pq_wire
+cargo nextest run -p consensus_signature --no-default-features --features pq-devnet \
+  --lib 'pq::tests'
+cargo test -p consensus_signature --no-default-features --features pq-devnet --doc
 ```
 
 Expected: tests fail because the PQ backend is incomplete.
@@ -423,8 +428,18 @@ For the exact pinned backend, strip its private six-byte `LMSI` envelope on outp
 the required raw header only inside `pq/backend.rs` after the Lighthouse envelope has selected the
 semantic kind. Enforce every length/version/kind check before invoking leanMultisig. Do not expose
 raw upstream `Claim`, `Signature`, `SecretKey`, or `verify`; expose a semantic claim requiring
-`OneTimeUseId`, a strict raw wrapper, and a narrow signing-key wrapper for the later journal-owned
-signing authority. Unknown non-exhaustive backend errors remain local/internal by default.
+`OneTimeUseId` and a strict raw wrapper. The raw sign primitive and unreserved key handle are
+crate-private and test-only in this task. Task 3.3 must co-locate that primitive with the
+journal-owning signing authority, or otherwise provide one non-bypassable reserve-and-sign
+operation; it must not re-export the unreserved primitive. Unknown non-exhaustive backend errors
+remain local/internal by default.
+
+Freeze the V1 contribution/signer cap at 32,768. Reject empty or oversized proving requests before
+decoding contributions or allocating a second vector, and reject oversized expected-signer slices
+before collecting backend keys. Empty expected-signer slices are rejected at the same boundary.
+Public errors carry only semantic request/failure categories; the
+opaque backend diagnostic terminates `Error::source`. The private exact-pin bridge classifies raw
+input failures separately from owned-prover failures, including `LocallyGeneratedProof`.
 
 This exact-pin bridge is acceptable for internal raw devnet work. Do not treat hostile aggregate
 decoding as hardened or distribute binaries until a narrow fork exposes representation-specific,
@@ -433,7 +448,14 @@ the bounded same-message evidence union.
 
 **Step 4: Verify GREEN**
 
-Run the same command. Expected: all raw PQ tests pass.
+Run the same commands, then run the real worker smoke:
+
+```bash
+RUSTFLAGS='-C target-feature=+avx2' cargo nextest run -p consensus_signature \
+  --no-default-features --features pq-devnet --lib pq_dependency_smoke
+```
+
+Expected: all framing/private raw tests and the two-signer worker smoke pass.
 
 **Step 5: Commit**
 
@@ -584,6 +606,9 @@ Run the targeted signing-method/validator-store tests. Expected: PQ signing is u
 Reserve the leaf durably, sign in a blocking/scoped worker, and return the explicit raw wire type.
 Accept only the local journal-owning PQ signing method in PQ mode; reject Web3Signer and other
 remote/distributed signing configurations with a clear startup error.
+Co-locate the upstream raw-sign primitive with this authority (or expose only one combined
+reserve-and-sign operation across a private boundary). Do not make the Task 2.3 test-only
+unreserved key/sign operation public or re-export it from `consensus_signature`.
 
 **Step 4: Verify GREEN**
 
