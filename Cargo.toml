@@ -55,6 +55,7 @@ members = [
     "consensus/swap_or_not_shuffle",
     "consensus/types",
     "crypto/bls",
+    "crypto/consensus_signature",
     "crypto/eth2_key_derivation",
     "crypto/eth2_keystore",
     "crypto/eth2_wallet",
@@ -120,6 +121,7 @@ cargo_metadata = "0.19"
 clap = { version = "4.5.4", features = ["derive", "cargo", "wrap_help"] }
 clap_utils = { path = "common/clap_utils" }
 compare_fields = "0.1"
+consensus_signature = { path = "crypto/consensus_signature" }
 console-subscriber = "0.4"
 context_deserialize = "0.2"
 criterion = "0.8"

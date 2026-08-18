@@ -1,0 +1,181 @@
+use std::borrow::Cow;
+
+pub use bls::Hash256;
+
+/// The serialized validator public key used by the active signature backend.
+pub type ValidatorPublicKeyBytes = bls::PublicKeyBytes;
+
+/// A decoded validator public key used during verification.
+pub type VerificationKey = bls::PublicKey;
+
+/// Evidence produced by one validator for one signing claim.
+pub type RawSignature = bls::Signature;
+
+/// Evidence produced by multiple validators for the same signing claim.
+pub type AggregateSignature = bls::AggregateSignature;
+
+/// A consensus-signature verification failure.
+///
+/// Only [`Self::InvalidEvidence`] indicates peer-provided evidence is invalid. The other variants
+/// represent local failures and must not be attributed to the peer.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerifyError {
+    /// The supplied signature does not authenticate the expected claim and signer set.
+    InvalidEvidence,
+    /// The local verification backend is not currently available.
+    LocalUnavailable,
+    /// Local verification limits prevent processing the request.
+    ResourceExhausted,
+    /// The local verification backend failed unexpectedly.
+    Internal,
+}
+
+impl std::fmt::Display for VerifyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::InvalidEvidence => "invalid consensus signature evidence",
+            Self::LocalUnavailable => "consensus signature verifier unavailable",
+            Self::ResourceExhausted => "consensus signature verification resources exhausted",
+            Self::Internal => "internal consensus signature verification failure",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for VerifyError {}
+
+/// The consensus information cryptographically authenticated by a signature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SigningClaim {
+    signing_root: Hash256,
+}
+
+impl SigningClaim {
+    /// Creates a claim for `signing_root`.
+    pub const fn new(signing_root: Hash256) -> Self {
+        Self { signing_root }
+    }
+
+    /// Returns the root authenticated by the signature.
+    pub const fn signing_root(self) -> Hash256 {
+        self.signing_root
+    }
+}
+
+/// A raw-signature verification request.
+#[derive(Clone, Copy)]
+pub struct RawVerificationRequest<'a> {
+    claim: SigningClaim,
+    public_key: &'a VerificationKey,
+    signature: &'a RawSignature,
+}
+
+impl<'a> RawVerificationRequest<'a> {
+    /// Creates a request to verify one validator signature.
+    pub const fn new(
+        claim: SigningClaim,
+        public_key: &'a VerificationKey,
+        signature: &'a RawSignature,
+    ) -> Self {
+        Self {
+            claim,
+            public_key,
+            signature,
+        }
+    }
+}
+
+/// An aggregate-signature verification request for a single signing claim.
+#[derive(Clone, Copy)]
+pub struct AggregateVerificationRequest<'a> {
+    claim: SigningClaim,
+    public_keys: &'a [&'a VerificationKey],
+    signature: &'a AggregateSignature,
+}
+
+impl<'a> AggregateVerificationRequest<'a> {
+    /// Creates a request to verify an aggregate over `public_keys`.
+    pub const fn new(
+        claim: SigningClaim,
+        public_keys: &'a [&'a VerificationKey],
+        signature: &'a AggregateSignature,
+    ) -> Self {
+        Self {
+            claim,
+            public_keys,
+            signature,
+        }
+    }
+}
+
+/// A validator-signature verification request accepted by the active backend.
+#[derive(Clone, Copy)]
+pub enum VerificationRequest<'a> {
+    /// Evidence from one validator.
+    Raw(RawVerificationRequest<'a>),
+    /// Evidence aggregated from validators that signed the same claim.
+    Aggregate(AggregateVerificationRequest<'a>),
+}
+
+impl<'a> From<RawVerificationRequest<'a>> for VerificationRequest<'a> {
+    fn from(request: RawVerificationRequest<'a>) -> Self {
+        Self::Raw(request)
+    }
+}
+
+impl<'a> From<AggregateVerificationRequest<'a>> for VerificationRequest<'a> {
+    fn from(request: AggregateVerificationRequest<'a>) -> Self {
+        Self::Aggregate(request)
+    }
+}
+
+/// Verifies one raw or aggregate request.
+pub fn verify(request: VerificationRequest<'_>) -> Result<(), VerifyError> {
+    let is_valid = match request {
+        VerificationRequest::Raw(request) => request
+            .signature
+            .verify(request.public_key, request.claim.signing_root()),
+        VerificationRequest::Aggregate(request) => request
+            .signature
+            .fast_aggregate_verify(request.claim.signing_root(), request.public_keys),
+    };
+
+    if is_valid {
+        Ok(())
+    } else {
+        Err(VerifyError::InvalidEvidence)
+    }
+}
+
+/// Batch-verifies raw and aggregate requests using the active backend.
+pub fn verify_all<'a>(
+    requests: impl IntoIterator<Item = VerificationRequest<'a>>,
+) -> Result<(), VerifyError> {
+    let signature_sets = requests.into_iter().map(signature_set).collect::<Vec<_>>();
+    if bls::verify_signature_sets(signature_sets.iter()) {
+        Ok(())
+    } else {
+        Err(VerifyError::InvalidEvidence)
+    }
+}
+
+fn signature_set(request: VerificationRequest<'_>) -> bls::SignatureSet<'_> {
+    match request {
+        VerificationRequest::Raw(request) => bls::SignatureSet::single_pubkey(
+            request.signature,
+            Cow::Borrowed(request.public_key),
+            request.claim.signing_root(),
+        ),
+        VerificationRequest::Aggregate(request) => bls::SignatureSet::multiple_pubkeys(
+            request.signature,
+            request
+                .public_keys
+                .iter()
+                .copied()
+                .map(Cow::Borrowed)
+                .collect(),
+            request.claim.signing_root(),
+        ),
+    }
+}
