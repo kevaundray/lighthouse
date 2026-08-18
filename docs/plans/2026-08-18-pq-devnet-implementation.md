@@ -542,6 +542,7 @@ git commit -m "feat: persist XMSS leaf reservations"
 
 **Files:**
 
+- Modify: root `Cargo.toml` for the feature-isolated `rustix` workspace dependency
 - Modify or create: `crypto/eth2_keystore/` PQ key storage modules
 - Modify: `common/validator_dir/`
 - Create: targeted key round-trip tests in each changed package
@@ -553,10 +554,12 @@ Cover generation, encrypted persistence, reload, public-key identity, malformed/
 bytes, wrong password, hostile KDF parameters, unsupported outer/scheme/backend versions, and
 one-time-use range preservation. On reload, require the derived public key and upstream inclusive
 range to match the authenticated metadata exactly. Normal unit tests use a small 8--16-leaf range;
-the real 1,120-leaf measurement is explicit/ignored.
+the real 1,120-leaf `0..=1119` measurement has a separate manual ignored test and must not run in
+ordinary verification.
 
-Add validator-directory tests for the distinct PQ filename and definition variant, 0600 modes,
-collision refusal, and discovery.
+Add validator-directory tests for the distinct PQ filename and directory-local definition, exact
+0700/0600 modes, collision refusal, canonical identity, and fail-closed immediate-child discovery.
+Do not add an account-utils/validator-client definition while its key type is still BLS-only.
 
 **Step 2: Verify RED using the narrowest affected package test**
 
@@ -566,13 +569,35 @@ Expected: failure because no PQ keystore format exists.
 
 Do not claim EIP-2335 compatibility if the payload is not an EIP-2333-derived BLS scalar. Add a
 separate `PqKeystore`/`PqValidatorDirBuilder` and `pq-voting-keystore.json`; reuse only the existing
-`eth2_keystore::Crypto` encryption primitives. The authenticated outer schema independently pins
-format version, scheme/parameter set, exact backend revision, 32-byte public key, and inclusive
-`one_time_use_range`. Usage state remains exclusively in `xmss_usage.sqlite`.
+`eth2_keystore::Crypto` encryption primitives. The outer schema pins format/version,
+scheme/parameter set, both exact bindings and backend revisions, canonical 32-byte public key, and
+inclusive `one_time_use_range`. Since `Crypto` authenticates ciphertext rather than arbitrary outer
+JSON, duplicate every security-relevant outer field in a canonical encrypted inner envelope and
+require byte-for-byte inner/outer equality after decrypt. Also require exact canonical upstream
+reserialization and derived public-key/range equality. Preflight one exact bounded KDF/cipher/
+checksum profile before running the KDF, and cap JSON/ciphertext input before allocation or crypto.
+Reject invalid UTF-8, raw empty passwords, passwords over 4,096 bytes, and passwords that become
+empty after the exact EIP-2335 NFKD normalization and Unicode control-character removal before key
+generation, KDF work, or storage mutation. V1 accepts any nonempty contiguous inclusive range of at
+most 1,120 IDs; validate its checked span before entropy/upstream key construction and again on
+metadata load. Usage state remains exclusively in `xmss_usage.sqlite`.
 
-Generate keys sequentially in tests and future callers; do not outer-parallelize upstream key
-generation or scrypt. This task stops at the reusable encrypted-key and validator-directory
-boundary and does not add an `lcli` command. Do not add padded or shadow BLS keys: the current
+Keep live upstream keys private to the storage implementation in this task: public production APIs
+may validate metadata/passwords but must not return a sign-capable key. The combined journal-owned
+decrypt/reserve/sign authority is introduced only in Task 3.3.
+
+Generate keys sequentially in tests and future callers; use a cross-process test lock and do not
+outer-parallelize upstream key generation or scrypt. Create PQ child directories at 0700 and files
+with descriptor-relative create-new 0600/no-follow/fd checks and durability syncs. Retain opened
+base/password directory descriptors across the KDF and use `mkdirat`/`openat` for every provisioning
+mutation, with final descriptor/entry/path identity checks. Perform read-only collision preflight
+before the KDF and retain exclusive creation enforcement afterward. Fail closed on partial,
+symlinked, mixed BLS/PQ, non-canonical, and replaced identities. Never perform pathname cleanup
+after a successful create: handled failures leave tombstones exactly like crashes, and retries
+collide until explicit provisioning recovery removes them. Document that the directory and
+external password file cannot be made one atomic transaction. This task stops at the reusable
+encrypted-key and validator-directory boundary and does not add an `lcli` command. Do not add
+padded or shadow BLS keys: the current
 validator registry still has a 48-byte BLS wire type, so provisioning and direct PQ genesis must
 follow Task 4.1's compile-time PQ public-key schema.
 
@@ -583,7 +608,7 @@ Record measurements in `docs/pq-devnet-findings.md`.
 **Step 5: Commit**
 
 ```bash
-git add Cargo.lock crypto/eth2_keystore common/validator_dir \
+git add Cargo.toml Cargo.lock crypto/eth2_keystore common/validator_dir \
   docs/plans/2026-08-18-pq-devnet-implementation.md docs/pq-devnet-findings.md
 git commit -m "feat: add experimental PQ validator keys"
 ```

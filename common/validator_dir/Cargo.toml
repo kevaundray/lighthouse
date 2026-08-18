@@ -6,6 +6,7 @@ edition = { workspace = true }
 
 [features]
 insecure_keys = []
+pq-devnet = ["eth2_keystore/pq-devnet", "dep:rustix", "dep:zeroize"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
@@ -17,8 +18,17 @@ filesystem = { workspace = true }
 hex = { workspace = true }
 lockfile = { workspace = true }
 rand = { workspace = true }
+rustix = { workspace = true, optional = true }
 tree_hash = { workspace = true }
 types = { workspace = true }
+zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
+fs2 = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
+
+[[test]]
+name = "pq_validator_dir"
+path = "tests/pq_validator_dir.rs"
+required-features = ["pq-devnet"]

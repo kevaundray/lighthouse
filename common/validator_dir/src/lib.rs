@@ -8,6 +8,8 @@
 
 mod builder;
 pub mod insecure_keys;
+#[cfg(feature = "pq-devnet")]
+mod pq_validator_dir;
 mod validator_dir;
 
 pub use crate::validator_dir::{
@@ -17,4 +19,8 @@ pub use crate::validator_dir::{
 pub use builder::{
     Builder, ETH1_DEPOSIT_DATA_FILE, Error as BuilderError, VOTING_KEYSTORE_FILE,
     WITHDRAWAL_KEYSTORE_FILE, keystore_password_path,
+};
+#[cfg(feature = "pq-devnet")]
+pub use pq_validator_dir::{
+    PQ_VOTING_KEYSTORE_FILE, PqValidatorDir, PqValidatorDirBuilder, PqValidatorDirError,
 };

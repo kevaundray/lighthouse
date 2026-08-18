@@ -3267,8 +3267,10 @@ dependencies = [
  "cipher",
  "ctr",
  "eth2_key_derivation",
+ "fs2",
  "hex",
  "hmac",
+ "lean-multisig",
  "pbkdf2",
  "rand 0.9.2",
  "scrypt",
@@ -10133,12 +10135,16 @@ dependencies = [
  "educe",
  "eth2_keystore",
  "filesystem",
+ "fs2",
  "hex",
  "lockfile",
  "rand 0.9.2",
+ "rustix",
+ "serde_json",
  "tempfile",
  "tree_hash",
  "types",
+ "zeroize",
 ]
 
 [[package]]

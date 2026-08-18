@@ -429,23 +429,74 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   host. It still verifies the exact signer set and rejects missing, extra, substituted, and
   wrong-claim contexts. No new peak-RSS measurement was taken in this slice.
 
-### 2026-08-18: PQ key storage and direct genesis path
+### 2026-08-18: PQ key storage implemented
 
 - Chose a distinct `PqKeystore` and `pq-voting-keystore.json`, reusing only Lighthouse's existing
-  EIP-2335 `Crypto` encryption envelope. The file authenticates its own format version, scheme,
-  exact backend revision, 32-byte derived public key, and inclusive one-time-use range; it is never
-  advertised as EIP-2335 or discovered as `voting-keystore.json`.
+  EIP-2335 `Crypto` encryption primitives. The payload is an XMSS key, not an EIP-2333 BLS scalar,
+  so the file is explicitly not advertised as EIP-2335 and is never discovered as
+  `voting-keystore.json`.
+- The outer schema pins the Lighthouse format/version, scheme, parameter set, exact bindings
+  revision `c0ef8e621556581b2beb0c4f72f99c001a026fe6`, exact leanVM backend revision
+  `aed646200cf5ae3199c25c61f2bfe094582678ae`, canonical lowercase 32-byte public key, and inclusive
+  one-time-use range. `Crypto` alone does not authenticate arbitrary outer JSON fields, so the
+  encrypted plaintext contains a canonical duplicate of every security-relevant field. Reload
+  requires an exact inner/outer match, exact canonical upstream reserialization, and rederived
+  public-key/range equality.
+- The controlled format accepts only scrypt `n=262144,r=8,p=1,dklen=32` with a 32-byte salt,
+  AES-128-CTR with a 16-byte IV, and SHA-256 with a 32-byte checksum. These checks happen before
+  the KDF, avoiding the generic envelope's much broader cost range. Public JSON input is capped at
+  16 MiB and ciphertext at 4 MiB before expensive processing. `PqKeystore` deliberately does not
+  implement public `Deserialize`; callers must use the bounded string/reader constructors.
+- V1 accepts raw passwords of 1--4,096 bytes only when they are valid UTF-8 and remain nonempty
+  after the exact EIP-2335 NFKD normalization and Unicode control-character removal shared with
+  encryption/decryption. Checked range/password preflight runs before entropy, upstream key
+  construction, scrypt, or provisioning mutation. Any nonempty contiguous inclusive one-time-use
+  range containing at most 1,120 IDs is accepted, and the range cap is rechecked on metadata load.
 - Upstream secret serialization persists the seed, range, precomputed top tree, version, and
   checksum but no used-leaf state. Reload must rederive and compare the public key/range; the
   separate SQLite journal remains mandatory. The live upstream key is not zeroized on drop, which
   remains an experimental limitation.
-- The initial 64-slot run plus 16-slot lookahead provisions IDs `0..=1119`. Key generation is linear
-  in range width, so generate validators sequentially and keep ordinary tests to small ranges.
-  Loading is cheap; the first signature rebuilds at most one bottom subtree and may be prepared.
+- No public storage API returns a live sign-capable upstream key. Task 3.2 only provides validated
+  metadata/password checks; Task 3.3 must introduce the narrow combined journal-owning authority.
+- `PqValidatorDirBuilder` retains rustix directory descriptors for existing base/password roots or
+  their parents, performs cheap descriptor-relative collision preflight before scrypt, and uses
+  only `mkdirat`/`openat` beneath those descriptors for provisioning mutations. Canonical
+  `0x<64-lower-hex>` validator directories are 0700; keystore/password files use exclusive create,
+  0600, no-follow, descriptor metadata/entry identity checks, and file/directory `fsync`. Final
+  validation rereads the keystore through the retained child descriptor and rejects path/descriptor
+  replacement. Directory-local discovery is deterministic, immediate-child-only, and rejects
+  symlinked, locally partial or malformed, mixed BLS/PQ, non-canonical, and post-open
+  identity-replacement cases. It cannot detect a missing external password file; password
+  validation or the startup provisioning cross-check reports that failure.
+  Password ingress is capped and reads directly into a fully preallocated zeroizing buffer, so
+  partial reads, oversize inputs, and read errors do not leave an ordinary secret `Vec`. It
+  deliberately does not create an account-utils/validator-client `ValidatorDefinition`: that type
+  remains BLS-keyed until Task 4.1.
+- The directory and external password file cannot be committed atomically. Pathname cleanup after a
+  successful create is deliberately forbidden because it can unlink an attacker-substituted inode.
+  Handled errors and process/power loss therefore leave fail-closed tombstone files/directories;
+  retries collide until provisioning explicitly inspects and removes the leftovers. Discovery fails
+  closed on a partial PQ directory. Descriptor-relative mutation prevents ancestor-path swaps from
+  redirecting writes, but an actor already able to mutate the retained directory can still race
+  same-inode content changes or hard links; provisioning roots must not be shared with such an actor.
+- Debug-profile measurement for an 8-leaf inclusive `0..=7` key on Linux 7.0.0-28-generic,
+  x86_64, AMD Ryzen 9 7950X3D (16 cores/32 threads), 62 GiB RAM, rustc 1.94.0: upstream bytes 730,
+  JSON bytes 2,631, deterministic key generation 56.503 ms, scrypt encryption 17.304 s, and
+  decrypt/reconstruct/validate 17.071 s. After the final review fixes, the serial 12-test active
+  hostile-input suite took 189.86 s and the 7-test validator-directory suite took 189.13 s. A
+  manual ignored measurement target now covers the real inclusive `0..=1119` range, but it was
+  deliberately not run in this slice: upstream key generation is linear and that measurement is
+  not practical during ordinary tests.
+
+### 2026-08-18: Direct PQ genesis decisions deferred to Task 4.1b
+
+- The initial 64-slot run plus 16-slot lookahead is planned to provision IDs `0..=1119`. Generate
+  validators sequentially and do not add outer keygen/scrypt parallelism.
 - The first devnet uses 16 validators so minimal-preset committees exercise real aggregation. Its
-  genesis registry is initialized directly from PQ public keys with deterministic execution
-  withdrawal credentials and zero deposits. BLS shadow keys, dummy deposit evidence, and weakened
-  deposit verification are forbidden.
+  future genesis registry will be initialized directly from PQ public keys with deterministic
+  execution withdrawal credentials and zero deposits. BLS shadow keys, dummy deposit evidence,
+  and weakened deposit verification remain forbidden.
 - Provisioning belongs in one PQ-only `lcli` command that derives keys deterministically, creates
   genesis, writes distinct validator directories, creates the bound XMSS journal, then reopens and
-  cross-checks every key, registry entry, and journal registration.
+  cross-checks every key, registry entry, and journal registration. This is Task 4.1b, after Task
+  4.1 replaces the BLS-sized registry/wire fields.
