@@ -160,7 +160,7 @@ API, verifies it, then corrupts one signature and observes rejection. The test m
 **Step 2: Run the targeted test and verify RED**
 
 ```bash
-cargo nextest run -p state_processing <new_test_name>
+cargo nextest run --release -p state_processing <new_test_name>
 ```
 
 Expected: the test fails because state processing still bypasses the facade.
@@ -173,8 +173,8 @@ algorithm invocation behind the consensus-signature facade.
 **Step 4: Verify GREEN and regression coverage**
 
 ```bash
-cargo nextest run -p state_processing <new_test_name>
-cargo nextest run -p state_processing
+cargo nextest run --release -p state_processing <new_test_name>
+cargo nextest run --release -p state_processing
 cargo check -p state_processing
 ```
 

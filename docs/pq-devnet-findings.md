@@ -36,6 +36,11 @@ testing, or devnet operation changes an assumption below.
   when decoding and verifying an aggregate.
 - The API caps one aggregate at 32,768 distinct XMSS signers and one multi-claim proof at 16
   claims in the inspected revision.
+- A clean external consumer successfully compiled the exact pins with Rust 1.88, Lighthouse's
+  current MSRV. The dependency has no Lean, Lake, Python, C compiler, or `build.rs` requirement;
+  the zkDSL program is embedded and compiled by Rust code at runtime.
+- The bindings package is named `lean-multisig` version 0.1.0, is unpublished, and has no Cargo
+  features in the inspected revision.
 
 ## Cryptographic and Wire Findings
 
@@ -77,6 +82,22 @@ Consequences:
 - The devnet must record proving latency, verification latency, proof size, queue depth, and peak
   resident memory.
 
+An exact-pin local dependency probe on 2026-08-18 added stronger operational evidence:
+
+- Calling `setup()` on an ordinary Rust test thread reproducibly aborted with stack overflow.
+- A dedicated 64 MiB-stack thread completed setup, a one-signer proof, contextual decode, and
+  verification. Upstream config requests a conservative 512 MiB minimum stack.
+- The debug probe took about 31.5 seconds and reached roughly 776 MiB process RSS for that one
+  aggregate.
+- Dependency-local `.cargo/config.toml` settings are not inherited by Lighthouse. The binding
+  requests AVX2 on x86 because its scalar fallback is documented as silently breaking
+  aggregation. The first devnet must require and validate AVX2, or use a fork that supplies a
+  correct portable/runtime-dispatched path.
+
+Initial implementation consequence: use one long-lived dedicated PQ worker with an explicitly
+large stack, initialize it before networking, and serialize setup/proving jobs. Do not set a large
+global `RUST_MIN_STACK`, which would reserve that stack policy for unrelated Lighthouse threads.
+
 ## Security/Maturity Findings
 
 - The pinned leanVM security policy says it is not production software.
@@ -86,6 +107,25 @@ Consequences:
   protocol version so test data cannot be mistaken for a future production scheme.
 - The bindings and safe Rust facade are very recent and unpublished as a standalone crates.io
   dependency. All git dependencies must be pinned by commit.
+- The bindings manifest declares `MIT OR Apache-2.0` but the inspected repository has no license
+  files. leanVM has an Apache-2.0 root license, while internal package manifests omit license
+  metadata. A Lighthouse fork should add the missing license files/metadata and document both git
+  sources for supply-chain review.
+
+## Binding Adaptation Findings
+
+A narrow fork is justified for the first devnet; the recursive circuit itself does not need to
+change initially. The fork should:
+
+1. expose distinct raw-signature and aggregate-proof decoding instead of one opaque `Signature`;
+2. rename the claim's `slot` field to a one-time-use or leaf identifier to prevent accidental
+   Ethereum-slot reuse;
+3. expose an explicit large-stack startup/worker contract and improve setup failure reporting;
+4. expose representation-specific limits and bounded decode entry points;
+5. add the missing license files and package metadata.
+
+The Lighthouse adapter must still apply its own protocol limits before calling the backend and
+must classify decode/invalid-proof errors separately from local setup/prover failures.
 
 ## Lighthouse Coupling Found During Investigation
 
@@ -130,6 +170,8 @@ Consequences:
   aggregation.
 - Required validator count and target hardware for the acceptance devnet.
 - Whether an external proving service is needed after initial end-to-end measurements.
+- Whether to require AVX2 for the entire first-devnet binary or patch leanVM for correct runtime
+  dispatch before the initial network launch.
 
 ## Findings Log
 
@@ -140,3 +182,15 @@ Consequences:
 - Confirmed that a devnet from genesis makes the project feasible without mainnet wire
   compatibility or validator-state migration.
 - Chose semantic branch-by-abstraction over generalizing Lighthouse's BLS point traits.
+
+### 2026-08-18: Exact dependency build and runtime probe
+
+- Confirmed the exact git pins compile on Rust 1.88 without a Lean toolchain.
+- Reproduced stack overflow when backend setup runs on an ordinary Rust test thread.
+- Completed setup and a one-signer aggregate on a dedicated large-stack thread, confirming that
+  worker ownership is a correctness requirement rather than an optional optimization.
+- Confirmed that an XMSS public key commits to its complete inclusive activation range. Genesis
+  key generation therefore requires a frozen duty-ID layout and advertised devnet lifetime; the
+  range cannot be extended without changing validator public keys.
+- Identified strict evidence-kind decoding, setup ergonomics, limits, and license metadata as the
+  minimal binding-fork delta.
