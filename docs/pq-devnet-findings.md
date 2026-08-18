@@ -205,14 +205,23 @@ Those require explicit absent/empty evidence rules rather than fake infinity sig
 
 ## XMSS Usage Journal
 
-The journal is owned by the local signing authority and uses SQLite rollback-journal mode with
-`synchronous=FULL`, exclusive process locking, one serialized connection, explicit application and
-schema versions, and fail-closed integrity checks. Provisioning alone creates it with restrictive
-permissions; normal validator startup opens an existing journal and refuses missing, corrupt,
-truncated, newer-schema, or mismatched state.
+The journal is owned by the local signing authority and uses SQLite DELETE rollback-journal mode
+with `synchronous=EXTRA`, exclusive database locking, one serialized connection, explicit
+application and schema versions, and fail-closed integrity checks. `EXTRA` is required because in
+rollback mode it additionally syncs the containing directory after journal unlink, closing the
+last-commit power-loss gap left by `FULL`, as documented by
+[SQLite's synchronous pragma](https://www.sqlite.org/pragma.html#pragma_synchronous). Provisioning
+alone creates and directory-syncs the
+database plus a persistent 0600 OS lockfile; normal validator startup opens existing regular files
+without creation or symlink following and refuses missing, corrupt, truncated, wrong-version,
+wrong-mode, insecure-permission, or mismatched state. The persistent lock guard never removes its
+pathname, avoiding an unlink-before-close inode race.
+The implementation rejects non-Unix PQ journal startup until an equivalent ACL/permission contract
+is implemented there; Unix lock and database opens reject symlinks and verify opened-file metadata.
 
-The logical tables bind each stable XMSS key identity to the profile, allocation version, genesis
-validators root, public key, and inclusive leaf range, then store permanent
+The logical tables bind each stable XMSS key identity, derived solely from its canonical 32-byte
+public key, to a fixed 32-byte profile ID, allocation version, genesis validators root, public key,
+and inclusive leaf range, then store permanent
 `(key_id, one_time_use_id) -> signing_root` reservations. Profile changes do not create a namespace
 escape: one underlying XMSS key can never reuse the same leaf under another profile. Reservations
 are never pruned and survive validator deletion/reimport.
@@ -340,6 +349,26 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   be reordered for PQ.
 - Confirmed validator deletion, EIP-3076 export, and recoverable-cache repair cannot delete,
   recreate, or substitute for XMSS usage state.
+
+### 2026-08-18: Crash-safe XMSS journal implemented
+
+- Added the feature-isolated `signing_method` journal with STRICT, WITHOUT ROWID key and
+  reservation tables, fixed application/schema/profile/allocation versions, key identity derived
+  from public-key bytes, exact active-binding validation, and permanent leaf tombstones.
+- Normal startup is non-creating and fail-closed across missing/corrupt/truncated/wrong-version
+  databases, non-DELETE mode, insecure permissions, symlinks, schema/integrity/foreign-key errors,
+  and key/profile/genesis/allocation/range mismatch. Extra historical key registrations remain
+  valid so validator deletion cannot erase state. Canonical `sqlite_schema` validation rejects
+  weakened constraints and every executable/extra schema object, including a trigger that could
+  delete a committed tombstone. Local SQLite and filesystem diagnostics are retained for startup
+  operability without changing fail-closed behavior.
+- Reservation uses one exclusive transaction with `ON CONFLICT DO NOTHING`; identical roots are
+  retryable and conflicting roots are refused. The transaction and connection mutex are released
+  before the callback. Callback error, panic, and process abort burn the committed leaf, while an
+  injected or process-abort failure before commit rolls back without invoking signing.
+- The targeted PQ journal matrix passes 25 tests, including conflicting and identical concurrent
+  attempts, a real second-process lock refusal, restart recovery, abort-before/after-commit
+  recovery, non-mutation of validator key files, and 0600 database/lock permissions.
 
 ### 2026-08-18: Frozen duty allocation implemented
 

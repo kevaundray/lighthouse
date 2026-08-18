@@ -2,6 +2,12 @@
 //!
 //! - Via a local `Keypair`.
 //! - Via a remote signer (Web3Signer)
+//!
+//! The PQ journal and its raw reservation operation are not public APIs:
+//!
+//! ```compile_fail
+//! use signing_method::xmss_journal::XmssUsageJournal;
+//! ```
 
 use bls::{Keypair, PublicKey, Signature};
 use consensus_signature::{OneTimeUseId, SigningDuty, SigningIdError};
@@ -20,6 +26,9 @@ use web3signer::{ForkInfo, MessageType, SigningRequest, SigningResponse};
 pub use web3signer::Web3SignerObject;
 
 mod web3signer;
+#[cfg(feature = "pq-devnet")]
+#[allow(dead_code)]
+pub(crate) mod xmss_journal;
 
 #[derive(Debug, PartialEq)]
 pub enum Error {

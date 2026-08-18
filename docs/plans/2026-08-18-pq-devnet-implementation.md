@@ -471,12 +471,13 @@ git commit -m "feat: add PQ raw signature backend"
 **Files:**
 
 - Create: `validator_client/signing_method/src/xmss_journal.rs`
-- Create: `validator_client/signing_method/tests/xmss_journal.rs`
+- Modify: `validator_client/signing_method/src/lib.rs`
 - Modify: `validator_client/signing_method/Cargo.toml`
 
 **Step 1: Write failing filesystem tests**
 
-Use a temporary directory and test:
+Use a temporary directory and crate-internal module tests so the reservation primitive remains
+inaccessible outside the journal-owning authority. Test:
 
 - reserve a fresh `(leaf, root)`;
 - identical retry succeeds;
@@ -495,7 +496,8 @@ Use a temporary directory and test:
 **Step 2: Verify RED**
 
 ```bash
-cargo nextest run -p signing_method --test xmss_journal
+cargo nextest run -p signing_method --no-default-features --features pq-devnet \
+  'xmss_journal::tests'
 ```
 
 Expected: compilation fails because the journal does not exist.
@@ -503,17 +505,26 @@ Expected: compilation fails because the journal does not exist.
 **Step 3: Implement the minimal durable journal**
 
 Create the separate global `validators_dir/xmss_usage.sqlite` design recorded in
-`docs/pq-devnet-findings.md`. Use SQLite rollback-journal mode, `synchronous=FULL`, exclusive
-locking, one serialized connection, fixed application/schema versions, and an OS lockfile. Normal
-startup opens and validates; only provisioning may create. Enforce uniqueness by stable key ID and
-one-time-use ID across profiles, never prune rows, and release the transaction/DB mutex before the
-signing callback. Keep `reserve` crate-private so production callers can only use the combined
-durable signing-authority operation.
+`docs/pq-devnet-findings.md`. Isolate SQLite and filesystem-lock dependencies behind the
+`signing_method/pq-devnet` feature. Use SQLite DELETE rollback-journal mode,
+`synchronous=EXTRA`, exclusive locking, one serialized connection, fixed application/schema
+versions, and a persistent 0600 OS lockfile that is never unlinked by its guard. Provisioning alone
+creates and directory-syncs the database and lock; normal startup performs a non-creating,
+non-symlink open and validates exact schema, integrity, permissions, and the active binding subset
+while permitting extra historical keys. Derive the stable key ID solely from canonical public-key
+bytes, freeze the 32-byte V1 profile ID and allocation version, never prune rows, and release the
+transaction/DB mutex before the signing callback. Keep raw `reserve` private; production sibling
+modules may only use the crate-private combined durable callback operation until Task 3.3 seals it
+behind the signing authority. The first PQ devnet journal is Unix-only and fails startup explicitly
+on unsupported platforms instead of weakening its permission contract.
 
 **Step 4: Verify GREEN**
 
 ```bash
-cargo nextest run -p signing_method --test xmss_journal
+cargo nextest run -p signing_method --no-default-features --features pq-devnet \
+  'xmss_journal::tests'
+cargo test -p signing_method --no-default-features --features pq-devnet --doc
+cargo check -p signing_method --no-default-features --features pq-devnet
 cargo check -p signing_method
 ```
 
@@ -522,7 +533,8 @@ Expected: all journal tests pass.
 **Step 5: Commit**
 
 ```bash
-git add validator_client/signing_method
+git add Cargo.lock validator_client/signing_method \
+  docs/plans/2026-08-18-pq-devnet-implementation.md docs/pq-devnet-findings.md
 git commit -m "feat: persist XMSS leaf reservations"
 ```
 
