@@ -386,12 +386,21 @@ git commit -m "feat: allocate XMSS leaves by validator duty"
 **Files:**
 
 - Modify: `crypto/consensus_signature/src/pq.rs`
+- Create: `crypto/consensus_signature/src/pq/backend.rs`
+- Create: `crypto/consensus_signature/src/pq/wire.rs`
+- Create: `crypto/consensus_signature/tests/pq_wire.rs`
 - Create: `crypto/consensus_signature/tests/pq_raw.rs`
 
 **Step 1: Write failing raw-signature tests**
 
-Cover deterministic retries, wrong root, wrong public key, wrong signing ID, malformed bytes,
-out-of-range signing ID, and parameter-set/version mismatch.
+Start with fast framing tests. Freeze a Lighthouse-owned `LHPQ` envelope with independent wire
+version, parameter-set, and evidence-kind bytes. Cover the exact 1,215-byte raw form; bad magic;
+unknown version, parameter set, and evidence kind; short/long payloads; and strict rejection of
+aggregate or absent evidence in an individual-signature field.
+
+Then cover deterministic raw-signature retries, wrong root, wrong public key, wrong signing ID,
+malformed/non-canonical payloads, signing outside the key range, and a canonical empty placeholder
+that never verifies. Raw verification must not initialize the aggregate prover.
 
 **Step 2: Verify RED**
 
@@ -404,8 +413,23 @@ Expected: tests fail because the PQ backend is incomplete.
 
 **Step 3: Implement raw signing and contextual verification**
 
-Keep wire bytes opaque until verification context is present. Enforce all length/version checks
-before invoking leanMultisig.
+Keep wire bytes opaque until verification context is present. The Lighthouse envelope is:
+
+```text
+"LHPQ" | wire_version=1 | parameter_set=1 | evidence_kind | backend_payload
+```
+
+For the exact pinned backend, strip its private six-byte `LMSI` envelope on output and reconstruct
+the required raw header only inside `pq/backend.rs` after the Lighthouse envelope has selected the
+semantic kind. Enforce every length/version/kind check before invoking leanMultisig. Do not expose
+raw upstream `Claim`, `Signature`, `SecretKey`, or `verify`; expose a semantic claim requiring
+`OneTimeUseId`, a strict raw wrapper, and a narrow signing-key wrapper for the later journal-owned
+signing authority. Unknown non-exhaustive backend errors remain local/internal by default.
+
+This exact-pin bridge is acceptable for internal raw devnet work. Do not treat hostile aggregate
+decoding as hardened or distribute binaries until a narrow fork exposes representation-specific,
+bounded decoding and resolves license metadata. Task 4.1 owns SSZ/TreeHash/serde integration and
+the bounded same-message evidence union.
 
 **Step 4: Verify GREEN**
 
@@ -493,8 +517,16 @@ git commit -m "feat: persist XMSS leaf reservations"
 
 **Step 1: Write failing key round-trip tests**
 
-Cover generation, encrypted persistence, reload, public-key identity, malformed key rejection, and
-activation/signing range preservation.
+Cover generation, encrypted persistence, reload, public-key identity, malformed/trailing secret
+bytes, wrong password, hostile KDF parameters, unsupported outer/scheme/backend versions, and
+one-time-use range preservation. On reload, require the derived public key and upstream inclusive
+range to match the authenticated metadata exactly. Normal unit tests use a small 8--16-leaf range;
+the real 1,120-leaf measurement is explicit/ignored.
+
+Add validator-directory tests for the distinct PQ filename and definition variant, 0600 modes,
+collision refusal, and discovery. Add direct-genesis tests proving that all 16 PQ keys appear in
+registry order, are active at epoch zero, consume no deposits, and produce deterministic genesis
+bytes for a fixed seed/config/time.
 
 **Step 2: Verify RED using the narrowest affected package test**
 
@@ -502,8 +534,18 @@ Expected: failure because no PQ keystore format exists.
 
 **Step 3: Implement an explicitly versioned experimental format**
 
-Do not claim EIP-2335 compatibility if the payload is not an EIP-2333-derived BLS scalar. Keep PQ
-files distinguishable from BLS keystores.
+Do not claim EIP-2335 compatibility if the payload is not an EIP-2333-derived BLS scalar. Add a
+separate `PqKeystore`/`PqValidatorDirBuilder` and `pq-voting-keystore.json`; reuse only the existing
+`eth2_keystore::Crypto` encryption primitives. The authenticated outer schema independently pins
+format version, scheme/parameter set, exact backend revision, 32-byte public key, and inclusive
+`one_time_use_range`. Usage state remains exclusively in `xmss_usage.sqlite`.
+
+Provision through a PQ-only `lcli` command rather than the BLS wallet/account-manager flow. Generate
+keys sequentially for IDs `0..=1119`; do not outer-parallelize upstream key generation or scrypt.
+Initialize the genesis validator registry directly from PQ public keys with deterministic execution
+withdrawal credentials. Do not generate BLS shadow keys, weaken deposit validation, create dummy
+deposit signatures, or consume XMSS leaves for genesis. Refactor the existing post-registry fork
+upgrade/finalization tail so the direct-registry and deposit paths share it.
 
 **Step 4: Verify GREEN and measure key size/load time**
 

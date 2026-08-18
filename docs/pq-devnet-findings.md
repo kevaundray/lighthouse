@@ -359,3 +359,42 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   they do not get invented `SignableMessage` variants. Tasks 3.3 and 6.2 own their explicit
   startup/invocation rejection tests. Empty sync aggregates and Gloas self-build placeholders are
   not `SignableMessage` signing requests and allocate no leaf.
+
+### 2026-08-18: PQ evidence envelope and strict raw boundary
+
+- Chose a Lighthouse-owned envelope: `LHPQ`, one-byte wire version, one-byte parameter-set ID,
+  one-byte semantic evidence kind, then the backend payload. The exact pinned raw form is 1,215
+  bytes: seven Lighthouse header bytes plus the 1,208-byte XMSS signature payload.
+- The adapter will not preserve the upstream private `LMSI` representation tag on the network.
+  Instead, one narrow exact-pin bridge strips it from locally produced evidence and reconstructs a
+  raw or aggregate backend header only after the Lighthouse envelope has selected the field kind.
+  This prevents conflicting attacker-controlled inner and outer kinds and lets a later fork replace
+  the bridge without changing devnet SSZ bytes.
+- Raw verification can proceed without prover setup. A PQ individual-signature field accepts only
+  the exact raw form. Same-message evidence will later admit raw promotion, aggregate proof, or a
+  canonical seven-byte absent value; aggregate evidence is capped at 512 KiB for V1.
+- A narrow fork is still required before hostile aggregate inputs or external distribution. The
+  current aggregate decoder contains nested variable-length allocations, and the pin exposes no
+  public representation-specific decoder or constants. The fork must add bounded raw/aggregate
+  APIs, parameter identity, one-time-use terminology, and complete license metadata.
+
+### 2026-08-18: PQ key storage and direct genesis path
+
+- Chose a distinct `PqKeystore` and `pq-voting-keystore.json`, reusing only Lighthouse's existing
+  EIP-2335 `Crypto` encryption envelope. The file authenticates its own format version, scheme,
+  exact backend revision, 32-byte derived public key, and inclusive one-time-use range; it is never
+  advertised as EIP-2335 or discovered as `voting-keystore.json`.
+- Upstream secret serialization persists the seed, range, precomputed top tree, version, and
+  checksum but no used-leaf state. Reload must rederive and compare the public key/range; the
+  separate SQLite journal remains mandatory. The live upstream key is not zeroized on drop, which
+  remains an experimental limitation.
+- The initial 64-slot run plus 16-slot lookahead provisions IDs `0..=1119`. Key generation is linear
+  in range width, so generate validators sequentially and keep ordinary tests to small ranges.
+  Loading is cheap; the first signature rebuilds at most one bottom subtree and may be prepared.
+- The first devnet uses 16 validators so minimal-preset committees exercise real aggregation. Its
+  genesis registry is initialized directly from PQ public keys with deterministic execution
+  withdrawal credentials and zero deposits. BLS shadow keys, dummy deposit evidence, and weakened
+  deposit verification are forbidden.
+- Provisioning belongs in one PQ-only `lcli` command that derives keys deterministically, creates
+  genesis, writes distinct validator directories, creates the bound XMSS journal, then reopens and
+  cross-checks every key, registry entry, and journal registration.
