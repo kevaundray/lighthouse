@@ -74,8 +74,9 @@ pub use per_slot_processing::{Error as SlotProcessingError, per_slot_processing}
 #[cfg(feature = "pq-attestation")]
 pub use pq_attestation::{
     PqAttestationCacheError, PqAttestationContribution, PqAttestationError, PqAttestationInvalid,
-    PqAttestationLocalError, PqValidatorKeyCache, build_pq_attestation_job,
-    build_pq_single_attestation_job, verify_pq_attestation_job,
+    PqAttestationLocalError, PqValidatorKeyCache, PreparedPqAttestation, VerifiedPqAttestation,
+    build_pq_attestation_job, build_pq_single_attestation_job, prepare_pq_attestation,
+    prepare_pq_attestation_aggregate, verify_pq_attestation_job,
 };
 #[cfg(not(any(feature = "pq-genesis", feature = "pq-attestation")))]
 pub use types::{EpochCache, EpochCacheError, EpochCacheKey};

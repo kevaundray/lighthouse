@@ -1430,39 +1430,130 @@ git add Cargo.lock consensus/state_processing testing/pq_devnet \
 git commit -m "feat: verify PQ attestation evidence"
 ```
 
-### Task 5.2: Replace attestation point mutation with aggregation jobs
+### Task 5.2a: Add an isolated, failure-atomic attestation aggregation coordinator
+
+**Status (2026-08-18): implemented and awaiting review.** The isolated coordinator and opaque
+verification transition compile without enabling either existing beacon-node pool. Fast state
+machine coverage is 15/15. The serialized journal-backed AVX2 integration test is 1/1 and completed
+in 137.36 seconds of test time (137.66 seconds command wall time, 794,400 KiB command-tree peak
+RSS) on this host. The Minimal preset produces a two-validator slot committee at the V1
+sixteen-validator registry cap, so a three-signer raw-plus-child catch-up case is not constructible
+in this harness; raw-plus-child backend recursion remains covered by Task 5.1.
+
+**Prerequisites:** Tasks 5.1 and 5.1a.
+
+The current `operation_pool` package cannot honestly enable the PQ profile yet. It unconditionally
+imports the full BLS `state_processing` surface, performs point mutation in
+`attestation_storage.rs`, and has a development dependency cycle through `beacon_chain`. There is
+also a second independent mutation path in `beacon_chain::naive_aggregation_pool`. Do not mass-gate
+either package merely to make a narrow test compile.
 
 **Files:**
 
-- Modify: `consensus/types/src/attestation/attestation.rs`
-- Modify: `beacon_node/operation_pool/src/attestation_storage.rs`
-- Modify: `beacon_node/operation_pool/src/lib.rs`
-- Modify: `beacon_node/beacon_chain/src/single_attestation.rs`
-- Modify: related attestation tests
+- Modify: root `Cargo.toml` and `Cargo.lock`
+- Create: `beacon_node/attestation_aggregation/Cargo.toml`
+- Create: `beacon_node/attestation_aggregation/src/lib.rs`
+- Modify: `consensus/state_processing/src/pq_attestation.rs`
+- Modify: `consensus/state_processing/src/lib.rs`
+- Modify: `testing/pq_devnet/Cargo.toml`
+- Create: `testing/pq_devnet/tests/pq_attestation_aggregation.rs`
+- Modify: `docs/pq-devnet-findings.md`
 
-**Step 1: Write a failing end-to-end aggregation test**
+**Step 1: Write failing sealed-candidate and state-machine tests**
 
-Build several valid single attestations, aggregate them, assert the participant union, verify the
-result, and reject a proof paired with altered participant bits.
+Add an opaque `VerifiedPqAttestation<E>` produced only after the Task 5.1a contextual job succeeds.
+It owns the Electra attestation, its exact sorted signer indices, and the verified claim. Callers may
+inspect it but may not construct it or replace its evidence. This prevents the coordinator's
+`insert_verified` entry point from becoming an unauthenticated storage bypass.
 
-**Step 2: Verify RED under PQ mode**
+In the isolated normal-dependency harness cover:
 
-Expected: current synchronous `add_assign` aggregation cannot produce PQ evidence.
+- exact duplicate, subset, strict-superset, and overlapping-incomparable candidates;
+- deterministic largest-first disjoint selection with stable tie-breaking;
+- one through sixteen candidates/signers and cap-plus-one rejection before allocation;
+- same data but different single committee keys never combine;
+- singleton retrieval returns verified evidence without proving;
+- only one in-flight proof per bucket;
+- an arrival during an awaited proof remains stored;
+- unrelated arrivals do not invalidate a snapshot, while removal/pruning of a selected candidate
+  makes the commit stale and never resurrects it;
+- queue/backend/output failure clears in-flight state and preserves every source for retry;
+- a fake executor that re-enters the coordinator proves no pool lock crosses job construction or
+  `.await`; and
+- generation overflow fails closed;
+- the 64th distinct bucket and exact 8 MiB retained-evidence total are accepted, while cap-plus-one
+  is rejected without a map entry or large evidence allocation; and
+- slot pruning releases both bucket and byte capacity, preserves current buckets, and makes a
+  removed in-flight bucket stale without resurrection.
 
-**Step 3: Submit aggregation jobs through a resource-limited service**
+**Step 2: Verify RED on an optional, isolated feature surface**
 
-Use a scoped blocking/Rayon execution path and an explicit one-job concurrency limit. Preserve a
-fast synchronous BLS implementation behind the same caller boundary.
+Create a workspace member `attestation_aggregation` whose default build is PQ-free. Its optional
+`pq-attestation` feature may enable only `consensus_signature/pq-devnet`,
+`state_processing/pq-attestation`, `types/pq-devnet`, and the lock/container dependencies it owns.
+Do not feature-unify `operation_pool` or `beacon_chain` in this slice.
 
-**Step 4: Verify GREEN under both backends**
+Expected RED: no sealed verified candidate, candidate coordinator, prepared snapshot, or atomic
+commit API exists.
 
-Run operation-pool, types, and beacon-chain attestation tests.
+**Step 3: Implement the deep coordinator boundary**
+
+Expose four actions under the PQ feature:
+
+1. `PqAttestationAggregationCoordinator::new(Arc<AggregationService>)`;
+2. synchronous `insert_verified(VerifiedPqAttestation<E>) -> InsertOutcome`; and
+3. synchronous `prepare_aggregate(bucket, state, key_cache, spec) -> PreparedAggregate`, followed
+   by `PreparedAggregate::execute().await -> AggregateOutcome`; and
+4. synchronous `prune_before_slot(cutoff) -> PruneOutcome`.
+
+Use a bucket key containing the full `AttestationData` plus exactly one Electra committee index.
+V1 rejects Base and multi-committee candidates and never combines committees. Store bounded
+candidate records with monotonic IDs. Equal/subset candidates are dominated, strict supersets
+atomically replace their subsets, and overlapping incomparable candidates remain. Candidate-only
+operation-pool use may retain verified aggregate gossip and drop dominated duplicates without
+proving.
+
+Apply two coordinator-wide bounds under the same mutex before cloning/inserting candidate storage:
+at most 64 distinct buckets, and at most `V1_MAX_AGGREGATION_INPUT_BYTES` (8 MiB) of actual retained
+`SameMessageEvidence` bytes. The bucket cap is four times the Minimal preset's honest two-epoch,
+sixteen-slot window. Existing-bucket inserts also obey the byte cap. Strict-superset replacement,
+aggregate commit, concurrent-dominated-arrival removal, and slot pruning must debit/release exact
+checked byte counts. Exact cap is accepted; overflow and cap-plus-one return a specific local
+capacity outcome without partial mutation. Pruning removes only buckets with `data.slot < cutoff`.
+
+Under the coordinator lock, select and mark one deterministic bounded snapshot in flight, then
+clone only bounded handles/IDs and release the lock. Build the Task 5.1a owned job and await the
+existing `AggregationService` outside all coordinator, state, cache, shuffling, and async-runtime
+locks. Do not add Rayon or another blocking layer: the service already owns the named 512 MiB OS
+worker, singleton setup, and one-active/one-queued admission.
+
+After success, reacquire one write lock and commit participant-bit union plus returned evidence as
+one atomic update only if every selected ID/value is still present and the final retained-byte
+total is within cap. Preserve unrelated arrivals.
+If a selected candidate was removed or pruned, return `StaleSnapshot` and install nothing. On every
+failure, clear in-flight state and preserve all candidates for retry. Treat post-verification
+`InvalidEvidence` as a local invariant failure, never as peer blame.
+
+**Step 4: Verify real proof construction and unchanged default builds**
+
+Use a serialized AVX2 integration test with two journal-backed raw singles. Assert union bits and
+contextual verification, reject altered bits/root/leaf/key, contextually verify the installed child
+as a singleton without reproving, and prove failure leaves sources unchanged. Require real
+raw-plus-child recursion at the Task 5.1 backend boundary, not in this coordinator harness: the
+frozen V1 registry cap of sixteen and Minimal preset's eight slots per epoch mathematically limit
+the one allowed slot committee to two validators, so a non-overlapping two-signer child plus third
+raw signer cannot exist. Do not weaken state-derived committee validation, combine committees, or
+add a test-only consensus profile. Also run fast fake-executor concurrency/state-machine tests,
+Rust 1.88 checks, warnings-denied Clippy, default BLS operation-pool/types tests, graph isolation,
+formatting, sorting, diff checks, and the mandatory full workspace `cargo check`.
 
 **Step 5: Commit**
 
 ```bash
-git add consensus/types beacon_node/operation_pool beacon_node/beacon_chain
-git commit -m "feat: aggregate attestations through signature service"
+git add Cargo.toml Cargo.lock beacon_node/attestation_aggregation consensus/state_processing \
+  testing/pq_devnet docs/plans/2026-08-18-pq-devnet-implementation.md \
+  docs/pq-devnet-findings.md
+git commit -m "feat: coordinate PQ attestation aggregation"
 ```
 
 ### Task 5.3: Verify PQ block and gossip evidence
@@ -1499,6 +1590,66 @@ Run targeted state-processing and beacon-chain tests.
 ```bash
 git add consensus/state_processing beacon_node/beacon_chain
 git commit -m "feat: verify PQ consensus signing evidence"
+```
+
+### Task 5.2b: Wire verified candidates into both beacon-node attestation pools
+
+**Prerequisites:** Tasks 5.2a and 5.3, plus a compiling top-level PQ feature spine for the affected
+beacon-node packages.
+
+**Files:**
+
+- Modify: `beacon_node/operation_pool/src/attestation_storage.rs`
+- Modify: `beacon_node/operation_pool/src/lib.rs`
+- Modify: `beacon_node/beacon_chain/src/naive_aggregation_pool.rs`
+- Modify: `beacon_node/beacon_chain/src/beacon_chain.rs`
+- Modify: beacon-chain startup/configuration and aggregate retrieval call sites
+- Modify: related operation-pool, naive-pool, and block-production tests
+
+**Step 1: Write failing real-caller tests**
+
+Cover verified single and aggregate gossip insertion, candidate dominance, on-demand local aggregate
+retrieval, block-selection retrieval, a concurrent arrival during proof construction, retry after
+resource failure, pruning during proof, and restart with an intentionally ephemeral candidate pool.
+Assert no method performs proving while holding an operation-pool or naive-pool lock.
+
+**Step 2: Verify RED through the real PQ feature spine**
+
+Expected: both pools still attempt synchronous BLS point mutation. Do not treat a narrow unit target
+that omits either real pool as completion.
+
+**Step 3: Replace both mutation paths with the coordinator**
+
+Embed one shared coordinator/key-cache/service owner in `BeaconChain`. Route only the sealed
+`VerifiedPqAttestation` returned by Task 5.3 into candidate storage. Make PQ aggregate retrieval
+async and on-demand; snapshot under locks, release them, await `PreparedAggregate`, and then commit
+through the coordinator. Keep the default BLS pool and persisted `pkc` representation byte-for-byte
+unchanged.
+
+For the first V1 operation pool, use candidate-only policy: retain verified aggregate gossip, drop
+dominated duplicates, and select maximal candidates for blocks. Do not synthesize cross-committee
+proofs, do not prove during synchronous insert/get paths, and do not re-prove persisted candidates
+during startup. Candidate state may remain ephemeral for the first devnet; restart recovery means
+the signing journal remains safe and the pool refills from gossip.
+
+**Step 4: Explicitly disable sync aggregation in V1**
+
+Disable validator sync duties and beacon-node sync contribution gossip/aggregation at startup.
+Block production must emit `SyncAggregate::empty()`: zero participant bits plus canonical absent PQ
+evidence, consuming no XMSS leaf. Verification must accept exactly that pair, reject absent evidence
+with any set bit, and reject raw/aggregate evidence with zero bits. Never emulate BLS infinity or
+silently run the BLS sync path.
+
+**Step 5: Verify both profiles and commit**
+
+Run the real operation-pool, naive-pool, beacon-chain, and block-production suites in PQ and default
+BLS configurations, plus networking-size and restart smoke tests affected by larger aggregate
+evidence.
+
+```bash
+git add beacon_node/operation_pool beacon_node/beacon_chain \
+  docs/plans/2026-08-18-pq-devnet-implementation.md docs/pq-devnet-findings.md
+git commit -m "feat: aggregate PQ attestations in beacon pools"
 ```
 
 ## Milestone 6: Networking, APIs, and Resource Limits

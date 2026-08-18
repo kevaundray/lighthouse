@@ -109,6 +109,181 @@ pub struct PqAttestationContribution<'a, E: EthSpec> {
     signer_indices: &'a [u64],
 }
 
+/// An owned contextual-verification request that holds no state or cache references.
+///
+/// Construct this value with [`prepare_pq_attestation`], release all state, cache, and shuffling
+/// locks, then consume it with [`PreparedPqAttestation::verify`].
+pub struct PreparedPqAttestation<E: EthSpec> {
+    attestation: Attestation<E>,
+    signer_indices: Vec<u64>,
+    claim: SameMessageClaim,
+    job: AggregationJob,
+}
+
+/// An Electra attestation authenticated against its exact claim, signer set, registry keys, and
+/// participant bits.
+///
+/// Its fields are intentionally private so storage callers cannot create an unauthenticated
+/// candidate or replace its evidence after verification.
+pub struct VerifiedPqAttestation<E: EthSpec> {
+    attestation: Attestation<E>,
+    signer_indices: Vec<u64>,
+    claim: SameMessageClaim,
+}
+
+impl<E: EthSpec> PreparedPqAttestation<E> {
+    /// Performs contextual evidence verification and seals the owned candidate on success.
+    pub async fn verify(
+        self,
+        service: &AggregationService,
+    ) -> Result<VerifiedPqAttestation<E>, PqAttestationError> {
+        let evidence = verify_pq_attestation_job(service, self.job).await?;
+        let mut attestation = self.attestation;
+        match &mut attestation {
+            Attestation::Electra(electra) => electra.signature = evidence,
+            Attestation::Base(_) => {
+                return Err(PqAttestationError::Local(
+                    PqAttestationLocalError::CacheInvariant,
+                ));
+            }
+        }
+        Ok(VerifiedPqAttestation {
+            attestation,
+            signer_indices: self.signer_indices,
+            claim: self.claim,
+        })
+    }
+}
+
+impl<E: EthSpec> VerifiedPqAttestation<E> {
+    pub const fn attestation(&self) -> &Attestation<E> {
+        &self.attestation
+    }
+
+    pub fn signer_indices(&self) -> &[u64] {
+        &self.signer_indices
+    }
+
+    pub const fn claim(&self) -> SameMessageClaim {
+        self.claim
+    }
+}
+
+/// Prepares an owned verification transition for one Electra candidate.
+pub fn prepare_pq_attestation<E: EthSpec>(
+    state: &BeaconState<E>,
+    key_cache: &PqValidatorKeyCache,
+    attestation: Attestation<E>,
+    signer_indices: Vec<u64>,
+    spec: &ChainSpec,
+) -> Result<PreparedPqAttestation<E>, PqAttestationError> {
+    single_electra_committee_index(&attestation)?;
+    let contribution = PqAttestationContribution::new(&attestation, &signer_indices);
+    let job = build_pq_attestation_job(state, key_cache, &[contribution], spec)?;
+    let claim = job.claim;
+    Ok(PreparedPqAttestation {
+        attestation,
+        signer_indices,
+        claim,
+        job,
+    })
+}
+
+/// Prepares one owned multi-contribution aggregate request without retaining borrowed state.
+pub fn prepare_pq_attestation_aggregate<E: EthSpec>(
+    state: &BeaconState<E>,
+    key_cache: &PqValidatorKeyCache,
+    contributions: Vec<(Attestation<E>, Vec<u64>)>,
+    spec: &ChainSpec,
+) -> Result<PreparedPqAttestation<E>, PqAttestationError> {
+    if contributions.len() > V1_MAX_AGGREGATION_CONTRIBUTIONS {
+        return Err(PqAttestationError::Invalid(
+            PqAttestationInvalid::TooManyContributions {
+                actual: contributions.len(),
+                max: V1_MAX_AGGREGATION_CONTRIBUTIONS,
+            },
+        ));
+    }
+    let first_committee = contributions
+        .first()
+        .ok_or(PqAttestationError::Invalid(
+            PqAttestationInvalid::EmptySignerSet,
+        ))
+        .and_then(|(attestation, _)| single_electra_committee_index(attestation))?;
+    for (attestation, _) in &contributions {
+        if single_electra_committee_index(attestation)? != first_committee {
+            return Err(PqAttestationError::Invalid(
+                PqAttestationInvalid::InvalidCommittee,
+            ));
+        }
+    }
+    let borrowed = contributions
+        .iter()
+        .map(|(attestation, signers)| PqAttestationContribution::new(attestation, signers))
+        .collect::<Vec<_>>();
+    let job = build_pq_attestation_job(state, key_cache, &borrowed, spec)?;
+    let claim = job.claim;
+    let signer_indices = job
+        .expected_signers
+        .iter()
+        .map(|signer| signer.validator_index)
+        .collect::<Vec<_>>();
+    let mut contribution_iter = contributions.into_iter();
+    let (mut attestation, _) = contribution_iter.next().ok_or(PqAttestationError::Invalid(
+        PqAttestationInvalid::EmptySignerSet,
+    ))?;
+    let Attestation::Electra(combined) = &mut attestation else {
+        return Err(PqAttestationError::Invalid(
+            PqAttestationInvalid::BaseAttestation,
+        ));
+    };
+    for (other, _) in contribution_iter {
+        let Attestation::Electra(other) = other else {
+            return Err(PqAttestationError::Invalid(
+                PqAttestationInvalid::BaseAttestation,
+            ));
+        };
+        for (position, present) in other.aggregation_bits.iter().enumerate() {
+            if present {
+                combined.aggregation_bits.set(position, true).map_err(|_| {
+                    PqAttestationError::Invalid(PqAttestationInvalid::InvalidBitfield)
+                })?;
+            }
+        }
+    }
+    Ok(PreparedPqAttestation {
+        attestation,
+        signer_indices,
+        claim,
+        job,
+    })
+}
+
+fn single_electra_committee_index<E: EthSpec>(
+    attestation: &Attestation<E>,
+) -> Result<u64, PqAttestationError> {
+    let Attestation::Electra(electra) = attestation else {
+        return Err(PqAttestationError::Invalid(
+            PqAttestationInvalid::BaseAttestation,
+        ));
+    };
+    let mut selected = electra
+        .committee_bits
+        .iter()
+        .enumerate()
+        .filter_map(|(index, present)| present.then_some(index));
+    let committee_index = selected.next().ok_or(PqAttestationError::Invalid(
+        PqAttestationInvalid::InvalidCommittee,
+    ))?;
+    if selected.next().is_some() {
+        return Err(PqAttestationError::Invalid(
+            PqAttestationInvalid::InvalidCommittee,
+        ));
+    }
+    u64::try_from(committee_index)
+        .map_err(|_| PqAttestationError::Invalid(PqAttestationInvalid::InvalidCommittee))
+}
+
 impl<'a, E: EthSpec> PqAttestationContribution<'a, E> {
     pub const fn new(attestation: &'a Attestation<E>, signer_indices: &'a [u64]) -> Self {
         Self {

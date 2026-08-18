@@ -1,0 +1,22 @@
+[package]
+name = "attestation_aggregation"
+version = "0.1.0"
+edition = { workspace = true }
+
+[features]
+default = []
+pq-attestation = [
+    "dep:consensus_signature",
+    "dep:parking_lot",
+    "dep:state_processing",
+    "dep:types",
+    "consensus_signature/pq-devnet",
+    "state_processing/pq-attestation",
+    "types/pq-devnet",
+]
+
+[dependencies]
+consensus_signature = { workspace = true, optional = true }
+parking_lot = { workspace = true, optional = true }
+state_processing = { workspace = true, optional = true }
+types = { workspace = true, optional = true }

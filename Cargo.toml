@@ -2,6 +2,7 @@
 members = [
     "account_manager",
     "beacon_node",
+    "beacon_node/attestation_aggregation",
     "beacon_node/beacon_chain",
     "beacon_node/beacon_processor",
     "beacon_node/builder_client",
@@ -109,6 +110,7 @@ alloy-signer-local = { version = "1", default-features = false }
 anyhow = "1"
 arbitrary = { version = "1", features = ["derive"] }
 async-channel = "1.9.0"
+attestation_aggregation = { path = "beacon_node/attestation_aggregation" }
 axum = "0.7.7"
 beacon_chain = { path = "beacon_node/beacon_chain" }
 beacon_node = { path = "beacon_node" }

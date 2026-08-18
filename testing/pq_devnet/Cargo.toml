@@ -12,6 +12,7 @@ required-features = ["pq-devnet"]
 [features]
 default = []
 pq-devnet = [
+    "dep:attestation_aggregation",
     "dep:clap",
     "dep:consensus_signature",
     "dep:ethereum_ssz",
@@ -30,6 +31,7 @@ pq-devnet = [
 ]
 
 [dependencies]
+attestation_aggregation = { workspace = true, optional = true, features = ["pq-attestation"] }
 clap = { workspace = true, features = ["derive"], optional = true }
 consensus_signature = { workspace = true, optional = true, features = ["pq-devnet"] }
 ethereum_ssz = { workspace = true, optional = true }
@@ -62,4 +64,9 @@ required-features = ["pq-devnet"]
 [[test]]
 name = "pq_attestation"
 path = "tests/pq_attestation.rs"
+required-features = ["pq-devnet"]
+
+[[test]]
+name = "pq_attestation_aggregation"
+path = "tests/pq_attestation_aggregation.rs"
 required-features = ["pq-devnet"]

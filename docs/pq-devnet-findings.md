@@ -898,3 +898,59 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   this host; a malformed-single contextual verification run completed in 23.89 seconds. After
   adding direct nonzero-data-index, bitfield/claimed-signer mismatch, and cross-contribution overlap
   regressions, the final serialized isolated suite passed 13/13 in 138.00 seconds.
+
+### 2026-08-18: Failure-atomic PQ attestation aggregation coordinator implemented
+
+- `attestation_aggregation` is a new optional workspace crate whose default build has no normal
+  dependencies. Its `pq-attestation` feature enables only the consensus-signature PQ backend, the
+  narrow state-processing attestation surface, PQ wire types, and its own `parking_lot` mutex. It
+  does not enable `operation_pool` or `beacon_chain`; those integrations remain Task 5.2b.
+- State processing now offers an owned prepare/verify transition. It releases every state, registry,
+  and committee-cache borrow before awaiting `AggregationService`, and only successful contextual
+  verification can construct the opaque `VerifiedPqAttestation`. Callers have read-only views of
+  the owned Electra attestation, exact sorted signer indices, and claim. A compile-fail test guards
+  the private constructor/evidence fields.
+- Candidate buckets contain the full `AttestationData` and exactly one Electra committee index.
+  The bounded state machine uses monotonic IDs, rejects equal/subset candidates, replaces strict
+  subsets, retains overlapping incomparable candidates, and selects largest-first disjoint sets
+  with insertion-ID tie-breaking. Both candidate and signer unions stop at sixteen, and generation
+  overflow fails before mutation.
+- Coordinator-wide retention is also bounded under that mutex: at most 64 distinct buckets and at
+  most 8 MiB (`V1_MAX_AGGREGATION_INPUT_BYTES`) of actual `SameMessageEvidence` bytes. Sixty-four is
+  four times the Minimal preset's honest two-epoch, sixteen-slot window. New-bucket and byte
+  capacity are checked before cloning/inserting candidate storage; exact caps are accepted and
+  cap-plus-one returns a specific outcome without mutation. Existing-bucket insert, dominance
+  replacement, aggregate commit, and concurrent-dominated-arrival cleanup all maintain checked
+  byte accounting.
+- Snapshot selection, ID/handle cloning, and the in-flight mark occur under one mutex. Owned job
+  construction and `.await` occur after releasing it. Commit rechecks every selected ID and `Arc`
+  identity, then replaces selected sources and any concurrent candidate dominated by the finished
+  signer union with union bits plus evidence in one lock hold. Genuinely incomparable/unrelated
+  arrivals survive. Pruned selections return `StaleSnapshot`; construction, queue,
+  backend, invalid-evidence, and dropped-preparation paths clear the in-flight marker and preserve
+  sources for retry. Invalid evidence after insertion is classified as a local invariant failure,
+  not peer blame.
+- `prune_before_slot` atomically removes buckets whose attestation slot is below the caller cutoff
+  and releases their candidate/evidence accounting. Current and future buckets are untouched. If
+  pruning removes an in-flight bucket, the shared prepared execution becomes `StaleSnapshot`; a
+  later commit, failure, or drop cannot recreate the bucket.
+- Fifteen fast tests cover dominance, including concurrent-arrival dominance at commit, stable
+  disjoint selection, one-through-sixteen limits and
+  cap-plus-one, exact/max-plus-one global bucket and byte caps without large allocations, pruning
+  capacity reuse, in-flight prune staleness on success and backend failure, replacement-token
+  isolation after prune/recreate, committee isolation, singleton/no-proof selection,
+  one in-flight snapshot,
+  unrelated arrival preservation, stale selected pruning, retry preservation, lock re-entry, and
+  generation exhaustion. The fake executor and real verifier now use the same private prepared
+  execution owner for unlocked await, failure/drop cleanup, stale checking, and atomic commit. The
+  real serialized AVX2 test uses two journal-backed raw signatures, verifies dropped preparation
+  and synchronous job-construction failure both permit retry, forces a wrong-key contextual
+  execution failure and successful retry, enforces one in-flight proof, commits and re-verifies the
+  two-bit recursive child, and rejects altered bits, root, leaf, and key. It passed 1/1 in 137.36
+  seconds (137.66 seconds command wall time) with a 794,400 KiB
+  command-tree peak RSS and zero swaps.
+- Raw-plus-child catch-up needs at least three distinct validators in one committee. With the V1
+  registry capped at sixteen, Minimal preset slot committees contain only two validators, so that
+  coordinator case is not constructible without changing the frozen profile or introducing a
+  test-only consensus preset. Task 5.1 already exercises real raw-plus-child recursion; this slice
+  records the coordinator limitation rather than weakening state-derived committee validation.
