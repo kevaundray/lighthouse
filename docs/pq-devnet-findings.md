@@ -10,8 +10,9 @@ testing, or devnet operation changes an assumption below.
 - Mainnet interoperability is not required for the PQ build.
 - KZG remains unchanged. Its use of BLS12-381 is not a validator-signature dependency.
 - The first devnet may intentionally omit post-genesis deposits, Web3Signer, external builders,
-  and BLS-to-execution-change operations. These exclusions must be explicit in configuration and
-  must not silently fall back to BLS validator signatures.
+  distributed-validator signing, voluntary exits, offline exit signing, Gloas, and
+  BLS-to-execution-change operations. These exclusions must be explicit in configuration and must
+  not silently fall back to BLS validator signatures.
 - A working result requires at least two nodes to start from the same genesis, connect, propose
   blocks, exchange attestations, verify PQ signing evidence, and advance/finalize the chain.
 
@@ -158,18 +159,52 @@ must classify decode/invalid-proof errors separately from local setup/prover fai
    migration.
 7. Preserve BLS as a regression backend during development. Existing consensus vectors are the
    oracle for the branch-by-abstraction refactor.
+8. Start the first PQ profile at Electra and keep Gloas disabled. Enabled sync-committee duties
+   use PQ evidence; they are not silently skipped or signed with BLS.
+9. Use the versioned `LeanPqDevnetV1` one-time-use layout below. Any added duty creates a new
+   profile and regenerated validator keys rather than silently changing offsets.
+
+## LeanPqDevnetV1 Signing-Duty Layout
+
+The initial Electra profile reserves 14 dense XMSS leaves per Ethereum slot:
+
+| Offset | Duty |
+| ---: | --- |
+| 0 | RANDAO reveal for the containing proposal slot |
+| 1 | Beacon block proposal |
+| 2 | Attestation |
+| 3 | Attestation selection proof |
+| 4 | Aggregate and proof |
+| 5 | Sync committee message |
+| 6–9 | Sync selection proof for subcommittee 0–3 |
+| 10–13 | Sync contribution and proof for subcommittee 0–3 |
+
+The checked mapping is `ethereum_slot * 14 + duty_offset`. Subcommittee indices at least four are
+rejected before conversion. The arithmetic maximum is slot 306,783,377; practical validator key
+ranges are much smaller and fixed by the devnet configuration before genesis. The initial smoke
+network should provision at least the planned runtime plus the 16-slot sync-duty lookahead. For a
+64-slot run this is 80 slot rows, or 1,120 leaves per validator.
+
+The semantic slot comes from the object being signed, never wall-clock time: proposal slot for
+RANDAO and blocks, attestation data slot, selection slot, aggregate data slot, sync message slot,
+and contribution slot plus subcommittee. RANDAO therefore needs its containing proposal slot added
+to the local signing request even though its BLS signing root contains only the epoch.
+
+The journal provides fail-closed at-most-one-publication semantics per duty instance. An identical
+root may be retried; a different root for the same duty and slot is refused. Supporting multiple
+aggregate attempts would require an explicit protocol attempt identifier and is outside V1.
+
+No one-time-use leaf is allocated for an empty sync aggregate or a Gloas self-build placeholder.
+Those require explicit absent/empty evidence rules rather than fake infinity signatures in PQ.
 
 ## Open Questions
 
 - Exact XMSS parameter set for the first devnet: inspected 32-byte/1,208-byte configuration or a
   newer higher-security configuration.
-- Exact duty-tag allocation and the number of XMSS leaves reserved per Ethereum slot.
 - Whether validator proposal and attestation duties use one tree with disjoint leaves or distinct
   keys/trees.
 - Whether the first block format carries one proof per aggregate or bounded multi-claim proof
   groups.
-- Whether sync committee signatures are included in milestone one or enabled after attestation
-  aggregation.
 - Required validator count and target hardware for the acceptance devnet.
 - Whether an external proving service is needed after initial end-to-end measurements.
 - Whether to require AVX2 for the entire first-devnet binary or patch leanVM for correct runtime
@@ -196,3 +231,13 @@ must classify decode/invalid-proof errors separately from local setup/prover fai
   range cannot be extended without changing validator public keys.
 - Identified strict evidence-kind decoding, setup ergonomics, limits, and license metadata as the
   minimal binding-fork delta.
+
+### 2026-08-18: Validator signing-duty inventory
+
+- Confirmed that production validator-client signing converges on
+  `validator_client/signing_method`, while account-manager offline exits bypass it.
+- Identified every same-slot collision, including proposal plus RANDAO, attester/aggregator duties,
+  and per-subcommittee sync selection/contribution duties.
+- Chose the dense 14-leaf `LeanPqDevnetV1` Electra layout and explicit initial exclusions above.
+- Confirmed validator registrations have no consensus slot and remote/distributed signers cannot
+  own the required local XMSS journal; PQ startup must reject those configurations.

@@ -294,11 +294,17 @@ git commit -m "build: pin lean multisig backend"
 
 Tests must cover:
 
-- every enabled `SignableMessage` variant maps to a stable duty tag;
+- all 14 `LeanPqDevnetV1` duty instances map to offsets `0..=13` exactly;
 - two different duties in one Ethereum slot receive different XMSS leaves;
 - the same duty and slot reproduce the same leaf;
-- overflow and devnet-lifetime violations return errors without panicking;
-- no duty tag is reused.
+- adjacent slots cannot collide;
+- sync subcommittees `0..=3` succeed while `4` and `u64::MAX` are rejected;
+- maximum slot 306,783,377 succeeds and the next slot is rejected without panicking;
+- every enabled `SignableMessage` arm extracts its semantic object slot and expected duty;
+- RANDAO uses the containing proposal slot rather than epoch start;
+- validator registration, remote/distributed signing, offline exits, voluntary exits, and Gloas
+  duties are explicitly unsupported under V1;
+- empty sync aggregates and self-build placeholders allocate no leaf.
 
 **Step 2: Verify RED**
 
@@ -310,8 +316,10 @@ Expected: compilation fails because `SigningId` and the allocation table do not 
 
 **Step 3: Implement the minimal checked mapping**
 
-Use checked arithmetic. Keep the number of leaves per slot and every assigned duty tag explicit.
-Do not hash duty names into leaf IDs.
+Implement the versioned Electra V1 table from `docs/pq-devnet-findings.md` with
+`LEAVES_PER_SLOT = 14` and checked `slot * 14 + duty_offset` arithmetic. Keep every assigned duty
+tag explicit; do not hash duty names or cast unchecked enum discriminants into leaf IDs. Add the
+containing proposal slot to RANDAO signing intent even though its signing root is epoch-bound.
 
 **Step 4: Verify GREEN**
 
