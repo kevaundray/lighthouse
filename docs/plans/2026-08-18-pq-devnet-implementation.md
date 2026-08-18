@@ -343,8 +343,11 @@ Tests must cover:
 - maximum slot 306,783,377 succeeds and the next slot is rejected without panicking;
 - every enabled `SignableMessage` arm extracts its semantic object slot and expected duty;
 - RANDAO uses the containing proposal slot rather than epoch start;
-- validator registration, remote/distributed signing, offline exits, voluntary exits, and Gloas
-  duties are explicitly unsupported under V1;
+- validator registration, voluntary exits, and Gloas `SignableMessage` arms return explicit V1
+  unsupported errors;
+- remote/distributed signing and account-manager offline exits are documented exclusions in this
+  allocation task; their startup/invocation enforcement and tests belong to Tasks 3.3 and 6.2
+  rather than a fake signing-duty API;
 - empty sync aggregates and self-build placeholders allocate no leaf.
 
 **Step 2: Verify RED**
@@ -527,6 +530,8 @@ git commit -m "feat: add experimental PQ validator keys"
 **Step 1: Write failing duty-signing tests**
 
 Cover proposer and attester duties first, including identical retry and conflicting-root refusal.
+Add PQ startup tests that reject Web3Signer and any other remote/distributed signing method before
+duties begin.
 
 **Step 2: Verify RED**
 
@@ -535,7 +540,8 @@ Run the targeted signing-method/validator-store tests. Expected: PQ signing is u
 **Step 3: Implement PQ local signing**
 
 Reserve the leaf durably, sign in a blocking/scoped worker, and return the explicit raw wire type.
-Reject Web3Signer configuration in PQ mode with a clear startup error.
+Accept only the local journal-owning PQ signing method in PQ mode; reject Web3Signer and other
+remote/distributed signing configurations with a clear startup error.
 
 **Step 4: Verify GREEN**
 
@@ -777,13 +783,14 @@ git commit -m "feat: support bounded PQ network messages"
 - Modify: `beacon_node/http_api/`
 - Modify: `validator_client/http_api/`
 - Modify: `validator_client/signing_method/src/web3signer.rs`
+- Modify: `account_manager/`
 - Modify: builder configuration/startup validation
 - Create: API serialization and startup-validation tests
 
 **Step 1: Write failing tests**
 
-Cover PQ JSON round trips plus explicit startup errors for Web3Signer and external builder modes in
-the first PQ devnet.
+Cover PQ JSON round trips plus explicit startup/configuration errors for external builder modes and
+an explicit unsupported error from account-manager offline-exit signing in the first PQ devnet.
 
 **Step 2: Verify RED**
 

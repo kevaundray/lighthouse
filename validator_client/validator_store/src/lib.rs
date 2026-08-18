@@ -126,7 +126,7 @@ pub trait ValidatorStore: Send + Sync {
     fn randao_reveal(
         &self,
         validator_pubkey: PublicKeyBytes,
-        signing_epoch: Epoch,
+        proposal_slot: Slot,
     ) -> impl Future<Output = Result<Signature, Error<Self::Error>>> + Send;
 
     fn set_validator_index(&self, validator_pubkey: &PublicKeyBytes, index: u64);
@@ -230,6 +230,19 @@ pub trait ValidatorStore: Send + Sync {
 pub enum UnsignedBlock<E: EthSpec> {
     Full(FullBlockContents<E>),
     Blinded(BlindedBeaconBlock<E>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn randao_reveal_api_is_keyed_by_proposal_slot() {
+        #[allow(dead_code)]
+        fn call_with_slot<S: ValidatorStore>(store: &S, public_key: PublicKeyBytes) {
+            std::mem::drop(store.randao_reveal(public_key, Slot::new(95)));
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

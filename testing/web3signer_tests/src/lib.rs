@@ -635,7 +635,7 @@ mod tests {
         .await
         .assert_signatures_match("randao_reveal", |pubkey, validator_store| async move {
             validator_store
-                .randao_reveal(pubkey, Epoch::new(0))
+                .randao_reveal(pubkey, Slot::new(95))
                 .await
                 .unwrap()
         })

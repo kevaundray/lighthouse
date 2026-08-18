@@ -8638,6 +8638,7 @@ name = "signing_method"
 version = "0.1.0"
 dependencies = [
  "bls",
+ "consensus_signature",
  "eth2_keystore",
  "ethereum_serde_utils",
  "lockfile",

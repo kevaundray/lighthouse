@@ -4,6 +4,7 @@
 //! - Via a remote signer (Web3Signer)
 
 use bls::{Keypair, PublicKey, Signature};
+use consensus_signature::{OneTimeUseId, SigningDuty, SigningIdError};
 use eth2_keystore::Keystore;
 use lockfile::Lockfile;
 use parking_lot::Mutex;
@@ -32,11 +33,23 @@ pub enum Error {
     TokioJoin(String),
     MergeForkNotSupported,
     GenesisForkVersionRequired,
+    PqSigningDutyUnsupported(UnsupportedPqSigningDuty),
+    PqSigningId(SigningIdError),
+}
+
+/// A signing request deliberately excluded from the frozen `LeanPqDevnetV1` profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnsupportedPqSigningDuty {
+    ValidatorRegistration,
+    VoluntaryExit,
+    ExecutionPayloadEnvelope,
+    PayloadAttestation,
+    ProposerPreferences,
 }
 
 /// Enumerates all messages that can be signed by a validator.
 pub enum SignableMessage<'a, E: EthSpec, Payload: AbstractExecPayload<E> = FullPayload<E>> {
-    RandaoReveal(Epoch),
+    RandaoReveal(Slot),
     BeaconBlock(&'a BeaconBlock<E, Payload>),
     AttestationData(&'a AttestationData),
     SignedAggregateAndProof(AggregateAndProofRef<'a, E>),
@@ -61,7 +74,9 @@ impl<E: EthSpec, Payload: AbstractExecPayload<E>> SignableMessage<'_, E, Payload
     /// not required here.
     pub fn signing_root(&self, domain: Hash256) -> Hash256 {
         match self {
-            SignableMessage::RandaoReveal(epoch) => epoch.signing_root(domain),
+            SignableMessage::RandaoReveal(proposal_slot) => proposal_slot
+                .epoch(E::slots_per_epoch())
+                .signing_root(domain),
             SignableMessage::BeaconBlock(b) => b.signing_root(domain),
             SignableMessage::AttestationData(a) => a.signing_root(domain),
             SignableMessage::SignedAggregateAndProof(a) => a.signing_root(domain),
@@ -77,6 +92,69 @@ impl<E: EthSpec, Payload: AbstractExecPayload<E>> SignableMessage<'_, E, Payload
             SignableMessage::PayloadAttestationData(d) => d.signing_root(domain),
             SignableMessage::ProposerPreferences(p) => p.signing_root(domain),
         }
+    }
+
+    /// Extracts the semantic duty and stateful-signature leaf for the V1 PQ profile.
+    pub fn lean_pq_devnet_v1_signing_id(&self) -> Result<(Slot, SigningDuty, OneTimeUseId), Error> {
+        let (slot, duty) = match self {
+            SignableMessage::RandaoReveal(proposal_slot) => {
+                (*proposal_slot, SigningDuty::RandaoReveal)
+            }
+            SignableMessage::BeaconBlock(block) => (block.slot(), SigningDuty::BeaconBlockProposal),
+            SignableMessage::AttestationData(attestation) => {
+                (attestation.slot, SigningDuty::Attestation)
+            }
+            SignableMessage::SignedAggregateAndProof(aggregate_and_proof) => (
+                aggregate_and_proof.aggregate().data().slot,
+                SigningDuty::AggregateAndProof,
+            ),
+            SignableMessage::SelectionProof(slot) => {
+                (*slot, SigningDuty::AttestationSelectionProof)
+            }
+            SignableMessage::SyncSelectionProof(selection) => (
+                selection.slot,
+                SigningDuty::sync_selection_proof(selection.subcommittee_index)
+                    .map_err(Error::PqSigningId)?,
+            ),
+            SignableMessage::SyncCommitteeSignature { slot, .. } => {
+                (*slot, SigningDuty::SyncCommitteeMessage)
+            }
+            SignableMessage::SignedContributionAndProof(contribution_and_proof) => (
+                contribution_and_proof.contribution.slot,
+                SigningDuty::sync_contribution_and_proof(
+                    contribution_and_proof.contribution.subcommittee_index,
+                )
+                .map_err(Error::PqSigningId)?,
+            ),
+            SignableMessage::ValidatorRegistration(_) => {
+                return Err(Error::PqSigningDutyUnsupported(
+                    UnsupportedPqSigningDuty::ValidatorRegistration,
+                ));
+            }
+            SignableMessage::VoluntaryExit(_) => {
+                return Err(Error::PqSigningDutyUnsupported(
+                    UnsupportedPqSigningDuty::VoluntaryExit,
+                ));
+            }
+            SignableMessage::ExecutionPayloadEnvelope(_) => {
+                return Err(Error::PqSigningDutyUnsupported(
+                    UnsupportedPqSigningDuty::ExecutionPayloadEnvelope,
+                ));
+            }
+            SignableMessage::PayloadAttestationData(_) => {
+                return Err(Error::PqSigningDutyUnsupported(
+                    UnsupportedPqSigningDuty::PayloadAttestation,
+                ));
+            }
+            SignableMessage::ProposerPreferences(_) => {
+                return Err(Error::PqSigningDutyUnsupported(
+                    UnsupportedPqSigningDuty::ProposerPreferences,
+                ));
+            }
+        };
+        let one_time_use_id =
+            OneTimeUseId::for_lean_pq_devnet_v1(slot.as_u64(), duty).map_err(Error::PqSigningId)?;
+        Ok((slot, duty, one_time_use_id))
     }
 }
 
@@ -211,7 +289,8 @@ impl SigningMethod {
 
                 // Map the message into a Web3Signer type.
                 let object = match signable_message {
-                    SignableMessage::RandaoReveal(epoch) => {
+                    SignableMessage::RandaoReveal(proposal_slot) => {
+                        let epoch = proposal_slot.epoch(E::slots_per_epoch());
                         Web3SignerObject::RandaoReveal { epoch }
                     }
                     SignableMessage::BeaconBlock(block) => Web3SignerObject::beacon_block(block)?,
@@ -280,6 +359,205 @@ impl SigningMethod {
 
                 Ok(response.signature)
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bls::PublicKeyBytes;
+    use consensus_signature::{IndividualSignature, OneTimeUseId, SigningDuty};
+
+    fn assert_signing_id<Payload: AbstractExecPayload<MinimalEthSpec>>(
+        message: SignableMessage<'_, MinimalEthSpec, Payload>,
+        expected_slot: Slot,
+        expected_duty: SigningDuty,
+    ) {
+        assert_eq!(
+            message.lean_pq_devnet_v1_signing_id(),
+            Ok((
+                expected_slot,
+                expected_duty,
+                OneTimeUseId::for_lean_pq_devnet_v1(expected_slot.as_u64(), expected_duty,)
+                    .expect("test slot is supported"),
+            ))
+        );
+    }
+
+    #[test]
+    fn randao_uses_the_containing_proposal_slot() {
+        let proposal_slot = Slot::new(95);
+        let message =
+            SignableMessage::<MinimalEthSpec, BlindedPayload<MinimalEthSpec>>::RandaoReveal(
+                proposal_slot,
+            );
+        let domain = Hash256::repeat_byte(0x42);
+
+        assert_eq!(
+            message.lean_pq_devnet_v1_signing_id(),
+            Ok((
+                proposal_slot,
+                SigningDuty::RandaoReveal,
+                OneTimeUseId::for_lean_pq_devnet_v1(
+                    proposal_slot.as_u64(),
+                    SigningDuty::RandaoReveal,
+                )
+                .expect("test slot is supported"),
+            ))
+        );
+        assert_eq!(
+            message.signing_root(domain),
+            proposal_slot
+                .epoch(MinimalEthSpec::slots_per_epoch())
+                .signing_root(domain)
+        );
+    }
+
+    #[test]
+    fn enabled_electra_messages_use_their_semantic_object_slots() {
+        let slot = Slot::new(1_234);
+        let mut spec = ChainSpec::minimal();
+        spec.electra_fork_epoch = Some(Epoch::new(0));
+        spec.gloas_fork_epoch = None;
+
+        let mut block = BeaconBlock::<MinimalEthSpec, BlindedPayload<MinimalEthSpec>>::empty(&spec);
+        *block.slot_mut() = slot;
+        assert_signing_id(
+            SignableMessage::BeaconBlock(&block),
+            slot,
+            SigningDuty::BeaconBlockProposal,
+        );
+
+        let attestation_data = AttestationData {
+            slot,
+            ..AttestationData::default()
+        };
+        assert_signing_id::<BlindedPayload<MinimalEthSpec>>(
+            SignableMessage::AttestationData(&attestation_data),
+            slot,
+            SigningDuty::Attestation,
+        );
+
+        let aggregate = Attestation::<MinimalEthSpec>::empty_for_signing(
+            0,
+            1,
+            slot,
+            Hash256::ZERO,
+            Checkpoint::default(),
+            Checkpoint::default(),
+            false,
+            &spec,
+        )
+        .expect("valid Electra test attestation");
+        let aggregate_and_proof = AggregateAndProof::from_attestation(
+            0,
+            aggregate,
+            SelectionProof::from(IndividualSignature::empty()),
+        );
+        assert_signing_id::<BlindedPayload<MinimalEthSpec>>(
+            SignableMessage::SignedAggregateAndProof(aggregate_and_proof.to_ref()),
+            slot,
+            SigningDuty::AggregateAndProof,
+        );
+
+        assert_signing_id::<BlindedPayload<MinimalEthSpec>>(
+            SignableMessage::SelectionProof(slot),
+            slot,
+            SigningDuty::AttestationSelectionProof,
+        );
+
+        let sync_selection = SyncAggregatorSelectionData {
+            slot,
+            subcommittee_index: 2,
+        };
+        assert_signing_id::<BlindedPayload<MinimalEthSpec>>(
+            SignableMessage::SyncSelectionProof(&sync_selection),
+            slot,
+            SigningDuty::sync_selection_proof(2).expect("subcommittee two is supported"),
+        );
+
+        assert_signing_id::<BlindedPayload<MinimalEthSpec>>(
+            SignableMessage::SyncCommitteeSignature {
+                beacon_block_root: Hash256::ZERO,
+                slot,
+            },
+            slot,
+            SigningDuty::SyncCommitteeMessage,
+        );
+
+        let sync_message = SyncCommitteeMessage {
+            slot,
+            beacon_block_root: Hash256::ZERO,
+            validator_index: 0,
+            signature: IndividualSignature::empty(),
+        };
+        let contribution =
+            SyncCommitteeContribution::<MinimalEthSpec>::from_message(&sync_message, 3, 0)
+                .expect("valid test contribution");
+        let contribution_and_proof = ContributionAndProof {
+            aggregator_index: 0,
+            contribution,
+            selection_proof: IndividualSignature::empty(),
+        };
+        assert_signing_id::<BlindedPayload<MinimalEthSpec>>(
+            SignableMessage::SignedContributionAndProof(&contribution_and_proof),
+            slot,
+            SigningDuty::sync_contribution_and_proof(3).expect("subcommittee three is supported"),
+        );
+    }
+
+    #[test]
+    fn v1_explicitly_rejects_messages_outside_the_electra_profile() {
+        let registration = ValidatorRegistrationData {
+            fee_recipient: Address::ZERO,
+            gas_limit: 0,
+            timestamp: 0,
+            pubkey: PublicKeyBytes::empty(),
+        };
+        let voluntary_exit = VoluntaryExit {
+            epoch: Epoch::new(1),
+            validator_index: 0,
+        };
+        let envelope = ExecutionPayloadEnvelope::<MinimalEthSpec>::empty();
+        let payload_attestation = PayloadAttestationData {
+            beacon_block_root: Hash256::ZERO,
+            slot: Slot::new(1),
+            payload_present: false,
+            blob_data_available: false,
+        };
+        let preferences = ProposerPreferences::default();
+
+        let cases = [
+            (
+                SignableMessage::<MinimalEthSpec, BlindedPayload<MinimalEthSpec>>::ValidatorRegistration(
+                    &registration,
+                ),
+                UnsupportedPqSigningDuty::ValidatorRegistration,
+            ),
+            (
+                SignableMessage::VoluntaryExit(&voluntary_exit),
+                UnsupportedPqSigningDuty::VoluntaryExit,
+            ),
+            (
+                SignableMessage::ExecutionPayloadEnvelope(&envelope),
+                UnsupportedPqSigningDuty::ExecutionPayloadEnvelope,
+            ),
+            (
+                SignableMessage::PayloadAttestationData(&payload_attestation),
+                UnsupportedPqSigningDuty::PayloadAttestation,
+            ),
+            (
+                SignableMessage::ProposerPreferences(&preferences),
+                UnsupportedPqSigningDuty::ProposerPreferences,
+            ),
+        ];
+
+        for (message, duty) in cases {
+            assert_eq!(
+                message.lean_pq_devnet_v1_signing_id(),
+                Err(Error::PqSigningDutyUnsupported(duty))
+            );
         }
     }
 }

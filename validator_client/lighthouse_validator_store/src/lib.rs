@@ -950,14 +950,15 @@ impl<T: SlotClock + 'static, E: EthSpec> ValidatorStore for LighthouseValidatorS
     async fn randao_reveal(
         &self,
         validator_pubkey: PublicKeyBytes,
-        signing_epoch: Epoch,
+        proposal_slot: Slot,
     ) -> Result<Signature, Error> {
         let signing_method = self.doppelganger_checked_signing_method(validator_pubkey)?;
+        let signing_epoch = proposal_slot.epoch(E::slots_per_epoch());
         let signing_context = self.signing_context(Domain::Randao, signing_epoch);
 
         let signature = signing_method
             .get_signature::<E, BlindedPayload<E>>(
-                SignableMessage::RandaoReveal(signing_epoch),
+                SignableMessage::RandaoReveal(proposal_slot),
                 signing_context,
                 &self.spec,
                 &self.task_executor,

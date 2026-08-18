@@ -340,3 +340,22 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   be reordered for PQ.
 - Confirmed validator deletion, EIP-3076 export, and recoverable-cache repair cannot delete,
   recreate, or substitute for XMSS usage state.
+
+### 2026-08-18: Frozen duty allocation implemented
+
+- Added semantic `SigningDuty` and `OneTimeUseId` types with the frozen 14-leaf
+  `LeanPqDevnetV1` mapping. Every duty offset is explicit; slot multiplication, offset addition,
+  and `u32` conversion are checked.
+- Enforced sync subcommittee indices `0..=3` and the maximum complete duty-row slot
+  `306,783,377`. Slot `306,783,378` is rejected for every duty even though its first four leaf
+  values would individually fit, so every accepted slot has a complete stable row.
+- Production `SignableMessage` extraction now obtains the slot from the signed object for all
+  enabled Electra duties. Validator registration, voluntary exit, execution-payload envelope,
+  payload attestation, and proposer preferences return typed V1-unsupported errors.
+- Changed the validator-store RANDAO API to accept the containing proposal slot. The validator
+  store and Web3Signer adapter derive the epoch from that slot, preserving the existing BLS
+  signing root while retaining the distinct V1 RANDAO leaf.
+- Remote/distributed signing and account-manager offline exits remain outside this local mapping;
+  they do not get invented `SignableMessage` variants. Tasks 3.3 and 6.2 own their explicit
+  startup/invocation rejection tests. Empty sync aggregates and Gloas self-build placeholders are
+  not `SignableMessage` signing requests and allocate no leaf.
