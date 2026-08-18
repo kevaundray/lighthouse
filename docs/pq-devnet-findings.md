@@ -58,8 +58,10 @@ testing, or devnet operation changes an assumption below.
 - Durable leaf-use state is part of cryptographic safety, not merely ordinary slashing
   protection. The signer must durably record `(leaf_id, signing_root)` before publication. A
   repeated identical root may be returned; a different root for an occupied leaf must fail hard.
-- Raw signatures and recursive aggregate proofs are different consensus types. In particular,
-  Lighthouse's current use of `AggregateSignature` inside `SingleAttestation` must be split.
+- Individual-signature fields and same-message evidence are different consensus concepts.
+  `SingleAttestation` must use a cheap promotable same-message evidence container: BLS stores its
+  existing aggregate point, while PQ may store either a tagged raw signature or recursive proof.
+  Converting a single attestation to indexed form must never invoke the prover.
 - PQ aggregate proof bytes must be length-bounded before allocation or parsing. The initial
   candidate limit is 512 KiB, subject to measurements with the exact pinned backend.
 

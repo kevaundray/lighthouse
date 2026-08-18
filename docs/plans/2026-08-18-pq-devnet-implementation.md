@@ -187,7 +187,7 @@ git add consensus/state_processing crypto/consensus_signature
 git commit -m "refactor: route consensus verification through signature facade"
 ```
 
-### Task 1.3: Separate raw and aggregate semantic types while retaining BLS bytes
+### Task 1.3: Separate individual and same-message semantic types while retaining BLS bytes
 
 **Files:**
 
@@ -212,8 +212,11 @@ Expected: compilation fails until the semantic types exist at the requested fiel
 
 **Step 3: Introduce BLS-backed newtypes or aliases**
 
-`SingleAttestation` and other one-signer objects use `RawSignature`; aggregate attestations and
-sync aggregates use `AggregateSignature`. Preserve exact BLS SSZ encodings.
+One-signer proposal, sync-message, and wrapper fields use `IndividualSignature`.
+`SingleAttestation`, indexed/aggregate attestations, contributions, and sync aggregates use
+`SameMessageEvidence`, whose PQ representation may contain a tagged raw signature or proof.
+Promotion of individual evidence into same-message evidence must be cheap and must not prove.
+Preserve exact BLS SSZ encodings.
 
 **Step 4: Verify GREEN**
 
@@ -229,7 +232,7 @@ Expected: schema and existing type tests pass.
 
 ```bash
 git add crypto/consensus_signature consensus/types
-git commit -m "refactor: distinguish raw and aggregate signing evidence"
+git commit -m "refactor: name consensus signing evidence semantically"
 ```
 
 ## Milestone 2: Pin and Adapt leanMultisig
