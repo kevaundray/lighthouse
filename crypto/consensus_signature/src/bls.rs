@@ -215,6 +215,9 @@ fn signature_set(request: VerificationRequest<'_>) -> bls::SignatureSet<'_> {
 pub(crate) fn aggregate_job(
     job: ValidatedAggregationJob,
 ) -> Result<SameMessageEvidence, AggregationError> {
+    // BLS executes synchronously, but consumes the same validated accounting metadata so backend
+    // selection does not change the operation-level job shape.
+    let _queued_evidence_bytes = job.queued_evidence_bytes;
     for contribution in &job.contributions {
         let public_keys = contribution
             .signers

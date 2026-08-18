@@ -1556,46 +1556,188 @@ git add Cargo.toml Cargo.lock beacon_node/attestation_aggregation consensus/stat
 git commit -m "feat: coordinate PQ attestation aggregation"
 ```
 
-### Task 5.3: Verify PQ block and gossip evidence
+### Task 5.3a: Add reserved priority admission to the singleton PQ worker
+
+**Prerequisites:** Task 5.1.
+
+Verification and recursive proving currently share one capacity-one queue. A local proof can fill
+that queue and turn valid block or attestation gossip into a local `QueueSaturated` failure. Never
+create a second prover owner: leanMultisig setup and process-global proving state are singleton.
 
 **Files:**
 
-- Modify: `consensus/state_processing/src/per_block_processing/signature_sets.rs`
-- Modify: `consensus/state_processing/src/per_block_processing/block_signature_verifier.rs`
-- Modify: `beacon_node/beacon_chain/src/attestation_verification.rs`
-- Modify: `beacon_node/beacon_chain/src/attestation_verification/batch.rs`
-- Modify: `beacon_node/beacon_chain/src/sync_committee_verification.rs`
-- Create: PQ block/gossip adversarial tests
+- Modify: `crypto/consensus_signature/Cargo.toml`
+- Modify: `crypto/consensus_signature/src/aggregation.rs`
+- Modify: `crypto/consensus_signature/src/pq.rs`
+- Modify: `crypto/consensus_signature/tests/aggregation.rs`
+- Modify: PQ worker/privacy tests and `docs/pq-devnet-findings.md`
 
-**Step 1: Write failing verification tests**
+**Step 1: Write failing scheduler tests**
 
-Cover valid proposer/raw attestation/aggregate proof, wrong leaf, wrong root, wrong signer bits,
-malformed proof, proof over size limit, and mixed valid/invalid batch behaviour.
+Cover three explicit work classes in this order: block/import verification, attestation-gossip
+verification, and local aggregation proving. Prove that a full aggregation queue cannot reject a
+reserved block request, block work runs before queued gossip/proving, each class is FIFO, all queues
+and total queued evidence bytes are bounded before admission while the active job remains
+separately per-job bounded, dropped queued receivers are skipped,
+shutdown drains admitted work without blocking Drop, and a caught worker panic permanently poisons
+the lifecycle and resolves every queued receiver.
 
-**Step 2: Verify RED under PQ mode**
+**Step 2: Verify RED**
 
-Expected: BLS `SignatureSet` construction or batch verification is still reached.
+Expected: `AggregationService` has only one undifferentiated `aggregate` entry point backed by a
+single `sync_channel(1)`.
 
-**Step 3: Reconstruct PQ context and invoke the verification engine**
+**Step 3: Implement one bounded priority scheduler**
 
-Resolve signer keys from state only after validating attacker-controlled indices. Ensure expensive
-verification executes outside async workers and has admission limits.
+Keep `aggregate(job)` as the low-priority proving API. Add an explicit verification API accepting
+only `Block` or `Gossip` admission classes; do not expose arbitrary numeric priority. Default BLS
+executes immediately and ignores scheduling. PQ validates and owns each job before enqueueing it.
 
-**Step 4: Verify GREEN under both backends**
+Replace the single channel with one private mutex/condition-variable scheduler owned by the same
+512 MiB worker. Give block verification reserved capacity, gossip bounded capacity, and aggregation
+one queued slot. Also cap total queued encoded evidence bytes with checked accounting so count
+bounds cannot retain many maximum-size jobs. The worker always pops block, then gossip, then local
+proof, checking receiver cancellation at the last safe point. Once backend work begins it remains
+non-cancellable. On panic, poison the process lifecycle, return `WorkerPanicked` to the active
+request, and resolve or drop every queued response as `WorkerStopped`.
 
-Run targeted state-processing and beacon-chain tests.
+Freeze the first conservative queued-only budgets at two block jobs/1 MiB, four gossip jobs/2 MiB,
+and one local aggregation job/8 MiB, with an 11 MiB checked global sum. Each verification slot can
+therefore hold one maximum 512 KiB evidence envelope and every class owns its byte budget: lower
+classes cannot consume block reservation. An active job is no longer queued and is separately
+bounded by the existing 8 MiB per-job cap, so the maximum retained evidence is 19 MiB plus bounded
+job metadata. Admission must opportunistically purge cancelled queued receivers before applying
+these limits, while the worker repeats the cancellation check at the last safe point.
 
-**Step 5: Commit**
+Process all jobs for one imported block sequentially in later tasks; fan-out would self-saturate the
+bounded scheduler. Priority does not pre-empt an already-running proof. Record that limitation and
+start the devnet with 120-second slots unless release-build measurements show that another setting
+has sufficient margin. This is an initial test setting, not a latency or liveness guarantee.
+
+**Step 4: Verify and commit**
+
+Run deterministic fake-worker scheduler tests, the real AVX2 recursive proof smoke, scalar and AVX2
+Rust 1.88/Clippy checks, all-feature checks, default BLS compatibility, formatting/sorting/diff, and
+the mandatory workspace check.
 
 ```bash
-git add consensus/state_processing beacon_node/beacon_chain
-git commit -m "feat: verify PQ consensus signing evidence"
+git add crypto/consensus_signature Cargo.lock \
+  docs/plans/2026-08-18-pq-devnet-implementation.md docs/pq-devnet-findings.md
+git commit -m "feat: prioritize PQ signature verification"
 ```
+
+### Task 5.3b: Add narrow prepared and verified PQ consensus requests
+
+**Prerequisites:** Tasks 5.1a, 5.2a, and 5.3a.
+
+Do not retrofit PQ into BLS `SignatureSet` or `BlockSignatureVerifier` in this slice. They are
+synchronous, decompressed-key-oriented, and batch-oriented; the PQ boundary is contextual,
+asynchronous, bounded, and one-time-ID-aware.
+
+**Files:**
+
+- Modify: `consensus/state_processing/Cargo.toml`
+- Create: `consensus/state_processing/src/pq_profile.rs`
+- Create: `consensus/state_processing/src/pq_verification.rs`
+- Modify: `consensus/state_processing/src/lib.rs`
+- Modify: `testing/pq_devnet/Cargo.toml`
+- Create: `testing/pq_devnet/tests/pq_consensus_verification.rs`
+- Modify: `docs/pq-devnet-findings.md`
+
+**Step 1: Write failing owned-request and adversarial tests**
+
+Add domain-specific owned transitions, not a public `(domain, duty, root)` crypto escape hatch:
+
+- `PreparedPqBlockProposal -> VerifiedPqBlockProposal` for gossip;
+- `PreparedPqBlock -> VerifiedPqBlock` for proposal, RANDAO, and every included attestation;
+- `PreparedPqAggregateAndProof -> VerifiedPqAggregateAndProof` for selection proof, outer signature,
+  and the sealed inner `VerifiedPqAttestation`.
+
+The verified wrapper owns the exact object (or an `Arc` to it), so it cannot be paired with another
+block/aggregate after verification. Assert prepared values are owned, `Send`, and contain no state
+or cache reference. Their fields and constructors must remain private.
+
+Cover valid proposal, RANDAO, raw single, recursive aggregate, selection proof, and outer aggregate
+signature; wrong root, leaf, proposer/aggregator key, signer bits/set, malformed/truncated/oversized
+evidence; structural failure before unavailable backend submission; mixed valid/invalid request
+ordering; and stable peer-invalid versus local failure classification.
+
+**Step 2: Implement a feature-isolated verification module**
+
+Add `state_processing/pq-verification`, implying `pq-attestation` but still excluding the normal
+BLS transition/deposit/sync/Gloas graph. Reuse one immutable `PqValidatorKeyCache`. Validate every
+attacker-controlled index, committee, bitfield, profile, and cap before cloning evidence. Derive
+each semantic claim centrally:
+
+- proposal domain and proposal-slot `BeaconBlockProposal` leaf;
+- epoch-bound RANDAO signing root with the proposal-slot `RandaoReveal` leaf;
+- target-epoch attester domain with the attestation data-slot leaf;
+- selection-proof and aggregate-and-proof roots with the aggregate data slot and their distinct
+  duty IDs.
+
+Submit jobs sequentially through the reserved Block/Gossip scheduler classes, release state/cache
+locks first, and mutate observed/pool state only after the sealed transition succeeds.
+
+Keep hash-chain/hash-onion RANDAO as a future versioned profile. V1 retains the frozen RANDAO duty
+and 14-leaf layout. A hash-chain profile needs a genesis commitment, transition and wire rules,
+rollback/backup policy, and must not silently renumber V1 leaves.
+
+**Step 3: Verify and commit**
+
+Run the isolated AVX2 harness, default BLS state-processing regressions, Rust 1.88, warnings-denied
+Clippy, graph isolation, formatting/sorting/diff, and the mandatory workspace check.
+
+```bash
+git add consensus/state_processing testing/pq_devnet Cargo.lock \
+  docs/plans/2026-08-18-pq-devnet-implementation.md docs/pq-devnet-findings.md
+git commit -m "feat: verify PQ consensus signing requests"
+```
+
+### Task 5.3c: Require a sealed verified block at the PQ transition boundary
+
+**Prerequisites:** Task 5.3b.
+
+Add a `state_processing/pq-transition` feature that reuses the ordinary unsigned transition logic
+behind a `VerifiedPqBlock` entry point. Do not copy the state transition and do not expose a public
+PQ `NoVerification` flag.
+
+The first V1 profile is Electra from genesis with a fixed 16-validator registry. Explicitly reject
+deposits/deposit requests, proposer and attester slashings, voluntary exits, BLS-to-execution
+changes, withdrawal/consolidation requests, Fulu/Gloas, and non-empty blob commitments before
+backend work. Require stable zero-deposit `eth1_data`. Preserve normal execution-payload validation,
+slot/epoch processing, fork choice inputs, justification/finalization, and forward range-sync block
+verification.
+
+For sync committees, accept exactly zero participant bits plus canonical absent PQ evidence. Reject
+zero bits with raw/aggregate evidence and any set bit with absent/raw/aggregate evidence. Then run
+the ordinary sync reward/penalty accounting for all false positions without invoking PQ crypto or
+consuming a leaf.
+
+### Task 5.3d: Migrate RANDAO HTTP transport to the active individual signature
+
+**Prerequisites:** Tasks 5.3b and 5.3c.
+
+Introduce an active-backend serialized individual-signature transport: BLS remains exactly
+`bls::SignatureBytes`, PQ uses strict `PqRawSignature`. Migrate `common/eth2`, block-production HTTP,
+and validator block-service callers. Keep builder/relay registration keys BLS-specific. In PQ mode
+reject `skip_randao_verification`; never substitute an empty PQ signature for BLS infinity.
+
+### Task 5.3e: Integrate sealed PQ verification into BeaconChain
+
+**Prerequisites:** Tasks 5.3b-d and the top-level PQ feature spine.
+
+Rebuild an immutable `Arc<PqValidatorKeyCache>` from the 16-validator registry at startup; never
+reinterpret or write the BLS `pkc` record. Add the singleton signature service to `BeaconChain`,
+route block gossip/import/range sync and single/aggregate gossip through the prepared/verified
+domain APIs, and preserve local failures as no-peer-penalty retryable outcomes. Explicitly disable
+sync duty polling/gossip/contribution pools, slasher, light-client, checkpoint sync/backfill,
+external builders/registrations, and unsupported APIs. Only after this slice is green wire both
+attestation pools in Task 5.2b.
 
 ### Task 5.2b: Wire verified candidates into both beacon-node attestation pools
 
-**Prerequisites:** Tasks 5.2a and 5.3, plus a compiling top-level PQ feature spine for the affected
-beacon-node packages.
+**Prerequisites:** Tasks 5.2a and 5.3e, including the compiling top-level PQ feature spine for the
+affected beacon-node packages.
 
 **Files:**
 
@@ -1621,10 +1763,11 @@ that omits either real pool as completion.
 **Step 3: Replace both mutation paths with the coordinator**
 
 Embed one shared coordinator/key-cache/service owner in `BeaconChain`. Route only the sealed
-`VerifiedPqAttestation` returned by Task 5.3 into candidate storage. Make PQ aggregate retrieval
-async and on-demand; snapshot under locks, release them, await `PreparedAggregate`, and then commit
-through the coordinator. Keep the default BLS pool and persisted `pkc` representation byte-for-byte
-unchanged.
+`VerifiedPqAttestation` returned by the Task 5.3e BeaconChain gossip path, using the domain
+verification transition introduced in Task 5.3b, into candidate storage. Make PQ aggregate
+retrieval async and on-demand; snapshot under locks, release them, await `PreparedAggregate`, and
+then commit through the coordinator. Keep the default BLS pool and persisted `pkc` representation
+byte-for-byte unchanged.
 
 For the first V1 operation pool, use candidate-only policy: retain verified aggregate gossip, drop
 dominated duplicates, and select maximal candidates for blocks. Do not synthesize cross-committee

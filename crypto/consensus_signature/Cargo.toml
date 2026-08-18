@@ -7,7 +7,7 @@ edition = { workspace = true }
 default = []
 arbitrary = ["dep:arbitrary"]
 pq-wire = []
-pq-devnet = ["pq-wire", "dep:futures", "dep:lean-multisig"]
+pq-devnet = ["pq-wire", "dep:futures", "dep:lean-multisig", "dep:parking_lot"]
 
 [dependencies]
 arbitrary = { workspace = true, features = ["derive"], optional = true }
@@ -17,6 +17,7 @@ ethereum_ssz = { workspace = true }
 futures = { workspace = true, optional = true }
 hex = { workspace = true }
 lean-multisig = { workspace = true, optional = true }
+parking_lot = { workspace = true, optional = true }
 serde = { workspace = true }
 tree_hash = { workspace = true }
 

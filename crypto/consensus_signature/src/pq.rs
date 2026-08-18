@@ -45,10 +45,12 @@ pub use crate::{
 
 use crate::OneTimeUseId;
 #[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+use crate::aggregation::AggregationResource;
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
 use crate::aggregation::InvalidAggregationJob;
-use crate::aggregation::{AggregationError, ValidatedAggregationJob};
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-use crate::aggregation::{AggregationResource, V1_MAX_AGGREGATION_OUTPUT_BYTES};
+use crate::aggregation::V1_MAX_AGGREGATION_OUTPUT_BYTES;
+use crate::aggregation::{AggregationError, ValidatedAggregationJob, VerificationClass};
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 use crate::pq_wire::PQ_EVIDENCE_HEADER_LEN;
 #[cfg(test)]
@@ -456,15 +458,19 @@ fn validate_canonical_signer_order(public_keys: &[PqPublicKey]) -> Result<(), Pq
 #[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
 use futures::channel::oneshot;
 #[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+use parking_lot::{Condvar, Mutex};
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
 use std::panic::{AssertUnwindSafe, catch_unwind};
 #[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
 use std::sync::atomic::{AtomicU8, Ordering};
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+use std::sync::mpsc::{SyncSender, sync_channel};
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+use std::thread::Builder;
 #[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
-use std::sync::mpsc::Receiver;
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-use std::thread::{Builder, JoinHandle};
+use std::thread::JoinHandle;
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+use std::{collections::VecDeque, sync::Arc};
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 const PQ_WORKER_STACK_SIZE: usize = 512 * 1024 * 1024;
@@ -561,8 +567,7 @@ impl std::error::Error for ProverError {
 /// same worker. This type is intentionally not cloneable, and a second live instance is rejected.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 pub(crate) struct PqProver {
-    commands: Option<SyncSender<Command>>,
-    worker: Option<JoinHandle<()>>,
+    worker: WorkerControl<ValidatedAggregationJob, PqSameMessageEvidence>,
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
@@ -583,21 +588,35 @@ impl PqProver {
         &self,
         job: ValidatedAggregationJob,
     ) -> Result<PqSameMessageEvidence, AggregationError> {
-        let commands = self
-            .commands
-            .as_ref()
-            .ok_or(AggregationError::WorkerStopped)?;
+        self.submit(WorkClass::Aggregate, job).await
+    }
+
+    pub(crate) async fn verify_job(
+        &self,
+        class: VerificationClass,
+        job: ValidatedAggregationJob,
+    ) -> Result<PqSameMessageEvidence, AggregationError> {
+        self.submit(class.into(), job).await
+    }
+
+    async fn submit(
+        &self,
+        class: WorkClass,
+        job: ValidatedAggregationJob,
+    ) -> Result<PqSameMessageEvidence, AggregationError> {
+        let scheduler = self.worker.scheduler()?;
         let (response, result) = oneshot::channel();
-        commands
-            .try_send(Command { job, response })
-            .map_err(|error| match error {
-                TrySendError::Full(_) => {
-                    AggregationError::ResourceExhausted(AggregationResource::QueueSaturated {
-                        max_queued: 1,
-                    })
-                }
-                TrySendError::Disconnected(_) => AggregationError::WorkerStopped,
-            })?;
+        let queued_evidence_bytes = job.queued_evidence_bytes;
+        scheduler
+            .try_admit(
+                class,
+                Command {
+                    job,
+                    queued_evidence_bytes,
+                    response,
+                },
+            )
+            .map_err(|error| error.into_aggregation_error(class, &scheduler.limits))?;
         result.await.map_err(|_| AggregationError::WorkerStopped)?
     }
 }
@@ -612,20 +631,36 @@ impl PqProver {
             claim,
             expected_signers,
             contributions,
+            queued_evidence_bytes,
         } = job;
-        drop((claim, expected_signers, contributions));
+        drop((
+            claim,
+            expected_signers,
+            contributions,
+            queued_evidence_bytes,
+        ));
         Err(AggregationError::Unavailable)
     }
-}
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-impl Drop for PqProver {
-    fn drop(&mut self) {
-        // Disconnecting drains the one admitted queued job and then stops the worker. Dropping the
-        // join handle detaches instead of blocking an async caller. The worker owns ActiveProver,
-        // so a replacement cannot start until every admitted proof has completed safely.
-        self.commands.take();
-        self.worker.take();
+    pub(crate) async fn verify_job(
+        &self,
+        class: VerificationClass,
+        job: ValidatedAggregationJob,
+    ) -> Result<PqSameMessageEvidence, AggregationError> {
+        let _ = class;
+        let ValidatedAggregationJob {
+            claim,
+            expected_signers,
+            contributions,
+            queued_evidence_bytes,
+        } = job;
+        drop((
+            claim,
+            expected_signers,
+            contributions,
+            queued_evidence_bytes,
+        ));
+        Err(AggregationError::Unavailable)
     }
 }
 
@@ -635,7 +670,586 @@ type Command = WorkerCommand<ValidatedAggregationJob, PqSameMessageEvidence>;
 #[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
 struct WorkerCommand<Job, Output> {
     job: Job,
+    queued_evidence_bytes: usize,
     response: oneshot::Sender<Result<Output, AggregationError>>,
+}
+
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+struct WorkerControl<Job, Output> {
+    scheduler: Option<Arc<PriorityScheduler<Job, Output>>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+impl<Job, Output> WorkerControl<Job, Output> {
+    fn scheduler(&self) -> Result<&Arc<PriorityScheduler<Job, Output>>, AggregationError> {
+        self.scheduler
+            .as_ref()
+            .ok_or(AggregationError::WorkerStopped)
+    }
+}
+
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+impl<Job, Output> Drop for WorkerControl<Job, Output> {
+    fn drop(&mut self) {
+        // Closing admissions drains already-admitted work by priority. Dropping the join handle
+        // detaches instead of blocking an async caller. The worker owns ActiveProver, so a
+        // replacement cannot start until every admitted request has completed safely.
+        if let Some(scheduler) = self.scheduler.take() {
+            scheduler.close();
+        }
+        self.worker.take();
+    }
+}
+
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkClass {
+    Block,
+    Gossip,
+    Aggregate,
+}
+
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+impl From<VerificationClass> for WorkClass {
+    fn from(class: VerificationClass) -> Self {
+        match class {
+            VerificationClass::Block => Self::Block,
+            VerificationClass::Gossip => Self::Gossip,
+        }
+    }
+}
+
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+#[derive(Clone, Copy)]
+struct SchedulerLimits {
+    block_count: usize,
+    gossip_count: usize,
+    aggregation_count: usize,
+    block_bytes: usize,
+    gossip_bytes: usize,
+    aggregation_bytes: usize,
+    total_bytes: usize,
+}
+
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+const PQ_BLOCK_QUEUE_CAPACITY: usize = 2;
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+const PQ_GOSSIP_QUEUE_CAPACITY: usize = 4;
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+const PQ_AGGREGATION_QUEUE_CAPACITY: usize = 1;
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+const PQ_BLOCK_QUEUE_BYTES: usize =
+    PQ_BLOCK_QUEUE_CAPACITY * crate::PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN;
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+const PQ_GOSSIP_QUEUE_BYTES: usize =
+    PQ_GOSSIP_QUEUE_CAPACITY * crate::PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN;
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+const PQ_AGGREGATION_QUEUE_BYTES: usize = crate::aggregation::V1_MAX_AGGREGATION_INPUT_BYTES;
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+const PQ_TOTAL_QUEUED_EVIDENCE_BYTES: usize =
+    PQ_BLOCK_QUEUE_BYTES + PQ_GOSSIP_QUEUE_BYTES + PQ_AGGREGATION_QUEUE_BYTES;
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+const PQ_SCHEDULER_LIMITS: SchedulerLimits = SchedulerLimits {
+    // Each verification slot can retain one maximum-size PQ evidence envelope. The independent
+    // class budgets are reservations: gossip and local proving cannot consume block capacity.
+    block_count: PQ_BLOCK_QUEUE_CAPACITY,
+    gossip_count: PQ_GOSSIP_QUEUE_CAPACITY,
+    aggregation_count: PQ_AGGREGATION_QUEUE_CAPACITY,
+    block_bytes: PQ_BLOCK_QUEUE_BYTES,
+    gossip_bytes: PQ_GOSSIP_QUEUE_BYTES,
+    aggregation_bytes: PQ_AGGREGATION_QUEUE_BYTES,
+    total_bytes: PQ_TOTAL_QUEUED_EVIDENCE_BYTES,
+};
+#[cfg(test)]
+const PQ_MAX_RETAINED_EVIDENCE_BYTES: usize =
+    PQ_TOTAL_QUEUED_EVIDENCE_BYTES + crate::aggregation::V1_MAX_AGGREGATION_INPUT_BYTES;
+
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SchedulerAdmissionError {
+    CountFull { max: usize },
+    ClassBytesFull { actual: usize, max: usize },
+    TotalBytesFull { actual: usize, max: usize },
+    Stopped,
+}
+
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+impl SchedulerAdmissionError {
+    fn into_aggregation_error(
+        self,
+        class: WorkClass,
+        limits: &SchedulerLimits,
+    ) -> AggregationError {
+        match self {
+            Self::Stopped => AggregationError::WorkerStopped,
+            Self::CountFull { .. } | Self::ClassBytesFull { .. } | Self::TotalBytesFull { .. } => {
+                AggregationError::ResourceExhausted(AggregationResource::QueueSaturated {
+                    max_queued: limits.count(class),
+                })
+            }
+        }
+    }
+}
+
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+impl SchedulerLimits {
+    fn count(&self, class: WorkClass) -> usize {
+        match class {
+            WorkClass::Block => self.block_count,
+            WorkClass::Gossip => self.gossip_count,
+            WorkClass::Aggregate => self.aggregation_count,
+        }
+    }
+
+    fn bytes(&self, class: WorkClass) -> usize {
+        match class {
+            WorkClass::Block => self.block_bytes,
+            WorkClass::Gossip => self.gossip_bytes,
+            WorkClass::Aggregate => self.aggregation_bytes,
+        }
+    }
+}
+
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+struct PriorityScheduler<Job, Output> {
+    limits: SchedulerLimits,
+    state: Mutex<SchedulerState<Job, Output>>,
+    ready: Condvar,
+    #[cfg(test)]
+    wait_hook: Mutex<Option<Arc<std::sync::Barrier>>>,
+}
+
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+struct SchedulerState<Job, Output> {
+    accepting: bool,
+    health: SchedulerHealth,
+    block: VecDeque<WorkerCommand<Job, Output>>,
+    gossip: VecDeque<WorkerCommand<Job, Output>>,
+    aggregate: VecDeque<WorkerCommand<Job, Output>>,
+    block_bytes: usize,
+    gossip_bytes: usize,
+    aggregate_bytes: usize,
+    total_bytes: usize,
+}
+
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SchedulerHealth {
+    Healthy,
+    AccountingPoisoned,
+}
+
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AccountingInvariantError;
+
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+struct AccountingPartitionError<Job, Output> {
+    removed: Vec<WorkerCommand<Job, Output>>,
+}
+
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+struct AccountingPartition<Job, Output> {
+    removed_bytes: usize,
+    removed: Vec<WorkerCommand<Job, Output>>,
+}
+
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+impl<Job, Output> std::fmt::Debug for AccountingPartitionError<Job, Output> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AccountingPartitionError")
+            .field("removed_count", &self.removed.len())
+            .finish()
+    }
+}
+
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+impl<Job, Output> PriorityScheduler<Job, Output> {
+    fn new(limits: SchedulerLimits) -> Self {
+        Self {
+            limits,
+            state: Mutex::new(SchedulerState {
+                accepting: true,
+                health: SchedulerHealth::Healthy,
+                block: VecDeque::new(),
+                gossip: VecDeque::new(),
+                aggregate: VecDeque::new(),
+                block_bytes: 0,
+                gossip_bytes: 0,
+                aggregate_bytes: 0,
+                total_bytes: 0,
+            }),
+            ready: Condvar::new(),
+            #[cfg(test)]
+            wait_hook: Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_wait_hook(limits: SchedulerLimits, wait_hook: Arc<std::sync::Barrier>) -> Self {
+        let scheduler = Self::new(limits);
+        *scheduler.wait_hook.lock() = Some(wait_hook);
+        scheduler
+    }
+
+    fn try_admit(
+        &self,
+        class: WorkClass,
+        command: WorkerCommand<Job, Output>,
+    ) -> Result<(), SchedulerAdmissionError> {
+        let mut state = self.state.lock();
+        let removed = match state.purge_cancelled() {
+            Ok(removed) => removed,
+            Err(error) => {
+                let stopped = state.poison_accounting_and_drain();
+                drop(state);
+                drop(error.removed);
+                drop(command);
+                Self::resolve_stopped(stopped);
+                self.ready.notify_all();
+                return Err(SchedulerAdmissionError::Stopped);
+            }
+        };
+        let admission = state.try_push(&self.limits, class, command);
+        drop(state);
+        drop(removed);
+        let result = match admission {
+            Ok(()) => Ok(()),
+            Err((error, rejected)) => {
+                drop(rejected);
+                Err(error)
+            }
+        };
+        if result.is_ok() {
+            self.ready.notify_one();
+        }
+        result
+    }
+
+    fn pop(&self) -> Option<WorkerCommand<Job, Output>> {
+        let mut state = self.state.lock();
+        loop {
+            if let Some((class, command)) = state.pop_highest_priority() {
+                if state
+                    .release_bytes(class, command.queued_evidence_bytes)
+                    .is_ok()
+                {
+                    return Some(command);
+                }
+                let mut stopped = vec![command];
+                stopped.extend(state.poison_accounting_and_drain());
+                drop(state);
+                Self::resolve_stopped(stopped);
+                self.ready.notify_all();
+                return None;
+            }
+            if !state.accepting {
+                return None;
+            }
+            #[cfg(test)]
+            if let Some(wait_hook) = self.wait_hook.lock().take() {
+                wait_hook.wait();
+            }
+            self.ready.wait(&mut state);
+        }
+    }
+
+    fn close(&self) {
+        self.state.lock().accepting = false;
+        self.ready.notify_all();
+    }
+
+    fn stop_and_resolve_queued(&self) {
+        let mut state = self.state.lock();
+        state.accepting = false;
+        let stopped = state
+            .drain_by_priority_exact()
+            .unwrap_or_else(|_| state.poison_accounting_and_drain());
+        drop(state);
+        Self::resolve_stopped(stopped);
+        self.ready.notify_all();
+    }
+
+    fn resolve_stopped(commands: Vec<WorkerCommand<Job, Output>>) {
+        for command in commands {
+            let _ = command.response.send(Err(AggregationError::WorkerStopped));
+        }
+    }
+
+    #[cfg(test)]
+    fn queued_evidence_bytes(&self) -> usize {
+        self.state.lock().total_bytes
+    }
+
+    #[cfg(test)]
+    fn accounting_poisoned(&self) -> bool {
+        self.state.lock().health == SchedulerHealth::AccountingPoisoned
+    }
+}
+
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+impl<Job, Output> SchedulerState<Job, Output> {
+    fn queue(&self, class: WorkClass) -> &VecDeque<WorkerCommand<Job, Output>> {
+        match class {
+            WorkClass::Block => &self.block,
+            WorkClass::Gossip => &self.gossip,
+            WorkClass::Aggregate => &self.aggregate,
+        }
+    }
+
+    fn queue_mut(&mut self, class: WorkClass) -> &mut VecDeque<WorkerCommand<Job, Output>> {
+        match class {
+            WorkClass::Block => &mut self.block,
+            WorkClass::Gossip => &mut self.gossip,
+            WorkClass::Aggregate => &mut self.aggregate,
+        }
+    }
+
+    fn class_bytes(&self, class: WorkClass) -> usize {
+        match class {
+            WorkClass::Block => self.block_bytes,
+            WorkClass::Gossip => self.gossip_bytes,
+            WorkClass::Aggregate => self.aggregate_bytes,
+        }
+    }
+
+    fn set_class_bytes(&mut self, class: WorkClass, bytes: usize) {
+        match class {
+            WorkClass::Block => self.block_bytes = bytes,
+            WorkClass::Gossip => self.gossip_bytes = bytes,
+            WorkClass::Aggregate => self.aggregate_bytes = bytes,
+        }
+    }
+
+    fn try_push(
+        &mut self,
+        limits: &SchedulerLimits,
+        class: WorkClass,
+        command: WorkerCommand<Job, Output>,
+    ) -> Result<(), (SchedulerAdmissionError, WorkerCommand<Job, Output>)> {
+        if !self.accepting || self.health != SchedulerHealth::Healthy {
+            return Err((SchedulerAdmissionError::Stopped, command));
+        }
+        let count_max = limits.count(class);
+        if self.queue(class).len() >= count_max {
+            return Err((
+                SchedulerAdmissionError::CountFull { max: count_max },
+                command,
+            ));
+        }
+        let class_max = limits.bytes(class);
+        let class_actual = match self
+            .class_bytes(class)
+            .checked_add(command.queued_evidence_bytes)
+        {
+            Some(actual) => actual,
+            None => {
+                return Err((
+                    SchedulerAdmissionError::ClassBytesFull {
+                        actual: usize::MAX,
+                        max: class_max,
+                    },
+                    command,
+                ));
+            }
+        };
+        if class_actual > class_max {
+            return Err((
+                SchedulerAdmissionError::ClassBytesFull {
+                    actual: class_actual,
+                    max: class_max,
+                },
+                command,
+            ));
+        }
+        let total_actual = match self.total_bytes.checked_add(command.queued_evidence_bytes) {
+            Some(actual) => actual,
+            None => {
+                return Err((
+                    SchedulerAdmissionError::TotalBytesFull {
+                        actual: usize::MAX,
+                        max: limits.total_bytes,
+                    },
+                    command,
+                ));
+            }
+        };
+        if total_actual > limits.total_bytes {
+            return Err((
+                SchedulerAdmissionError::TotalBytesFull {
+                    actual: total_actual,
+                    max: limits.total_bytes,
+                },
+                command,
+            ));
+        }
+        self.set_class_bytes(class, class_actual);
+        self.total_bytes = total_actual;
+        self.queue_mut(class).push_back(command);
+        Ok(())
+    }
+
+    fn pop_highest_priority(&mut self) -> Option<(WorkClass, WorkerCommand<Job, Output>)> {
+        self.block
+            .pop_front()
+            .map(|command| (WorkClass::Block, command))
+            .or_else(|| {
+                self.gossip
+                    .pop_front()
+                    .map(|command| (WorkClass::Gossip, command))
+            })
+            .or_else(|| {
+                self.aggregate
+                    .pop_front()
+                    .map(|command| (WorkClass::Aggregate, command))
+            })
+    }
+
+    fn release_bytes(
+        &mut self,
+        class: WorkClass,
+        bytes: usize,
+    ) -> Result<(), AccountingInvariantError> {
+        if self.health != SchedulerHealth::Healthy {
+            return Err(AccountingInvariantError);
+        }
+        let class_bytes = self
+            .class_bytes(class)
+            .checked_sub(bytes)
+            .ok_or(AccountingInvariantError)?;
+        let total_bytes = self
+            .total_bytes
+            .checked_sub(bytes)
+            .ok_or(AccountingInvariantError)?;
+        self.set_class_bytes(class, class_bytes);
+        self.total_bytes = total_bytes;
+        Ok(())
+    }
+
+    fn purge_cancelled(
+        &mut self,
+    ) -> Result<Vec<WorkerCommand<Job, Output>>, AccountingPartitionError<Job, Output>> {
+        if self.health != SchedulerHealth::Healthy {
+            return Err(AccountingPartitionError {
+                removed: Vec::new(),
+            });
+        }
+        let mut removed = Vec::new();
+        for class in [WorkClass::Block, WorkClass::Gossip, WorkClass::Aggregate] {
+            let AccountingPartition {
+                removed_bytes,
+                removed: mut class_removed,
+            } = match Self::partition_matching_once(self.queue_mut(class), |command| {
+                command.response.is_canceled()
+            }) {
+                Ok(partition) => partition,
+                Err(mut error) => {
+                    removed.append(&mut error.removed);
+                    return Err(AccountingPartitionError { removed });
+                }
+            };
+            if self.release_bytes(class, removed_bytes).is_err() {
+                removed.append(&mut class_removed);
+                return Err(AccountingPartitionError { removed });
+            }
+            removed.append(&mut class_removed);
+        }
+        Ok(removed)
+    }
+
+    fn partition_matching_once(
+        queue: &mut VecDeque<WorkerCommand<Job, Output>>,
+        mut remove: impl FnMut(&WorkerCommand<Job, Output>) -> bool,
+    ) -> Result<AccountingPartition<Job, Output>, AccountingPartitionError<Job, Output>> {
+        let original_len = queue.len();
+        let mut removed_bytes = 0usize;
+        let mut removed = Vec::new();
+        for _ in 0..original_len {
+            let Some(command) = queue.pop_front() else {
+                return Err(AccountingPartitionError { removed });
+            };
+            if remove(&command) {
+                let next_removed_bytes = removed_bytes.checked_add(command.queued_evidence_bytes);
+                removed.push(command);
+                let Some(next_removed_bytes) = next_removed_bytes else {
+                    return Err(AccountingPartitionError { removed });
+                };
+                removed_bytes = next_removed_bytes;
+            } else {
+                queue.push_back(command);
+            }
+        }
+        Ok(AccountingPartition {
+            removed_bytes,
+            removed,
+        })
+    }
+
+    fn drain_by_priority_exact(
+        &mut self,
+    ) -> Result<Vec<WorkerCommand<Job, Output>>, AccountingInvariantError> {
+        if self.health != SchedulerHealth::Healthy {
+            return Err(AccountingInvariantError);
+        }
+        let block_bytes = Self::queue_evidence_bytes(&self.block)?;
+        let gossip_bytes = Self::queue_evidence_bytes(&self.gossip)?;
+        let aggregate_bytes = Self::queue_evidence_bytes(&self.aggregate)?;
+        let total_bytes = block_bytes
+            .checked_add(gossip_bytes)
+            .and_then(|total| total.checked_add(aggregate_bytes))
+            .ok_or(AccountingInvariantError)?;
+        if block_bytes != self.block_bytes
+            || gossip_bytes != self.gossip_bytes
+            || aggregate_bytes != self.aggregate_bytes
+            || total_bytes != self.total_bytes
+        {
+            return Err(AccountingInvariantError);
+        }
+        let queued_count = self
+            .block
+            .len()
+            .checked_add(self.gossip.len())
+            .and_then(|count| count.checked_add(self.aggregate.len()))
+            .ok_or(AccountingInvariantError)?;
+        let mut drained = Vec::with_capacity(queued_count);
+        drained.extend(self.block.drain(..));
+        drained.extend(self.gossip.drain(..));
+        drained.extend(self.aggregate.drain(..));
+        self.block_bytes = 0;
+        self.gossip_bytes = 0;
+        self.aggregate_bytes = 0;
+        self.total_bytes = 0;
+        Ok(drained)
+    }
+
+    fn queue_evidence_bytes(
+        queue: &VecDeque<WorkerCommand<Job, Output>>,
+    ) -> Result<usize, AccountingInvariantError> {
+        queue
+            .iter()
+            .try_fold(0usize, |total, command| {
+                total.checked_add(command.queued_evidence_bytes)
+            })
+            .ok_or(AccountingInvariantError)
+    }
+
+    fn poison_accounting_and_drain(&mut self) -> Vec<WorkerCommand<Job, Output>> {
+        self.health = SchedulerHealth::AccountingPoisoned;
+        self.accepting = false;
+        let mut drained = Vec::new();
+        drained.extend(self.block.drain(..));
+        drained.extend(self.gossip.drain(..));
+        drained.extend(self.aggregate.drain(..));
+        // The queue is now empty. Resetting the counters is explicit recovery after permanently
+        // poisoning admissions, rather than silently hiding an arithmetic mismatch.
+        self.block_bytes = 0;
+        self.gossip_bytes = 0;
+        self.aggregate_bytes = 0;
+        self.total_bytes = 0;
+        drained
+    }
 }
 
 #[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
@@ -728,18 +1342,21 @@ fn start_prover() -> Result<PqProver, ProverError> {
         .try_activate()
         .map_err(ProverError::Unavailable)?;
     let active = ActiveProver::new(&PQ_PROVER_LIFECYCLE);
-    let (command_sender, command_receiver) = sync_channel(1);
+    let scheduler = Arc::new(PriorityScheduler::new(PQ_SCHEDULER_LIMITS));
     let (initialization_sender, initialization_receiver) = sync_channel(1);
+    let worker_scheduler = Arc::clone(&scheduler);
     let worker = Builder::new()
         .name("pq-prover".into())
         .stack_size(PQ_WORKER_STACK_SIZE)
-        .spawn(move || worker_main(command_receiver, initialization_sender, active))
+        .spawn(move || worker_main(worker_scheduler, initialization_sender, active))
         .map_err(ProverError::WorkerSpawn)?;
 
     match initialization_receiver.recv() {
         Ok(InitializationResult::Ready) => Ok(PqProver {
-            commands: Some(command_sender),
-            worker: Some(worker),
+            worker: WorkerControl {
+                scheduler: Some(scheduler),
+                worker: Some(worker),
+            },
         }),
         Ok(InitializationResult::Panicked) => {
             let _ = worker.join();
@@ -764,7 +1381,7 @@ enum InitializationResult {
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 fn worker_main(
-    commands: Receiver<Command>,
+    scheduler: Arc<PriorityScheduler<ValidatedAggregationJob, PqSameMessageEvidence>>,
     initialized: SyncSender<InitializationResult>,
     _active: ActiveProver,
 ) {
@@ -777,16 +1394,16 @@ fn worker_main(
         return;
     }
 
-    run_worker_loop(commands, &PQ_PROVER_LIFECYCLE, execute_aggregation_job);
+    run_worker_loop(scheduler, &PQ_PROVER_LIFECYCLE, execute_aggregation_job);
 }
 
 #[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
 fn run_worker_loop<Job, Output>(
-    commands: Receiver<WorkerCommand<Job, Output>>,
+    scheduler: Arc<PriorityScheduler<Job, Output>>,
     lifecycle: &ProverLifecycle,
     mut execute: impl FnMut(Job) -> Result<Output, AggregationError>,
 ) {
-    while let Ok(command) = commands.recv() {
+    while let Some(command) = scheduler.pop() {
         if command.response.is_canceled() {
             // Dropping the async result receiver is cancellation. The check is deliberately at
             // the last safe point: once recursive proving begins it must run to completion. No
@@ -800,6 +1417,7 @@ fn run_worker_loop<Job, Output>(
             }
             Err(_) => {
                 let _ = command.response.send(Err(AggregationError::WorkerPanicked));
+                scheduler.stop_and_resolve_queued();
                 break;
             }
         }
@@ -885,6 +1503,7 @@ mod tests {
                 signers: vec![signer],
                 evidence,
             }],
+            queued_evidence_bytes: expected.len(),
         };
 
         let result = super::execute_aggregation_job(job)
@@ -904,6 +1523,7 @@ mod tests {
                 }],
                 evidence: PqSameMessageEvidence::from(&raw),
             }],
+            queued_evidence_bytes: raw.as_bytes().len(),
         };
         assert_eq!(
             super::execute_aggregation_job(wrong_claim_job),
@@ -922,6 +1542,7 @@ mod tests {
                 signers: vec![wrong_key_signer],
                 evidence: PqSameMessageEvidence::from(&raw),
             }],
+            queued_evidence_bytes: raw.as_bytes().len(),
         };
         assert_eq!(
             super::execute_aggregation_job(wrong_key_job),
@@ -929,155 +1550,641 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bounded_worker_saturates_at_one_queued_job_and_skips_cancelled_work() {
-        use futures::channel::oneshot;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::mpsc::{TrySendError, sync_channel};
-        use std::sync::{Arc, Barrier};
+    fn scheduler_limits() -> super::SchedulerLimits {
+        super::SchedulerLimits {
+            block_count: 2,
+            gossip_count: 2,
+            aggregation_count: 2,
+            block_bytes: 10,
+            gossip_bytes: 10,
+            aggregation_bytes: 10,
+            total_bytes: 30,
+        }
+    }
 
-        let lifecycle = Arc::new(ProverLifecycle::idle());
-        lifecycle.try_activate().expect("test worker activates");
-        let entered = Arc::new(Barrier::new(2));
-        let release = Arc::new(Barrier::new(2));
-        let executions = Arc::new(AtomicUsize::new(0));
-        let (commands, receiver) = sync_channel(1);
-        let worker = {
-            let lifecycle = Arc::clone(&lifecycle);
-            let entered = Arc::clone(&entered);
-            let release = Arc::clone(&release);
-            let executions = Arc::clone(&executions);
-            std::thread::Builder::new()
-                .name("pq-prover-test".into())
-                .spawn(move || {
-                    super::run_worker_loop(receiver, &lifecycle, |job| {
-                        assert_eq!(std::thread::current().name(), Some("pq-prover-test"));
-                        executions.fetch_add(1, Ordering::SeqCst);
-                        if job == 1 {
-                            entered.wait();
-                            release.wait();
-                        }
-                        Ok(job)
-                    });
-                })
-                .expect("test worker starts")
-        };
-
-        let (first_response, first_result) = oneshot::channel();
-        commands
-            .try_send(super::WorkerCommand {
-                job: 1,
-                response: first_response,
-            })
-            .expect("active job admitted");
-        entered.wait();
-
-        let (cancelled_response, cancelled_result) = oneshot::channel();
-        commands
-            .try_send(super::WorkerCommand {
-                job: 2,
-                response: cancelled_response,
-            })
-            .expect("one queued job admitted");
-        drop(cancelled_result);
-
-        let (overflow_response, _overflow_result) = oneshot::channel();
-        assert!(matches!(
-            commands.try_send(super::WorkerCommand {
-                job: 3,
-                response: overflow_response,
-            }),
-            Err(TrySendError::Full(_))
-        ));
-
-        release.wait();
-        assert_eq!(
-            futures::executor::block_on(first_result).expect("worker responds"),
-            Ok(1)
-        );
-        drop(commands);
-        worker.join().expect("worker exits after disconnect");
-        assert_eq!(executions.load(Ordering::SeqCst), 1);
+    fn command(
+        job: u8,
+        queued_evidence_bytes: usize,
+    ) -> (
+        super::WorkerCommand<u8, u8>,
+        futures::channel::oneshot::Receiver<Result<u8, AggregationError>>,
+    ) {
+        let (response, result) = futures::channel::oneshot::channel();
+        (
+            super::WorkerCommand {
+                job,
+                queued_evidence_bytes,
+                response,
+            },
+            result,
+        )
     }
 
     #[test]
-    fn worker_panic_poisoning_stop_and_output_error_are_classified() {
-        use futures::channel::oneshot;
-        use std::sync::Arc;
-        use std::sync::mpsc::sync_channel;
+    fn full_lower_priority_byte_budgets_leave_block_admission_reserved() {
+        let scheduler = super::PriorityScheduler::new(scheduler_limits());
+        let (gossip, _gossip_result) = command(1, 10);
+        scheduler
+            .try_admit(super::WorkClass::Gossip, gossip)
+            .expect("full gossip byte budget is admitted");
+        let (aggregation, _aggregation_result) = command(2, 10);
+        scheduler
+            .try_admit(super::WorkClass::Aggregate, aggregation)
+            .expect("full aggregation byte budget is admitted");
+        let (block, _block_result) = command(3, 10);
+        scheduler
+            .try_admit(super::WorkClass::Block, block)
+            .expect("maximum block remains reserved");
+        assert_eq!(scheduler.queued_evidence_bytes(), 30);
+    }
 
-        let output_lifecycle = Arc::new(ProverLifecycle::idle());
-        output_lifecycle
-            .try_activate()
-            .expect("output worker activates");
-        let (output_commands, output_receiver) = sync_channel(1);
-        let output_worker = {
-            let lifecycle = Arc::clone(&output_lifecycle);
-            std::thread::spawn(move || {
-                super::run_worker_loop(output_receiver, &lifecycle, |_job: u8| -> Result<u8, _> {
-                    Err(AggregationError::OutputTooLarge {
-                        actual: 513,
-                        max: 512,
-                    })
-                });
-            })
-        };
-        let (output_response, output_result) = oneshot::channel();
-        output_commands
-            .try_send(super::WorkerCommand {
-                job: 1,
-                response: output_response,
-            })
-            .expect("output job admitted");
+    #[test]
+    fn production_scheduler_limits_pin_reserved_and_total_evidence_bounds() {
+        let limits = super::PQ_SCHEDULER_LIMITS;
+        assert_eq!(limits.block_count, 2);
+        assert_eq!(limits.gossip_count, 4);
+        assert_eq!(limits.aggregation_count, 1);
         assert_eq!(
-            futures::executor::block_on(output_result).expect("worker responds"),
-            Err(AggregationError::OutputTooLarge {
-                actual: 513,
-                max: 512,
+            limits.block_bytes,
+            limits
+                .block_count
+                .checked_mul(crate::PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN)
+                .expect("production block byte bound fits usize")
+        );
+        assert_eq!(
+            limits.gossip_bytes,
+            limits
+                .gossip_count
+                .checked_mul(crate::PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN)
+                .expect("production gossip byte bound fits usize")
+        );
+        assert_eq!(
+            limits.aggregation_bytes,
+            crate::aggregation::V1_MAX_AGGREGATION_INPUT_BYTES
+        );
+        assert_eq!(
+            limits.total_bytes,
+            limits
+                .block_bytes
+                .checked_add(limits.gossip_bytes)
+                .and_then(|total| total.checked_add(limits.aggregation_bytes))
+                .expect("production queued byte bound fits usize")
+        );
+        assert_eq!(
+            super::PQ_MAX_RETAINED_EVIDENCE_BYTES,
+            limits
+                .total_bytes
+                .checked_add(crate::aggregation::V1_MAX_AGGREGATION_INPUT_BYTES)
+                .expect("production retained byte bound fits usize")
+        );
+    }
+
+    #[test]
+    fn scheduler_pops_block_then_gossip_then_aggregate_fifo() {
+        let scheduler = super::PriorityScheduler::new(scheduler_limits());
+        let mut results = Vec::new();
+        for (class, job) in [
+            (super::WorkClass::Aggregate, 50),
+            (super::WorkClass::Aggregate, 51),
+            (super::WorkClass::Gossip, 30),
+            (super::WorkClass::Gossip, 31),
+            (super::WorkClass::Block, 10),
+            (super::WorkClass::Block, 11),
+        ] {
+            let (command, result) = command(job, 1);
+            scheduler.try_admit(class, command).expect("job admitted");
+            results.push(result);
+        }
+        scheduler.close();
+
+        let mut jobs = Vec::new();
+        while let Some(command) = scheduler.pop() {
+            jobs.push(command.job);
+        }
+        assert_eq!(jobs, [10, 11, 30, 31, 50, 51]);
+        assert_eq!(scheduler.queued_evidence_bytes(), 0);
+        drop(results);
+    }
+
+    #[test]
+    fn scheduler_checks_each_count_and_byte_cap_before_retaining_a_job() {
+        for class in [
+            super::WorkClass::Block,
+            super::WorkClass::Gossip,
+            super::WorkClass::Aggregate,
+        ] {
+            let scheduler = super::PriorityScheduler::new(scheduler_limits());
+            let mut results = Vec::new();
+            for job in [1, 2] {
+                let (command, result) = command(job, 1);
+                scheduler.try_admit(class, command).expect("at count cap");
+                results.push(result);
+            }
+            let (overflow, _result) = command(3, 1);
+            assert_eq!(
+                scheduler.try_admit(class, overflow),
+                Err(super::SchedulerAdmissionError::CountFull { max: 2 })
+            );
+            assert_eq!(scheduler.queued_evidence_bytes(), 2);
+            drop(results);
+        }
+
+        let scheduler = super::PriorityScheduler::new(scheduler_limits());
+        let (at_max, _result) = command(1, 10);
+        scheduler
+            .try_admit(super::WorkClass::Gossip, at_max)
+            .expect("exact class byte cap");
+        let (class_overflow, _result) = command(2, 1);
+        assert_eq!(
+            scheduler.try_admit(super::WorkClass::Gossip, class_overflow),
+            Err(super::SchedulerAdmissionError::ClassBytesFull {
+                actual: 11,
+                max: 10,
             })
         );
-        drop(output_commands);
-        output_worker.join().expect("output worker stops");
-        output_lifecycle.release();
+        assert_eq!(scheduler.queued_evidence_bytes(), 10);
 
-        let panic_lifecycle = Arc::new(ProverLifecycle::idle());
-        panic_lifecycle
-            .try_activate()
-            .expect("panic worker activates");
-        let (panic_commands, panic_receiver) = sync_channel(1);
-        let panic_worker = {
-            let lifecycle = Arc::clone(&panic_lifecycle);
+        let total_scheduler = super::PriorityScheduler::new(super::SchedulerLimits {
+            block_bytes: usize::MAX,
+            gossip_bytes: usize::MAX,
+            aggregation_bytes: usize::MAX,
+            total_bytes: 10,
+            ..scheduler_limits()
+        });
+        let (at_total, _result) = command(1, 10);
+        total_scheduler
+            .try_admit(super::WorkClass::Block, at_total)
+            .expect("exact total byte cap");
+        let (total_overflow, _result) = command(2, 1);
+        assert_eq!(
+            total_scheduler.try_admit(super::WorkClass::Gossip, total_overflow),
+            Err(super::SchedulerAdmissionError::TotalBytesFull {
+                actual: 11,
+                max: 10,
+            })
+        );
+        assert_eq!(total_scheduler.queued_evidence_bytes(), 10);
+    }
+
+    #[test]
+    fn dropped_queued_responses_are_skipped_and_release_bytes() {
+        use std::sync::{Arc, Mutex};
+
+        let scheduler = Arc::new(super::PriorityScheduler::new(scheduler_limits()));
+        let (cancelled, cancelled_result) = command(1, 7);
+        scheduler
+            .try_admit(super::WorkClass::Block, cancelled)
+            .expect("cancelled job admitted");
+        let (live, live_result) = command(2, 3);
+        scheduler
+            .try_admit(super::WorkClass::Block, live)
+            .expect("live job admitted");
+        // Cancel only after the final admission so this command remains queued until the worker's
+        // last-safe cancellation check.
+        drop(cancelled_result);
+        scheduler.close();
+
+        let lifecycle = ProverLifecycle::idle();
+        lifecycle.try_activate().expect("worker activates");
+        let executions = Arc::new(Mutex::new(Vec::new()));
+        super::run_worker_loop(Arc::clone(&scheduler), &lifecycle, {
+            let executions = Arc::clone(&executions);
+            move |job| {
+                executions.lock().expect("test mutex").push(job);
+                Ok(job)
+            }
+        });
+
+        assert_eq!(futures::executor::block_on(live_result), Ok(Ok(2)));
+        assert_eq!(*executions.lock().expect("test mutex"), [2]);
+        assert_eq!(scheduler.queued_evidence_bytes(), 0);
+        lifecycle.release();
+    }
+
+    #[test]
+    fn admission_purges_cancelled_work_before_applying_count_and_byte_caps() {
+        let scheduler = super::PriorityScheduler::new(super::SchedulerLimits {
+            block_count: 1,
+            ..scheduler_limits()
+        });
+        let (cancelled, cancelled_result) = command(1, 10);
+        scheduler
+            .try_admit(super::WorkClass::Block, cancelled)
+            .expect("first maximum block admitted");
+        drop(cancelled_result);
+
+        let (replacement, _replacement_result) = command(2, 10);
+        scheduler
+            .try_admit(super::WorkClass::Block, replacement)
+            .expect("cancelled block is purged before admission caps");
+        assert_eq!(scheduler.queued_evidence_bytes(), 10);
+    }
+
+    #[test]
+    fn cancellation_partition_decides_each_identity_once_and_sums_that_exact_set() {
+        use std::collections::VecDeque;
+
+        let mut results = Vec::new();
+        let mut queue = VecDeque::new();
+        for (job, bytes) in [(1, 1), (2, 7), (3, 2)] {
+            let (command, result) = command(job, bytes);
+            queue.push_back(command);
+            results.push(result);
+        }
+        let mut calls = [0u8; 4];
+
+        let super::AccountingPartition {
+            removed_bytes,
+            removed,
+        } = super::SchedulerState::partition_matching_once(&mut queue, |queued_command| {
+            let position = usize::from(queued_command.job);
+            calls[position] = calls[position].saturating_add(1);
+            // A second observation deliberately changes its answer, modeling cancellation
+            // changing between scans. The helper must never make that second observation.
+            queued_command.job == 2 && calls[position] == 1
+        })
+        .expect("the exact removed-byte sum fits");
+
+        assert_eq!(removed_bytes, 7);
+        assert_eq!(calls, [0, 1, 1, 1]);
+        assert_eq!(
+            queue.iter().map(|command| command.job).collect::<Vec<_>>(),
+            [1, 3]
+        );
+        assert_eq!(
+            removed
+                .iter()
+                .map(|command| command.job)
+                .collect::<Vec<_>>(),
+            [2]
+        );
+        drop(removed);
+        drop(results);
+    }
+
+    #[test]
+    fn admission_destroys_cancelled_jobs_only_after_releasing_scheduler_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Weak};
+
+        struct ReentrantDropJob {
+            scheduler: Weak<super::PriorityScheduler<ReentrantDropJob, u8>>,
+            lock_was_free: Arc<AtomicBool>,
+        }
+
+        impl Drop for ReentrantDropJob {
+            fn drop(&mut self) {
+                let lock_was_free = self
+                    .scheduler
+                    .upgrade()
+                    .is_some_and(|scheduler| scheduler.state.try_lock().is_some());
+                self.lock_was_free.store(lock_was_free, Ordering::SeqCst);
+            }
+        }
+
+        let scheduler = Arc::new(super::PriorityScheduler::new(scheduler_limits()));
+        let first_lock_was_free = Arc::new(AtomicBool::new(false));
+        let (first_response, first_result) = futures::channel::oneshot::channel();
+        scheduler
+            .try_admit(
+                super::WorkClass::Block,
+                super::WorkerCommand {
+                    job: ReentrantDropJob {
+                        scheduler: Arc::downgrade(&scheduler),
+                        lock_was_free: Arc::clone(&first_lock_was_free),
+                    },
+                    queued_evidence_bytes: 1,
+                    response: first_response,
+                },
+            )
+            .expect("first job admitted");
+        drop(first_result);
+
+        let second_lock_was_free = Arc::new(AtomicBool::new(false));
+        let (second_response, second_result) = futures::channel::oneshot::channel();
+        scheduler
+            .try_admit(
+                super::WorkClass::Block,
+                super::WorkerCommand {
+                    job: ReentrantDropJob {
+                        scheduler: Arc::downgrade(&scheduler),
+                        lock_was_free: Arc::clone(&second_lock_was_free),
+                    },
+                    queued_evidence_bytes: 1,
+                    response: second_response,
+                },
+            )
+            .expect("replacement job admitted after purge");
+
+        assert!(first_lock_was_free.load(Ordering::SeqCst));
+        drop(second_result);
+        scheduler.close();
+        let command = scheduler.pop().expect("replacement remains queued");
+        drop(command);
+        assert!(second_lock_was_free.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn owner_drop_drains_admitted_work_and_does_not_wait_for_active_work() {
+        use std::sync::{Arc, Barrier, mpsc};
+        use std::time::Duration;
+
+        let scheduler = Arc::new(super::PriorityScheduler::new(scheduler_limits()));
+        let (active, active_result) = command(1, 1);
+        scheduler
+            .try_admit(super::WorkClass::Block, active)
+            .expect("active job admitted");
+        let (queued, queued_result) = command(2, 1);
+        scheduler
+            .try_admit(super::WorkClass::Gossip, queued)
+            .expect("queued job admitted");
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let lifecycle = Box::leak(Box::new(ProverLifecycle::idle()));
+        lifecycle.try_activate().expect("worker activates");
+        let (exited_sender, exited_receiver) = mpsc::channel();
+        let worker = {
+            let scheduler = Arc::clone(&scheduler);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
             std::thread::spawn(move || {
-                super::run_worker_loop(panic_receiver, &lifecycle, |_job: u8| -> Result<u8, _> {
-                    panic!("injected worker panic")
+                super::run_worker_loop(scheduler, lifecycle, |job| {
+                    if job == 1 {
+                        entered.wait();
+                        release.wait();
+                    }
+                    Ok(job)
                 });
+                let _ = exited_sender.send(());
             })
         };
-        let (panic_response, panic_result) = oneshot::channel();
-        panic_commands
-            .try_send(super::WorkerCommand {
-                job: 1,
-                response: panic_response,
+        entered.wait();
+
+        let owner = super::WorkerControl {
+            scheduler: Some(Arc::clone(&scheduler)),
+            worker: Some(worker),
+        };
+        let (dropped_sender, dropped_receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(owner);
+            let _ = dropped_sender.send(());
+        });
+        dropped_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("owner Drop is nonblocking while backend is active");
+        release.wait();
+
+        assert_eq!(futures::executor::block_on(active_result), Ok(Ok(1)));
+        assert_eq!(futures::executor::block_on(queued_result), Ok(Ok(2)));
+        exited_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("closed scheduler drains and exits");
+    }
+
+    #[test]
+    fn admission_notifies_a_worker_already_waiting_on_the_condition_variable() {
+        use std::sync::{Arc, Barrier, mpsc};
+        use std::time::Duration;
+
+        let waiting = Arc::new(Barrier::new(2));
+        let scheduler = Arc::new(super::PriorityScheduler::new_with_wait_hook(
+            scheduler_limits(),
+            Arc::clone(&waiting),
+        ));
+        let (popped_sender, popped_receiver) = mpsc::channel();
+        let worker = {
+            let scheduler = Arc::clone(&scheduler);
+            std::thread::spawn(move || {
+                let popped = scheduler.pop().map(|command| command.job);
+                let _ = popped_sender.send(popped);
             })
-            .expect("panic job admitted");
+        };
+        waiting.wait();
+
+        let (admitted, admitted_result) = command(7, 1);
+        scheduler
+            .try_admit(super::WorkClass::Block, admitted)
+            .expect("admission wakes waiting worker");
+
         assert_eq!(
-            futures::executor::block_on(panic_result).expect("panic is contained"),
-            Err(AggregationError::WorkerPanicked)
+            popped_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("notify_one wakes worker"),
+            Some(7)
         );
-        panic_worker.join().expect("panic is caught inside worker");
+        assert!(futures::executor::block_on(admitted_result).is_err());
+        worker
+            .join()
+            .expect("waiting worker exits after one command");
+    }
+
+    #[test]
+    fn close_notifies_a_waiting_worker_and_releases_its_lifecycle() {
+        use std::sync::{Arc, Barrier, mpsc};
+        use std::time::Duration;
+
+        let waiting = Arc::new(Barrier::new(2));
+        let scheduler = Arc::new(super::PriorityScheduler::<u8, u8>::new_with_wait_hook(
+            scheduler_limits(),
+            Arc::clone(&waiting),
+        ));
+        let lifecycle = Box::leak(Box::new(ProverLifecycle::idle()));
+        lifecycle.try_activate().expect("worker activates");
+        let active = super::ActiveProver::new(lifecycle);
+        let (exited_sender, exited_receiver) = mpsc::channel();
+        let worker = {
+            let scheduler = Arc::clone(&scheduler);
+            std::thread::spawn(move || {
+                let _active = active;
+                assert!(scheduler.pop().is_none());
+                let _ = exited_sender.send(());
+            })
+        };
+        waiting.wait();
+
+        scheduler.close();
+
+        exited_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("notify_all wakes closed worker");
+        worker.join().expect("closed worker exits");
+        assert_eq!(lifecycle.try_activate(), Ok(()));
+        lifecycle.release();
+    }
+
+    #[test]
+    fn worker_panic_resolves_active_and_queued_and_poison_lifecycle() {
+        let scheduler = std::sync::Arc::new(super::PriorityScheduler::new(scheduler_limits()));
+        let (active, active_result) = command(1, 1);
+        scheduler
+            .try_admit(super::WorkClass::Block, active)
+            .expect("active job admitted");
+        let (queued_block, queued_block_result) = command(2, 1);
+        scheduler
+            .try_admit(super::WorkClass::Block, queued_block)
+            .expect("queued block admitted");
+        let (queued_gossip, queued_gossip_result) = command(3, 1);
+        scheduler
+            .try_admit(super::WorkClass::Gossip, queued_gossip)
+            .expect("queued gossip admitted");
+        let (queued_aggregate, queued_aggregate_result) = command(4, 1);
+        scheduler
+            .try_admit(super::WorkClass::Aggregate, queued_aggregate)
+            .expect("queued aggregate admitted");
+        scheduler.close();
+        let lifecycle = ProverLifecycle::idle();
+        lifecycle.try_activate().expect("worker activates");
+
+        super::run_worker_loop(scheduler, &lifecycle, |_job| -> Result<u8, _> {
+            panic!("injected worker panic")
+        });
+
         assert_eq!(
-            panic_lifecycle.try_activate(),
+            futures::executor::block_on(active_result),
+            Ok(Err(AggregationError::WorkerPanicked))
+        );
+        for queued in [
+            queued_block_result,
+            queued_gossip_result,
+            queued_aggregate_result,
+        ] {
+            assert_eq!(
+                futures::executor::block_on(queued),
+                Ok(Err(AggregationError::WorkerStopped))
+            );
+        }
+        assert_eq!(
+            lifecycle.try_activate(),
             Err(ProverUnavailable::ProcessPoisoned)
         );
-        let (stopped_response, _stopped_result) = oneshot::channel();
-        assert!(
-            panic_commands
-                .try_send(super::WorkerCommand {
-                    job: 2,
-                    response: stopped_response,
-                })
-                .is_err()
+    }
+
+    #[test]
+    fn stopping_resolves_wakers_without_holding_the_scheduler_lock() {
+        use futures::task::{ArcWake, waker_ref};
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::{Context, Poll};
+
+        struct LockProbe {
+            scheduler: Arc<super::PriorityScheduler<u8, u8>>,
+            woken: AtomicBool,
+            lock_was_free: AtomicBool,
+        }
+
+        impl ArcWake for LockProbe {
+            fn wake_by_ref(probe: &Arc<Self>) {
+                probe.woken.store(true, Ordering::SeqCst);
+                probe
+                    .lock_was_free
+                    .store(probe.scheduler.state.try_lock().is_some(), Ordering::SeqCst);
+            }
+        }
+
+        let scheduler = Arc::new(super::PriorityScheduler::new(scheduler_limits()));
+        let (queued, mut result) = command(1, 1);
+        scheduler
+            .try_admit(super::WorkClass::Gossip, queued)
+            .expect("queued job admitted");
+        let probe = Arc::new(LockProbe {
+            scheduler: Arc::clone(&scheduler),
+            woken: AtomicBool::new(false),
+            lock_was_free: AtomicBool::new(false),
+        });
+        let waker = waker_ref(&probe);
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(
+            Pin::new(&mut result).poll(&mut context),
+            Poll::Pending
+        ));
+
+        scheduler.stop_and_resolve_queued();
+
+        assert!(probe.woken.load(Ordering::SeqCst));
+        assert!(probe.lock_was_free.load(Ordering::SeqCst));
+        assert_eq!(
+            futures::executor::block_on(result),
+            Ok(Err(AggregationError::WorkerStopped))
         );
+    }
+
+    #[test]
+    fn accounting_underflow_poison_stops_and_resolves_the_scheduler() {
+        let scheduler = super::PriorityScheduler::new(scheduler_limits());
+        let (queued, result) = command(1, 1);
+        scheduler
+            .try_admit(super::WorkClass::Block, queued)
+            .expect("queued job admitted");
+        scheduler.state.lock().block_bytes = 0;
+
+        assert!(scheduler.pop().is_none());
+        assert_eq!(
+            futures::executor::block_on(result),
+            Ok(Err(AggregationError::WorkerStopped))
+        );
+        assert!(scheduler.accounting_poisoned());
+        let (replacement, _replacement_result) = command(2, 1);
+        assert_eq!(
+            scheduler.try_admit(super::WorkClass::Block, replacement),
+            Err(super::SchedulerAdmissionError::Stopped)
+        );
+    }
+
+    #[test]
+    fn accounting_overflow_during_cancel_purge_poison_stops_admission() {
+        let scheduler = super::PriorityScheduler::new(super::SchedulerLimits {
+            block_count: 2,
+            block_bytes: usize::MAX,
+            total_bytes: usize::MAX,
+            ..scheduler_limits()
+        });
+        let (first, first_result) = command(1, usize::MAX);
+        let (second, second_result) = command(2, 1);
+        drop((first_result, second_result));
+        {
+            let mut state = scheduler.state.lock();
+            state.block.push_back(first);
+            state.block.push_back(second);
+            state.block_bytes = usize::MAX;
+            state.total_bytes = usize::MAX;
+        }
+
+        let (replacement, _replacement_result) = command(3, 1);
+        assert_eq!(
+            scheduler.try_admit(super::WorkClass::Block, replacement),
+            Err(super::SchedulerAdmissionError::Stopped)
+        );
+        assert!(scheduler.accounting_poisoned());
+        assert_eq!(scheduler.queued_evidence_bytes(), 0);
+        let (later, _later_result) = command(4, 1);
+        assert_eq!(
+            scheduler.try_admit(super::WorkClass::Block, later),
+            Err(super::SchedulerAdmissionError::Stopped)
+        );
+    }
+
+    #[test]
+    fn scheduler_admission_failures_map_only_to_local_queue_saturation() {
+        for error in [
+            super::SchedulerAdmissionError::CountFull { max: 2 },
+            super::SchedulerAdmissionError::ClassBytesFull {
+                actual: 11,
+                max: 10,
+            },
+            super::SchedulerAdmissionError::TotalBytesFull {
+                actual: 31,
+                max: 30,
+            },
+        ] {
+            assert_eq!(
+                error.into_aggregation_error(super::WorkClass::Block, &scheduler_limits()),
+                AggregationError::ResourceExhausted(
+                    crate::aggregation::AggregationResource::QueueSaturated { max_queued: 2 }
+                )
+            );
+        }
     }
 
     #[test]

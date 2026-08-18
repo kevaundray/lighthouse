@@ -75,6 +75,19 @@ pub enum InvalidAggregationJob {
     ContributionOverlap,
     SignerUnionMismatch,
     InvalidPublicKey,
+    VerificationRequiresSingleContribution { actual: usize },
+}
+
+/// Semantic admission class for contextual signature verification.
+///
+/// Local recursive proving has no public class: callers must use [`AggregationService::aggregate`]
+/// and therefore cannot promote proving work into a verification queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerificationClass {
+    /// Signature evidence required while verifying or importing a block.
+    Block,
+    /// Signature evidence received through attestation gossip.
+    Gossip,
 }
 
 /// The local resource limit exceeded by an aggregation request.
@@ -187,17 +200,39 @@ impl AggregationService {
             self.prover.aggregate_job(job).await
         }
     }
+
+    /// Contextually verifies exactly one raw or already-aggregated contribution.
+    ///
+    /// PQ builds use the semantic class for reserved admission. BLS builds execute immediately;
+    /// both backends enforce the same verification-only job shape.
+    pub async fn verify(
+        &self,
+        class: VerificationClass,
+        job: AggregationJob,
+    ) -> Result<SameMessageEvidence, AggregationError> {
+        let job = ValidatedAggregationJob::new_verification(job)?;
+        #[cfg(not(feature = "pq-devnet"))]
+        {
+            let _ = class;
+            crate::bls::aggregate_job(job)
+        }
+        #[cfg(feature = "pq-devnet")]
+        {
+            self.prover.verify_job(class, job).await
+        }
+    }
 }
 
 pub(crate) struct ValidatedAggregationJob {
     pub(crate) claim: SameMessageClaim,
     pub(crate) expected_signers: Vec<AggregationSigner>,
     pub(crate) contributions: Vec<AggregationContribution>,
+    pub(crate) queued_evidence_bytes: usize,
 }
 
 impl ValidatedAggregationJob {
     fn new(job: AggregationJob) -> Result<Self, AggregationError> {
-        validate_limits(&job)?;
+        let queued_evidence_bytes = validate_limits(&job)?;
         validate_signer_list(&job.expected_signers, false)?;
 
         let mut seen_expected = vec![false; job.expected_signers.len()];
@@ -245,11 +280,22 @@ impl ValidatedAggregationJob {
             claim: job.claim,
             expected_signers: job.expected_signers,
             contributions: job.contributions,
+            queued_evidence_bytes,
         })
+    }
+
+    fn new_verification(job: AggregationJob) -> Result<Self, AggregationError> {
+        let actual = job.contributions.len();
+        if actual != 1 {
+            return Err(AggregationError::InvalidJob(
+                InvalidAggregationJob::VerificationRequiresSingleContribution { actual },
+            ));
+        }
+        Self::new(job)
     }
 }
 
-fn validate_limits(job: &AggregationJob) -> Result<(), AggregationError> {
+fn validate_limits(job: &AggregationJob) -> Result<usize, AggregationError> {
     if job.expected_signers.len() > V1_MAX_AGGREGATION_SIGNERS {
         return Err(AggregationError::ResourceExhausted(
             AggregationResource::TooManySigners {
@@ -285,7 +331,7 @@ fn validate_limits(job: &AggregationJob) -> Result<(), AggregationError> {
             },
         ));
     }
-    validate_total_input_bytes(
+    let queued_evidence_bytes = validate_total_input_bytes(
         job.contributions
             .iter()
             .map(|contribution| evidence_len(&contribution.evidence)),
@@ -300,12 +346,12 @@ fn validate_limits(job: &AggregationJob) -> Result<(), AggregationError> {
             InvalidAggregationJob::EmptyContributions,
         ));
     }
-    Ok(())
+    Ok(queued_evidence_bytes)
 }
 
 fn validate_total_input_bytes(
     lengths: impl IntoIterator<Item = usize>,
-) -> Result<(), AggregationError> {
+) -> Result<usize, AggregationError> {
     let total_input_bytes = lengths
         .into_iter()
         .try_fold(0usize, usize::checked_add)
@@ -323,7 +369,7 @@ fn validate_total_input_bytes(
             },
         ));
     }
-    Ok(())
+    Ok(total_input_bytes)
 }
 
 fn validate_signer_list(
@@ -379,7 +425,7 @@ mod tests {
     fn total_input_cap_is_checked_without_allocating_payloads() {
         assert_eq!(
             validate_total_input_bytes([V1_MAX_AGGREGATION_INPUT_BYTES]),
-            Ok(())
+            Ok(V1_MAX_AGGREGATION_INPUT_BYTES)
         );
         assert_eq!(
             validate_total_input_bytes([V1_MAX_AGGREGATION_INPUT_BYTES, 1]),

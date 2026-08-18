@@ -4,7 +4,7 @@ use bls::SecretKey;
 use consensus_signature::{
     AggregationContribution, AggregationError, AggregationJob, AggregationService,
     AggregationSigner, Hash256, OneTimeUseId, SameMessageClaim, SameMessageEvidence, SigningDuty,
-    V1_MAX_AGGREGATION_CONTRIBUTIONS, V1_MAX_AGGREGATION_SIGNERS,
+    V1_MAX_AGGREGATION_CONTRIBUTIONS, V1_MAX_AGGREGATION_SIGNERS, VerificationClass,
     is_individual_same_message_evidence,
 };
 use futures::executor::block_on;
@@ -63,6 +63,59 @@ fn one_contribution_is_verified_and_returned_without_reencoding() {
     .expect("one valid contribution is promoted without proving");
 
     assert_eq!(result.serialize(), expected_bytes);
+}
+
+#[test]
+fn bls_verification_classes_execute_equivalently_without_queueing() {
+    let key = secret_key(1);
+    let claim = claim(0x42);
+    let signer = signer(7, &key);
+    let evidence = evidence(&key, claim);
+    let expected_bytes = evidence.serialize();
+    let service = AggregationService::new().expect("BLS aggregation service is available");
+
+    for class in [VerificationClass::Block, VerificationClass::Gossip] {
+        let result = block_on(service.verify(
+            class,
+            AggregationJob {
+                claim,
+                expected_signers: vec![signer.clone()],
+                contributions: vec![contribution(vec![signer.clone()], evidence.clone())],
+            },
+        ))
+        .expect("BLS verification ignores scheduler admission class");
+
+        assert_eq!(result.serialize(), expected_bytes);
+    }
+}
+
+#[test]
+fn verification_api_rejects_multi_contribution_proving() {
+    let first_key = secret_key(1);
+    let second_key = secret_key(2);
+    let claim = claim(0x42);
+    let first = signer(1, &first_key);
+    let second = signer(2, &second_key);
+    let service = AggregationService::new().expect("BLS aggregation service is available");
+
+    assert_eq!(
+        block_on(service.verify(
+            VerificationClass::Block,
+            AggregationJob {
+                claim,
+                expected_signers: vec![first.clone(), second.clone()],
+                contributions: vec![
+                    contribution(vec![first], evidence(&first_key, claim)),
+                    contribution(vec![second], evidence(&second_key, claim)),
+                ],
+            },
+        )),
+        Err(AggregationError::InvalidJob(
+            consensus_signature::InvalidAggregationJob::VerificationRequiresSingleContribution {
+                actual: 2,
+            }
+        ))
+    );
 }
 
 #[test]

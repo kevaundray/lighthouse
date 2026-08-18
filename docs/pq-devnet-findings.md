@@ -835,15 +835,10 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   raw+child, and child+child jobs work; peer proof/decode mismatches are `InvalidEvidence`, while
   structural caller errors and post-verification proving failures stay local.
 - `PqProver` and its constructor are crate-private; `AggregationService` is the sole public owner
-  that can synchronously initialize or reserve the process singleton. Submission uses non-blocking
-  `try_send` into a capacity-one queue and an async-compatible oneshot result, giving one active and
-  at most one queued proof. A dropped result receiver is checked immediately before backend entry
-  and the queued job is silently skipped because no receiver remains to observe a result; an
-  already-started proof is never cancelled mid-flight. Deterministic worker tests cover queue
-  saturation, that pre-entry skip without backend execution, execution on the named OS worker
-  rather than the awaiting thread, channel stop, output overflow, caught panic, and permanent
-  lifecycle poisoning. Wire-only `types/pq-devnet` builds do not compile this execution service or
-  its futures dependency.
+  that can synchronously initialize or reserve the process singleton. Its original capacity-one
+  submission channel was replaced in Task 5.3a by the reserved scheduler described below.
+  Wire-only `types/pq-devnet` builds do not compile this execution service, scheduler, parking-lot,
+  or futures dependency.
 - The unavailable-build cfg now has one complete fallback for every target other than an
   AVX2-compiled x86-64 binary. Its target mapping returns `UnsupportedTarget` on non-x86-64 and
   `Avx2NotEnabledAtCompileTime` on scalar x86-64; host unit tests cover both mappings and the native
@@ -954,3 +949,58 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   coordinator case is not constructible without changing the frozen profile or introducing a
   test-only consensus preset. Task 5.1 already exercises real raw-plus-child recursion; this slice
   records the coordinator limitation rather than weakening state-derived committee validation.
+
+### 2026-08-18: Reserved PQ verification admission implemented
+
+- `AggregationService::verify` exposes only the semantic `Block` and `Gossip` classes. It requires
+  exactly one contribution before queue admission, so callers can contextually verify either raw
+  evidence or an existing recursive child but cannot promote multi-contribution proving into a
+  high-priority class. `aggregate` remains the only local recursive-proving API and maps to a
+  private lowest-priority class. Default BLS verifies immediately and returns the same evidence as
+  its aggregation boundary; the class has no scheduling effect and BLS wire behavior is unchanged.
+- One private parking-lot mutex/condition-variable scheduler feeds the existing named 512 MiB
+  singleton worker and process-global backend owner. It pops Block, then Gossip, then Aggregate,
+  FIFO within each class. Frozen queued-only limits are two block jobs/1 MiB, four gossip jobs/2
+  MiB, and one aggregation job/8 MiB. The independently owned class budgets sum to an 11 MiB global
+  checked queued-evidence cap, so filling gossip and aggregation cannot consume the block reserve.
+  The active job is accounted separately and remains bounded by the existing 8 MiB job-input cap;
+  maximum retained evidence is therefore 19 MiB plus bounded signer/job metadata.
+- Admission bounded-scans the seven possible queued entries and purges dropped result receivers
+  before checking counts or bytes. Each command's cancellation state is observed exactly once in a
+  one-pass stable partition, and the checked removed-byte sum covers that exact removed identity
+  set; a receiver dropping concurrently after its live decision remains queued and accounted until
+  the next admission or worker pop. Removed commands are accumulated while the queue and accounting
+  change atomically, then destroyed only after releasing the scheduler lock, because job `Drop`
+  implementations and response machinery may re-enter the scheduler. The worker releases queued
+  accounting on pop and checks cancellation again immediately before backend entry. Once backend
+  work starts it remains non-cancellable. Dropping the service closes admissions and detaches
+  without joining; admitted jobs drain by priority and the worker retains the lifecycle guard until
+  it exits.
+- Queue releases use checked subtraction. Cancellation scans use checked addition, and shutdown
+  first validates each class sum and the global sum against the queued commands. Any underflow,
+  overflow, or mismatch permanently marks scheduler accounting poisoned, closes admission, and
+  resolves retained work as `WorkerStopped`; counters are reset only after the poisoned scheduler
+  has drained every queue. Normal and poisoned shutdown both finish draining under the scheduler
+  lock, release that lock, and only then wake response futures, so a custom waker may safely
+  re-enter scheduler admission without deadlock.
+- A caught active backend panic returns `WorkerPanicked`, permanently poisons the singleton
+  lifecycle, closes admissions, and explicitly resolves every queued response as `WorkerStopped`.
+  Count, class-byte, and global-byte admission failures all remain local
+  `ResourceExhausted(QueueSaturated)` results and must never become peer-invalid attribution.
+- Priority is cooperative, not pre-emptive: a block request arriving during an active recursive
+  proof waits for that proof to finish. Later block callers must submit their signature jobs
+  sequentially rather than fan out into the bounded queue. Start the first devnet with 120-second
+  slots and treat that only as a conservative test setting pending release-build end-to-end
+  measurements; lengthen it if active-proof and sequential block verification lack margin.
+- Deterministic tests cover lower-class saturation with maximum block admission still available,
+  strict priority/FIFO order, exact count/class/global byte caps and cap-plus-one without evidence
+  allocation, distinct admission-time and last-safe worker-time cancellation, notification of a
+  worker already waiting on admission, close notification and lifecycle release, nonblocking owner
+  Drop with draining, panic fan-out/poisoning, local queue-error classification, the single public
+  backend owner, and default BLS equivalence. The real AVX2 recursion smoke continues to exercise
+  the same singleton worker and local proving entry point. The final-tree AVX2 debug run passed 1/1
+  in 206.19 seconds of test time (3:27.38 command wall including compilation): raw+raw took 7.723
+  and 7.405 seconds and emitted 106,895 and 106,546 bytes, raw+child took 85.838 seconds and emitted
+  164,420 bytes, and child+child took 76.066 seconds and emitted 159,551 bytes. The timed command
+  tree peaked at 2,615,112 KiB RSS with zero swaps; this is not a worker-thread-only memory
+  measurement.

@@ -2087,6 +2087,7 @@ dependencies = [
  "futures",
  "hex",
  "lean-multisig",
+ "parking_lot",
  "serde",
  "serde_json",
  "tree_hash",

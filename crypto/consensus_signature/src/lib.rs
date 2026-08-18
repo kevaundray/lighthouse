@@ -44,7 +44,7 @@ pub use aggregation::{
     AggregationContribution, AggregationError, AggregationJob, AggregationResource,
     AggregationService, AggregationSigner, InvalidAggregationJob, SameMessageClaim,
     V1_MAX_AGGREGATION_CONTRIBUTIONS, V1_MAX_AGGREGATION_INPUT_BYTES,
-    V1_MAX_AGGREGATION_OUTPUT_BYTES, V1_MAX_AGGREGATION_SIGNERS,
+    V1_MAX_AGGREGATION_OUTPUT_BYTES, V1_MAX_AGGREGATION_SIGNERS, VerificationClass,
     is_individual_same_message_evidence,
 };
 pub use signing_id::{
