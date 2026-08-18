@@ -8,6 +8,7 @@ use std::ops::RangeInclusive;
 const UPSTREAM_MAGIC: &[u8; 4] = b"LMSI";
 const UPSTREAM_VERSION: u8 = 1;
 const UPSTREAM_RAW_KIND: u8 = 0;
+const UPSTREAM_AGGREGATE_KIND: u8 = 1;
 const UPSTREAM_HEADER_LEN: usize = UPSTREAM_MAGIC.len() + 2;
 
 pub(crate) type BackendSignature = lean_multisig::Signature;
@@ -146,6 +147,34 @@ pub(crate) fn decode_raw_signature(
     upstream.push(UPSTREAM_RAW_KIND);
     upstream.extend_from_slice(&payload);
     BackendSignature::from_bytes(&upstream, &backend_claim(claim), &[public_key])
+}
+
+pub(crate) fn encode_aggregate_signature(
+    signature: &BackendSignature,
+) -> Result<Vec<u8>, BackendError> {
+    let bytes = signature.to_bytes();
+    if !has_upstream_envelope(&bytes, UPSTREAM_AGGREGATE_KIND) {
+        return Err(BackendError(lean_multisig::Error::MalformedSignature));
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn decode_aggregate_signature(
+    bytes: &[u8],
+    public_keys: &[[u8; 32]],
+    claim: &PqSigningClaim,
+) -> Result<BackendSignature, lean_multisig::Error> {
+    if !has_upstream_envelope(bytes, UPSTREAM_AGGREGATE_KIND) {
+        return Err(lean_multisig::Error::MalformedSignature);
+    }
+    BackendSignature::from_bytes(bytes, &backend_claim(claim), public_keys)
+}
+
+fn has_upstream_envelope(bytes: &[u8], kind: u8) -> bool {
+    bytes.len() > UPSTREAM_HEADER_LEN
+        && bytes.get(..UPSTREAM_MAGIC.len()) == Some(UPSTREAM_MAGIC)
+        && bytes.get(UPSTREAM_MAGIC.len()).copied() == Some(UPSTREAM_VERSION)
+        && bytes.get(UPSTREAM_MAGIC.len() + 1).copied() == Some(kind)
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]

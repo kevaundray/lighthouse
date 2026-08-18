@@ -18,6 +18,7 @@ pub use crate::{
 };
 
 use crate::OneTimeUseId;
+use crate::pq_wire::PQ_EVIDENCE_HEADER_LEN;
 use backend::BackendSignature;
 #[cfg(test)]
 use backend::BackendSigningKey;
@@ -167,6 +168,8 @@ pub enum PqVerifyError {
 pub enum PqVerifyRequestError {
     EmptySignerSet,
     TooManySigners { actual: usize, max: usize },
+    DuplicateSigner,
+    NonCanonicalSignerOrder,
 }
 
 impl std::fmt::Display for PqVerifyRequestError {
@@ -175,6 +178,10 @@ impl std::fmt::Display for PqVerifyRequestError {
             Self::EmptySignerSet => formatter.write_str("no PQ signers supplied"),
             Self::TooManySigners { actual, max } => {
                 write!(formatter, "too many PQ signers: {actual}, maximum {max}")
+            }
+            Self::DuplicateSigner => formatter.write_str("duplicate PQ signer"),
+            Self::NonCanonicalSignerOrder => {
+                formatter.write_str("PQ signers are not in canonical public-key order")
             }
         }
     }
@@ -189,6 +196,19 @@ impl PqVerifyError {
             | lean_multisig::Error::MalformedSignature
             | lean_multisig::Error::MessageMismatch
             | lean_multisig::Error::SignerSetMismatch => Self::InvalidEvidence,
+            _ => Self::Internal,
+        }
+    }
+
+    fn from_aggregate_backend(error: lean_multisig::Error) -> Self {
+        match error {
+            lean_multisig::Error::InvalidSignature { .. }
+            | lean_multisig::Error::Proof(_)
+            | lean_multisig::Error::MalformedSignature
+            | lean_multisig::Error::MessageMismatch
+            | lean_multisig::Error::SignerSetMismatch => Self::InvalidEvidence,
+            // Public keys and the request structure are locally resolved. Unknown variants from
+            // the non-exhaustive upstream error remain local rather than becoming peer blame.
             _ => Self::Internal,
         }
     }
@@ -255,10 +275,26 @@ impl PqRawContribution {
 
 /// An in-memory aggregate proof produced by the owned prover.
 ///
-/// Its network encoding remains deliberately unavailable until Task 4.1 adds the bounded,
-/// representation-specific same-message evidence union.
+/// Its network encoding is available only through [`Self::into_same_message_evidence`], which
+/// validates the frozen output bound before constructing same-message evidence.
 #[derive(Clone, Debug)]
 pub struct PqAggregateSignature(BackendSignature);
+
+impl PqAggregateSignature {
+    /// Converts a locally proved aggregate into bounded Lighthouse same-message evidence.
+    ///
+    /// The complete pinned upstream `LMSI` envelope is retained inside the Lighthouse aggregate
+    /// payload. No public API can construct this type from arbitrary bytes.
+    pub fn into_same_message_evidence(self) -> Result<PqSameMessageEvidence, AggregateError> {
+        let envelope = backend::encode_aggregate_signature(&self.0)
+            .map_err(|error| AggregateError::Internal(PqBackendError(error)))?;
+        let evidence_len = PQ_EVIDENCE_HEADER_LEN.saturating_add(envelope.len());
+        validate_aggregate_evidence_len(evidence_len)?;
+        Ok(PqSameMessageEvidence::from_backend_aggregate_envelope(
+            envelope,
+        ))
+    }
+}
 
 /// Verifies one in-memory aggregate against its exact claim and signer set.
 pub fn verify_aggregate(
@@ -267,12 +303,41 @@ pub fn verify_aggregate(
     claim: &PqSigningClaim,
 ) -> Result<(), PqVerifyError> {
     validate_aggregate_signer_count(public_keys.len())?;
+    validate_canonical_signer_order(public_keys)?;
     let public_keys = public_keys
         .iter()
         .map(PqPublicKey::backend_bytes)
         .collect::<Vec<_>>();
     backend::verify_signature(&signature.0, &public_keys, claim)
         .map_err(PqVerifyError::from_backend)
+}
+
+/// Contextually decodes and verifies bounded aggregate evidence.
+///
+/// `public_keys` must be the exact expected signer set in strictly ascending canonical byte
+/// order. The outer size and signer-count bounds are checked before collecting backend keys or
+/// invoking backend parsing/setup.
+pub fn verify_aggregate_evidence(
+    evidence: &PqSameMessageEvidence,
+    public_keys: &[PqPublicKey],
+    claim: &PqSigningClaim,
+) -> Result<(), PqVerifyError> {
+    if evidence.as_bytes().len() > PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN {
+        return Err(PqVerifyError::InvalidEvidence);
+    }
+    validate_aggregate_signer_count(public_keys.len())?;
+    validate_canonical_signer_order(public_keys)?;
+    let envelope = evidence
+        .backend_aggregate_envelope()
+        .map_err(|_| PqVerifyError::InvalidEvidence)?;
+    let backend_public_keys = public_keys
+        .iter()
+        .map(PqPublicKey::backend_bytes)
+        .collect::<Vec<_>>();
+    let signature = backend::decode_aggregate_signature(envelope, &backend_public_keys, claim)
+        .map_err(PqVerifyError::from_aggregate_backend)?;
+    backend::verify_signature(&signature, &backend_public_keys, claim)
+        .map_err(PqVerifyError::from_aggregate_backend)
 }
 
 fn validate_aggregate_signer_count(count: usize) -> Result<(), PqVerifyError> {
@@ -288,6 +353,25 @@ fn validate_aggregate_signer_count(count: usize) -> Result<(), PqVerifyError> {
                 max: PQ_MAX_SIGNERS,
             },
         ));
+    }
+    Ok(())
+}
+
+fn validate_canonical_signer_order(public_keys: &[PqPublicKey]) -> Result<(), PqVerifyError> {
+    for pair in public_keys.windows(2) {
+        match pair[0].cmp(&pair[1]) {
+            std::cmp::Ordering::Less => {}
+            std::cmp::Ordering::Equal => {
+                return Err(PqVerifyError::InvalidRequest(
+                    PqVerifyRequestError::DuplicateSigner,
+                ));
+            }
+            std::cmp::Ordering::Greater => {
+                return Err(PqVerifyError::InvalidRequest(
+                    PqVerifyRequestError::NonCanonicalSignerOrder,
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -382,6 +466,8 @@ pub enum AggregateError {
     InvalidEvidence(PqBackendError),
     /// The owned job is empty or exceeds an upstream protocol limit.
     InvalidRequest(PqAggregateRequestError),
+    /// A locally produced proof exceeds the frozen devnet resource limit.
+    Resource(PqAggregateResourceError),
     /// The local prover is unavailable before a worker exists.
     Unavailable(ProverUnavailable),
     /// The worker stopped before accepting or answering this job.
@@ -398,6 +484,24 @@ pub enum PqAggregateRequestError {
     Empty,
     TooManyContributions { actual: usize, max: usize },
 }
+
+/// A bounded local aggregate-output failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PqAggregateResourceError {
+    ProofTooLarge { actual: usize, max: usize },
+}
+
+impl std::fmt::Display for PqAggregateResourceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProofTooLarge { actual, max } => {
+                write!(formatter, "PQ proof length {actual} exceeds maximum {max}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PqAggregateResourceError {}
 
 impl std::fmt::Display for PqAggregateRequestError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -425,6 +529,18 @@ fn validate_aggregate_contribution_count(count: usize) -> Result<(), AggregateEr
             PqAggregateRequestError::TooManyContributions {
                 actual: count,
                 max: PQ_MAX_SIGNERS,
+            },
+        ));
+    }
+    Ok(())
+}
+
+fn validate_aggregate_evidence_len(length: usize) -> Result<(), AggregateError> {
+    if length > PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN {
+        return Err(AggregateError::Resource(
+            PqAggregateResourceError::ProofTooLarge {
+                actual: length,
+                max: PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN,
             },
         ));
     }
@@ -463,6 +579,7 @@ impl std::fmt::Display for AggregateError {
             Self::InvalidRequest(error) => {
                 write!(formatter, "invalid PQ aggregation request: {error}")
             }
+            Self::Resource(error) => write!(formatter, "PQ aggregation resource limit: {error}"),
             Self::Unavailable(error) => write!(formatter, "PQ prover unavailable: {error}"),
             Self::WorkerStopped => formatter.write_str("PQ prover worker stopped"),
             Self::WorkerPanicked => formatter.write_str("PQ prover worker panicked"),
@@ -476,6 +593,7 @@ impl std::error::Error for AggregateError {
         match self {
             Self::InvalidEvidence(error) | Self::Internal(error) => Some(error),
             Self::InvalidRequest(error) => Some(error),
+            Self::Resource(error) => Some(error),
             Self::Unavailable(error) => Some(error),
             Self::WorkerStopped | Self::WorkerPanicked => None,
         }
@@ -736,10 +854,13 @@ const fn build_mode_unavailable() -> ProverUnavailable {
 #[cfg(test)]
 mod tests {
     use super::{
-        AggregateError, PQ_MAX_SIGNERS, PqAggregateRequestError, PqBackendError, PqRawSignature,
-        PqSignError, PqSigningClaim, PqUnreservedSigningKey, PqVerifyError, PqVerifyRequestError,
-        ProverLifecycle, ProverUnavailable, catch_backend_panic,
-        validate_aggregate_contribution_count, validate_aggregate_signer_count, verify_raw,
+        AggregateError, PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN, PQ_MAX_SIGNERS, PqAggregateRequestError,
+        PqAggregateResourceError, PqBackendError, PqPublicKey, PqRawSignature,
+        PqSameMessageEvidence, PqSignError, PqSigningClaim, PqUnreservedSigningKey, PqVerifyError,
+        PqVerifyRequestError, ProverLifecycle, ProverUnavailable, catch_backend_panic,
+        validate_aggregate_contribution_count, validate_aggregate_evidence_len,
+        validate_aggregate_signer_count, validate_canonical_signer_order,
+        verify_aggregate_evidence, verify_raw,
     };
     use crate::{OneTimeUseId, SigningDuty};
     use std::error::Error as _;
@@ -799,6 +920,81 @@ mod tests {
                     max: PQ_MAX_SIGNERS,
                 }
             ))
+        );
+    }
+
+    #[test]
+    fn aggregate_evidence_size_is_checked_without_allocating_the_payload() {
+        assert!(validate_aggregate_evidence_len(PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN).is_ok());
+        assert!(matches!(
+            validate_aggregate_evidence_len(PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN + 1),
+            Err(AggregateError::Resource(
+                PqAggregateResourceError::ProofTooLarge { actual, max }
+            )) if actual == PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN + 1
+                && max == PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN
+        ));
+    }
+
+    #[test]
+    fn aggregate_verification_rejects_noncanonical_signer_context_before_backend_setup() {
+        let evidence = PqSameMessageEvidence::from_bytes(b"LHPQ\x01\x01\x01LMSI\x01\x01\x00")
+            .expect("structurally bounded aggregate evidence");
+        let first = PqPublicKey::deserialize(&[1; 32]).expect("fixed-size public key");
+        let second = PqPublicKey::deserialize(&[2; 32]).expect("fixed-size public key");
+        let claim = PqSigningClaim::new([0x42; 32], randao_id());
+
+        assert_eq!(
+            validate_canonical_signer_order(&[first, first]),
+            Err(PqVerifyError::InvalidRequest(
+                PqVerifyRequestError::DuplicateSigner
+            ))
+        );
+        assert_eq!(
+            verify_aggregate_evidence(&evidence, &[second, first], &claim),
+            Err(PqVerifyError::InvalidRequest(
+                PqVerifyRequestError::NonCanonicalSignerOrder
+            ))
+        );
+        assert_eq!(
+            verify_aggregate_evidence(&evidence, &[], &claim),
+            Err(PqVerifyError::InvalidRequest(
+                PqVerifyRequestError::EmptySignerSet
+            ))
+        );
+        let oversized = vec![first; PQ_MAX_SIGNERS + 1];
+        assert_eq!(
+            verify_aggregate_evidence(&evidence, &oversized, &claim),
+            Err(PqVerifyError::InvalidRequest(
+                PqVerifyRequestError::TooManySigners {
+                    actual: PQ_MAX_SIGNERS + 1,
+                    max: PQ_MAX_SIGNERS,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn aggregate_verification_rejects_non_aggregate_outer_kinds() {
+        let key = signing_key(7);
+        let claim = PqSigningClaim::new([0x42; 32], randao_id());
+        let raw = key.sign(&claim).expect("raw signature");
+        let raw_evidence = PqSameMessageEvidence::from(&raw);
+        let absent = PqSameMessageEvidence::empty();
+
+        assert_eq!(
+            verify_aggregate_evidence(&raw_evidence, &[key.public_key()], &claim),
+            Err(PqVerifyError::InvalidEvidence)
+        );
+        assert_eq!(
+            verify_aggregate_evidence(&absent, &[key.public_key()], &claim),
+            Err(PqVerifyError::InvalidEvidence)
+        );
+        let mismatched_inner_kind =
+            PqSameMessageEvidence::from_bytes(b"LHPQ\x01\x01\x01LMSI\x01\x00\x00")
+                .expect("generic wire decoding keeps the aggregate payload opaque");
+        assert_eq!(
+            verify_aggregate_evidence(&mismatched_inner_kind, &[key.public_key()], &claim),
+            Err(PqVerifyError::InvalidEvidence)
         );
     }
 
@@ -893,7 +1089,7 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[test]
     fn pq_dependency_smoke() {
-        use super::{PqProver, PqRawContribution, ProverError, verify_aggregate};
+        use super::{PqProver, PqRawContribution, ProverError};
 
         let prover = PqProver::new().expect("PQ prover worker starts and initializes");
         assert!(matches!(
@@ -932,17 +1128,107 @@ mod tests {
                 claim,
             )
             .expect("two-signer PQ aggregate");
-        let expected_signers = [first_public_key, second_public_key];
-        verify_aggregate(&aggregate, &expected_signers, &claim).expect("aggregate verifies");
+        let evidence = aggregate
+            .into_same_message_evidence()
+            .expect("bounded Lighthouse aggregate evidence");
+        assert_eq!(&evidence.as_bytes()[..7], b"LHPQ\x01\x01\x01");
+        assert_eq!(&evidence.as_bytes()[7..13], b"LMSI\x01\x01");
+
+        let mut expected_signers = [first_public_key, second_public_key];
+        expected_signers.sort();
+        verify_aggregate_evidence(&evidence, &expected_signers, &claim)
+            .expect("encoded aggregate verifies");
 
         let wrong_claim = PqSigningClaim::new([0x43; 32], one_time_use_id);
-        let missing_signer = [first_public_key];
-        let extra_signer = [first_public_key, second_public_key, wrong_key.public_key()];
-        let wrong_signer = [first_public_key, wrong_key.public_key()];
-        assert!(verify_aggregate(&aggregate, &missing_signer, &claim).is_err());
-        assert!(verify_aggregate(&aggregate, &extra_signer, &claim).is_err());
-        assert!(verify_aggregate(&aggregate, &wrong_signer, &claim).is_err());
-        assert!(verify_aggregate(&aggregate, &expected_signers, &wrong_claim).is_err());
+        let wrong_id_claim = PqSigningClaim::new([0x42; 32], block_id());
+        let missing_signer = [expected_signers[0]];
+        let mut extra_signer = [first_public_key, second_public_key, wrong_key.public_key()];
+        extra_signer.sort();
+        let mut wrong_signer = [first_public_key, wrong_key.public_key()];
+        wrong_signer.sort();
+        for result in [
+            verify_aggregate_evidence(&evidence, &missing_signer, &claim),
+            verify_aggregate_evidence(&evidence, &extra_signer, &claim),
+            verify_aggregate_evidence(&evidence, &wrong_signer, &claim),
+            verify_aggregate_evidence(&evidence, &expected_signers, &wrong_claim),
+            verify_aggregate_evidence(&evidence, &expected_signers, &wrong_id_claim),
+        ] {
+            assert_eq!(result, Err(PqVerifyError::InvalidEvidence));
+        }
+
+        assert_eq!(
+            verify_aggregate_evidence(
+                &evidence,
+                &[expected_signers[0], expected_signers[0]],
+                &claim,
+            ),
+            Err(PqVerifyError::InvalidRequest(
+                PqVerifyRequestError::DuplicateSigner
+            ))
+        );
+        assert_eq!(
+            verify_aggregate_evidence(
+                &evidence,
+                &[expected_signers[1], expected_signers[0]],
+                &claim,
+            ),
+            Err(PqVerifyError::InvalidRequest(
+                PqVerifyRequestError::NonCanonicalSignerOrder
+            ))
+        );
+
+        for malformed_bytes in [
+            &evidence.as_bytes()[..evidence.as_bytes().len() - 1],
+            b"LHPQ\x01\x01\x01LMSI\x01\x01".as_slice(),
+        ] {
+            let malformed = PqSameMessageEvidence::from_bytes(malformed_bytes)
+                .expect("generic wire decoding intentionally keeps payload opaque");
+            assert_eq!(
+                verify_aggregate_evidence(&malformed, &expected_signers, &claim),
+                Err(PqVerifyError::InvalidEvidence)
+            );
+        }
+
+        let mut trailing_bytes = evidence.as_bytes().to_vec();
+        trailing_bytes.push(0);
+        let trailing = PqSameMessageEvidence::from_bytes(&trailing_bytes)
+            .expect("generic wire decoding intentionally keeps payload opaque");
+        assert_eq!(
+            verify_aggregate_evidence(&trailing, &expected_signers, &claim),
+            Err(PqVerifyError::InvalidEvidence)
+        );
+
+        let mut corrupted_bytes = evidence.as_bytes().to_vec();
+        let last_byte = corrupted_bytes
+            .last_mut()
+            .expect("aggregate evidence is nonempty");
+        *last_byte ^= 1;
+        let corrupted = PqSameMessageEvidence::from_bytes(&corrupted_bytes)
+            .expect("generic wire decoding intentionally keeps payload opaque");
+        assert_eq!(
+            verify_aggregate_evidence(&corrupted, &expected_signers, &claim),
+            Err(PqVerifyError::InvalidEvidence)
+        );
+        let backend_public_keys = expected_signers
+            .iter()
+            .map(PqPublicKey::backend_bytes)
+            .collect::<Vec<_>>();
+        let corrupted_signature = super::backend::decode_aggregate_signature(
+            corrupted
+                .backend_aggregate_envelope()
+                .expect("aggregate outer kind"),
+            &backend_public_keys,
+            &claim,
+        )
+        .expect("the mutation preserves the upstream aggregate encoding");
+        let proof_error =
+            super::backend::verify_signature(&corrupted_signature, &backend_public_keys, &claim)
+                .expect_err("the mutated proof is invalid");
+        assert!(matches!(proof_error, lean_multisig::Error::Proof(_)));
+        assert_eq!(
+            PqVerifyError::from_aggregate_backend(proof_error),
+            PqVerifyError::InvalidEvidence
+        );
     }
 
     #[test]

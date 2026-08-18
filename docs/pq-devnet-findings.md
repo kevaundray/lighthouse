@@ -403,11 +403,12 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
 - Chose a Lighthouse-owned envelope: `LHPQ`, one-byte wire version, one-byte parameter-set ID,
   one-byte semantic evidence kind, then the backend payload. The exact pinned raw form is 1,215
   bytes: seven Lighthouse header bytes plus the 1,208-byte XMSS signature payload.
-- The adapter will not preserve the upstream private `LMSI` representation tag on the network.
-  Instead, one narrow exact-pin bridge strips it from locally produced evidence and reconstructs a
-  raw or aggregate backend header only after the Lighthouse envelope has selected the field kind.
-  This prevents conflicting attacker-controlled inner and outer kinds and lets a later fork replace
-  the bridge without changing devnet SSZ bytes.
+- The fixed-size raw adapter does not preserve the upstream private `LMSI` representation tag on
+  the network: it strips the raw tag locally and reconstructs it only after the Lighthouse envelope
+  has selected the raw field kind. Aggregate evidence cannot use that shortcut because the pinned
+  backend exposes only the complete private `Signature::to_bytes()` representation. Task 4.2
+  therefore preserves the full `LMSI/version/aggregate` envelope inside the Lighthouse aggregate
+  payload and checks that inner representation before contextual decoding.
 - Raw verification can proceed without prover setup. A PQ individual-signature field accepts only
   the exact raw form. Same-message evidence will later admit raw promotion, aggregate proof, or a
   canonical seven-byte absent value; aggregate evidence is capped at 512 KiB for V1.
@@ -774,3 +775,39 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   compiling boundary rejects Web3Signer by construction, gates remote mutation and EIP-3076 APIs,
   and returns explicit errors for unsupported signing duties; it does not claim an executable PQ
   validator client yet.
+
+### 2026-08-18: Bounded contextual aggregate evidence implemented
+
+- Task 4.1 already supplied the final 512 KiB variable-size SSZ type and Lighthouse raw,
+  aggregate, and absent framing. Task 4.2's actual RED was the missing backend-owned aggregate
+  construction and contextual hostile decode/verify boundary; no `types` container or tree-root
+  change was needed.
+- `PqAggregateSignature::into_same_message_evidence` is the only local aggregate-output path. The
+  type remains opaque and can be obtained only from the owned `PqProver`. Conversion retains the
+  complete pinned upstream `LMSI/version1/aggregate` envelope inside
+  `LHPQ/version1/parameter1/aggregate`, checks the full outer length against 512 KiB before
+  constructing the wire value, and reports a typed local `ProofTooLarge` resource error.
+- `verify_aggregate_evidence` requires the bounded evidence, exact semantic `PqSigningClaim`, and
+  expected public keys in strictly ascending canonical byte order. It rejects empty/over-limit,
+  duplicate, or permuted local signer contexts before allocating the backend key vector or entering
+  backend parsing/setup. Raw and absent outer kinds are invalid aggregate evidence. Missing, extra,
+  substituted, wrong-root, and wrong-one-time-ID contexts fail cryptographic verification.
+- Generic SSZ decoding remains intentionally non-cryptographic: it checks only the Lighthouse
+  envelope/kind and 512 KiB cap, leaving the aggregate payload opaque. Contextual verification
+  separately requires the exact inner `LMSI/version1/aggregate` envelope and rejects malformed,
+  truncated, trailing, or cryptographically invalid proofs. A mutated real two-signer proof was
+  confirmed to reach upstream `Error::Proof(_)` and is classified as peer `InvalidEvidence`;
+  locally generated proof errors on the owned prover path remain `Internal`. Unknown upstream
+  variants remain internal, and backend sources are not exposed through the public verification
+  error chain.
+- The exact outer cap is accepted and max-plus-one is rejected before copying into the bounded wire
+  value. The pinned upstream serializer and aggregate decoder still allocate their private nested
+  representation internally. This is acceptable for the controlled exact-pin devnet because the
+  Lighthouse outer cap is enforced first, but a public/untrusted hardening fork must add
+  representation-specific bounded serialization/decoding APIs and resolve the already-recorded
+  license provenance. No fork is required to continue this private devnet slice.
+- Final focused evidence on this host: the scalar PQ suite passed 35/35 in 0.276 seconds; the
+  AVX2-only real two-signer encode/decode/verify and adversarial proof test passed in 35.381 seconds;
+  the default BLS suite passed 7/7. Scalar and AVX2 Rust 1.88 checks, scalar and AVX2 Clippy with
+  warnings denied, the Lean-free `types/pq-devnet` normal dependency graph check, Cargo formatting
+  and sorting, doc tests, diff checks, and the mandatory default workspace `cargo check` all passed.

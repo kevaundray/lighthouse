@@ -274,6 +274,16 @@ fn same_message_evidence_is_bounded_variable_ssz_from_v1() {
 
 #[test]
 fn same_message_evidence_rejects_malformed_or_oversized_envelopes() {
+    let mut maximum = vec![0; PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN];
+    maximum[..HEADER_LEN].copy_from_slice(b"LHPQ\x01\x01\x01");
+    assert_eq!(
+        PqSameMessageEvidence::from_bytes(&maximum)
+            .expect("the exact aggregate evidence cap is accepted")
+            .as_bytes()
+            .len(),
+        PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN
+    );
+
     let mut oversized = vec![0; PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN + 1];
     oversized[..HEADER_LEN].copy_from_slice(b"LHPQ\x01\x01\x01");
 

@@ -426,9 +426,12 @@ Keep wire bytes opaque until verification context is present. The Lighthouse env
 "LHPQ" | wire_version=1 | parameter_set=1 | evidence_kind | backend_payload
 ```
 
-For the exact pinned backend, strip its private six-byte `LMSI` envelope on output and reconstruct
-the required raw header only inside `pq/backend.rs` after the Lighthouse envelope has selected the
-semantic kind. Enforce every length/version/kind check before invoking leanMultisig. Do not expose
+For the exact pinned backend's fixed-size raw form, strip its private six-byte `LMSI` envelope on
+output and reconstruct the required raw header only inside `pq/backend.rs` after the Lighthouse
+envelope has selected the semantic kind. Aggregate evidence is different: Task 4.2 preserves its
+complete upstream `Signature::to_bytes()` envelope inside the Lighthouse aggregate payload because
+the pinned private representation has no public aggregate-payload codec. Enforce every
+length/version/kind check before invoking leanMultisig. Do not expose
 raw upstream `Claim`, `Signature`, `SecretKey`, or `verify`; expose a semantic claim requiring
 `OneTimeUseId` and a strict raw wrapper. The raw sign primitive and unreserved key handle are
 crate-private and test-only in this task. Task 3.3 must co-locate that primitive with the
@@ -1164,31 +1167,59 @@ git commit -m "feat: provision PQ validator genesis"
 **Files:**
 
 - Modify: `crypto/consensus_signature/src/pq.rs`
-- Modify: `consensus/types/src/attestation/attestation.rs`
-- Modify: `consensus/types/src/sync_committee/sync_aggregate.rs`
-- Create: aggregate-proof SSZ and adversarial decoding tests
+- Modify: `crypto/consensus_signature/src/pq/backend.rs`
+- Modify: `crypto/consensus_signature/src/pq_wire.rs`
+- Modify: `crypto/consensus_signature/tests/pq_wire_schema.rs`
+- Modify: `docs/pq-devnet-findings.md`
 
-**Step 1: Write failing bounds tests**
+**Step 1: Write failing contextual-boundary tests**
 
-Cover empty proof, maximum accepted proof, one byte over the limit, invalid envelope version,
-trailing bytes, and allocation-before-length-check regressions.
+Task 4.1 already introduced bounded variable-size SSZ, Lighthouse framing, raw promotion, and
+absent evidence. Preserve those tests and add the missing boundary: opaque locally generated
+aggregate construction plus contextual hostile decode/verify. Cover a real two-signer proof,
+wrong root and one-time-use ID, missing/extra/substituted/duplicate/permuted signers, raw/absent
+kinds, malformed/truncated/trailing upstream envelopes, maximum and one-byte-over-limit evidence,
+allocation-before-bound regressions, and local-versus-peer proof-error classification.
 
 **Step 2: Verify RED**
 
-Expected: no bounded PQ aggregate evidence exists.
+Expected: the wire type exists, but no backend-owned conversion or contextual aggregate verifier
+exists. Do not describe the already-implemented generic SSZ bound as missing.
 
-**Step 3: Implement the bounded opaque wire type**
+**Step 3: Implement backend-owned construction and contextual verification**
 
-Parsing remains contextual and occurs during verification, not generic SSZ decoding.
+Only the opaque `PqAggregateSignature` returned by `PqProver` may create local aggregate evidence.
+Retain the complete pinned upstream `LMSI/version/aggregate` envelope inside the Lighthouse
+aggregate payload. Check the 512 KiB full-evidence cap before constructing the wire value and
+return a typed local `ProofTooLarge` resource error.
+
+Generic SSZ/wire decoding continues to validate only the Lighthouse envelope, semantic kind, and
+outer byte limit. Contextual verification accepts `PqSameMessageEvidence`, `PqSigningClaim`, and
+the exact expected `PqPublicKey` list. Require the list to be duplicate-free and strictly ordered
+by canonical public-key bytes. Check evidence and signer bounds before collecting keys or entering
+backend parsing/setup, reject raw and absent kinds, and map malformed bytes, claim/signer mismatch,
+and peer `Error::Proof(_)` to `InvalidEvidence`. Locally generated prover/proof failures remain
+local/internal; unknown non-exhaustive backend errors fail closed as internal. Keep backend
+diagnostics opaque.
+
+No `consensus/types` dependency or container change is required: Task 4.1 already gave attestation
+and sync aggregate fields their final variable-size PQ shape. A fork is not required for this
+controlled exact-pin devnet slice. Before public or broadly untrusted deployment, fork the binding
+to expose representation-specific bounded decoding/serialization so nested backend allocations
+are enforced internally rather than only by Lighthouse's outer 512 KiB cap.
 
 **Step 4: Verify GREEN in BLS and PQ configurations**
 
-Run targeted type tests and checks.
+Run fast scalar framing/classification tests, the serialized AVX2 two-signer proof test, default BLS
+compatibility, Rust 1.88 scalar/AVX2 checks, the `types/pq-devnet` Lean-free graph check, Clippy with
+warnings denied, formatting, dependency sorting, diff checks, and the mandatory workspace
+`cargo check`.
 
 **Step 5: Commit**
 
 ```bash
-git add crypto/consensus_signature consensus/types
+git add crypto/consensus_signature docs/plans/2026-08-18-pq-devnet-implementation.md \
+  docs/pq-devnet-findings.md
 git commit -m "feat: add bounded PQ aggregate proof evidence"
 ```
 

@@ -11,6 +11,8 @@ const AGGREGATE_EVIDENCE_KIND: u8 = 1;
 const ABSENT_EVIDENCE_KIND: u8 = 2;
 const HEADER_LEN: usize = MAGIC.len() + 3;
 pub(crate) const RAW_PAYLOAD_LEN: usize = 1_208;
+#[cfg(feature = "pq-devnet")]
+pub(crate) const PQ_EVIDENCE_HEADER_LEN: usize = HEADER_LEN;
 
 /// Exact byte length of a V1 PQ validator public key.
 pub const PQ_PUBLIC_KEY_LEN: usize = 32;
@@ -179,6 +181,34 @@ impl PqSameMessageEvidence {
     /// Returns true only for the canonical absent envelope.
     pub fn is_empty(&self) -> bool {
         self.0.as_slice() == b"LHPQ\x01\x01\x02"
+    }
+
+    /// Wraps a complete, already-validated upstream aggregate envelope.
+    ///
+    /// This is crate-private so locally generated aggregate evidence can only originate from the
+    /// opaque backend signature returned by the owned prover.
+    #[cfg(feature = "pq-devnet")]
+    pub(crate) fn from_backend_aggregate_envelope(envelope: Vec<u8>) -> Self {
+        let mut bytes = Vec::with_capacity(HEADER_LEN.saturating_add(envelope.len()));
+        bytes.extend_from_slice(b"LHPQ\x01\x01\x01");
+        bytes.extend(envelope);
+        Self(bytes)
+    }
+
+    /// Returns the opaque aggregate payload after requiring the aggregate outer kind.
+    #[cfg(feature = "pq-devnet")]
+    pub(crate) fn backend_aggregate_envelope(&self) -> Result<&[u8], PqWireError> {
+        match self.0.get(MAGIC.len() + 2).copied() {
+            Some(AGGREGATE_EVIDENCE_KIND) => self
+                .0
+                .get(HEADER_LEN..)
+                .ok_or(PqWireError::InvalidAggregateLength(self.0.len())),
+            Some(kind) => Err(PqWireError::WrongEvidenceKind(kind)),
+            None => Err(PqWireError::InvalidLength {
+                actual: self.0.len(),
+                expected: HEADER_LEN,
+            }),
+        }
     }
 }
 
