@@ -567,3 +567,33 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   `types`: they must forward the matching `types/pq-devnet` profile whenever they directly enable
   `consensus_signature/pq-devnet` or `pq-wire`. `signing_method/pq-devnet` therefore selects both
   crates; selecting only the signature crate mixes PQ aliases with BLS-only `types` helpers.
+
+### 2026-08-18: Signing-authority and provisioning boundary correction
+
+- Rust has no cross-crate private or friend visibility. Keeping encrypted-key decryption in
+  `eth2_keystore` and the XMSS journal in `signing_method` would require a public live key, secret
+  bytes, raw reservation, or callback bridge. Any of those recreates an unjournaled signing path.
+  The accepted correction is a new feature-isolated `pq_signing` crate that privately owns the PQ
+  keystore decoder, upstream live keys, SQLite journal, per-key signing locks, and the only raw
+  signing operation.
+- Public `pq_signing` APIs expose encrypted keystores, authenticated public metadata, a
+  journal-provision/validate facade returning no handle, one global authority, bound signer handles,
+  and a combined blocking `sign(claim)` operation. Live upstream keys, decrypted bytes, raw reserve
+  calls/results, generic backends, callbacks, and unreserved signing remain crate-private.
+- `eth2_keystore` returns to BLS/EIP-2335 primitives plus shared exact password normalization. PQ
+  storage moves beside the authority. `validator_dir` and `signing_method` depend on that facade;
+  `types` continues to depend only on lean-free `consensus_signature/pq-wire`.
+- The implementation order is now Task 4.1 wire schema, Task 3.3a authority/provisioning boundary,
+  Task 4.1b direct genesis/provisioning, then Task 3.3b duty routing. This lets the provisioning tool
+  bind the journal without ever receiving reservation authority and lets the validator client load
+  only an already-provisioned journal.
+- Existing `lcli` is not a viable first PQ command boundary: it unconditionally pulls beacon,
+  state-processing, networking, store, and execution crates, which feature-unifies PQ `types` into
+  still-BLS-only callers. Task 4.1b therefore uses a minimal feature-isolated provisioning binary
+  and a temporary genesis-only state-processing feature surface. Neither boundary is evidence that
+  ordinary PQ block processing is complete.
+- Direct-genesis ordering has no journal cycle: deterministic seeds produce encrypted keys/public
+  keys; those keys produce the direct registry and `genesis_validators_root`; that root then binds
+  the journal. The journal uses the validators root, never the state or block root. Staging output is
+  published atomically without cleanup; public artifacts are deterministic, while encrypted
+  keystore JSON intentionally differs because salts and IVs use fresh entropy.

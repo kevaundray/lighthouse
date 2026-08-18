@@ -613,13 +613,115 @@ git add Cargo.toml Cargo.lock crypto/eth2_keystore common/validator_dir \
 git commit -m "feat: add experimental PQ validator keys"
 ```
 
-**Execution dependency:** after this storage task, execute Task 4.1 before Task 3.3. Then execute
-Task 4.1b to create the direct-registry genesis and provisioned validator set. Task 3.3 can only
-route real duties once those compile-time PQ wire types exist.
+**Execution dependency:** after this storage task, execute Task 4.1, then Task 3.3a. Task 3.3a
+deepens the provisional storage/journal modules into one non-bypassable authority before Task 4.1b
+uses its provisioning facade. Route real duties only in Task 3.3b after the direct PQ genesis and
+validator set exist.
 
-### Task 3.3: Route validator duties through PQ signing authority
+### Task 3.3a: Consolidate PQ storage and the journal into one signing authority
 
-**Prerequisites:** Tasks 3.2, 4.1, and 4.1b.
+**Prerequisites:** Tasks 3.1, 3.2, and 4.1.
+
+**Files:**
+
+- Create: `crypto/pq_signing/Cargo.toml`
+- Create: private authority modules under `crypto/pq_signing/src/`
+- Move/adapt: PQ keystore code/tests from `crypto/eth2_keystore/`
+- Move/adapt: XMSS journal code/tests from `validator_client/signing_method/`
+- Modify: `crypto/eth2_keystore/` to expose only reusable encryption/password-normalization
+  primitives, with no leanMultisig dependency
+- Modify: `common/validator_dir/` to use `pq_signing::PqKeystore`
+- Modify: `validator_client/signing_method/` to depend on the new facade but not own SQLite/XMSS
+  internals
+- Create: authority, provisioning, privacy, and crash integration tests
+- Modify: `docs/pq-devnet-findings.md`
+
+**Step 1: Write failing authority/privacy tests**
+
+Require one crate to own encrypted PQ-key decoding, the live upstream key, durable reservations,
+and raw signing. Add compile-fail tests proving public callers cannot obtain a live key, decrypted
+key bytes, raw reservation API, reservation result, caller-supplied post-reservation callback, or
+unreserved signing primitive.
+
+At the public boundary require:
+
+- bounded/versioned `PqKeystore` generation, parsing, metadata, and password authentication;
+- `AuthenticatedPqKeyMetadata`, containing only the validated public key/profile/range;
+- `provision_usage_journal(...) -> Result<(), _>` and
+  `validate_usage_journal(...) -> Result<(), _>`, which never return a journal/reservation handle;
+- one global `PqSigningAuthority` owning the journal and all loaded local PQ keys;
+- lightweight bound `PqSigner` handles whose only cryptographic operation is
+  `sign(PqSigningClaim) -> PqRawSignature`.
+
+Cover successful encrypted-key-to-signature verification, identical retry returning byte-identical
+evidence, conflicting root and out-of-range ID never reaching the backend, duplicate/mismatched
+keys failing startup, missing journal failing startup, and a second process being refused by the
+persistent lock. Retain subprocess crash cases before commit, after commit/before sign, and after
+sign/before return.
+
+**Step 2: Verify RED**
+
+Run the new crate's doc/privacy, keystore, journal, and authority tests. Expected: the consolidated
+crate and safe facade do not exist; the current cross-crate private pieces cannot be connected
+without exposing a bypass.
+
+**Step 3: Implement the deep `pq_signing` boundary**
+
+Move the experimental non-EIP-2335 PQ keystore and the complete XMSS journal under private sibling
+modules in `pq_signing`. `eth2_keystore` returns to owning BLS/EIP-2335 encryption primitives and a
+narrow shared NFKD/control-removal helper only. Remove the public builder that accepts an upstream
+`lean_multisig::SecretKey`.
+
+Use `pub(in crate::authority)` for keystore decryption, live-key construction, raw upstream signing,
+journal open/reserve, and reservation outcomes. No cross-crate `pub` decrypted-key, upstream-key,
+generic backend, raw reserve, or callback API is permitted. Construct the frozen Lighthouse raw
+envelope internally and validate it through `PqRawSignature` before return.
+
+The authority is synchronous and explicitly blocking. Startup acquires the one global journal,
+validates all bindings, then decrypts/reconstructs keys sequentially. Each signing operation:
+
+1. validates the bound key/profile/range;
+2. commits `(key, one_time_use_id, signing_root)` durably and releases the DB mutex;
+3. acquires a per-key signing mutex;
+4. produces the deterministic raw signature.
+
+Never hold the SQLite and key mutexes together. Any error, panic, cancellation, or abort after
+commit burns the leaf; same-root retry remains valid and different-root retry never calls the
+backend. Task 3.3b, not this crate, dispatches the entire blocking operation through Lighthouse's
+scoped executor.
+
+Change `validator_dir/pq-devnet` and `signing_method/pq-devnet` to depend on `pq_signing`; remove
+their direct PQ SQLite/lean ownership. Keep `types/pq-devnet` dependent only on
+`consensus_signature/pq-wire`.
+
+**Step 4: Verify GREEN**
+
+```bash
+cargo test -p pq_signing --no-default-features --features pq-devnet --doc
+cargo nextest run -p pq_signing --no-default-features --features pq-devnet
+cargo check -p eth2_keystore
+cargo check -p validator_dir --no-default-features --features pq-devnet
+cargo check -p signing_method --no-default-features --features pq-devnet
+cargo tree -p types --no-default-features --features pq-devnet -e normal,build | \
+  rg 'lean-multisig|lean_multisig_api|lean_vm|rec_aggregation'
+cargo check
+```
+
+The graph command must produce no matches. Run heavy real-key tests serially and preserve Rust 1.88
+coverage, feature isolation, clippy, formatting, dependency sorting, and the full workspace check.
+
+**Step 5: Commit**
+
+```bash
+git add Cargo.toml Cargo.lock crypto/pq_signing crypto/eth2_keystore common/validator_dir \
+  validator_client/signing_method docs/plans/2026-08-18-pq-devnet-implementation.md \
+  docs/pq-devnet-findings.md
+git commit -m "feat: add journal-owned PQ signing authority"
+```
+
+### Task 3.3b: Route validator duties through the PQ signing authority
+
+**Prerequisites:** Tasks 3.3a and 4.1b.
 
 **Files:**
 
@@ -641,12 +743,11 @@ Run the targeted signing-method/validator-store tests. Expected: PQ signing is u
 
 **Step 3: Implement PQ local signing**
 
-Reserve the leaf durably, sign in a blocking/scoped worker, and return the explicit raw wire type.
+Call the authority's combined blocking reserve-and-sign operation through Lighthouse's
+blocking/scoped worker and return the explicit raw wire type.
 Accept only the local journal-owning PQ signing method in PQ mode; reject Web3Signer and other
 remote/distributed signing configurations with a clear startup error.
-Co-locate the upstream raw-sign primitive with this authority (or expose only one combined
-reserve-and-sign operation across a private boundary). Do not make the Task 2.3 test-only
-unreserved key/sign operation public or re-export it from `consensus_signature`.
+Do not reintroduce an upstream-key, raw reserve, callback, or unreserved signing escape hatch.
 
 **Step 4: Verify GREEN**
 
@@ -655,7 +756,7 @@ Run targeted tests and `cargo check` for the changed packages.
 **Step 5: Commit**
 
 ```bash
-git add validator_client
+git add validator_client docs/pq-devnet-findings.md
 git commit -m "feat: sign validator duties with PQ keys"
 ```
 
@@ -805,13 +906,16 @@ git commit -m "feat: add PQ consensus wire types"
 
 ### Task 4.1b: Provision PQ validators and build a direct-registry genesis
 
-**Prerequisites:** Tasks 3.2 and 4.1.
+**Prerequisites:** Tasks 4.1 and 3.3a.
 
 **Files:**
 
-- Modify: relevant PQ-gated `lcli` account/genesis commands
+- Create: a feature-isolated minimal package/binary such as `testing/pq_devnet/` with binary name
+  `lcli-pq-devnet`; do not add the first PQ command to the dependency-heavy existing `lcli`
 - Modify or create: PQ validator provisioning helpers under `common/validator_dir/`
-- Modify: the genesis/state-initialization path under `beacon_node/` or `consensus/state_processing/`
+- Modify: `consensus/state_processing/` to expose a temporary genesis-only PQ compilation surface
+  without per-block/signature modules
+- Modify: the genesis/state-initialization path to share the post-registry fork-upgrade tail
 - Create: deterministic direct-registry genesis tests
 - Modify: `docs/pq-devnet-findings.md`
 
@@ -825,37 +929,62 @@ Generate a small fixed validator set from a fixed seed/configuration and require
 - the generated validator directories use `pq-voting-keystore.json` and the usage journal is
   provisioned and bound to every key, range, allocation version, parameter profile, and genesis
   validators root;
-- generating twice yields identical public configuration and genesis state bytes.
+- generating twice yields identical public configuration, registry ordering, directory identities,
+  journal bindings, and genesis state bytes. Keystore ciphertext JSON is intentionally randomized
+  by fresh salt and IV and is not compared byte-for-byte.
 
 Use small key ranges in ordinary tests. Add an ignored/measured test for the initial devnet range
 `0..=1119` only after the validator count and lifetime are frozen.
 
 **Step 2: Verify RED**
 
-Run the narrow PQ-only `lcli`, genesis, and validator-directory tests. Expected: the direct PQ
-registry/provisioning path does not exist.
+Run the narrow PQ-only standalone-tool, genesis-only state-processing, authority-provisioning, and
+validator-directory tests. Expected: the direct PQ registry/provisioning path does not exist.
 
 **Step 3: Implement the PQ-only provisioning command and genesis path**
 
-Generate and encrypt PQ keys sequentially, create their validator directories, and construct the
-genesis validator registry directly from their PQ public keys. Reuse/refactor only the
-post-registry state-finalization and fork-upgrade tail from the deposit genesis path. Never create
-dummy deposits, unchecked deposit signatures, padded public keys, shadow BLS keys, or consume XMSS
-leaves during genesis.
+The existing `lcli` package unconditionally depends on BLS-heavy beacon/state/network crates; a PQ
+subcommand there would feature-unify PQ `types` through callers that are not migrated yet. Add a
+minimal package whose default feature set is empty and whose PQ binary target requires
+`pq-devnet`. Similarly, add a temporary `state_processing/pq-genesis` surface that compiles only
+genesis, fork upgrades, and their minimal dependencies; default `state_processing` continues to
+compile its full unchanged path.
 
-Create and bind the usage journal as part of provisioning, then reopen and cross-check every
-keystore, registry entry, range, and journal binding before reporting success. Reject collisions
-and partial pre-existing output rather than overwriting it.
+Generate and encrypt PQ keys sequentially, create their validator directories, and construct the
+genesis validator registry directly from their PQ public keys. Refactor the existing deposit-based
+genesis function so both entry points share one post-registry activation/fork-upgrade/cache/root
+tail. Never create dummy deposits, unchecked deposit signatures, padded public keys, shadow BLS
+keys, or consume XMSS leaves during genesis. Use Electra at epoch zero, an empty deposit root/count/
+index and pending-deposit queue, deterministic execution withdrawal credentials, and canonical
+zero sync-committee aggregate-key placeholders.
+
+Use the frozen V1 profile: minimal preset, 16 validators, `0..=1119`, sequential construction, and
+domain-separated validator seeds
+`SHA256("lighthouse/pq-devnet/validator-seed/v1" || master_seed || index_be_u64)`. Read the exact
+32-byte master seed and bounded password from files into zeroizing storage; never accept either on
+the process command line.
+
+Build under a deterministic sibling staging path, reject existing final/staging paths before KDF
+work, and never clean partial output automatically. After all files are durable, use an atomic
+no-replace publish and sync the parent. A crash leaves a named tombstone for explicit inspection.
+
+Obtain `genesis_validators_root` from the constructed state, then call only the authority's
+non-signing journal provisioning facade. Reopen and cross-check every keystore, registry entry,
+range, and journal binding before and after publication. Discovery order is lexical by public key;
+cross-check by key map while separately preserving derivation-index registry order.
 
 **Step 4: Verify GREEN**
 
-Run the targeted PQ tests, regenerate twice and compare public outputs/state bytes, then run the
-default BLS genesis regressions and the mandatory full workspace `cargo check`.
+Run fast pure direct-genesis tests with synthetic keys, authority facade tests, and one-validator
+small-range end-to-end provisioning. Regenerate into two fresh destinations and compare public
+outputs/state. Keep the full 16-validator `0..=1119` run ignored/manual and measure it separately.
+Then run default BLS genesis regressions and the mandatory full workspace `cargo check`.
 
 **Step 5: Commit**
 
 ```bash
-git add Cargo.lock lcli common/validator_dir beacon_node consensus/state_processing \
+git add Cargo.toml Cargo.lock testing/pq_devnet common/validator_dir consensus/state_processing \
+  crypto/pq_signing \
   docs/plans/2026-08-18-pq-devnet-implementation.md docs/pq-devnet-findings.md
 git commit -m "feat: provision PQ validator genesis"
 ```
