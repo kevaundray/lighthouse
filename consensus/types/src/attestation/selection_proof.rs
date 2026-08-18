@@ -1,6 +1,7 @@
 use std::cmp;
 
-use bls::{PublicKey, SecretKey, Signature};
+use bls::{PublicKey, SecretKey};
+use consensus_signature::IndividualSignature;
 use ethereum_hashing::hash;
 use safe_arith::{ArithError, SafeArith};
 use serde::{Deserialize, Serialize};
@@ -14,7 +15,7 @@ use crate::{
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(PartialEq, Debug, Clone, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct SelectionProof(Signature);
+pub struct SelectionProof(IndividualSignature);
 
 impl SelectionProof {
     pub fn new<E: EthSpec>(
@@ -84,14 +85,14 @@ impl SelectionProof {
     }
 }
 
-impl From<SelectionProof> for Signature {
-    fn from(from: SelectionProof) -> Signature {
+impl From<SelectionProof> for IndividualSignature {
+    fn from(from: SelectionProof) -> IndividualSignature {
         from.0
     }
 }
 
-impl From<Signature> for SelectionProof {
-    fn from(sig: Signature) -> Self {
+impl From<IndividualSignature> for SelectionProof {
+    fn from(sig: IndividualSignature) -> Self {
         Self(sig)
     }
 }

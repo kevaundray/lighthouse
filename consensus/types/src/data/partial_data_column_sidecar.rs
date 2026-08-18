@@ -243,7 +243,7 @@ impl<E: EthSpec> PartialDataColumn<E> {
 mod tests {
     use super::*;
     use crate::MinimalEthSpec;
-    use bls::Signature;
+    use consensus_signature::IndividualSignature;
     use fixed_bytes::FixedBytesExtended;
     use kzg::KzgCommitment;
     use ssz::Encode;
@@ -304,7 +304,7 @@ mod tests {
                     state_root: Hash256::zero(),
                     body_root: Hash256::zero(),
                 },
-                signature: Signature::empty(),
+                signature: IndividualSignature::empty(),
             },
             kzg_commitments_inclusion_proof: FixedVector::new(
                 vec![Hash256::zero(); E::kzg_commitments_inclusion_proof_depth()],

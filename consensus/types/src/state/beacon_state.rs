@@ -2,6 +2,7 @@ use std::{fmt, hash::Hash, mem, sync::Arc};
 
 use bls::{AggregatePublicKey, PublicKeyBytes, Signature};
 use compare_fields::CompareFields;
+use consensus_signature::IndividualSignature;
 use context_deserialize::ContextDeserialize;
 use educe::Educe;
 use ethereum_hashing::hash;
@@ -1290,7 +1291,7 @@ impl<E: EthSpec> BeaconState<E> {
         &self,
         slot: Slot,
         index: CommitteeIndex,
-        slot_signature: &Signature,
+        slot_signature: &IndividualSignature,
         spec: &ChainSpec,
     ) -> Result<bool, BeaconStateError> {
         let committee = self.get_beacon_committee(slot, index)?;
@@ -1687,7 +1688,7 @@ impl<E: EthSpec> BeaconState<E> {
     pub fn update_randao_mix(
         &mut self,
         epoch: Epoch,
-        signature: &Signature,
+        signature: &IndividualSignature,
     ) -> Result<(), BeaconStateError> {
         let i = epoch
             .as_usize()

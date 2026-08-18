@@ -3,7 +3,7 @@ use std::{
     slice::Iter,
 };
 
-use bls::AggregateSignature;
+use consensus_signature::SameMessageEvidence;
 use context_deserialize::context_deserialize;
 use educe::Educe;
 use serde::{Deserialize, Serialize};
@@ -63,7 +63,7 @@ pub struct IndexedAttestation<E: EthSpec> {
     #[serde(with = "ssz_types::serde_utils::quoted_u64_var_list")]
     pub attesting_indices: VariableList<u64, E::MaxValidatorsPerSlot>,
     pub data: AttestationData,
-    pub signature: AggregateSignature,
+    pub signature: SameMessageEvidence,
 }
 
 impl<E: EthSpec> IndexedAttestation<E> {

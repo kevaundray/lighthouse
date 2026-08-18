@@ -9,10 +9,20 @@ pub type ValidatorPublicKeyBytes = bls::PublicKeyBytes;
 pub type VerificationKey = bls::PublicKey;
 
 /// Evidence produced by one validator for one signing claim.
-pub type RawSignature = bls::Signature;
+pub type IndividualSignature = bls::Signature;
 
-/// Evidence produced by multiple validators for the same signing claim.
-pub type AggregateSignature = bls::AggregateSignature;
+/// Evidence authorizing one signing claim for one or more validators.
+///
+/// In the BLS profile this is an aggregate signature, including the one-signer aggregate used by
+/// `SingleAttestation`. The PQ profile may instead use a cheaply promotable tagged raw signature
+/// or aggregate proof.
+pub type SameMessageEvidence = bls::AggregateSignature;
+
+/// Backwards-compatible name used while verification callers migrate to semantic terminology.
+pub type RawSignature = IndividualSignature;
+
+/// Backwards-compatible name used while aggregation callers migrate to semantic terminology.
+pub type AggregateSignature = SameMessageEvidence;
 
 /// A backend-owned request used while state-processing callers migrate to semantic requests.
 ///

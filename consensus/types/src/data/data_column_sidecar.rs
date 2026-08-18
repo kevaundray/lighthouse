@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use bls::Signature;
+use consensus_signature::IndividualSignature;
 use context_deserialize::context_deserialize;
 use educe::Educe;
 use kzg::{KzgCommitment, KzgProof};
@@ -221,7 +221,7 @@ impl<E: EthSpec> DataColumnSidecarFulu<E> {
             kzg_proofs: VariableList::new(vec![KzgProof::empty()]).unwrap(),
             signed_block_header: SignedBeaconBlockHeader {
                 message: BeaconBlockHeader::empty(),
-                signature: Signature::empty(),
+                signature: IndividualSignature::empty(),
             },
             kzg_commitments_inclusion_proof: Default::default(),
         }
@@ -241,7 +241,7 @@ impl<E: EthSpec> DataColumnSidecarFulu<E> {
             kzg_proofs: VariableList::new(vec![KzgProof::empty(); max_blobs_per_block]).unwrap(),
             signed_block_header: SignedBeaconBlockHeader {
                 message: BeaconBlockHeader::empty(),
-                signature: Signature::empty(),
+                signature: IndividualSignature::empty(),
             },
             kzg_commitments_inclusion_proof: Default::default(),
         }

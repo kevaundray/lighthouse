@@ -1,4 +1,5 @@
-use bls::{SecretKey, Signature};
+use bls::SecretKey;
+use consensus_signature::IndividualSignature;
 use context_deserialize::context_deserialize;
 use serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
@@ -57,7 +58,7 @@ pub struct SignedAggregateAndProof<E: EthSpec> {
     #[superstruct(flatten)]
     pub message: AggregateAndProof<E>,
     /// The aggregate attestation.
-    pub signature: Signature,
+    pub signature: IndividualSignature,
 }
 
 impl<E: EthSpec> SignedAggregateAndProof<E> {
@@ -96,7 +97,10 @@ impl<E: EthSpec> SignedAggregateAndProof<E> {
     }
 
     /// Produces a new `SignedAggregateAndProof` given a `signature` of `aggregate`
-    pub fn from_aggregate_and_proof(aggregate: AggregateAndProof<E>, signature: Signature) -> Self {
+    pub fn from_aggregate_and_proof(
+        aggregate: AggregateAndProof<E>,
+        signature: IndividualSignature,
+    ) -> Self {
         match aggregate {
             AggregateAndProof::Base(message) => {
                 SignedAggregateAndProof::Base(SignedAggregateAndProofBase { message, signature })

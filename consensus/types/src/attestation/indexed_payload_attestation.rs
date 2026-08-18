@@ -1,5 +1,5 @@
 use crate::{EthSpec, ForkName, PayloadAttestationData};
-use bls::AggregateSignature;
+use consensus_signature::SameMessageEvidence;
 use context_deserialize::context_deserialize;
 use serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
@@ -15,7 +15,7 @@ pub struct IndexedPayloadAttestation<E: EthSpec> {
     #[serde(with = "ssz_types::serde_utils::quoted_u64_var_list")]
     pub attesting_indices: VariableList<u64, E::PTCSize>,
     pub data: PayloadAttestationData,
-    pub signature: AggregateSignature,
+    pub signature: SameMessageEvidence,
 }
 
 #[cfg(test)]

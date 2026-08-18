@@ -1,4 +1,4 @@
-use bls::AggregateSignature;
+use consensus_signature::SameMessageEvidence;
 use context_deserialize::context_deserialize;
 use educe::Educe;
 use safe_arith::{ArithError, SafeArith};
@@ -36,7 +36,7 @@ impl From<ArithError> for Error {
 #[context_deserialize(ForkName)]
 pub struct SyncAggregate<E: EthSpec> {
     pub sync_committee_bits: BitVector<E::SyncCommitteeSize>,
-    pub sync_committee_signature: AggregateSignature,
+    pub sync_committee_signature: SameMessageEvidence,
 }
 
 impl<E: EthSpec> SyncAggregate<E> {
@@ -45,7 +45,7 @@ impl<E: EthSpec> SyncAggregate<E> {
     pub fn new() -> Self {
         Self {
             sync_committee_bits: BitVector::default(),
-            sync_committee_signature: AggregateSignature::infinity(),
+            sync_committee_signature: SameMessageEvidence::infinity(),
         }
     }
 
@@ -84,7 +84,7 @@ impl<E: EthSpec> SyncAggregate<E> {
     pub fn empty() -> Self {
         Self {
             sync_committee_bits: BitVector::default(),
-            sync_committee_signature: AggregateSignature::empty(),
+            sync_committee_signature: SameMessageEvidence::empty(),
         }
     }
 

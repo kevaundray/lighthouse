@@ -1,6 +1,6 @@
 use crate::ForkName;
 use crate::attestation::payload_attestation_data::PayloadAttestationData;
-use bls::Signature;
+use consensus_signature::IndividualSignature;
 use context_deserialize::context_deserialize;
 use serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
@@ -13,7 +13,7 @@ pub struct PayloadAttestationMessage {
     #[serde(with = "serde_utils::quoted_u64")]
     pub validator_index: u64,
     pub data: PayloadAttestationData,
-    pub signature: Signature,
+    pub signature: IndividualSignature,
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 use std::{fmt::Debug, hash::Hash, sync::Arc};
 
-use bls::Signature;
+use consensus_signature::IndividualSignature;
 use context_deserialize::context_deserialize;
 use educe::Educe;
 use kzg::{BYTES_PER_BLOB, BYTES_PER_FIELD_ELEMENT, Kzg, KzgCommitment, KzgProof};
@@ -203,7 +203,7 @@ impl<E: EthSpec> BlobSidecar<E> {
             kzg_proof: KzgProof::empty(),
             signed_block_header: SignedBeaconBlockHeader {
                 message: BeaconBlockHeader::empty(),
-                signature: Signature::empty(),
+                signature: IndividualSignature::empty(),
             },
             kzg_commitment_inclusion_proof: Default::default(),
         }

@@ -1,4 +1,5 @@
 use arbitrary::Arbitrary;
+use consensus_signature::IndividualSignature;
 use kzg::{KzgCommitment, KzgProof};
 
 use crate::{
@@ -19,7 +20,7 @@ pub fn generate_rand_block_and_blobs<E: EthSpec>(
     u: &mut arbitrary::Unstructured,
 ) -> arbitrary::Result<(SignedBeaconBlock<E, FullPayload<E>>, Vec<BlobSidecar<E>>)> {
     let inner = map_fork_name!(fork_name, BeaconBlock, <_>::arbitrary(u)?);
-    let mut block = SignedBeaconBlock::from_block(inner, bls::Signature::arbitrary(u)?);
+    let mut block = SignedBeaconBlock::from_block(inner, IndividualSignature::arbitrary(u)?);
     let mut blob_sidecars = vec![];
 
     if block.fork_name_unchecked() < ForkName::Deneb {

@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 
-use bls::Signature;
+use consensus_signature::IndividualSignature;
 use context_deserialize::{ContextDeserialize, context_deserialize};
 use educe::Educe;
 use merkle_proof::MerkleTree;
@@ -107,7 +107,7 @@ pub const BLOB_KZG_COMMITMENTS_INDEX: usize = 11;
 #[serde(bound = "E: EthSpec, Payload: AbstractExecPayload<E>")]
 #[tree_hash(enum_behaviour = "transparent")]
 pub struct BeaconBlockBody<E: EthSpec, Payload: AbstractExecPayload<E> = FullPayload<E>> {
-    pub randao_reveal: Signature,
+    pub randao_reveal: IndividualSignature,
     pub eth1_data: Eth1Data,
     pub graffiti: Graffiti,
     pub proposer_slashings: VariableList<ProposerSlashing, E::MaxProposerSlashings>,

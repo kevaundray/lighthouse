@@ -1,4 +1,4 @@
-use bls::AggregateSignature;
+use consensus_signature::SameMessageEvidence;
 use context_deserialize::context_deserialize;
 use serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
@@ -33,7 +33,7 @@ pub struct SyncCommitteeContribution<E: EthSpec> {
     #[serde(with = "serde_utils::quoted_u64")]
     pub subcommittee_index: u64,
     pub aggregation_bits: BitVector<E::SyncSubcommitteeSize>,
-    pub signature: AggregateSignature,
+    pub signature: SameMessageEvidence,
 }
 
 impl<E: EthSpec> SyncCommitteeContribution<E> {
@@ -57,7 +57,7 @@ impl<E: EthSpec> SyncCommitteeContribution<E> {
             beacon_block_root: message.beacon_block_root,
             subcommittee_index,
             aggregation_bits: bits,
-            signature: AggregateSignature::from(&message.signature),
+            signature: SameMessageEvidence::from(&message.signature),
         })
     }
 

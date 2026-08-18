@@ -1,4 +1,5 @@
-use bls::{PublicKey, SecretKey, Signature};
+use bls::{PublicKey, SecretKey};
+use consensus_signature::IndividualSignature;
 use context_deserialize::context_deserialize;
 use serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
@@ -61,7 +62,7 @@ pub struct AggregateAndProof<E: EthSpec> {
     pub aggregate: Attestation<E>,
     /// A proof provided by the validator that permits them to publish on the
     /// `beacon_aggregate_and_proof` gossipsub topic.
-    pub selection_proof: Signature,
+    pub selection_proof: IndividualSignature,
 }
 
 impl<'a, E: EthSpec> AggregateAndProofRef<'a, E> {

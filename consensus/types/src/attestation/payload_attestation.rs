@@ -1,6 +1,6 @@
 use crate::attestation::payload_attestation_data::PayloadAttestationData;
 use crate::{EthSpec, ForkName};
-use bls::AggregateSignature;
+use consensus_signature::SameMessageEvidence;
 use context_deserialize::context_deserialize;
 use educe::Educe;
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,7 @@ use tree_hash_derive::TreeHash;
 pub struct PayloadAttestation<E: EthSpec> {
     pub aggregation_bits: BitVector<E::PTCSize>,
     pub data: PayloadAttestationData,
-    pub signature: AggregateSignature,
+    pub signature: SameMessageEvidence,
 }
 
 #[cfg(test)]

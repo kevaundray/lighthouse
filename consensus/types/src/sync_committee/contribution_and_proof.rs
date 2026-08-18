@@ -1,4 +1,5 @@
-use bls::{SecretKey, Signature};
+use bls::SecretKey;
+use consensus_signature::IndividualSignature;
 use context_deserialize::context_deserialize;
 use serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
@@ -27,7 +28,7 @@ pub struct ContributionAndProof<E: EthSpec> {
     pub contribution: SyncCommitteeContribution<E>,
     /// A proof provided by the validator that permits them to publish on the
     /// `sync_committee_contribution_and_proof` gossipsub topic.
-    pub selection_proof: Signature,
+    pub selection_proof: IndividualSignature,
 }
 
 impl<E: EthSpec> ContributionAndProof<E> {

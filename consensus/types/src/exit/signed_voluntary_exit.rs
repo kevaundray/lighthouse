@@ -1,4 +1,4 @@
-use bls::Signature;
+use consensus_signature::IndividualSignature;
 use context_deserialize::context_deserialize;
 use serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
@@ -14,7 +14,7 @@ use crate::{exit::VoluntaryExit, fork::ForkName};
 #[context_deserialize(ForkName)]
 pub struct SignedVoluntaryExit {
     pub message: VoluntaryExit,
-    pub signature: Signature,
+    pub signature: IndividualSignature,
 }
 
 #[cfg(test)]

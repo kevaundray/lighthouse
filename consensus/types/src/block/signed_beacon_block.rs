@@ -1,6 +1,7 @@
 use std::fmt;
 
-use bls::{PublicKey, Signature};
+use bls::PublicKey;
+use consensus_signature::IndividualSignature;
 use context_deserialize::ContextDeserialize;
 use educe::Educe;
 use merkle_proof::MerkleTree;
@@ -116,7 +117,7 @@ pub struct SignedBeaconBlock<E: EthSpec, Payload: AbstractExecPayload<E> = FullP
     pub message: BeaconBlockFulu<E, Payload>,
     #[superstruct(only(Gloas), partial_getter(rename = "message_gloas"))]
     pub message: BeaconBlockGloas<E, Payload>,
-    pub signature: Signature,
+    pub signature: IndividualSignature,
 }
 
 impl<E: EthSpec, Payload: AbstractExecPayload<E>> ForkVersionDecode
@@ -167,7 +168,7 @@ impl<E: EthSpec, Payload: AbstractExecPayload<E>> SignedBeaconBlock<E, Payload> 
         let mut builder = ssz::SszDecoderBuilder::new(bytes);
 
         builder.register_anonymous_variable_length_item()?;
-        builder.register_type::<Signature>()?;
+        builder.register_type::<IndividualSignature>()?;
 
         let mut decoder = builder.build()?;
 
@@ -178,8 +179,8 @@ impl<E: EthSpec, Payload: AbstractExecPayload<E>> SignedBeaconBlock<E, Payload> 
         Ok(Self::from_block(message, signature))
     }
 
-    /// Create a new `SignedBeaconBlock` from a `BeaconBlock` and `Signature`.
-    pub fn from_block(block: BeaconBlock<E, Payload>, signature: Signature) -> Self {
+    /// Create a new `SignedBeaconBlock` from a `BeaconBlock` and an individual signature.
+    pub fn from_block(block: BeaconBlock<E, Payload>, signature: IndividualSignature) -> Self {
         match block {
             BeaconBlock::Base(message) => {
                 SignedBeaconBlock::Base(SignedBeaconBlockBase { message, signature })
@@ -208,11 +209,11 @@ impl<E: EthSpec, Payload: AbstractExecPayload<E>> SignedBeaconBlock<E, Payload> 
         }
     }
 
-    /// Deconstruct the `SignedBeaconBlock` into a `BeaconBlock` and `Signature`.
+    /// Deconstruct the `SignedBeaconBlock` into a `BeaconBlock` and an individual signature.
     ///
     /// This is necessary to get a `&BeaconBlock` from a `SignedBeaconBlock` because
     /// `SignedBeaconBlock` only contains a `BeaconBlock` _variant_.
-    pub fn deconstruct(self) -> (BeaconBlock<E, Payload>, Signature) {
+    pub fn deconstruct(self) -> (BeaconBlock<E, Payload>, IndividualSignature) {
         map_signed_beacon_block_into_beacon_block!(self, |block, beacon_block_cons| {
             (beacon_block_cons(block.message), block.signature)
         })
@@ -743,7 +744,7 @@ mod test {
         type E = MainnetEthSpec;
 
         let spec = &E::default_spec();
-        let sig = Signature::empty();
+        let sig = IndividualSignature::empty();
         let blocks = vec![
             SignedBeaconBlock::<E>::from_block(
                 BeaconBlock::Base(BeaconBlockBase::empty(spec)),
@@ -799,7 +800,7 @@ mod test {
         type E = MainnetEthSpec;
 
         let spec = &spec_with_all_forks_enabled::<E>();
-        let sig = Signature::empty();
+        let sig = IndividualSignature::empty();
         let blocks = vec![
             SignedBeaconBlock::<E>::from_block(
                 BeaconBlock::Base(BeaconBlockBase::empty(spec)),

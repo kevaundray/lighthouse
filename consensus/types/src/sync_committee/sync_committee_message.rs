@@ -1,4 +1,5 @@
-use bls::{SecretKey, Signature};
+use bls::SecretKey;
+use consensus_signature::IndividualSignature;
 use context_deserialize::context_deserialize;
 use serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
@@ -19,7 +20,7 @@ pub struct SyncCommitteeMessage {
     #[serde(with = "serde_utils::quoted_u64")]
     pub validator_index: u64,
     // Signature by the validator over `beacon_block_root`.
-    pub signature: Signature,
+    pub signature: IndividualSignature,
 }
 
 impl SyncCommitteeMessage {

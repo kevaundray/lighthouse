@@ -3,7 +3,8 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-use bls::{AggregateSignature, SecretKey, Signature};
+use bls::SecretKey;
+use consensus_signature::{IndividualSignature, SameMessageEvidence};
 use context_deserialize::{ContextDeserialize, context_deserialize};
 use educe::Educe;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -80,7 +81,7 @@ pub struct Attestation<E: EthSpec> {
     #[superstruct(only(Electra), partial_getter(rename = "aggregation_bits_electra"))]
     pub aggregation_bits: BitList<E::MaxValidatorsPerSlot>,
     pub data: AttestationData,
-    pub signature: AggregateSignature,
+    pub signature: SameMessageEvidence,
     #[superstruct(only(Electra))]
     pub committee_bits: BitVector<E::MaxCommitteesPerSlot>,
 }
@@ -133,7 +134,7 @@ impl<E: EthSpec> Attestation<E> {
                     target,
                 },
                 committee_bits,
-                signature: AggregateSignature::infinity(),
+                signature: SameMessageEvidence::infinity(),
             }))
         } else {
             Ok(Attestation::Base(AttestationBase {
@@ -146,7 +147,7 @@ impl<E: EthSpec> Attestation<E> {
                     source,
                     target,
                 },
-                signature: AggregateSignature::infinity(),
+                signature: SameMessageEvidence::infinity(),
             }))
         }
     }
@@ -207,7 +208,7 @@ impl<E: EthSpec> Attestation<E> {
     /// Returns an `AlreadySigned` error if the `committee_position`'th bit is already `true`.
     pub fn add_signature(
         &mut self,
-        signature: &Signature,
+        signature: &IndividualSignature,
         committee_position: usize,
     ) -> Result<(), Error> {
         match self {
@@ -379,7 +380,7 @@ impl<E: EthSpec> AttestationElectra<E> {
     /// Returns an `AlreadySigned` error if the `committee_position`'th bit is already `true`.
     pub fn add_signature(
         &mut self,
-        signature: &Signature,
+        signature: &IndividualSignature,
         committee_position: usize,
     ) -> Result<(), Error> {
         if self
@@ -453,7 +454,7 @@ impl<E: EthSpec> AttestationBase<E> {
     /// Returns an `AlreadySigned` error if the `committee_position`'th bit is already `true`.
     pub fn add_signature(
         &mut self,
-        signature: &Signature,
+        signature: &IndividualSignature,
         committee_position: usize,
     ) -> Result<(), Error> {
         if self
@@ -619,7 +620,7 @@ pub struct SingleAttestation {
     #[serde(with = "serde_utils::quoted_u64")]
     pub attester_index: u64,
     pub data: AttestationData,
-    pub signature: AggregateSignature,
+    pub signature: SameMessageEvidence,
 }
 
 impl SingleAttestation {
@@ -660,7 +661,7 @@ mod tests {
         let aggregation_bits =
             size_of::<BitList<<MainnetEthSpec as EthSpec>::MaxValidatorsPerCommittee>>();
         let attestation_data = size_of::<AttestationData>();
-        let signature = size_of::<AggregateSignature>();
+        let signature = size_of::<SameMessageEvidence>();
 
         assert_eq!(aggregation_bits, 144);
         assert_eq!(attestation_data, 128);
@@ -683,7 +684,7 @@ mod tests {
         let attestation_data = size_of::<AttestationData>();
         let committee_bits =
             size_of::<BitList<<MainnetEthSpec as EthSpec>::MaxCommitteesPerSlot>>();
-        let signature = size_of::<AggregateSignature>();
+        let signature = size_of::<SameMessageEvidence>();
 
         assert_eq!(aggregation_bits, 144);
         assert_eq!(committee_bits, 144);

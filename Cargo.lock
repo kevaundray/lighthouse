@@ -9522,6 +9522,7 @@ dependencies = [
  "beacon_chain",
  "bls",
  "compare_fields",
+ "consensus_signature",
  "context_deserialize",
  "criterion",
  "educe",

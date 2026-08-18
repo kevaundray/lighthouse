@@ -1,4 +1,5 @@
-use bls::{PublicKey, Signature};
+use bls::PublicKey;
+use consensus_signature::IndividualSignature;
 use context_deserialize::context_deserialize;
 use serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
@@ -18,7 +19,7 @@ use crate::{
 #[context_deserialize(ForkName)]
 pub struct SignedBeaconBlockHeader {
     pub message: BeaconBlockHeader,
-    pub signature: Signature,
+    pub signature: IndividualSignature,
 }
 
 impl SignedBeaconBlockHeader {

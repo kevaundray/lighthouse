@@ -1,6 +1,7 @@
 use std::{fmt, marker::PhantomData};
 
-use bls::{AggregateSignature, PublicKeyBytes, SecretKey, Signature, SignatureBytes};
+use bls::{PublicKeyBytes, SecretKey, SignatureBytes};
+use consensus_signature::{IndividualSignature, SameMessageEvidence};
 use context_deserialize::ContextDeserialize;
 use educe::Educe;
 use fixed_bytes::FixedBytesExtended;
@@ -345,7 +346,7 @@ impl<E: EthSpec, Payload: AbstractExecPayload<E>> EmptyBlock for BeaconBlockBase
             parent_root: Hash256::zero(),
             state_root: Hash256::zero(),
             body: BeaconBlockBodyBase {
-                randao_reveal: Signature::empty(),
+                randao_reveal: IndividualSignature::empty(),
                 eth1_data: Eth1Data {
                     deposit_root: Hash256::zero(),
                     block_hash: Hash256::zero(),
@@ -376,7 +377,7 @@ impl<E: EthSpec, Payload: AbstractExecPayload<E>> BeaconBlockBase<E, Payload> {
 
         let signed_header = SignedBeaconBlockHeader {
             message: header,
-            signature: Signature::empty(),
+            signature: IndividualSignature::empty(),
         };
         let indexed_attestation = IndexedAttestationBase {
             attesting_indices: VariableList::new(vec![
@@ -385,7 +386,7 @@ impl<E: EthSpec, Payload: AbstractExecPayload<E>> BeaconBlockBase<E, Payload> {
             ])
             .unwrap(),
             data: AttestationData::default(),
-            signature: AggregateSignature::empty(),
+            signature: SameMessageEvidence::empty(),
         };
 
         let deposit_data = DepositData {
@@ -408,7 +409,7 @@ impl<E: EthSpec, Payload: AbstractExecPayload<E>> BeaconBlockBase<E, Payload> {
             aggregation_bits: BitList::with_capacity(E::MaxValidatorsPerCommittee::to_usize())
                 .unwrap(),
             data: AttestationData::default(),
-            signature: AggregateSignature::empty(),
+            signature: SameMessageEvidence::empty(),
         };
 
         let deposit = Deposit {
@@ -423,7 +424,7 @@ impl<E: EthSpec, Payload: AbstractExecPayload<E>> BeaconBlockBase<E, Payload> {
 
         let signed_voluntary_exit = SignedVoluntaryExit {
             message: voluntary_exit,
-            signature: Signature::empty(),
+            signature: IndividualSignature::empty(),
         };
 
         let mut block = BeaconBlockBase::<E, Payload>::empty(spec);
@@ -471,7 +472,7 @@ impl<E: EthSpec, Payload: AbstractExecPayload<E>> EmptyBlock for BeaconBlockAlta
             parent_root: Hash256::zero(),
             state_root: Hash256::zero(),
             body: BeaconBlockBodyAltair {
-                randao_reveal: Signature::empty(),
+                randao_reveal: IndividualSignature::empty(),
                 eth1_data: Eth1Data {
                     deposit_root: Hash256::zero(),
                     block_hash: Hash256::zero(),
@@ -495,7 +496,7 @@ impl<E: EthSpec, Payload: AbstractExecPayload<E>> BeaconBlockAltair<E, Payload> 
     pub fn full(spec: &ChainSpec) -> Self {
         let base_block: BeaconBlockBase<_, Payload> = BeaconBlockBase::full(spec);
         let sync_aggregate = SyncAggregate {
-            sync_committee_signature: AggregateSignature::empty(),
+            sync_committee_signature: SameMessageEvidence::empty(),
             sync_committee_bits: BitVector::default(),
         };
         BeaconBlockAltair {
@@ -513,7 +514,7 @@ impl<E: EthSpec, Payload: AbstractExecPayload<E>> BeaconBlockAltair<E, Payload> 
                 deposits: base_block.body.deposits,
                 voluntary_exits: base_block.body.voluntary_exits,
                 sync_aggregate,
-                randao_reveal: Signature::empty(),
+                randao_reveal: IndividualSignature::empty(),
                 eth1_data: Eth1Data {
                     deposit_root: Hash256::zero(),
                     block_hash: Hash256::zero(),
@@ -538,7 +539,7 @@ impl<E: EthSpec, Payload: AbstractExecPayload<E>> EmptyBlock for BeaconBlockBell
             parent_root: Hash256::zero(),
             state_root: Hash256::zero(),
             body: BeaconBlockBodyBellatrix {
-                randao_reveal: Signature::empty(),
+                randao_reveal: IndividualSignature::empty(),
                 eth1_data: Eth1Data {
                     deposit_root: Hash256::zero(),
                     block_hash: Hash256::zero(),
@@ -569,7 +570,7 @@ impl<E: EthSpec, Payload: AbstractExecPayload<E>> EmptyBlock for BeaconBlockCape
             parent_root: Hash256::zero(),
             state_root: Hash256::zero(),
             body: BeaconBlockBodyCapella {
-                randao_reveal: Signature::empty(),
+                randao_reveal: IndividualSignature::empty(),
                 eth1_data: Eth1Data {
                     deposit_root: Hash256::zero(),
                     block_hash: Hash256::zero(),
@@ -601,7 +602,7 @@ impl<E: EthSpec, Payload: AbstractExecPayload<E>> EmptyBlock for BeaconBlockDene
             parent_root: Hash256::zero(),
             state_root: Hash256::zero(),
             body: BeaconBlockBodyDeneb {
-                randao_reveal: Signature::empty(),
+                randao_reveal: IndividualSignature::empty(),
                 eth1_data: Eth1Data {
                     deposit_root: Hash256::zero(),
                     block_hash: Hash256::zero(),
@@ -634,7 +635,7 @@ impl<E: EthSpec, Payload: AbstractExecPayload<E>> EmptyBlock for BeaconBlockElec
             parent_root: Hash256::zero(),
             state_root: Hash256::zero(),
             body: BeaconBlockBodyElectra {
-                randao_reveal: Signature::empty(),
+                randao_reveal: IndividualSignature::empty(),
                 eth1_data: Eth1Data {
                     deposit_root: Hash256::zero(),
                     block_hash: Hash256::zero(),
@@ -668,7 +669,7 @@ impl<E: EthSpec, Payload: AbstractExecPayload<E>> EmptyBlock for BeaconBlockFulu
             parent_root: Hash256::zero(),
             state_root: Hash256::zero(),
             body: BeaconBlockBodyFulu {
-                randao_reveal: Signature::empty(),
+                randao_reveal: IndividualSignature::empty(),
                 eth1_data: Eth1Data {
                     deposit_root: Hash256::zero(),
                     block_hash: Hash256::zero(),
@@ -699,7 +700,7 @@ impl<E: EthSpec, Payload: AbstractExecPayload<E>> EmptyBlock for BeaconBlockGloa
             parent_root: Hash256::zero(),
             state_root: Hash256::zero(),
             body: BeaconBlockBodyGloas {
-                randao_reveal: Signature::empty(),
+                randao_reveal: IndividualSignature::empty(),
                 eth1_data: Eth1Data {
                     deposit_root: Hash256::zero(),
                     block_hash: Hash256::zero(),
