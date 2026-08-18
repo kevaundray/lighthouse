@@ -538,14 +538,12 @@ git add Cargo.lock validator_client/signing_method \
 git commit -m "feat: persist XMSS leaf reservations"
 ```
 
-### Task 3.2: Add PQ validator key storage and genesis generation
+### Task 3.2: Add PQ validator key storage
 
 **Files:**
 
 - Modify or create: `crypto/eth2_keystore/` PQ key storage modules
 - Modify: `common/validator_dir/`
-- Modify: `account_manager/`
-- Modify: `lcli/`
 - Create: targeted key round-trip tests in each changed package
 - Modify: `docs/pq-devnet-findings.md`
 
@@ -558,9 +556,7 @@ range to match the authenticated metadata exactly. Normal unit tests use a small
 the real 1,120-leaf measurement is explicit/ignored.
 
 Add validator-directory tests for the distinct PQ filename and definition variant, 0600 modes,
-collision refusal, and discovery. Add direct-genesis tests proving that all 16 PQ keys appear in
-registry order, are active at epoch zero, consume no deposits, and produce deterministic genesis
-bytes for a fixed seed/config/time.
+collision refusal, and discovery.
 
 **Step 2: Verify RED using the narrowest affected package test**
 
@@ -574,12 +570,11 @@ separate `PqKeystore`/`PqValidatorDirBuilder` and `pq-voting-keystore.json`; reu
 format version, scheme/parameter set, exact backend revision, 32-byte public key, and inclusive
 `one_time_use_range`. Usage state remains exclusively in `xmss_usage.sqlite`.
 
-Provision through a PQ-only `lcli` command rather than the BLS wallet/account-manager flow. Generate
-keys sequentially for IDs `0..=1119`; do not outer-parallelize upstream key generation or scrypt.
-Initialize the genesis validator registry directly from PQ public keys with deterministic execution
-withdrawal credentials. Do not generate BLS shadow keys, weaken deposit validation, create dummy
-deposit signatures, or consume XMSS leaves for genesis. Refactor the existing post-registry fork
-upgrade/finalization tail so the direct-registry and deposit paths share it.
+Generate keys sequentially in tests and future callers; do not outer-parallelize upstream key
+generation or scrypt. This task stops at the reusable encrypted-key and validator-directory
+boundary and does not add an `lcli` command. Do not add padded or shadow BLS keys: the current
+validator registry still has a 48-byte BLS wire type, so provisioning and direct PQ genesis must
+follow Task 4.1's compile-time PQ public-key schema.
 
 **Step 4: Verify GREEN and measure key size/load time**
 
@@ -588,12 +583,18 @@ Record measurements in `docs/pq-devnet-findings.md`.
 **Step 5: Commit**
 
 ```bash
-git add crypto/eth2_keystore common/validator_dir account_manager lcli \
-  docs/pq-devnet-findings.md
+git add Cargo.lock crypto/eth2_keystore common/validator_dir \
+  docs/plans/2026-08-18-pq-devnet-implementation.md docs/pq-devnet-findings.md
 git commit -m "feat: add experimental PQ validator keys"
 ```
 
+**Execution dependency:** after this storage task, execute Task 4.1 before Task 3.3. Then execute
+Task 4.1b to create the direct-registry genesis and provisioned validator set. Task 3.3 can only
+route real duties once those compile-time PQ wire types exist.
+
 ### Task 3.3: Route validator duties through PQ signing authority
+
+**Prerequisites:** Tasks 3.2, 4.1, and 4.1b.
 
 **Files:**
 
@@ -674,6 +675,63 @@ Expected: both suites pass with their own pinned schemas.
 ```bash
 git add crypto/consensus_signature consensus/types beacon_node/beacon_chain/tests/schema_stability.rs
 git commit -m "feat: add PQ consensus wire types"
+```
+
+### Task 4.1b: Provision PQ validators and build a direct-registry genesis
+
+**Prerequisites:** Tasks 3.2 and 4.1.
+
+**Files:**
+
+- Modify: relevant PQ-gated `lcli` account/genesis commands
+- Modify or create: PQ validator provisioning helpers under `common/validator_dir/`
+- Modify: the genesis/state-initialization path under `beacon_node/` or `consensus/state_processing/`
+- Create: deterministic direct-registry genesis tests
+- Modify: `docs/pq-devnet-findings.md`
+
+**Step 1: Write failing provisioning and genesis tests**
+
+Generate a small fixed validator set from a fixed seed/configuration and require:
+
+- registry public keys are the generated 32-byte PQ keys in deterministic order;
+- every validator is active at genesis, with deterministic execution withdrawal credentials;
+- no deposit signatures or BLS shadow keys are generated or checked;
+- the generated validator directories use `pq-voting-keystore.json` and the usage journal is
+  provisioned and bound to every key, range, allocation version, parameter profile, and genesis
+  validators root;
+- generating twice yields identical public configuration and genesis state bytes.
+
+Use small key ranges in ordinary tests. Add an ignored/measured test for the initial devnet range
+`0..=1119` only after the validator count and lifetime are frozen.
+
+**Step 2: Verify RED**
+
+Run the narrow PQ-only `lcli`, genesis, and validator-directory tests. Expected: the direct PQ
+registry/provisioning path does not exist.
+
+**Step 3: Implement the PQ-only provisioning command and genesis path**
+
+Generate and encrypt PQ keys sequentially, create their validator directories, and construct the
+genesis validator registry directly from their PQ public keys. Reuse/refactor only the
+post-registry state-finalization and fork-upgrade tail from the deposit genesis path. Never create
+dummy deposits, unchecked deposit signatures, padded public keys, shadow BLS keys, or consume XMSS
+leaves during genesis.
+
+Create and bind the usage journal as part of provisioning, then reopen and cross-check every
+keystore, registry entry, range, and journal binding before reporting success. Reject collisions
+and partial pre-existing output rather than overwriting it.
+
+**Step 4: Verify GREEN**
+
+Run the targeted PQ tests, regenerate twice and compare public outputs/state bytes, then run the
+default BLS genesis regressions and the mandatory full workspace `cargo check`.
+
+**Step 5: Commit**
+
+```bash
+git add Cargo.lock lcli common/validator_dir beacon_node consensus/state_processing \
+  docs/plans/2026-08-18-pq-devnet-implementation.md docs/pq-devnet-findings.md
+git commit -m "feat: provision PQ validator genesis"
 ```
 
 ### Task 4.2: Define bounded aggregate-proof evidence
@@ -898,22 +956,23 @@ git commit -m "feat: expose PQ devnet APIs safely"
 
 - Create: `scripts/local_testnet/pq/` configuration and launch assets
 - Modify: `scripts/local_testnet/README.md`
-- Modify: relevant `lcli` genesis commands
 - Modify: `docs/pq-devnet-findings.md`
 
 **Step 1: Write a failing configuration smoke test**
 
-The test generates PQ keys/genesis and validates that every registry key and enabled signature
-field uses the PQ parameter set.
+The test invokes the Task 4.1b provisioning command, validates that every registry key and enabled
+signature field uses the PQ parameter set, and checks that launcher arguments select only the PQ
+binary/profile.
 
 **Step 2: Verify RED**
 
-Expected: no reproducible PQ genesis path exists.
+Expected: no reproducible multi-process PQ launcher/preset exists.
 
 **Step 3: Implement the smallest useful preset**
 
 Start with a measured validator count and one committee. Disable unsupported protocol features
-explicitly. Pin all timing and proof-size limits.
+explicitly. Pin all timing and proof-size limits. Reuse the already-tested Task 4.1b key/genesis
+command; do not duplicate provisioning logic in shell.
 
 **Step 4: Verify GREEN**
 
@@ -923,7 +982,7 @@ same seed.
 **Step 5: Commit**
 
 ```bash
-git add scripts/local_testnet lcli docs/pq-devnet-findings.md
+git add scripts/local_testnet docs/pq-devnet-findings.md
 git commit -m "feat: add reproducible PQ devnet"
 ```
 
