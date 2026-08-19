@@ -1482,3 +1482,42 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   full AVX2 production file was not rerun for this slice; its focused publication cases and mutation
   runs are recorded in the implementation plan. Hash-chain/hash-onion RANDAO remains future-only,
   while V1 retains the signature-derived duty and frozen 14-leaf allocation.
+
+### 2026-08-19: Isolated bounded PQ proposer HTTP surface implemented (Task 5.3e-e2b)
+
+- A feature-empty `pq_http_api` crate exposes only full V3 block production and full V2 signed-block
+  publication. It is absent from the ordinary `http_api`, beacon-node client, validator client, and
+  Lighthouse runtime graphs. Its constructor binds one exact chain, executor, and bounded e-e2a
+  broadcaster; the real server and gossipsub worker remain e-e4 assembly work.
+- GET accepts only a bounded, deny-unknown query with the canonical active PQ RANDAO reveal and
+  optional graffiti. Malformed/overflow slots and unsupported options are typed 400 responses.
+  JSON/SSZ negotiation preserves Electra, full/unblinded metadata, the exact execution value, zero
+  consensus value, and all standard headers. Two non-waiting response permits are retained by the
+  exact serialized allocation through `Bytes::from_owner` until Hyper releases every clone.
+- POST validates the exact path, method, empty query, Electra version, media-type essence, declared
+  length, and admission before consuming a process-owned bounded body stream. It rejects checked
+  declared/media excess per chunk, caps 4,096 chunk objects and their metadata, times out incomplete
+  bodies, and performs fallible contiguous coalescing plus contextual JSON/SSZ decoding only on the
+  blocking executor. Full Electra contents with explicit empty proofs/blobs are mandatory; trailing
+  JSON, block-only forms, nonempty sidecars, invalid signatures, and root/context mutations fail
+  before broadcast or Engine work.
+- The retained-memory calculation now covers both raw transport chunks and the temporary contiguous
+  decode copy, bounded metadata, and fixed bookkeeping across both publication admissions. Resource
+  allocation failure maps to a coarse standard Beacon API JSON 503. All other non-success paths also
+  use `eth2::types::ErrorMessage`; status mapping exhaustively distinguishes malformed/invalid,
+  stale/equivocation/terminal, capacity, pending, retryable-local, published, and committed states.
+- Publication and body ownership are detached once accepted. Tests prove a two-megabyte request is
+  coalesced off the current-thread reactor, the heartbeat remains responsive, and canceling the HTTP
+  caller cannot interrupt the exact acknowledged broadcast, Engine validation, atomic persistence,
+  or head update. Slow clients occupy the two admissions only until the bounded timeout; cap+1 is
+  rejected before its body is polled and permits recover immediately.
+- Independent review drove custom slot/media semantics, standard error codecs, real-client and route
+  coverage, slow-body deadlines, decode cancellation sensitivity, bounded test waits, and exact
+  raw-plus-copy memory accounting. Fresh parent verification passed 15/15 warning-denied crate
+  tests, 8/8 e-e2a publication tests, default/PQ feature checks, AVX2 route compilation, focused
+  warning-denied Clippy, formatting, manifest ordering, and feature isolation. Focused real-route
+  evidence includes the strict policy test (79.81 seconds), slow-body recovery (82.01 seconds), and
+  JSON/SSZ produce-sign-publish-cancel-restart route (133.43 seconds); live equivocation/retry and
+  terminal rejection also passed. The real server/network adapter remains deferred to e-e4.
+- Hash-chain/hash-onion RANDAO remains a future versioned proposal. V1 retains the signature-derived,
+  slot-bound RANDAO duty and frozen 14-leaf allocation.

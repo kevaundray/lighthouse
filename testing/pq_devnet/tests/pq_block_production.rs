@@ -9,19 +9,24 @@ use beacon_chain::{
 #[cfg(target_feature = "avx2")]
 use consensus_signature::{
     AggregationService, OneTimeUseId, PqPublicKey, PqRawSignature, SigningDuty,
-    ValidatorPublicKeyBytes,
+    ValidatorPublicKeyBytes, serialize_individual_signature,
 };
+#[cfg(target_feature = "avx2")]
+use eth2::{BeaconNodeHttpClient, SensitiveUrl, Timeouts};
 #[cfg(target_feature = "avx2")]
 use network::PqNetworkBlockProcessor;
 #[cfg(target_feature = "avx2")]
 use network::{
     PQ_BLOCK_PUBLICATION_ADMISSION_CAPACITY, PqBlockPublicationDisposition,
-    PqBlockPublicationService, PqPublicationCapacity, pq_block_broadcast_channel,
+    PqBlockPublicationService, PqPublicationBodyLimits, PqPublicationCapacity,
+    pq_block_broadcast_channel,
 };
+#[cfg(target_feature = "avx2")]
+use pq_http_api::{PqHttpApi, TestingPqHttpBlockingHook};
 #[cfg(target_feature = "avx2")]
 use pq_signing::{PqKeyUnlock, PqKeystore, PqSigningAuthority, provision_usage_journal};
 #[cfg(target_feature = "avx2")]
-use ssz::Decode;
+use ssz::{Decode, Encode};
 #[cfg(target_feature = "avx2")]
 use std::collections::VecDeque;
 #[cfg(target_feature = "avx2")]
@@ -29,6 +34,8 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+#[cfg(target_feature = "avx2")]
+use std::time::Duration;
 #[cfg(target_feature = "avx2")]
 use store::{HotColdDB, MemoryStore, StoreConfig};
 #[cfg(target_feature = "avx2")]
@@ -2362,5 +2369,814 @@ fn pq_block_production_requires_avx2_backend() {
     assert_eq!(
         <types::MinimalEthSpec as types::EthSpec>::slots_per_epoch(),
         8
+    );
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn pq_http_surface_exposes_only_full_v3_production_and_full_v2_publication() {
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    let fixture = valid_production_fixture(false, false);
+    let (broadcast_sender, _broadcast_receiver) = pq_block_broadcast_channel();
+    let routes = PqHttpApi::new(
+        Arc::clone(&fixture.chain),
+        fixture._runtime.task_executor.clone(),
+        broadcast_sender,
+    )
+    .expect("PQ HTTP API")
+    .routes();
+
+    for (method, path) in [
+        ("GET", "/eth/v2/validator/blocks/1"),
+        ("GET", "/eth/v4/validator/blocks/1"),
+        ("GET", "/eth/v1/validator/blinded_blocks/1"),
+        ("POST", "/eth/v2/beacon/blinded_blocks"),
+        ("POST", "/eth/v1/beacon/blocks"),
+        ("GET", "/eth/v1/validator/duties/proposer/0"),
+    ] {
+        let response = warp::test::request()
+            .method(method)
+            .path(path)
+            .reply(&routes)
+            .await;
+        assert_eq!(response.status(), 404, "unsupported route {method} {path}");
+    }
+    for (method, path) in [
+        ("POST", "/eth/v3/validator/blocks/1"),
+        ("GET", "/eth/v2/beacon/blocks"),
+    ] {
+        let response = warp::test::request()
+            .method(method)
+            .path(path)
+            .reply(&routes)
+            .await;
+        assert_eq!(response.status(), 405, "wrong method {method} {path}");
+    }
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn pq_http_request_policy_rejects_before_production_or_body_decode() {
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    let fixture = valid_production_fixture(false, false);
+    let (broadcast_sender, _broadcast_receiver) = pq_block_broadcast_channel();
+    let routes = PqHttpApi::new(
+        Arc::clone(&fixture.chain),
+        fixture._runtime.task_executor.clone(),
+        broadcast_sender,
+    )
+    .expect("PQ HTTP API")
+    .routes();
+    let randao = serialize_individual_signature(&fixture.randao).to_string();
+    let body_limits = PqPublicationBodyLimits::try_from_spec::<MinimalEthSpec>(&fixture.spec)
+        .expect("publication body limits");
+    let max_json_bytes = body_limits.max_json_bytes();
+
+    let cases = [
+        (
+            warp::test::request()
+                .method("GET")
+                .path("/eth/v3/validator/blocks/1"),
+            400,
+            "missing randao",
+        ),
+        (
+            warp::test::request().method("GET").path(&format!(
+                "/eth/v3/validator/blocks/not-a-slot?randao_reveal={randao}"
+            )),
+            400,
+            "malformed slot",
+        ),
+        (
+            warp::test::request().method("GET").path(&format!(
+                "/eth/v3/validator/blocks/18446744073709551616?randao_reveal={randao}"
+            )),
+            400,
+            "overflowing slot",
+        ),
+        (
+            warp::test::request().method("GET").path(&format!(
+                "/eth/v3/validator/blocks/1?randao_reveal={randao}&skip_randao_verification"
+            )),
+            400,
+            "skip randao",
+        ),
+        (
+            warp::test::request().method("GET").path(&format!(
+                "/eth/v3/validator/blocks/1?randao_reveal={randao}&builder_boost_factor=100"
+            )),
+            400,
+            "builder option",
+        ),
+        (
+            warp::test::request().method("GET").path(&format!(
+                "/eth/v3/validator/blocks/1?randao_reveal={randao}&randao_reveal={randao}"
+            )),
+            400,
+            "duplicate randao query",
+        ),
+        (
+            warp::test::request()
+                .method("GET")
+                .path(&format!(
+                    "/eth/v3/validator/blocks/1?randao_reveal={randao}"
+                ))
+                .header("accept", "text/plain"),
+            406,
+            "unsupported accept",
+        ),
+        (
+            warp::test::request()
+                .method("POST")
+                .path("/eth/v2/beacon/blocks"),
+            411,
+            "missing content length",
+        ),
+        (
+            warp::test::request()
+                .method("POST")
+                .path("/eth/v2/beacon/blocks")
+                .header(
+                    "content-length",
+                    max_json_bytes.saturating_add(1).to_string(),
+                ),
+            413,
+            "body cap plus one",
+        ),
+        (
+            warp::test::request()
+                .method("POST")
+                .path("/eth/v2/beacon/blocks")
+                .header("content-length", max_json_bytes.to_string())
+                .header("content-type", "application/json")
+                .header("eth-consensus-version", "electra")
+                .body("{}"),
+            400,
+            "exact body cap reaches contextual decode",
+        ),
+        (
+            warp::test::request()
+                .method("POST")
+                .path("/eth/v2/beacon/blocks")
+                .header("content-length", "2")
+                .header("content-type", "text/plain")
+                .header("eth-consensus-version", "electra")
+                .body("{}"),
+            415,
+            "unsupported content type",
+        ),
+        (
+            warp::test::request()
+                .method("POST")
+                .path("/eth/v2/beacon/blocks")
+                .header("content-length", "2")
+                .header("content-type", "application/json")
+                .body("{}"),
+            400,
+            "missing consensus version",
+        ),
+        (
+            warp::test::request()
+                .method("POST")
+                .path("/eth/v2/beacon/blocks")
+                .header("content-length", "2")
+                .header("content-type", "application/json")
+                .header("eth-consensus-version", "fulu")
+                .body("{}"),
+            400,
+            "wrong consensus version",
+        ),
+        (
+            warp::test::request()
+                .method("POST")
+                .path("/eth/v2/beacon/blocks?broadcast_validation=consensus")
+                .header("content-length", "2")
+                .header("content-type", "application/json")
+                .header("eth-consensus-version", "electra")
+                .body("{}"),
+            400,
+            "unsupported publish query",
+        ),
+        (
+            warp::test::request()
+                .method("POST")
+                .path("/eth/v2/beacon/blocks")
+                .header("content-length", "2")
+                .header("content-type", "Application/JSON; charset=UTF-8")
+                .header("eth-consensus-version", "electra")
+                .body("{}"),
+            400,
+            "case-insensitive JSON media essence with valid parameters",
+        ),
+        (
+            warp::test::request()
+                .method("POST")
+                .path("/eth/v2/beacon/blocks")
+                .header("content-length", "2")
+                .header("content-type", "application/json")
+                .header("eth-consensus-version", "electra")
+                .header("accept", "text/plain")
+                .body("{}"),
+            400,
+            "publish ignores Accept",
+        ),
+        (
+            warp::test::request()
+                .method("POST")
+                .path("/eth/v2/beacon/blocks")
+                .header("content-length", "2")
+                .header("content-type", "application/json")
+                .header("eth-consensus-version", "electra")
+                .body("{}"),
+            400,
+            "malformed contextual block contents",
+        ),
+    ];
+
+    for (request, expected, label) in cases {
+        let response = request.reply(&routes).await;
+        assert_eq!(response.status(), expected, "{label}");
+    }
+
+    let raw_at_cap = format!("x={}", "a".repeat(4094));
+    let at_cap = warp::test::request()
+        .method("GET")
+        .path(&format!("/eth/v3/validator/blocks/1?{raw_at_cap}"))
+        .reply(&routes)
+        .await;
+    assert_eq!(at_cap.status(), 400);
+    assert!(
+        std::str::from_utf8(at_cap.body())
+            .expect("error JSON")
+            .contains("request parameters are invalid"),
+        "the exact raw-query cap must reach typed parsing",
+    );
+    let raw_over_cap = format!("x={}", "a".repeat(4095));
+    let over_cap = warp::test::request()
+        .method("GET")
+        .path(&format!("/eth/v3/validator/blocks/1?{raw_over_cap}"))
+        .reply(&routes)
+        .await;
+    assert_eq!(over_cap.status(), 400);
+    assert!(
+        std::str::from_utf8(over_cap.body())
+            .expect("error JSON")
+            .contains("query exceeds the PQ HTTP limit"),
+        "cap+1 must fail in the raw-query guard before typed parsing",
+    );
+    assert_eq!(fixture.execution.payload_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        0
+    );
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn pq_http_publication_admission_precedes_stream_polling_and_recovers_after_timeout() {
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    let fixture = valid_production_fixture(false, false);
+    let (broadcast_sender, _broadcast_receiver) = pq_block_broadcast_channel();
+    let body_collections_started = Arc::new(AtomicUsize::new(0));
+    let routes = PqHttpApi::new(
+        Arc::clone(&fixture.chain),
+        fixture._runtime.task_executor.clone(),
+        broadcast_sender,
+    )
+    .expect("PQ HTTP API")
+    .testing_only_observe_body_collections(Arc::clone(&body_collections_started))
+    .routes();
+    let (address, server) = warp::serve(routes).bind_ephemeral(([127, 0, 0, 1], 0));
+    let server = tokio::spawn(server);
+    let client = warp::hyper::Client::new();
+    let uri = format!("http://{address}/eth/v2/beacon/blocks");
+
+    let mut body_senders = Vec::new();
+    let mut stalled = Vec::new();
+    for _ in 0..PQ_BLOCK_PUBLICATION_ADMISSION_CAPACITY {
+        let (body_sender, body) = warp::hyper::Body::channel();
+        body_senders.push(body_sender);
+        let request = warp::hyper::Request::post(&uri)
+            .header("content-length", "2")
+            .header("content-type", "application/json")
+            .header("eth-consensus-version", "electra")
+            .body(body)
+            .expect("stalled publication request");
+        let client = client.clone();
+        stalled.push(tokio::spawn(async move { client.request(request).await }));
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while body_collections_started.load(Ordering::SeqCst)
+            != PQ_BLOCK_PUBLICATION_ADMISSION_CAPACITY
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("exact admitted body collectors started");
+
+    let cap_plus_one = warp::hyper::Request::post(&uri)
+        .header("content-length", "2")
+        .header("content-type", "application/json")
+        .header("eth-consensus-version", "electra")
+        .body(warp::hyper::Body::from("{}"))
+        .expect("cap+1 request");
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        client.request(cap_plus_one),
+    )
+    .await
+    .expect("cap+1 must not wait")
+    .expect("cap+1 response");
+    assert_eq!(response.status(), 429);
+    assert_eq!(
+        body_collections_started.load(Ordering::SeqCst),
+        PQ_BLOCK_PUBLICATION_ADMISSION_CAPACITY,
+        "the rejected request body stream must remain unpolled",
+    );
+
+    for response in stalled {
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
+            .await
+            .expect("stalled body timeout")
+            .expect("client task")
+            .expect("timeout response");
+        assert_eq!(response.status(), 408);
+    }
+    drop(body_senders);
+
+    let recovered = warp::hyper::Request::post(&uri)
+        .header("content-length", "2")
+        .header("content-type", "application/json")
+        .header("eth-consensus-version", "electra")
+        .body(warp::hyper::Body::from("{}"))
+        .expect("recovered request");
+    let response = client.request(recovered).await.expect("recovered response");
+    assert_eq!(response.status(), 400);
+    assert_eq!(
+        body_collections_started.load(Ordering::SeqCst),
+        PQ_BLOCK_PUBLICATION_ADMISSION_CAPACITY + 1,
+    );
+    server.abort();
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn pq_http_v3_json_production_and_full_publication_round_trip() {
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    let fixture = valid_production_fixture(false, false);
+    let (broadcast_sender, mut broadcast_receiver) = pq_block_broadcast_channel();
+    let decode_hook = TestingPqHttpBlockingHook::blocking();
+    let routes = PqHttpApi::new(
+        Arc::clone(&fixture.chain),
+        fixture._runtime.task_executor.clone(),
+        broadcast_sender.clone(),
+    )
+    .expect("PQ HTTP API")
+    .testing_only_block_decode(Arc::clone(&decode_hook))
+    .routes();
+    let (address, server) = warp::serve(routes.clone()).bind_ephemeral(([127, 0, 0, 1], 0));
+    let server = tokio::spawn(server);
+    let client = BeaconNodeHttpClient::new(
+        SensitiveUrl::parse(&format!("http://{address}/")).expect("ephemeral PQ HTTP URL"),
+        Timeouts::set_all(Duration::from_secs(180)),
+    );
+    let randao = serialize_individual_signature(&fixture.randao);
+    let graffiti = Graffiti([0x6b; 32]);
+    let (decoded, metadata) = client
+        .get_validator_blocks_v3::<MinimalEthSpec>(
+            Slot::new(1),
+            &randao,
+            Some(&graffiti),
+            None,
+            None,
+        )
+        .await
+        .expect("BeaconNodeHttpClient V3 JSON response");
+    assert_eq!(decoded.version, ForkName::Electra);
+    assert!(!metadata.execution_payload_blinded);
+    assert_eq!(metadata.execution_payload_value, Uint256::ZERO);
+    assert_eq!(metadata.consensus_block_value, Uint256::ZERO);
+    let eth2::types::ProduceBlockV3Response::Full(decoded_contents) = decoded.data else {
+        panic!("PQ V3 JSON must be full")
+    };
+    assert_eq!(decoded_contents.block().body().graffiti(), &graffiti);
+    assert!(matches!(
+        &decoded_contents,
+        eth2::types::FullBlockContents::BlockContents(_)
+    ));
+    assert_eq!(fixture.execution.payload_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        0
+    );
+
+    let (ssz_response, ssz_metadata) = client
+        .get_validator_blocks_v3_ssz::<MinimalEthSpec>(
+            Slot::new(1),
+            &randao,
+            Some(&graffiti),
+            None,
+            None,
+        )
+        .await
+        .expect("BeaconNodeHttpClient V3 SSZ response");
+    assert!(!ssz_metadata.execution_payload_blinded);
+    assert_eq!(ssz_metadata.execution_payload_value, Uint256::ZERO);
+    assert_eq!(ssz_metadata.consensus_block_value, Uint256::ZERO);
+    let eth2::types::ProduceBlockV3Response::Full(ssz_contents) = ssz_response else {
+        panic!("PQ V3 SSZ must be full")
+    };
+    assert_eq!(
+        ssz_contents.block().canonical_root(),
+        decoded_contents.block().canonical_root(),
+    );
+    assert_eq!(fixture.execution.payload_calls.load(Ordering::SeqCst), 2);
+
+    let (block, sidecars) = decoded_contents.deconstruct();
+    let signed = sign_block(&fixture, block);
+    let (invalid_message, _) = signed.as_ref().clone().deconstruct();
+    let invalid_signature = Arc::new(SignedBeaconBlock::from_block(
+        invalid_message,
+        consensus_signature::IndividualSignature::empty(),
+    ));
+    let invalid_request =
+        eth2::types::PublishBlockRequest::new(invalid_signature, sidecars.clone());
+    let invalid_body = serde_json::to_vec(&invalid_request).expect("invalid signed Electra JSON");
+    let missing_context_request = eth2::types::PublishBlockRequest::new(Arc::clone(&signed), None);
+    let missing_context_body =
+        serde_json::to_vec(&missing_context_request).expect("block-only Electra JSON");
+    let (mut wrong_root_message, _) = signed.as_ref().clone().deconstruct();
+    *wrong_root_message.state_root_mut() = Hash256::repeat_byte(0x7d);
+    let wrong_root = sign_equivocating_block(&fixture, wrong_root_message);
+    let wrong_root_request = eth2::types::PublishBlockRequest::new(wrong_root, sidecars.clone());
+    let wrong_root_body =
+        serde_json::to_vec(&wrong_root_request).expect("wrong-root signed Electra JSON");
+    let invalid_routes = PqHttpApi::new(
+        Arc::clone(&fixture.chain),
+        fixture._runtime.task_executor.clone(),
+        broadcast_sender,
+    )
+    .expect("invalid-publication PQ HTTP API")
+    .routes();
+    let invalid = warp::test::request()
+        .method("POST")
+        .path("/eth/v2/beacon/blocks")
+        .header("content-length", invalid_body.len().to_string())
+        .header("content-type", "application/json")
+        .header("eth-consensus-version", "electra")
+        .body(invalid_body)
+        .reply(&invalid_routes)
+        .await;
+    assert_eq!(invalid.status(), 400);
+    let missing_context = warp::test::request()
+        .method("POST")
+        .path("/eth/v2/beacon/blocks")
+        .header("content-length", missing_context_body.len().to_string())
+        .header("content-type", "application/json")
+        .header("eth-consensus-version", "electra")
+        .body(missing_context_body)
+        .reply(&invalid_routes)
+        .await;
+    assert_eq!(missing_context.status(), 400);
+    let wrong_root = warp::test::request()
+        .method("POST")
+        .path("/eth/v2/beacon/blocks")
+        .header("content-length", wrong_root_body.len().to_string())
+        .header("content-type", "application/json")
+        .header("eth-consensus-version", "electra")
+        .body(wrong_root_body)
+        .reply(&invalid_routes)
+        .await;
+    assert_eq!(wrong_root.status(), 400);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), broadcast_receiver.recv())
+            .await
+            .is_err(),
+        "an invalid proposal signature must be rejected before broadcast",
+    );
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        0,
+        "an invalid proposal signature must be rejected before Engine",
+    );
+    let publish_request = eth2::types::PublishBlockRequest::new(Arc::clone(&signed), sidecars);
+    let mut json_body = serde_json::to_vec(&publish_request).expect("full signed Electra JSON");
+    json_body.resize(json_body.len().max(2 * 1024 * 1024), b' ');
+    assert!(json_body.len() >= 2 * 1024 * 1024);
+    let request = warp::test::request()
+        .method("POST")
+        .path("/eth/v2/beacon/blocks")
+        .header("content-length", json_body.len().to_string())
+        .header("content-type", "application/json")
+        .header("eth-consensus-version", "electra")
+        .body(json_body.clone());
+    let publish_routes = routes.clone();
+    let response = tokio::spawn(async move { request.reply(&publish_routes).await });
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while decode_hook.entered() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("blocking decode entered");
+    let heartbeat = tokio::spawn(async {
+        tokio::task::yield_now().await;
+        1usize
+    });
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), heartbeat)
+            .await
+            .expect("heartbeat while decode is blocked")
+            .expect("heartbeat task"),
+        1,
+    );
+    response.abort();
+    assert!(
+        response
+            .await
+            .expect_err("canceled HTTP caller")
+            .is_cancelled(),
+        "the HTTP caller must be gone while blocking decode owns the body and admission",
+    );
+    decode_hook.release();
+    let broadcast = tokio::time::timeout(Duration::from_secs(180), broadcast_receiver.recv())
+        .await
+        .expect("publication broadcast timeout")
+        .expect("publication broadcast command");
+    assert_eq!(broadcast.block().as_ref(), signed.as_ref());
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        0,
+        "broadcast must be acknowledged before Engine notification",
+    );
+    let pending = warp::test::request()
+        .method("POST")
+        .path("/eth/v2/beacon/blocks")
+        .header("content-length", json_body.len().to_string())
+        .header("content-type", "application/json")
+        .header("eth-consensus-version", "electra")
+        .body(json_body)
+        .reply(&routes)
+        .await;
+    assert_eq!(pending.status(), 202);
+    broadcast.acknowledge(Ok(()));
+    tokio::time::timeout(std::time::Duration::from_secs(180), async {
+        while fixture.execution.new_payload_calls.load(Ordering::SeqCst) == 0
+            || fixture.chain.head_snapshot().beacon_block.slot() != Slot::new(1)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached HTTP publication commits");
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        fixture.chain.head_snapshot().beacon_block.slot(),
+        Slot::new(1)
+    );
+
+    let duplicate = client
+        .post_beacon_blocks_v2_ssz(&publish_request, None)
+        .await;
+    assert_eq!(
+        duplicate
+            .expect("BeaconNodeHttpClient SSZ publication duplicate")
+            .status(),
+        200,
+    );
+    assert_eq!(
+        client
+            .post_beacon_blocks_v2(&publish_request, None)
+            .await
+            .expect("BeaconNodeHttpClient JSON publication duplicate")
+            .status(),
+        200,
+    );
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        1,
+        "an exact committed duplicate must not re-notify Engine",
+    );
+
+    let restarted = Arc::new(
+        BeaconChainBuilder::<TestWitness>::pq_new(MinimalEthSpec)
+            .store(Arc::clone(&fixture.store))
+            .custom_spec(Arc::clone(&fixture.spec))
+            .resume_from_db()
+            .expect("resume HTTP-published block")
+            .pq_aggregation_service(Arc::clone(&fixture.aggregation_service))
+            .task_executor(fixture._runtime.task_executor.clone())
+            .testing_only_pq_execution_notifier(fixture.execution.clone())
+            .build()
+            .expect("restart after HTTP publication"),
+    );
+    let (restart_broadcast, _restart_receiver) = pq_block_broadcast_channel();
+    let restart_routes = PqHttpApi::new(
+        restarted,
+        fixture._runtime.task_executor.clone(),
+        restart_broadcast,
+    )
+    .expect("restart PQ HTTP API")
+    .routes();
+    let restart_body = publish_request.as_ssz_bytes();
+    let restart_duplicate = warp::test::request()
+        .method("POST")
+        .path("/eth/v2/beacon/blocks")
+        .header("content-length", restart_body.len().to_string())
+        .header("content-type", "application/octet-stream")
+        .header("eth-consensus-version", "electra")
+        .body(restart_body)
+        .reply(&restart_routes)
+        .await;
+    assert_eq!(restart_duplicate.status(), 200);
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        1,
+        "persisted exact signed duplicate must not notify Engine after restart",
+    );
+    server.abort();
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn pq_http_publication_maps_retry_and_equivocation_after_awaiting_service() {
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    let fixture = valid_production_fixture(false, false);
+    fixture.execution.set_new_payload_responses([
+        execution_layer::PayloadStatus::Syncing,
+        execution_layer::PayloadStatus::Valid,
+    ]);
+    let produced = fixture
+        .chain
+        .produce_pq_block_v3(Slot::new(1), fixture.randao.clone(), Graffiti::default())
+        .await
+        .expect("valid full block production");
+    let (block, sidecars) = produced.into_contents().deconstruct();
+    let signed = sign_block(&fixture, block);
+    let request = eth2::types::PublishBlockRequest::new(Arc::clone(&signed), sidecars);
+    let body = serde_json::to_vec(&request).expect("full signed Electra JSON");
+    let equivocation = fixture
+        .chain
+        .produce_pq_block_v3(Slot::new(1), fixture.randao.clone(), Graffiti([0xe2; 32]))
+        .await
+        .expect("valid equivocating full block production");
+    let (equivocation, equivocation_sidecars) = equivocation.into_contents().deconstruct();
+    let equivocation = sign_equivocating_block(&fixture, equivocation);
+    let equivocation_request =
+        eth2::types::PublishBlockRequest::new(equivocation, equivocation_sidecars);
+    let equivocation_body =
+        serde_json::to_vec(&equivocation_request).expect("equivocating Electra JSON");
+    let (broadcast_sender, mut broadcast_receiver) = pq_block_broadcast_channel();
+    let routes = PqHttpApi::new(
+        Arc::clone(&fixture.chain),
+        fixture._runtime.task_executor.clone(),
+        broadcast_sender,
+    )
+    .expect("PQ HTTP API")
+    .routes();
+
+    let first_routes = routes.clone();
+    let first_body = body.clone();
+    let first = tokio::spawn(async move {
+        warp::test::request()
+            .method("POST")
+            .path("/eth/v2/beacon/blocks")
+            .header("content-length", first_body.len().to_string())
+            .header("content-type", "application/json")
+            .header("eth-consensus-version", "electra")
+            .body(first_body)
+            .reply(&first_routes)
+            .await
+    });
+    let first_broadcast = tokio::time::timeout(Duration::from_secs(180), broadcast_receiver.recv())
+        .await
+        .expect("first broadcast timeout")
+        .expect("first broadcast");
+    let equivocation = warp::test::request()
+        .method("POST")
+        .path("/eth/v2/beacon/blocks")
+        .header("content-length", equivocation_body.len().to_string())
+        .header("content-type", "application/json")
+        .header("eth-consensus-version", "electra")
+        .body(equivocation_body)
+        .reply(&routes)
+        .await;
+    assert_eq!(equivocation.status(), 409);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), broadcast_receiver.recv())
+            .await
+            .is_err(),
+        "a conflicting root must not broadcast",
+    );
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        0,
+        "live equivocation must be resolved before Engine",
+    );
+    first_broadcast.acknowledge(Ok(()));
+    let first = tokio::time::timeout(Duration::from_secs(180), first)
+        .await
+        .expect("retryable publication completes")
+        .expect("retryable publication task");
+    assert_eq!(first.status(), 503);
+
+    let retry = warp::test::request()
+        .method("POST")
+        .path("/eth/v2/beacon/blocks")
+        .header("content-length", body.len().to_string())
+        .header("content-type", "application/json")
+        .header("eth-consensus-version", "electra")
+        .body(body)
+        .reply(&routes)
+        .await;
+    assert_eq!(retry.status(), 200);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), broadcast_receiver.recv())
+            .await
+            .is_err(),
+        "post-broadcast Engine retry must not rebroadcast",
+    );
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        2,
+    );
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn pq_http_publication_maps_engine_rejection_to_terminal_conflict() {
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    let fixture = valid_production_fixture(false, false);
+    fixture.execution.set_new_payload_responses([
+        execution_layer::PayloadStatus::InvalidBlockHash {
+            validation_error: Some("terminal HTTP publication fixture".to_owned()),
+        },
+    ]);
+    let produced = fixture
+        .chain
+        .produce_pq_block_v3(Slot::new(1), fixture.randao.clone(), Graffiti::default())
+        .await
+        .expect("valid full block production");
+    let (block, sidecars) = produced.into_contents().deconstruct();
+    let signed = sign_block(&fixture, block);
+    let request = eth2::types::PublishBlockRequest::new(signed, sidecars);
+    let body = serde_json::to_vec(&request).expect("full signed Electra JSON");
+    let (broadcast_sender, mut broadcast_receiver) = pq_block_broadcast_channel();
+    let routes = PqHttpApi::new(
+        Arc::clone(&fixture.chain),
+        fixture._runtime.task_executor.clone(),
+        broadcast_sender,
+    )
+    .expect("PQ HTTP API")
+    .routes();
+
+    let first_routes = routes.clone();
+    let first_body = body.clone();
+    let first = tokio::spawn(async move {
+        warp::test::request()
+            .method("POST")
+            .path("/eth/v2/beacon/blocks")
+            .header("content-length", first_body.len().to_string())
+            .header("content-type", "application/json")
+            .header("eth-consensus-version", "electra")
+            .body(first_body)
+            .reply(&first_routes)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(180), broadcast_receiver.recv())
+        .await
+        .expect("terminal broadcast timeout")
+        .expect("terminal broadcast")
+        .acknowledge(Ok(()));
+    let first = tokio::time::timeout(Duration::from_secs(180), first)
+        .await
+        .expect("terminal publication completes")
+        .expect("terminal publication task");
+    assert_eq!(first.status(), 409);
+
+    let duplicate = warp::test::request()
+        .method("POST")
+        .path("/eth/v2/beacon/blocks")
+        .header("content-length", body.len().to_string())
+        .header("content-type", "application/json")
+        .header("eth-consensus-version", "electra")
+        .body(body)
+        .reply(&routes)
+        .await;
+    assert_eq!(duplicate.status(), 409);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), broadcast_receiver.recv())
+            .await
+            .is_err(),
+        "terminal duplicate must not rebroadcast",
+    );
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        1,
+        "terminal duplicate must not re-notify Engine",
     );
 }

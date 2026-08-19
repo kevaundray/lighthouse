@@ -27,13 +27,15 @@ pub use network_beacon_processor::NetworkBeaconProcessor;
 #[cfg(feature = "pq-devnet")]
 pub use pq_runtime::{
     PQ_BLOCK_BROADCAST_QUEUE_CAPACITY, PQ_BLOCK_PUBLICATION_ADMISSION_CAPACITY,
-    PQ_PUBLICATION_FIXED_BODY_ALLOWANCE_BYTES, PqBlockBroadcastAcknowledgement,
-    PqBlockBroadcastCommand, PqBlockBroadcastError, PqBlockBroadcastReceiver,
-    PqBlockBroadcastSender, PqBlockPublicationAdmission, PqBlockPublicationConfigurationError,
-    PqBlockPublicationDisposition, PqBlockPublicationLocalError, PqBlockPublicationService,
-    PqBlockPublicationTerminal, PqGossipAggregateDisposition, PqGossipAttestationDisposition,
-    PqGossipBlockDisposition, PqNetworkBlockProcessor, PqPublicationBodyLimits,
-    PqPublicationCapacity, pq_block_broadcast_channel,
+    PQ_BLOCK_PUBLICATION_BODY_CHUNK_CAPACITY, PQ_BLOCK_PUBLICATION_BODY_CHUNK_METADATA_BYTES,
+    PQ_BLOCK_PUBLICATION_RETAINED_BODY_FIXED_BYTES, PQ_PUBLICATION_FIXED_BODY_ALLOWANCE_BYTES,
+    PqBlockBroadcastAcknowledgement, PqBlockBroadcastCommand, PqBlockBroadcastError,
+    PqBlockBroadcastReceiver, PqBlockBroadcastSender, PqBlockPublicationAdmission,
+    PqBlockPublicationConfigurationError, PqBlockPublicationDisposition,
+    PqBlockPublicationLocalError, PqBlockPublicationService, PqBlockPublicationTerminal,
+    PqGossipAggregateDisposition, PqGossipAttestationDisposition, PqGossipBlockDisposition,
+    PqNetworkBlockProcessor, PqPublicationBodyLimits, PqPublicationCapacity,
+    pq_block_broadcast_channel,
 };
 #[cfg(not(feature = "pq-devnet"))]
 pub use service::{

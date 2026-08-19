@@ -2128,20 +2128,51 @@ typed rejection. Return the normal full V3 JSON/SSZ shape with Electra consensus
 `execution_payload_blinded = false`, exact execution value, and zero consensus value for the
 zero-attestation slice.
 
-Acquire publication admission and enforce content-length limits before buffering. Decode JSON/SSZ
-on the blocking executor, require Electra plus the supported content type/version headers, require
-full `BlockContents` with explicit empty blob/proof lists, and reject block-only, blinded, Fulu/Gloas,
-or nonempty sidecar inputs before verification/broadcast. Match every production/publication error
-explicitly: malformed/profile/PQ-invalid input is 400; stale/past/expired/equivocation/terminal
-conflict is 409; admission or broadcast capacity is 429; oversized/unsupported media is 413/415;
-retryable proof/clock/Engine/broadcast/store/task failures are 503; successful and already-committed
-publication is 200; an exact pending root is 202. Do not collapse this table through a broad
-`is_retryable` fallback.
+The current devnet continues to use its slot-bound PQ RANDAO transport. A hashchain RANDAO proposal
+exists as a possible follow-up design, but e-e2b neither selects nor implements that alternative.
+
+Acquire publication admission and enforce content-length limits before buffering. Retain at most
+4,096 bounded transport chunk objects while streaming, reject a checked next length as soon as it
+exceeds either the declaration or media cap, then fallibly allocate and coalesce the contiguous body
+only on the blocking executor. The retained-memory bound covers both raw chunks and the temporary
+contiguous decode copy, bounded chunk metadata, and fixed bookkeeping across both admissions. Decode
+JSON/SSZ on that blocking executor, require Electra plus the supported content type/version headers,
+require full `BlockContents` with explicit empty blob/proof lists, and reject block-only, blinded,
+Fulu/Gloas, or nonempty sidecar inputs before verification/broadcast. Match every
+production/publication error explicitly: malformed/profile/PQ-invalid input is 400;
+stale/past/expired/equivocation/terminal conflict is 409; admission or broadcast capacity is 429;
+oversized/unsupported media is 413/415; retryable proof/clock/Engine/broadcast/store/task failures are
+503; successful and already-committed publication is 200; an exact pending root is 202. Do not
+collapse this table through a broad `is_retryable` fallback.
 
 Cover actual awaited Warp filters and `BeaconNodeHttpClient` JSON/SSZ round trips, standard headers
 and metadata, every unsupported route/option/version, body/query/admission cap and cap+1, signed and
 root/context mutations before broadcast, successful publication ordering, cancellation and retry
 mapping, committed versus terminal duplicates, and one serialized real AVX route through restart.
+
+Focused implementation evidence (2026-08-19): the new `pq_http_api` crate is feature-empty by
+default and remains absent from `beacon_node`, `client`, and `lighthouse`. Its warning-denied scalar
+suite passed 15/15, covering native Warp 411/413 recovery, raw-query cap/cap+1, contextual JSON
+trailing data, actual media-specific body-length recheck, full-Electra JSON/SSZ decoding with explicit
+empty sidecars, exhaustive production/publication status classes, SSZ V3 headers, bounded streamed
+body collection, single-large-chunk blocking/heartbeat sensitivity inside the shared coalescer,
+deterministic allocation-failure-to-503 mapping, raw-plus-copy retained-memory accounting, and
+response permits retained through body clones and the exact two-response cap.
+Warning-denied default and `pq-devnet` crate checks, focused Clippy, formatting, and the warning-denied
+AVX2 production-target no-run compile passed. The strict query/header/version/body policy route passed
+1/1 in 79.81 seconds, including malformed/overflow slots and duplicate queries without payload or
+Engine calls. The incomplete-body ephemeral-server route held two streaming clients until the
+testing-only two-second timeout, rejected cap+1 with 429 before polling its body, returned 408 for the
+stalled requests, and immediately recovered its permits (1/1 in 82.01 seconds). The serialized
+real-chain route passed 1/1 in 133.43 seconds: `BeaconNodeHttpClient` completed full V3 JSON and SSZ
+production; block-only, invalid-signature, and proposal-signed wrong-state-root publications failed
+before broadcast/Engine; a padded two-megabyte Warp request reached the shared blocking coalescer,
+preserved an async heartbeat, and survived HTTP caller cancellation; and the exact
+broadcast preceded the detached Engine/database/head commit. Client JSON/SSZ duplicates and a restart
+SSZ duplicate were idempotent. Awaited route tests additionally covered live equivocation plus
+SYNCING-to-VALID retry without rebroadcast (1/1 in 132.56 seconds), and terminal Engine rejection with
+no duplicate Engine call. Broad workspace gates and the real network/server adapter remain deferred
+pending review and e-e4.
 
 #### Task 5.3e-e3: Add a proposer-only PQ validator-client service
 

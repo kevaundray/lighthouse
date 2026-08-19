@@ -12,6 +12,13 @@ use types::{ChainSpec, EthSpec, Hash256, SignedBeaconBlock};
 
 pub const PQ_BLOCK_PUBLICATION_ADMISSION_CAPACITY: usize = 2;
 pub const PQ_PUBLICATION_FIXED_BODY_ALLOWANCE_BYTES: usize = 1024 * 1024;
+/// A publication body may be split into at most this many transport chunks before it is rejected
+/// as a local resource failure. The limit bounds retained chunk objects independently of bytes.
+pub const PQ_BLOCK_PUBLICATION_BODY_CHUNK_CAPACITY: usize = 4096;
+/// The HTTP collector rejects chunk object types larger than this accounting bound.
+pub const PQ_BLOCK_PUBLICATION_BODY_CHUNK_METADATA_BYTES: usize = 128;
+/// Per-admission allowance for the chunk vector and other fixed collection bookkeeping.
+pub const PQ_BLOCK_PUBLICATION_RETAINED_BODY_FIXED_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PqPublicationBodyLimits {
@@ -39,8 +46,14 @@ impl PqPublicationBodyLimits {
         let max_json_bytes = max_ssz_bytes
             .checked_mul(2)?
             .checked_add(PQ_PUBLICATION_FIXED_BODY_ALLOWANCE_BYTES)?;
+        let raw_chunks_and_decode_copy = max_json_bytes.checked_mul(2)?;
+        let chunk_metadata = PQ_BLOCK_PUBLICATION_BODY_CHUNK_CAPACITY
+            .checked_mul(PQ_BLOCK_PUBLICATION_BODY_CHUNK_METADATA_BYTES)?;
+        let retained_per_admission = raw_chunks_and_decode_copy
+            .checked_add(chunk_metadata)?
+            .checked_add(PQ_BLOCK_PUBLICATION_RETAINED_BODY_FIXED_BYTES)?;
         let max_retained_body_bytes =
-            max_json_bytes.checked_mul(PQ_BLOCK_PUBLICATION_ADMISSION_CAPACITY)?;
+            retained_per_admission.checked_mul(PQ_BLOCK_PUBLICATION_ADMISSION_CAPACITY)?;
         Some(Self {
             max_ssz_bytes,
             max_json_bytes,

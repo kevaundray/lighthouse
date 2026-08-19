@@ -6,8 +6,9 @@ use consensus_signature::IndividualSignature;
 use consensus_signature::{PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN, PQ_RAW_SIGNATURE_LEN};
 use network::{
     PQ_BLOCK_BROADCAST_QUEUE_CAPACITY, PQ_BLOCK_PUBLICATION_ADMISSION_CAPACITY,
-    PQ_PUBLICATION_FIXED_BODY_ALLOWANCE_BYTES, PqBlockBroadcastError,
-    PqBlockPublicationConfigurationError, PqBlockPublicationDisposition,
+    PQ_BLOCK_PUBLICATION_BODY_CHUNK_CAPACITY, PQ_BLOCK_PUBLICATION_BODY_CHUNK_METADATA_BYTES,
+    PQ_BLOCK_PUBLICATION_RETAINED_BODY_FIXED_BYTES, PQ_PUBLICATION_FIXED_BODY_ALLOWANCE_BYTES,
+    PqBlockBroadcastError, PqBlockPublicationConfigurationError, PqBlockPublicationDisposition,
     PqBlockPublicationTerminal, PqPublicationBodyLimits, PqPublicationCapacity,
     pq_block_broadcast_channel,
 };
@@ -134,9 +135,12 @@ fn publication_body_limits_are_checked_and_bound_all_admitted_json() {
     let expected_json = expected_ssz * 2 + PQ_PUBLICATION_FIXED_BODY_ALLOWANCE_BYTES;
     assert_eq!(limits.max_ssz_bytes(), expected_ssz);
     assert_eq!(limits.max_json_bytes(), expected_json);
+    let expected_per_admission = expected_json * 2
+        + PQ_BLOCK_PUBLICATION_BODY_CHUNK_CAPACITY * PQ_BLOCK_PUBLICATION_BODY_CHUNK_METADATA_BYTES
+        + PQ_BLOCK_PUBLICATION_RETAINED_BODY_FIXED_BYTES;
     assert_eq!(
         limits.max_retained_body_bytes(),
-        expected_json * PQ_BLOCK_PUBLICATION_ADMISSION_CAPACITY,
+        expected_per_admission * PQ_BLOCK_PUBLICATION_ADMISSION_CAPACITY,
     );
 
     spec.max_payload_size = u64::MAX;

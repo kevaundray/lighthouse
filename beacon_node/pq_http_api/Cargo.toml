@@ -1,0 +1,55 @@
+[package]
+name = "pq_http_api"
+version = "0.1.0"
+edition = { workspace = true }
+
+[features]
+default = []
+pq-devnet = [
+    "dep:beacon_chain",
+    "dep:bytes",
+    "dep:consensus_signature",
+    "dep:context_deserialize",
+    "dep:eth2",
+    "dep:ethereum_ssz",
+    "dep:futures",
+    "dep:mediatype",
+    "dep:network",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:task_executor",
+    "dep:tokio",
+    "dep:types",
+    "dep:warp",
+    "beacon_chain/pq-devnet",
+    "consensus_signature/pq-devnet",
+    "consensus_signature/pq-wire",
+    "eth2/pq-wire",
+    "network/pq-devnet",
+    "types/pq-devnet",
+]
+pq-startup-testing = [
+    "pq-devnet",
+    "beacon_chain/pq-startup-testing",
+    "network/pq-startup-testing",
+]
+
+[dependencies]
+beacon_chain = { path = "../beacon_chain", optional = true, default-features = false }
+bytes = { workspace = true, optional = true }
+consensus_signature = { workspace = true, optional = true }
+context_deserialize = { workspace = true, optional = true }
+eth2 = { workspace = true, optional = true }
+ethereum_ssz = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+mediatype = { version = "0.19.13", optional = true }
+network = { path = "../network", optional = true, default-features = false }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+task_executor = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["time"] }
+types = { workspace = true, optional = true }
+warp = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

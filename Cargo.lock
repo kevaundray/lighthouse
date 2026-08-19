@@ -7255,6 +7255,7 @@ dependencies = [
  "futures",
  "hex",
  "network",
+ "pq_http_api",
  "pq_signing",
  "rustix",
  "serde",
@@ -7269,7 +7270,29 @@ dependencies = [
  "tokio",
  "types",
  "validator_dir",
+ "warp",
  "zeroize",
+]
+
+[[package]]
+name = "pq_http_api"
+version = "0.1.0"
+dependencies = [
+ "beacon_chain",
+ "bytes",
+ "consensus_signature",
+ "context_deserialize",
+ "eth2",
+ "ethereum_ssz",
+ "futures",
+ "mediatype",
+ "network",
+ "serde",
+ "serde_json",
+ "task_executor",
+ "tokio",
+ "types",
+ "warp",
 ]
 
 [[package]]

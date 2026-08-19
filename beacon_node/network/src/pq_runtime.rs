@@ -15,10 +15,12 @@ pub use broadcast::{
     pq_block_broadcast_channel,
 };
 pub use publication::{
-    PQ_BLOCK_PUBLICATION_ADMISSION_CAPACITY, PQ_PUBLICATION_FIXED_BODY_ALLOWANCE_BYTES,
-    PqBlockPublicationAdmission, PqBlockPublicationConfigurationError,
-    PqBlockPublicationDisposition, PqBlockPublicationLocalError, PqBlockPublicationService,
-    PqBlockPublicationTerminal, PqPublicationBodyLimits, PqPublicationCapacity,
+    PQ_BLOCK_PUBLICATION_ADMISSION_CAPACITY, PQ_BLOCK_PUBLICATION_BODY_CHUNK_CAPACITY,
+    PQ_BLOCK_PUBLICATION_BODY_CHUNK_METADATA_BYTES, PQ_BLOCK_PUBLICATION_RETAINED_BODY_FIXED_BYTES,
+    PQ_PUBLICATION_FIXED_BODY_ALLOWANCE_BYTES, PqBlockPublicationAdmission,
+    PqBlockPublicationConfigurationError, PqBlockPublicationDisposition,
+    PqBlockPublicationLocalError, PqBlockPublicationService, PqBlockPublicationTerminal,
+    PqPublicationBodyLimits, PqPublicationCapacity,
 };
 
 /// Result of full contextual and PQ evidence verification for unaggregated gossip.
