@@ -2048,21 +2048,67 @@ mutation failed the shared classifier test. Those two exact behavior tests passe
 focused warning-denied AVX2 `--no-run` compile passed. The full 16-test file was not rerun because
 neither final change alters the proof or Engine behavior already covered above.
 
-#### Task 5.3e-e2: Expose the narrow PQ full-V3 HTTP production and publish routes
+#### Task 5.3e-e2a: Seal local HTTP publication and add an acknowledged broadcaster
 
-Compile a PQ-specific HTTP surface instead of enabling the ordinary BLS/full-runtime module graph.
-Expose only `GET /eth/v3/validator/blocks/{slot}` for local full production and the standard full
-signed-block publish route needed by a validator client. Decode the active PQ RANDAO transport and
-always verify it; reject `skip_randao_verification`, V2/V4 production, blinded endpoints,
-builder-boost/builder selection, Gloas, registration, and sync-service endpoints. Return the normal
-full V3 JSON/SSZ shape and metadata with `execution_payload_blinded = false`.
+Do not route locally submitted validator blocks through either the RPC importer or the inbound-gossip
+source. Add an honest `Publish` source to the existing e-c verification boundary and preserve the
+exact immutable signed block inside a publish-specific propagation capability. Reuse the complete
+proposal/RANDAO/attestation proof and owned post-state transition, but distinguish an already
+committed root from an Engine-rejected or otherwise terminal root at the public publication seam.
+Committed duplicate publication is idempotent success; a prior terminal rejection is conflict.
 
-The publish handler must decode full signed block contents, enter the existing e-c full verification
-boundary, propagate through an immutable process-owned broadcaster, then consume the exact
-post-propagation capability for Engine notification and atomic import. It must never call raw
-persistence or mark propagation without a successful broadcaster result. Cover actual awaited HTTP
-filters, serialization headers, unsupported routes/options, propagation-before-Engine ordering,
-and retry/terminal mappings.
+Add one bounded, process-owned block-broadcast command channel. Each command owns the exact block
+from the sealed capability and a one-shot acknowledgment. A positive acknowledgment means that the
+network worker accepted that exact immutable block for gossipsub publication; enqueueing an ordinary
+unbounded `NetworkMessage::Publish` is not sufficient. The real network adapter remains deferred to
+e-e4, while the isolated test actor returns deterministic acknowledgments through the same bounded
+channel. Do not expose a per-request broadcaster strategy.
+
+After full verification, move the admission, propagation capability, broadcaster request, Engine
+notification, and atomic database/head commit into one detached process-owned task. Await broadcast
+acknowledgment before consuming `after_propagation`; only then run the existing chain-owned Engine
+and persistence path. Caller cancellation before acknowledgment drops the unpromoted capability and
+restores propagation retryability. A broadcast failure retries propagation; Engine `SYNCING`,
+transport, or store failure after successful broadcast retries commit without rebroadcast. Once
+Engine returns `VALID`, database/head completion retains the existing cancellation-independent
+guarantee. Add non-waiting HTTP publication admission before body buffering, a bounded broadcaster
+queue, and checked body limits so neither raw requests nor verified post-states accumulate waiters.
+
+Exercise the source/capability and broadcaster lifecycle before adding routes: exact block ownership,
+pending and committed duplicates, terminal rejection, equivocation, queue/admission cap and cap+1,
+failed acknowledgment and rebroadcast retry, post-broadcast Engine/store retry without rebroadcast,
+caller cancellation at broadcaster and Engine barriers, event ordering, and restart-visible commit.
+
+#### Task 5.3e-e2b: Expose the isolated PQ full-V3 HTTP production and publish routes
+
+Create a feature-empty-by-default `beacon_node/pq_http_api` crate instead of enabling the ordinary
+`http_api` crate, whose monolithic BLS/slasher/router graph remains incompatible and exposes many
+unsupported endpoints. The narrow crate owns an immutable `Arc<BeaconChain>`, the e-e2a publication
+facade, and its process `TaskExecutor`; e-e4 supplies the real broadcaster receiver and server
+binding. Do not add this crate to `beacon_node`, `client`, or `lighthouse` until e-e4.
+
+Expose only `GET /eth/v3/validator/blocks/{slot}` for local full production and
+`POST /eth/v2/beacon/blocks` for full signed-block publication. Decode the active PQ RANDAO transport
+and always verify it; reject `skip_randao_verification`, V2/V4 production, blinded endpoints,
+builder boost/selection, Gloas, registration, sync, duties, and unknown query fields by absence or
+typed rejection. Return the normal full V3 JSON/SSZ shape with Electra consensus version,
+`execution_payload_blinded = false`, exact execution value, and zero consensus value for the
+zero-attestation slice.
+
+Acquire publication admission and enforce content-length limits before buffering. Decode JSON/SSZ
+on the blocking executor, require Electra plus the supported content type/version headers, require
+full `BlockContents` with explicit empty blob/proof lists, and reject block-only, blinded, Fulu/Gloas,
+or nonempty sidecar inputs before verification/broadcast. Match every production/publication error
+explicitly: malformed/profile/PQ-invalid input is 400; stale/past/expired/equivocation/terminal
+conflict is 409; admission or broadcast capacity is 429; oversized/unsupported media is 413/415;
+retryable proof/clock/Engine/broadcast/store/task failures are 503; successful and already-committed
+publication is 200; an exact pending root is 202. Do not collapse this table through a broad
+`is_retryable` fallback.
+
+Cover actual awaited Warp filters and `BeaconNodeHttpClient` JSON/SSZ round trips, standard headers
+and metadata, every unsupported route/option/version, body/query/admission cap and cap+1, signed and
+root/context mutations before broadcast, successful publication ordering, cancellation and retry
+mapping, committed versus terminal duplicates, and one serialized real AVX route through restart.
 
 #### Task 5.3e-e3: Add a proposer-only PQ validator-client service
 
@@ -2077,7 +2123,8 @@ e-e2 test server, including byte-identical retry and full propose/sign/publish i
 
 #### Task 5.3e-e4: Assemble the PQ network, HTTP, and proposer runtime
 
-Replace the top-level `DeferredRuntimeIntegration` boundary only after e-e1 through e-e3 are green.
+Replace the top-level `DeferredRuntimeIntegration` boundary only after e-e1, e-e2a, e-e2b, and e-e3
+are green.
 Construct exactly one aggregation service, task executor, execution layer, bounded BeaconChain,
 network processor/broadcaster, narrow HTTP server, and proposer-only validator service in fail-closed
 order. Keep ordinary router/sync/backfill/history, builders, registration, sync duties, slasher,
