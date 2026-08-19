@@ -63,7 +63,7 @@ impl TestingPqBlockingHook {
         self.release.notify_all();
     }
 
-    fn run(&self) {
+    pub(crate) fn run(&self) {
         self.entered.fetch_add(1, Ordering::SeqCst);
         let mut released = self.released.lock().expect("PQ blocking test hook lock");
         while !*released {

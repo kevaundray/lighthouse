@@ -1,20 +1,31 @@
-use beacon_chain::{
-    PQ_BLOCK_IMPORT_ADMISSION_CAPACITY, PQ_FORWARD_RANGE_BLOCK_CAPACITY, PqBlockImportSource,
-    PqEnginePayloadDisposition, PqEnginePayloadStatus, PqImportError, PqImportLocalError,
-    PqImportPeerInvalid, TestingPqExternalReservation, TestingPqGossipClaim, TestingPqGossipFinish,
-    TestingPqGossipObservationCache, classify_pq_engine_payload_status,
-};
 #[cfg(target_feature = "avx2")]
 use beacon_chain::{
-    PqNewPayloadTransport, TestingPqBlockingHook,
+    PQ_ATTESTATION_GOSSIP_ADMISSION_CAPACITY, PqNewPayloadTransport, TestingPqBlockingHook,
     builder::{BeaconChainBuilder, Witness},
 };
+use beacon_chain::{
+    PQ_BLOCK_IMPORT_ADMISSION_CAPACITY, PQ_FORWARD_RANGE_BLOCK_CAPACITY, PqAttestationGossipError,
+    PqAttestationGossipLocalError, PqBlockImportSource, PqEnginePayloadDisposition,
+    PqEnginePayloadStatus, PqImportError, PqImportLocalError, PqImportPeerInvalid,
+    TestingPqAttestationObservationCache, TestingPqExternalReservation, TestingPqGossipClaim,
+    TestingPqGossipFinish, TestingPqGossipObservationCache, classify_pq_engine_payload_status,
+    testing_only_pq_attestation_advance_distance, testing_only_pq_attestation_late_window,
+    testing_only_pq_attestation_target_root,
+};
 #[cfg(target_feature = "avx2")]
-use consensus_signature::{AggregationService, OneTimeUseId, PqPublicKey, SigningDuty};
+use consensus_signature::{
+    AggregationService, OneTimeUseId, PqPublicKey, PqRawSignature, PqSameMessageEvidence,
+    SigningDuty,
+};
 #[cfg(target_feature = "avx2")]
-use network::{PqGossipBlockDisposition, PqNetworkBlockProcessor};
+use network::{
+    PqGossipAggregateDisposition, PqGossipAttestationDisposition, PqGossipBlockDisposition,
+    PqNetworkBlockProcessor,
+};
 #[cfg(target_feature = "avx2")]
 use pq_signing::{PqKeyUnlock, PqKeystore, PqSigningAuthority, provision_usage_journal};
+#[cfg(target_feature = "avx2")]
+use ssz_types::{BitList, BitVector};
 #[cfg(target_feature = "avx2")]
 use std::sync::Arc;
 #[cfg(target_feature = "avx2")]
@@ -27,15 +38,314 @@ use std::{
 };
 #[cfg(target_feature = "avx2")]
 use store::{HotColdDB, MemoryStore, StoreConfig};
-#[cfg(target_feature = "avx2")]
 use types::EthSpec;
 #[cfg(target_feature = "avx2")]
 use types::SignedBeaconBlock;
 #[cfg(target_feature = "avx2")]
 use types::{
-    BeaconBlock, ChainSpec, Domain, ExecutionPayloadRef, ForkName, MinimalEthSpec, SignedRoot,
+    AggregateAndProof, Attestation, AttestationData, AttestationElectra, BeaconBlock, ChainSpec,
+    Checkpoint, Domain, ExecutionPayloadRef, ForkName, MinimalEthSpec, SelectionProof,
+    SignedAggregateAndProof, SignedRoot, SingleAttestation, SubnetId,
 };
 use types::{Hash256, Slot};
+
+#[test]
+fn pq_attestation_errors_expose_nested_local_causes() {
+    use std::error::Error;
+
+    let aggregation = consensus_signature::AggregationError::Unavailable;
+    let state_error = state_processing::PqAttestationError::Local(
+        state_processing::PqAttestationLocalError::Aggregation(aggregation),
+    );
+    assert_eq!(
+        state_error.source().map(ToString::to_string),
+        Some(aggregation.to_string())
+    );
+
+    let gossip_error = PqAttestationGossipError::Local(PqAttestationGossipLocalError::Aggregate(
+        state_processing::PqConsensusLocalError::Attestation(
+            state_processing::PqAttestationLocalError::Aggregation(aggregation),
+        ),
+    ));
+    assert_eq!(
+        gossip_error.source().map(ToString::to_string),
+        Some(aggregation.to_string())
+    );
+}
+
+#[test]
+fn pq_attestation_precheck_prunes_stale_capacity_before_status() {
+    let mut cache = TestingPqAttestationObservationCache::default();
+    assert_eq!(cache.capacity(), 16 * 2);
+    for validator in 0..cache.capacity() {
+        cache
+            .observe_single(
+                types::Epoch::new(0),
+                validator as u64,
+                Hash256::with_last_byte(validator as u8),
+                Slot::new(0),
+            )
+            .expect("fill bounded stale observation cache");
+    }
+    assert_eq!(cache.len_singles(), cache.capacity());
+
+    let epoch_one_start = types::Epoch::new(1).start_slot(types::MinimalEthSpec::slots_per_epoch());
+    assert_eq!(
+        cache.precheck_single(types::Epoch::new(1), 0, epoch_one_start),
+        beacon_chain::PqAttestationGossipObservation::Unseen
+    );
+    assert_eq!(cache.len_singles(), 0);
+}
+
+#[test]
+fn pq_aggregate_precheck_prunes_stale_capacity_before_status() {
+    let mut cache = TestingPqAttestationObservationCache::default();
+    for validator in 0..cache.capacity() {
+        let identity = Hash256::with_last_byte(validator as u8);
+        let generation = cache
+            .claim_aggregate(
+                types::Epoch::new(0),
+                validator as u64,
+                Slot::new(0),
+                identity,
+                0,
+                identity,
+                &[0],
+                Slot::new(0),
+            )
+            .expect("fill bounded stale aggregate cache");
+        assert!(cache.finalize_aggregate(
+            types::Epoch::new(0),
+            validator as u64,
+            Slot::new(0),
+            identity,
+            0,
+            identity,
+            generation,
+            &[0],
+        ));
+    }
+    let epoch_one_start = types::Epoch::new(1).start_slot(types::MinimalEthSpec::slots_per_epoch());
+    assert_eq!(
+        cache.precheck_aggregate(
+            types::Epoch::new(1),
+            0,
+            epoch_one_start,
+            Hash256::repeat_byte(0xf0),
+            0,
+            &[0],
+            epoch_one_start,
+        ),
+        beacon_chain::PqAttestationGossipObservation::Unseen
+    );
+    assert_eq!(cache.len_aggregators(), 0);
+    assert_eq!(cache.len_aggregate_candidates(), 0);
+}
+
+#[test]
+fn pq_attestation_prior_epoch_head_becomes_next_epoch_target_root() {
+    let referenced_root = Hash256::repeat_byte(0x11);
+    let historical_target = Hash256::repeat_byte(0x22);
+    assert_eq!(
+        testing_only_pq_attestation_target_root::<types::MinimalEthSpec>(
+            Slot::new(7),
+            referenced_root,
+            Slot::new(8),
+            historical_target,
+        ),
+        referenced_root
+    );
+    assert_eq!(
+        testing_only_pq_attestation_target_root::<types::MinimalEthSpec>(
+            Slot::new(8),
+            referenced_root,
+            Slot::new(9),
+            historical_target,
+        ),
+        referenced_root
+    );
+    assert_eq!(
+        testing_only_pq_attestation_target_root::<types::MinimalEthSpec>(
+            Slot::new(9),
+            referenced_root,
+            Slot::new(10),
+            historical_target,
+        ),
+        historical_target
+    );
+}
+
+#[test]
+fn pq_attestation_context_advancement_is_explicitly_bounded() {
+    let max = types::MinimalEthSpec::slots_per_epoch()
+        .checked_mul(2)
+        .and_then(|slots| slots.checked_add(2))
+        .expect("minimal bound");
+    assert_eq!(
+        testing_only_pq_attestation_advance_distance::<types::MinimalEthSpec>(
+            Slot::new(0),
+            Slot::new(max),
+        )
+        .expect("exact bound"),
+        max
+    );
+    assert!(matches!(
+        testing_only_pq_attestation_advance_distance::<types::MinimalEthSpec>(
+            Slot::new(0),
+            Slot::new(max + 1),
+        ),
+        Err(PqAttestationGossipError::Local(
+            PqAttestationGossipLocalError::StateAdvanceTooLarge { .. }
+        ))
+    ));
+}
+
+#[test]
+fn pq_attestation_generation_exhaustion_fails_closed_without_observation() {
+    let mut cache = TestingPqAttestationObservationCache::default();
+    cache.set_next_generation(u64::MAX);
+    assert_eq!(
+        cache.observe_single(
+            types::Epoch::new(0),
+            1,
+            Hash256::repeat_byte(1),
+            Slot::new(0),
+        ),
+        Err(beacon_chain::PqAttestationGossipObservation::GenerationExhausted)
+    );
+    assert_eq!(cache.len_singles(), 0);
+}
+
+#[test]
+fn pq_attestation_receipt_timing_is_local_and_never_peer_penalized() {
+    let future =
+        PqAttestationGossipError::Local(PqAttestationGossipLocalError::ReceiptBeforeWindow {
+            attestation: Slot::new(9),
+            latest_permissible: Slot::new(8),
+        });
+    assert!(!future.should_penalize_peer());
+    assert!(future.is_retryable());
+
+    let past = PqAttestationGossipError::Local(PqAttestationGossipLocalError::ReceiptAfterWindow {
+        attestation: Slot::new(7),
+        earliest_permissible: Slot::new(8),
+    });
+    assert!(!past.should_penalize_peer());
+    assert!(!past.is_retryable());
+
+    let lineage_changed = PqAttestationGossipError::Local(
+        PqAttestationGossipLocalError::BoundHeadNoLongerCanonical {
+            bound: Hash256::repeat_byte(1),
+            current: Hash256::repeat_byte(2),
+        },
+    );
+    assert!(!lineage_changed.should_penalize_peer());
+    assert!(!lineage_changed.is_retryable());
+}
+
+#[test]
+fn pq_attestation_late_window_accepts_boundaries_and_ignores_expiry() {
+    assert!(
+        testing_only_pq_attestation_late_window(Slot::new(8), Slot::new(8), Slot::new(9)).is_ok()
+    );
+    assert!(
+        testing_only_pq_attestation_late_window(Slot::new(9), Slot::new(8), Slot::new(9)).is_ok()
+    );
+    let expired = testing_only_pq_attestation_late_window(Slot::new(7), Slot::new(8), Slot::new(9))
+        .expect_err("proof completed after gossip expiry");
+    assert!(matches!(
+        expired,
+        PqAttestationGossipError::Local(
+            PqAttestationGossipLocalError::ProofOutlivedPropagationWindow { .. }
+        )
+    ));
+    assert!(!expired.should_penalize_peer());
+    assert!(!expired.is_retryable());
+
+    let future = testing_only_pq_attestation_late_window(Slot::new(10), Slot::new(8), Slot::new(9))
+        .expect_err("local clock still sees the attestation as future");
+    assert!(matches!(
+        future,
+        PqAttestationGossipError::Local(PqAttestationGossipLocalError::ReceiptBeforeWindow { .. })
+    ));
+    assert!(!future.should_penalize_peer());
+    assert!(future.is_retryable());
+}
+
+#[test]
+fn pq_single_observation_cancellation_reopens_and_conflicts_ignore() {
+    let mut cache = TestingPqAttestationObservationCache::default();
+    let epoch = types::Epoch::new(0);
+    let first = Hash256::repeat_byte(1);
+    let conflicting = Hash256::repeat_byte(2);
+    let generation = cache
+        .claim_single(epoch, 3, first, Slot::new(0))
+        .expect("first pending claim");
+    assert_eq!(
+        cache.status_single(epoch, 3, conflicting),
+        beacon_chain::PqAttestationGossipObservation::Pending
+    );
+    assert!(cache.rollback_single(epoch, 3, first, generation));
+    assert_eq!(
+        cache.status_single(epoch, 3, conflicting),
+        beacon_chain::PqAttestationGossipObservation::Unseen
+    );
+    let retry_generation = cache
+        .claim_single(epoch, 3, conflicting, Slot::new(0))
+        .expect("conflicting single may retry after cancellation");
+    assert!(cache.finalize_single(epoch, 3, conflicting, retry_generation));
+    assert_eq!(
+        cache.status_single(epoch, 3, first),
+        beacon_chain::PqAttestationGossipObservation::Observed
+    );
+}
+
+#[test]
+fn pq_aggregate_observation_updates_both_indexes_atomically() {
+    let mut cache = TestingPqAttestationObservationCache::default();
+    let epoch = types::Epoch::new(0);
+    let slot = Slot::new(0);
+    let data_root = Hash256::repeat_byte(3);
+    let identity = Hash256::repeat_byte(4);
+    let first_generation = cache
+        .claim_aggregate(epoch, 7, slot, data_root, 0, identity, &[0], slot)
+        .expect("first aggregate claim");
+    assert_eq!(cache.len_aggregators(), 1);
+    assert_eq!(cache.len_aggregate_candidates(), 1);
+    assert!(cache.rollback_aggregate(
+        epoch,
+        7,
+        slot,
+        data_root,
+        0,
+        identity,
+        first_generation,
+        &[0],
+    ));
+    assert_eq!(cache.len_aggregators(), 0);
+    assert_eq!(cache.len_aggregate_candidates(), 0);
+
+    let superset = [0, 1];
+    let retry_generation = cache
+        .claim_aggregate(epoch, 8, slot, data_root, 0, identity, &superset, slot)
+        .expect("aggregate retry");
+    assert!(cache.finalize_aggregate(
+        epoch,
+        8,
+        slot,
+        data_root,
+        0,
+        identity,
+        retry_generation,
+        &superset,
+    ));
+    assert_eq!(cache.len_aggregators(), 1);
+    assert_eq!(cache.len_aggregate_candidates(), 1);
+    assert_eq!(
+        cache.precheck_aggregate(epoch, 9, slot, data_root, 0, &[0], slot),
+        beacon_chain::PqAttestationGossipObservation::Observed
+    );
+}
 
 #[test]
 fn every_external_block_source_uses_the_same_import_boundary() {
@@ -77,6 +387,18 @@ fn peer_invalid_and_local_failures_have_stable_scoring_and_retry_policy() {
     assert!(!stale.is_retryable());
     assert_eq!(PQ_BLOCK_IMPORT_ADMISSION_CAPACITY, 2);
     assert_eq!(PQ_FORWARD_RANGE_BLOCK_CAPACITY, 8);
+
+    let gossip_capacity =
+        PqAttestationGossipError::Local(PqAttestationGossipLocalError::IngressCapacity);
+    assert!(!gossip_capacity.should_penalize_peer());
+    assert!(gossip_capacity.is_retryable());
+    let aged_proof = PqAttestationGossipError::Local(
+        PqAttestationGossipLocalError::ProofOutlivedPropagationWindow {
+            attestation: Slot::new(1),
+        },
+    );
+    assert!(!aged_proof.should_penalize_peer());
+    assert!(!aged_proof.is_retryable());
 }
 
 #[test]
@@ -487,6 +809,7 @@ async fn wait_for_test_condition(mut condition: impl FnMut() -> bool, descriptio
 #[cfg(target_feature = "avx2")]
 #[tokio::test(flavor = "current_thread")]
 async fn full_gossip_verification_precedes_observation_engine_commit_and_restart() {
+    assert_eq!(PQ_ATTESTATION_GOSSIP_ADMISSION_CAPACITY, 2);
     let test_runtime = task_executor::test_utils::TestRuntime::default();
     let temporary_directory = tempfile::TempDir::new().expect("temporary directory");
     let journal_path = temporary_directory.path().join("xmss_usage.sqlite");
@@ -505,27 +828,56 @@ async fn full_gossip_verification_precedes_observation_engine_commit_and_restart
         &spec,
     )
     .expect("direct PQ genesis");
+    genesis
+        .build_all_committee_caches(&spec)
+        .expect("genesis committee caches");
     let proposer_index = genesis
         .get_beacon_proposer_index(Slot::new(1), &spec)
         .expect("slot-one proposer");
+    let attester_index = *genesis
+        .get_beacon_committee(Slot::new(0), 0)
+        .expect("genesis committee")
+        .committee
+        .iter()
+        .find(|validator_index| **validator_index != proposer_index)
+        .expect("committee participant distinct from proposer");
     let maximum_leaf = OneTimeUseId::for_lean_pq_devnet_v1(1, SigningDuty::BeaconBlockProposal)
         .expect("slot-one proposal leaf")
         .as_u32();
-    let keystore =
+    let proposer_keystore =
         PqKeystore::from_seed([0xa5; 32], 0..=maximum_leaf, PASSWORD).expect("fixture keystore");
-    let authenticated = keystore.authenticate(PASSWORD).expect("authenticated key");
+    let proposer_authenticated = proposer_keystore
+        .authenticate(PASSWORD)
+        .expect("authenticated proposer key");
+    let attester_keystore = PqKeystore::from_seed([0xb5; 32], 0..=maximum_leaf, PASSWORD)
+        .expect("attester fixture keystore");
+    let attester_authenticated = attester_keystore
+        .authenticate(PASSWORD)
+        .expect("authenticated attester key");
     genesis
         .validators_mut()
         .get_mut(proposer_index)
         .expect("proposer validator")
-        .pubkey = *authenticated.public_key();
+        .pubkey = *proposer_authenticated.public_key();
+    genesis
+        .validators_mut()
+        .get_mut(attester_index)
+        .expect("attester validator")
+        .pubkey = *attester_authenticated.public_key();
     let genesis_validators_root = genesis.genesis_validators_root().0;
-    provision_usage_journal(&journal_path, genesis_validators_root, &[authenticated])
-        .expect("usage journal");
+    provision_usage_journal(
+        &journal_path,
+        genesis_validators_root,
+        &[proposer_authenticated, attester_authenticated],
+    )
+    .expect("usage journal");
     let authority = PqSigningAuthority::open(
         &journal_path,
         genesis_validators_root,
-        vec![PqKeyUnlock::new(keystore, PASSWORD).expect("unlock")],
+        vec![
+            PqKeyUnlock::new(proposer_keystore, PASSWORD).expect("proposer unlock"),
+            PqKeyUnlock::new(attester_keystore, PASSWORD).expect("attester unlock"),
+        ],
     )
     .expect("signing authority");
     let store = exact_snapshot_store(Arc::clone(&spec));
@@ -545,6 +897,304 @@ async fn full_gossip_verification_precedes_observation_engine_commit_and_restart
     );
     let processor = PqNetworkBlockProcessor::new(Arc::clone(&chain));
     let genesis_root = chain.head_snapshot().beacon_block_root;
+
+    let late_lineage_hook = TestingPqBlockingHook::blocking();
+    let late_lineage_chain = Arc::new(
+        BeaconChainBuilder::<TestWitness>::pq_new(MinimalEthSpec)
+            .store(exact_snapshot_store(Arc::clone(&spec)))
+            .custom_spec(Arc::clone(&spec))
+            .genesis_state(genesis.clone())
+            .expect("persist late-lineage genesis")
+            .pq_aggregation_service(Arc::clone(&service))
+            .task_executor(test_runtime.task_executor.clone())
+            .testing_only_pq_blocking_hook(Arc::clone(&late_lineage_hook))
+            .testing_only_pq_execution_notifier(Arc::new(RecordingTransport::always_valid()))
+            .build()
+            .expect("late-lineage PQ chain"),
+    );
+    let late_check_chain = Arc::clone(&late_lineage_chain);
+    let late_check = tokio::spawn(async move {
+        late_check_chain
+            .testing_only_pq_attestation_bound_is_canonical(genesis_root)
+            .await
+    });
+    while late_lineage_hook.entered() == 0 {
+        tokio::task::yield_now().await;
+    }
+    late_check.abort();
+    assert_eq!(
+        late_lineage_chain.testing_only_pq_attestation_gossip_available_permits(),
+        PQ_ATTESTATION_GOSSIP_ADMISSION_CAPACITY - 1,
+        "canceling the waiter must not release admission during detached lineage work",
+    );
+    late_lineage_hook.release();
+    while late_lineage_chain.testing_only_pq_attestation_gossip_available_permits()
+        != PQ_ATTESTATION_GOSSIP_ADMISSION_CAPACITY
+    {
+        tokio::task::yield_now().await;
+    }
+
+    let mut gossip_state = genesis.clone();
+    gossip_state
+        .build_all_committee_caches(&spec)
+        .expect("genesis gossip committee caches");
+    let committee = gossip_state
+        .get_beacon_committee(Slot::new(0), 0)
+        .expect("genesis gossip committee");
+    let attester_index = attester_index as u64;
+    let invalid_attestation = SingleAttestation {
+        committee_index: 0,
+        attester_index,
+        data: AttestationData {
+            slot: Slot::new(0),
+            index: 0,
+            beacon_block_root: genesis_root,
+            source: Checkpoint::default(),
+            target: Checkpoint {
+                epoch: types::Epoch::new(0),
+                root: genesis_root,
+            },
+        },
+        signature: PqSameMessageEvidence::from(&PqRawSignature::empty()),
+    };
+    let gossip_subnet = SubnetId::compute_subnet_for_single_attestation::<MinimalEthSpec>(
+        &invalid_attestation,
+        gossip_state
+            .get_committee_count_at_slot(Slot::new(0))
+            .expect("committee count"),
+        &spec,
+    )
+    .expect("gossip subnet");
+    let first_admission = chain
+        .testing_try_reserve_pq_attestation_gossip_admission()
+        .expect("first bounded gossip admission");
+    let second_admission = chain
+        .testing_try_reserve_pq_attestation_gossip_admission()
+        .expect("second bounded gossip admission");
+    assert!(matches!(
+        processor
+            .verify_gossip_attestation(invalid_attestation.clone(), gossip_subnet)
+            .await,
+        PqGossipAttestationDisposition::Ignore(PqAttestationGossipError::Local(
+            PqAttestationGossipLocalError::IngressCapacity
+        ))
+    ));
+    drop(first_admission);
+    let canceled_capacity = chain
+        .testing_try_reserve_pq_attestation_gossip_admission()
+        .expect("dropped admission immediately frees capacity");
+    drop(canceled_capacity);
+    drop(second_admission);
+    match processor
+        .verify_gossip_attestation(invalid_attestation, gossip_subnet)
+        .await
+    {
+        PqGossipAttestationDisposition::Reject(_) => {}
+        PqGossipAttestationDisposition::Ignore(error) => {
+            panic!("invalid single was ignored instead of rejected: {error:?}")
+        }
+        PqGossipAttestationDisposition::Accept(_) => {
+            panic!("invalid single was accepted")
+        }
+    }
+
+    let attestation_data = AttestationData {
+        slot: Slot::new(0),
+        index: 0,
+        beacon_block_root: genesis_root,
+        source: Checkpoint::default(),
+        target: Checkpoint {
+            epoch: types::Epoch::new(0),
+            root: genesis_root,
+        },
+    };
+    let attestation_domain = spec.get_domain(
+        types::Epoch::new(0),
+        Domain::BeaconAttester,
+        &genesis.fork(),
+        genesis.genesis_validators_root(),
+    );
+    let attestation_signature = authority
+        .signer(
+            &genesis
+                .validators()
+                .get(attester_index as usize)
+                .expect("attester validator")
+                .pubkey,
+        )
+        .expect("bound attester signer")
+        .sign(consensus_signature::pq::PqSigningClaim::new(
+            attestation_data.signing_root(attestation_domain).0,
+            OneTimeUseId::for_lean_pq_devnet_v1(0, SigningDuty::Attestation)
+                .expect("attestation leaf"),
+        ))
+        .expect("valid attestation signature");
+    let valid_attestation = SingleAttestation {
+        committee_index: 0,
+        attester_index,
+        data: attestation_data.clone(),
+        signature: PqSameMessageEvidence::from(&attestation_signature),
+    };
+    let PqGossipAttestationDisposition::Accept(first_single_token) = processor
+        .verify_gossip_attestation(valid_attestation.clone(), gossip_subnet)
+        .await
+    else {
+        panic!("valid single attestation must receive propagation capability")
+    };
+    let mut conflicting_single = valid_attestation.clone();
+    conflicting_single.data.beacon_block_root = Hash256::repeat_byte(0xa5);
+    conflicting_single.data.target.root = Hash256::repeat_byte(0xa6);
+    let PqGossipAttestationDisposition::Ignore(conflict) = processor
+        .verify_gossip_attestation(conflicting_single, gossip_subnet)
+        .await
+    else {
+        panic!("a prior single observation must ignore conflict before context or evidence work")
+    };
+    assert!(!conflict.should_penalize_peer());
+    assert!(matches!(
+        processor
+            .verify_gossip_attestation(valid_attestation.clone(), gossip_subnet)
+            .await,
+        PqGossipAttestationDisposition::Ignore(_)
+    ));
+    drop(first_single_token);
+    let PqGossipAttestationDisposition::Accept(retry_single_token) = processor
+        .verify_gossip_attestation(valid_attestation.clone(), gossip_subnet)
+        .await
+    else {
+        panic!("dropped propagation capability must make the exact single retryable")
+    };
+    let verified_single = (*retry_single_token)
+        .mark_propagated()
+        .expect("finalize single propagation");
+    let (verified_single, verified_subnet, verified_single_head) = verified_single.into_parts();
+    assert_eq!(verified_single.single_attestation(), &valid_attestation);
+    assert_eq!(verified_subnet, gossip_subnet);
+    assert_eq!(verified_single_head, genesis_root);
+
+    let mut aggregate_bits =
+        BitList::<<MinimalEthSpec as EthSpec>::MaxValidatorsPerSlot>::with_capacity(
+            committee.committee.len(),
+        )
+        .expect("aggregate bits");
+    aggregate_bits.set(0, true).expect("aggregate participant");
+    let mut committee_bits =
+        BitVector::<<MinimalEthSpec as EthSpec>::MaxCommitteesPerSlot>::default();
+    committee_bits.set(0, true).expect("aggregate committee");
+    let aggregate_attestation = Attestation::Electra(AttestationElectra {
+        aggregation_bits: aggregate_bits,
+        data: AttestationData {
+            slot: Slot::new(0),
+            index: 0,
+            beacon_block_root: genesis_root,
+            source: Checkpoint::default(),
+            target: Checkpoint {
+                epoch: types::Epoch::new(0),
+                root: genesis_root,
+            },
+        },
+        signature: PqSameMessageEvidence::from(&PqRawSignature::empty()),
+        committee_bits,
+    });
+    let aggregate_message = AggregateAndProof::from_attestation(
+        attester_index,
+        aggregate_attestation,
+        SelectionProof::from(PqRawSignature::empty()),
+    );
+    let invalid_aggregate = SignedAggregateAndProof::from_aggregate_and_proof(
+        aggregate_message,
+        PqRawSignature::empty(),
+    );
+    assert!(matches!(
+        processor.verify_gossip_aggregate(invalid_aggregate).await,
+        PqGossipAggregateDisposition::Reject(_)
+    ));
+
+    let selection_domain = spec.get_domain(
+        types::Epoch::new(0),
+        Domain::SelectionProof,
+        &genesis.fork(),
+        genesis.genesis_validators_root(),
+    );
+    let selection_signature = authority
+        .signer(
+            &genesis
+                .validators()
+                .get(attester_index as usize)
+                .expect("aggregate validator")
+                .pubkey,
+        )
+        .expect("bound aggregate signer")
+        .sign(consensus_signature::pq::PqSigningClaim::new(
+            Slot::new(0).signing_root(selection_domain).0,
+            OneTimeUseId::for_lean_pq_devnet_v1(0, SigningDuty::AttestationSelectionProof)
+                .expect("selection leaf"),
+        ))
+        .expect("selection signature");
+    let mut valid_aggregate_bits =
+        BitList::<<MinimalEthSpec as EthSpec>::MaxValidatorsPerSlot>::with_capacity(
+            committee.committee.len(),
+        )
+        .expect("valid aggregate bits");
+    let attester_position = committee
+        .committee
+        .iter()
+        .position(|validator_index| *validator_index == attester_index as usize)
+        .expect("attester committee position");
+    valid_aggregate_bits
+        .set(attester_position, true)
+        .expect("valid aggregate participant");
+    let mut valid_committee_bits =
+        BitVector::<<MinimalEthSpec as EthSpec>::MaxCommitteesPerSlot>::default();
+    valid_committee_bits
+        .set(0, true)
+        .expect("valid aggregate committee");
+    let valid_inner = Attestation::Electra(AttestationElectra {
+        aggregation_bits: valid_aggregate_bits,
+        data: attestation_data,
+        signature: PqSameMessageEvidence::from(&attestation_signature),
+        committee_bits: valid_committee_bits,
+    });
+    let valid_message = AggregateAndProof::from_attestation(
+        attester_index,
+        valid_inner,
+        SelectionProof::from(selection_signature),
+    );
+    let outer_domain = spec.get_domain(
+        types::Epoch::new(0),
+        Domain::AggregateAndProof,
+        &genesis.fork(),
+        genesis.genesis_validators_root(),
+    );
+    let outer_signature = authority
+        .signer(
+            &genesis
+                .validators()
+                .get(attester_index as usize)
+                .expect("outer validator")
+                .pubkey,
+        )
+        .expect("bound outer signer")
+        .sign(consensus_signature::pq::PqSigningClaim::new(
+            valid_message.signing_root(outer_domain).0,
+            OneTimeUseId::for_lean_pq_devnet_v1(0, SigningDuty::AggregateAndProof)
+                .expect("outer leaf"),
+        ))
+        .expect("outer signature");
+    let valid_aggregate =
+        SignedAggregateAndProof::from_aggregate_and_proof(valid_message, outer_signature);
+    let PqGossipAggregateDisposition::Accept(aggregate_token) = processor
+        .verify_gossip_aggregate(valid_aggregate.clone())
+        .await
+    else {
+        panic!("valid aggregate must receive propagation capability")
+    };
+    let verified_aggregate = (*aggregate_token)
+        .mark_propagated()
+        .expect("finalize aggregate propagation");
+    let (verified_aggregate, verified_aggregate_head) = verified_aggregate.into_parts();
+    assert_eq!(verified_aggregate.aggregate().as_ref(), &valid_aggregate);
+    assert_eq!(verified_aggregate_head, genesis_root);
 
     let mut pre_state = genesis.clone();
     state_processing::per_slot_processing_pq(&mut pre_state, &spec)
@@ -800,6 +1450,18 @@ async fn full_gossip_verification_precedes_observation_engine_commit_and_restart
     let outcome = range_error.imported.first().expect("exact imported prefix");
     assert_eq!(outcome.block_root, signed.canonical_root());
     assert_eq!(chain.head_snapshot().beacon_block_root, outcome.block_root);
+    assert!(
+        chain
+            .testing_only_pq_attestation_bound_is_canonical(genesis_root)
+            .await
+            .expect("late canonical-lineage check")
+    );
+    assert!(
+        !chain
+            .testing_only_pq_attestation_bound_is_canonical(Hash256::repeat_byte(0xfe))
+            .await
+            .expect("late non-canonical-lineage check")
+    );
     assert_eq!(transport.calls.lock().expect("calls lock").len(), 3);
     assert!(matches!(
         processor.commit_gossip_block(queued_before_range).await,

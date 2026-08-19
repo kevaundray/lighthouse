@@ -1248,8 +1248,9 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   monitoring, and testing utilities; network service, router, beacon processor, status, sync,
   subnet, NAT, DHT, and metrics modules; client notifier/metrics/ordinary builder; HTTP API,
   metrics, and timer dependencies; validator-client, account-manager, database-manager, and other
-  top-level subcommands. Task 5.3e-c restores gossip/import/range-sync call chains, 5.3e-d restores
-  local production and supported APIs, and 5.3e-e restores PQ validator duties. No omitted API has
+  top-level subcommands. Task 5.3e-c restores block gossip/import/range-sync call chains, 5.3e-d
+  restores external attestation-gossip verification, and later slices restore local production,
+  supported APIs, and PQ validator duties. No omitted API has
   an empty/success behavior stub: the surviving production boundary returns the explicit typed
   `DeferredRuntimeIntegration` before side effects.
 - Verification evidence: Rust 1.88 warning-denied scalar and AVX2 checks of
@@ -1364,3 +1365,37 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   5.3e-c handoff.
 - Hash-chain/hash-onion RANDAO remains a future versioned proposal. V1 continues to authenticate the
   epoch signing root with the proposal-slot RANDAO leaf and retains the frozen 14-leaf allocation.
+
+### 2026-08-19: Sealed PQ attestation-gossip verification implemented (Task 5.3e-d)
+
+- `PreparedPqSingleAttestation -> VerifiedPqSingleAttestation` now binds the exact wire
+  `SingleAttestation` to its independently reconstructed one-bit Electra attestation and contextual
+  Gossip-priority job. The existing aggregate transition verifies selection proof, inner evidence,
+  and outer aggregate-and-proof sequentially and preserves both exact outer and verified inner
+  provenance. Private fields prevent raw/job substitution.
+- The PQ BeaconChain facade admits at most two gossip candidates without waiting, transfers the
+  permit through detached preparation/proof/late-lineage work, and returns it only after a
+  propagation token is finalized or dropped. Context preparation loads the referenced canonical
+  block and exact per-slot snapshot, bounds slot advancement, validates target, committee, subnet,
+  cache, and signer context, and releases all state/cache/store borrows before async proof work.
+- Cheap prune-aware duplicate and dominance checks run before store traversal or evidence cloning.
+  After proof, the chain rechecks the gossip window and proves that the bound head remains on the
+  current bounded canonical lineage; normal child imports do not force reproof. Receipt-time and
+  locally expired work are ignored without peer penalty. Known invalid context/evidence remains
+  peer-attributable.
+- Observation is two-phase and generation-bound. Singles transition from unseen to pending only
+  after proof, then to observed only after the caller reports gossipsub propagation; dropping the
+  token rolls pending state back. Aggregate aggregator/epoch and subset/dominance entries are
+  reserved, finalized, or rolled back atomically under one mutex. Generations use checked
+  arithmetic, stale entries prune before capacity checks, and the exact 16-validator/two-epoch
+  profile bounds each observation index to 32 entries without eviction.
+- This slice is deliberately validation-only. It exposes awaited single and aggregate dispositions
+  plus consuming sealed provenance for later coordinator integration, but does not claim fork-choice
+  vote application, pool insertion, HTTP publication, router/service wiring, local production, or
+  validator duties. The ordinary BLS paths remain unchanged.
+- Parent verification passed 20/20 warning-denied scalar lifecycle/context tests and the real
+  journal-backed AVX2 awaited block/single/aggregate route 1/1 in 186.53 seconds. Independent review
+  reran the AVX2 route in 186.55 seconds. Rust 1.88 warning-denied scalar and AVX2 top-level PQ
+  checks, focused state-processing/network/beacon-chain Clippy, formatting, dependency ordering,
+  and diff hygiene also pass. Hash-chain/hash-onion RANDAO remains future-only; the V1 14-leaf
+  allocation is unchanged.

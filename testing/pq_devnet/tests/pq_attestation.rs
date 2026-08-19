@@ -10,7 +10,8 @@ use state_processing::{
     DirectGenesisValidator, PqAttestationCacheError, PqAttestationContribution, PqAttestationError,
     PqAttestationInvalid, PqAttestationLocalError, PqValidatorKeyCache,
     aggregate_pq_attestation_job, build_pq_attestation_job, build_pq_single_attestation_job,
-    initialize_beacon_state_from_validators, verify_pq_attestation_job,
+    initialize_beacon_state_from_validators, prepare_pq_single_attestation,
+    verify_pq_attestation_job,
 };
 use types::{
     Attestation, AttestationData, AttestationElectra, BeaconState, ChainSpec, Checkpoint, Domain,
@@ -812,6 +813,52 @@ fn valid_raw_and_two_signer_evidence_are_verified_against_bits_and_cache_keys() 
         .collect::<Vec<_>>();
     let cache = PqValidatorKeyCache::from_state(&state).expect("valid PQ registry");
     let service = AggregationService::new().expect("PQ aggregation service");
+
+    let (single_position, single_validator_index) = participants[0];
+    let single_signature_position = committee_indices
+        .iter()
+        .position(|candidate| *candidate == single_validator_index)
+        .expect("single signature position");
+    let single = SingleAttestation {
+        committee_index: 0,
+        attester_index: single_validator_index as u64,
+        data: data.clone(),
+        signature: PqSameMessageEvidence::from(
+            signatures
+                .get(single_signature_position)
+                .expect("single raw signature"),
+        ),
+    };
+    let prepared_single = prepare_pq_single_attestation(&state, &cache, single.clone(), &spec)
+        .expect("prepared exact single attestation");
+    assert_eq!(prepared_single.single_attestation(), &single);
+    let verified_single =
+        block_on(prepared_single.verify(&service)).expect("verified exact single attestation");
+    assert_eq!(verified_single.single_attestation(), &single);
+    assert_eq!(
+        verified_single.signer_index(),
+        single_validator_index as u64
+    );
+    let Attestation::Electra(verified_electra) = verified_single.attestation() else {
+        panic!("single attestation must convert to Electra");
+    };
+    assert_eq!(verified_electra.data, data);
+    assert_eq!(
+        verified_electra.aggregation_bits.len(),
+        committee_indices.len()
+    );
+    assert!(
+        verified_electra
+            .aggregation_bits
+            .get(single_position)
+            .expect("participant bit")
+    );
+    assert!(
+        verified_electra
+            .committee_bits
+            .get(0)
+            .expect("committee bit")
+    );
 
     let single_job = build_pq_attestation_job(&state, &cache, &requests[..1], &spec)
         .expect("single raw contribution");

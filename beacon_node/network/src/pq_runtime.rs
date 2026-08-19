@@ -1,9 +1,27 @@
 use beacon_chain::{
-    BeaconChain, BeaconChainTypes, PqBlockImportOutcome, PqBlockImportRequest, PqForwardRangeError,
-    PqGossipCommitToken, PqGossipObservation, PqGossipPropagationToken, PqImportError,
+    BeaconChain, BeaconChainTypes, PqAggregateGossipPropagationToken, PqAttestationGossipError,
+    PqBlockImportOutcome, PqBlockImportRequest, PqForwardRangeError, PqGossipCommitToken,
+    PqGossipObservation, PqGossipPropagationToken, PqImportError, PqSingleGossipPropagationToken,
 };
 use std::sync::Arc;
-use types::SignedBeaconBlock;
+use types::{SignedAggregateAndProof, SignedBeaconBlock, SingleAttestation, SubnetId};
+
+/// Result of full contextual and PQ evidence verification for unaggregated gossip.
+pub enum PqGossipAttestationDisposition<E: types::EthSpec> {
+    /// Propagate, then consume with `PqSingleGossipPropagationToken::mark_propagated`.
+    Accept(Box<PqSingleGossipPropagationToken<E>>),
+    /// Deterministically invalid context or evidence. Reject and penalize the peer.
+    Reject(PqAttestationGossipError),
+    /// Local resource/head/service failure or duplicate. Ignore without peer penalty.
+    Ignore(PqAttestationGossipError),
+}
+
+/// Result of full contextual and PQ evidence verification for aggregate-and-proof gossip.
+pub enum PqGossipAggregateDisposition<E: types::EthSpec> {
+    Accept(Box<PqAggregateGossipPropagationToken<E>>),
+    Reject(PqAttestationGossipError),
+    Ignore(PqAttestationGossipError),
+}
 
 /// Result of the complete sealed verification which precedes a gossipsub decision.
 pub enum PqGossipBlockDisposition<T: BeaconChainTypes> {
@@ -32,6 +50,37 @@ pub struct PqNetworkBlockProcessor<T: BeaconChainTypes> {
 impl<T: BeaconChainTypes> PqNetworkBlockProcessor<T> {
     pub fn new(chain: Arc<BeaconChain<T>>) -> Self {
         Self { chain }
+    }
+
+    pub async fn verify_gossip_attestation(
+        &self,
+        attestation: SingleAttestation,
+        subnet: SubnetId,
+    ) -> PqGossipAttestationDisposition<T::EthSpec> {
+        match self
+            .chain
+            .verify_pq_single_attestation_for_gossip(attestation, subnet)
+            .await
+        {
+            Ok(token) => PqGossipAttestationDisposition::Accept(Box::new(token)),
+            Err(error) if error.should_penalize_peer() => {
+                PqGossipAttestationDisposition::Reject(error)
+            }
+            Err(error) => PqGossipAttestationDisposition::Ignore(error),
+        }
+    }
+
+    pub async fn verify_gossip_aggregate(
+        &self,
+        aggregate: SignedAggregateAndProof<T::EthSpec>,
+    ) -> PqGossipAggregateDisposition<T::EthSpec> {
+        match self.chain.verify_pq_aggregate_for_gossip(aggregate).await {
+            Ok(token) => PqGossipAggregateDisposition::Accept(Box::new(token)),
+            Err(error) if error.should_penalize_peer() => {
+                PqGossipAggregateDisposition::Reject(error)
+            }
+            Err(error) => PqGossipAggregateDisposition::Ignore(error),
+        }
     }
 
     pub async fn verify_gossip_block(

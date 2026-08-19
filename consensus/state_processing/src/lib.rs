@@ -115,9 +115,11 @@ pub use per_slot_processing::{Error as SlotProcessingError, per_slot_processing}
 #[cfg(feature = "pq-attestation")]
 pub use pq_attestation::{
     PqAttestationCacheError, PqAttestationContribution, PqAttestationError, PqAttestationInvalid,
-    PqAttestationLocalError, PqValidatorKeyCache, PreparedPqAttestation, VerifiedPqAttestation,
+    PqAttestationLocalError, PqValidatorKeyCache, PreparedPqAttestation,
+    PreparedPqSingleAttestation, VerifiedPqAttestation, VerifiedPqSingleAttestation,
     aggregate_pq_attestation_job, build_pq_attestation_job, build_pq_single_attestation_job,
-    prepare_pq_attestation, prepare_pq_attestation_aggregate, verify_pq_attestation_job,
+    prepare_pq_attestation, prepare_pq_attestation_aggregate, prepare_pq_single_attestation,
+    verify_pq_attestation_job,
 };
 #[cfg(feature = "pq-attestation")]
 pub use pq_profile::{

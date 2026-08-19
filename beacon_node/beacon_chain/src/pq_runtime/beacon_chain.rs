@@ -115,6 +115,9 @@ pub struct BeaconChain<T: BeaconChainTypes> {
     pub(crate) observed_pq_blocks: Arc<Mutex<crate::pq_import::PqGossipObservationCache>>,
     pub(crate) pq_import_gate: Arc<tokio::sync::Semaphore>,
     pub(crate) pq_import_admission: Arc<tokio::sync::Semaphore>,
+    pub(crate) pq_attestation_gossip_admission: Arc<tokio::sync::Semaphore>,
+    pub(crate) pq_attestation_gossip_observations:
+        Arc<Mutex<crate::pq_attestation_gossip::PqAttestationGossipObservationCache<T::EthSpec>>>,
     pub(crate) pq_execution_notifier: crate::pq_import::PqExecutionNotifier<T::EthSpec>,
     pub(crate) task_executor: TaskExecutor,
     #[cfg(feature = "pq-startup-testing")]
@@ -154,6 +157,12 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             pq_import_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             pq_import_admission: Arc::new(tokio::sync::Semaphore::new(
                 crate::PQ_BLOCK_IMPORT_ADMISSION_CAPACITY,
+            )),
+            pq_attestation_gossip_admission: Arc::new(tokio::sync::Semaphore::new(
+                crate::PQ_ATTESTATION_GOSSIP_ADMISSION_CAPACITY,
+            )),
+            pq_attestation_gossip_observations: Arc::new(Mutex::new(
+                crate::pq_attestation_gossip::PqAttestationGossipObservationCache::default(),
             )),
             pq_execution_notifier,
             task_executor,

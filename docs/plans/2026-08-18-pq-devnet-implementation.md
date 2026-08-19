@@ -1856,10 +1856,10 @@ For this bounded slice, compile-time omit the ordinary BeaconChain gossip/import
 fork-choice, payload/builder/Gloas, sync-duty, slashing, monitoring, persistence, historical,
 light-client, and worker modules; omit the network service/router/sync/subnet processors; and omit
 HTTP API/metrics/timers and non-beacon-node CLI subcommands. The PQ operation pool is an ephemeral
-ownership root only and exposes no fabricated insertion/retrieval behavior. Task 5.3e-c
-restores network gossip and import callers, Task 5.3e-d restores local production and APIs, and
-Task 5.3e-e restores validator-client duties. Default BLS module selection and behavior remain
-unchanged.
+ownership root only and exposes no fabricated insertion/retrieval behavior. Task 5.3e-c restores
+network block-gossip and import callers, Task 5.3e-d restores external attestation gossip through
+sealed verification, and later slices restore pool insertion, local production/APIs, and
+validator-client duties. Default BLS module selection and behavior remain unchanged.
 
 #### Task 5.3e-a: Seal local production before BeaconChain wiring
 
@@ -1926,6 +1926,59 @@ network-service, local-production/API, and validator-duty slices are assembled. 
 the real consuming BeaconChain and PQ network-processor call chains without exposing raw transition,
 raw persistence, `NoVerification`, per-call Engine substitution, BLS batch verification, checkpoint
 sync, backfill, or historical reconstruction.
+
+#### Task 5.3e-d: Verify external attestation gossip through sealed PQ boundaries
+
+Keep the ordinary BLS attestation verifier, batch verifier, pool insertion, fork choice, local
+aggregation, production, HTTP API, and validator-client duties unchanged or omitted under the PQ
+runtime graph. Extend only the PQ network processor with awaited unaggregated-attestation and signed
+aggregate-and-proof gossip entry points.
+
+The unaggregated wire boundary must use a private-field
+`PreparedPqSingleAttestation -> VerifiedPqSingleAttestation` transition. The prepared value owns the
+exact `SingleAttestation`, its derived Electra attestation, signer/claim bindings, and verification
+job; callers cannot pair a generic prepared job with different raw wire bytes. Signed
+aggregate-and-proof gossip continues to use the existing private-field
+`PreparedPqAggregateAndProof -> VerifiedPqAggregateAndProof` transition. Both paths submit only
+`VerificationClass::Gossip` work to the process-owned priority `AggregationService`; they never
+invoke aggregate proving or create another service.
+
+Acquire one of a small, fixed number of chain-owned gossip admissions without waiting before
+snapshot or preparation work, and retain it through proof and observation. Perform a prune-aware
+key/subset duplicate precheck before loading a block, state, job, or evidence. Then clone the exact
+canonical head and run propagation-slot, canonical-root/target, subnet, committee, cache, bounded
+referenced-head-to-attestation-slot advancement, and owned-job preparation on the chain-owned
+blocking executor. Release all head, cache, and observation borrows before awaiting the aggregation
+service. After proof, repeat timeliness, bounded canonical ancestry, and duplicate checks before
+observation; a canonical head advance is accepted while a lineage change or proof that outlives its
+gossip window is a local ignore without peer blame. Receipt-time future/past ambiguity is also a
+local ignore rather than a peer penalty; future work remains retryable while expired work does not.
+Invalid structure, context, or evidence is peer-attributable; unavailable head/clock/executor and
+proof-service resource failures are local and unpenalized.
+
+After successful proof verification, atomically transition the exact attestation identity from
+unseen to pending with a fresh generation and return a generation-bound propagation capability.
+Only that first capability can be marked propagated and consumed into sealed provenance for the
+later Task 5.2b coordinator. Dropping it before propagation rolls pending back to unseen and releases
+its admission; concurrent duplicates cannot propagate or consume it. Aggregate reservation updates
+the aggregator-per-target-epoch and attestation subset/superset boundaries together under one mutex,
+so finalization or rollback cannot expose a partial observation. Transfer the non-waiting ingress
+permit into the capability and retain it until propagation finalization or rollback. Bound the
+observation map from the exact 16-validator registry and the propagation-slot window, prune expired
+entries, and never evict current evidence. No observation changes occur before proof success, and no
+lock is held across blocking work or an await. Stale-entry pruning may occur during the cheap
+precheck, but no live pending/observed claim is created or replaced before proof success. Generation
+allocation is checked and fails closed on exhaustion.
+
+This slice ends at `Accept`/`Ignore`/`Reject` plus the sealed verified provenance required by the
+later coordinator. It does not insert into either attestation pool, claim fork-choice processing,
+or fabricate successful downstream work. Exercise the real awaited network entry points for
+unaggregated and aggregate gossip with valid and invalid AVX evidence, pending duplicates,
+propagation-capability cancellation/retry, and consuming sealed provenance. Run the prune,
+generation, timing, target-root, bounded-advancement, canonical-lineage, single-conflict, and atomic
+aggregate-index lifecycle checks in the runnable `pq_devnet` route. Local service errors retain
+typed no-peer-penalty mapping; this slice does not claim an operation-pool/fork-choice insertion or
+local production/API result.
 
 ### Task 5.2b: Wire verified candidates into both beacon-node attestation pools
 

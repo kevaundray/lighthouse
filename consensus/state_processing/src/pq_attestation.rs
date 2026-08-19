@@ -5,12 +5,13 @@ use consensus_signature::{
     SigningDuty, SigningIdError, V1_MAX_AGGREGATION_CONTRIBUTIONS, V1_MAX_AGGREGATION_SIGNERS,
     VerificationClass, is_individual_same_message_evidence,
 };
+use ssz_types::{BitList, BitVector};
 use std::collections::BTreeMap;
 #[cfg(feature = "pq-verification")]
 use types::AttestationRef;
 use types::{
-    Attestation, BeaconState, BeaconStateError, ChainSpec, Domain, EthSpec, SignedRoot,
-    SingleAttestation,
+    Attestation, AttestationElectra, BeaconState, BeaconStateError, ChainSpec, Domain, EthSpec,
+    SignedRoot, SingleAttestation,
 };
 
 /// Startup failure while rebuilding the ephemeral PQ registry cache.
@@ -107,7 +108,20 @@ impl std::fmt::Display for PqAttestationError {
     }
 }
 
-impl std::error::Error for PqAttestationError {}
+impl std::error::Error for PqAttestationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Local(PqAttestationLocalError::SigningId(error)) => Some(error),
+            Self::Local(PqAttestationLocalError::Aggregation(error)) => Some(error),
+            Self::Invalid(_)
+            | Self::Local(
+                PqAttestationLocalError::UnsupportedProfile
+                | PqAttestationLocalError::CommitteeCacheUnavailable
+                | PqAttestationLocalError::CacheInvariant,
+            ) => None,
+        }
+    }
+}
 
 /// Ephemeral registry-order cache for the compile-time PQ profile.
 ///
@@ -152,6 +166,70 @@ pub struct VerifiedPqAttestation<E: EthSpec> {
     signer_indices: Vec<u64>,
     signers: Vec<AggregationSigner>,
     claim: SameMessageClaim,
+}
+
+/// An owned single-attestation gossip request bound to its exact wire object and Electra
+/// conversion.
+///
+/// Private fields prevent callers from pairing arbitrary `SingleAttestation` bytes with a generic
+/// prepared attestation job.
+pub struct PreparedPqSingleAttestation<E: EthSpec> {
+    single_attestation: SingleAttestation,
+    prepared_attestation: PreparedPqAttestation<E>,
+}
+
+/// A fully authenticated single-attestation wire object and its exact Electra candidate.
+pub struct VerifiedPqSingleAttestation<E: EthSpec> {
+    single_attestation: SingleAttestation,
+    verified_attestation: VerifiedPqAttestation<E>,
+}
+
+impl<E: EthSpec> PreparedPqSingleAttestation<E> {
+    pub const fn single_attestation(&self) -> &SingleAttestation {
+        &self.single_attestation
+    }
+
+    /// Verifies this external gossip candidate at gossip priority and preserves exact wire
+    /// provenance in the returned sealed value.
+    pub async fn verify(
+        self,
+        service: &AggregationService,
+    ) -> Result<VerifiedPqSingleAttestation<E>, PqAttestationError> {
+        let Self {
+            single_attestation,
+            prepared_attestation,
+        } = self;
+        let verified_attestation = prepared_attestation
+            .verify(service, VerificationClass::Gossip)
+            .await?;
+        if verified_attestation.attestation().signature() != &single_attestation.signature {
+            return Err(PqAttestationError::Local(
+                PqAttestationLocalError::CacheInvariant,
+            ));
+        }
+        Ok(VerifiedPqSingleAttestation {
+            single_attestation,
+            verified_attestation,
+        })
+    }
+}
+
+impl<E: EthSpec> VerifiedPqSingleAttestation<E> {
+    pub const fn single_attestation(&self) -> &SingleAttestation {
+        &self.single_attestation
+    }
+
+    pub const fn attestation(&self) -> &Attestation<E> {
+        self.verified_attestation.attestation()
+    }
+
+    pub const fn signer_index(&self) -> u64 {
+        self.single_attestation.attester_index
+    }
+
+    pub fn into_parts(self) -> (SingleAttestation, VerifiedPqAttestation<E>) {
+        (self.single_attestation, self.verified_attestation)
+    }
 }
 
 impl<E: EthSpec> PreparedPqAttestation<E> {
@@ -249,6 +327,65 @@ pub fn prepare_pq_attestation<E: EthSpec>(
         signers,
         claim,
         job,
+    })
+}
+
+/// Prepares a single-attestation gossip request while retaining its exact wire provenance.
+pub fn prepare_pq_single_attestation<E: EthSpec>(
+    state: &BeaconState<E>,
+    key_cache: &PqValidatorKeyCache,
+    single_attestation: SingleAttestation,
+    spec: &ChainSpec,
+) -> Result<PreparedPqSingleAttestation<E>, PqAttestationError> {
+    let job = build_pq_single_attestation_job(state, key_cache, &single_attestation, spec)?;
+    let committee = state
+        .get_beacon_committee(
+            single_attestation.data.slot,
+            single_attestation.committee_index,
+        )
+        .map_err(classify_committee_error)?;
+    let attester_position = usize::try_from(single_attestation.attester_index).map_err(|_| {
+        PqAttestationError::Invalid(PqAttestationInvalid::InvalidAttesterIndex(
+            single_attestation.attester_index,
+        ))
+    })?;
+    let committee_position = committee
+        .committee
+        .iter()
+        .position(|validator_index| *validator_index == attester_position)
+        .ok_or(PqAttestationError::Invalid(
+            PqAttestationInvalid::AttesterNotInCommittee(single_attestation.attester_index),
+        ))?;
+    let mut aggregation_bits =
+        BitList::<E::MaxValidatorsPerSlot>::with_capacity(committee.committee.len())
+            .map_err(|_| PqAttestationError::Invalid(PqAttestationInvalid::InvalidBitfield))?;
+    aggregation_bits
+        .set(committee_position, true)
+        .map_err(|_| PqAttestationError::Invalid(PqAttestationInvalid::InvalidBitfield))?;
+    let committee_index = usize::try_from(single_attestation.committee_index)
+        .map_err(|_| PqAttestationError::Invalid(PqAttestationInvalid::InvalidCommittee))?;
+    let mut committee_bits = BitVector::<E::MaxCommitteesPerSlot>::default();
+    committee_bits
+        .set(committee_index, true)
+        .map_err(|_| PqAttestationError::Invalid(PqAttestationInvalid::InvalidCommittee))?;
+    let attestation = Attestation::Electra(AttestationElectra {
+        aggregation_bits,
+        data: single_attestation.data.clone(),
+        signature: single_attestation.signature.clone(),
+        committee_bits,
+    });
+    let claim = job.claim;
+    let signers = job.expected_signers.clone();
+    let prepared_attestation = PreparedPqAttestation {
+        attestation,
+        signer_indices: vec![single_attestation.attester_index],
+        signers,
+        claim,
+        job,
+    };
+    Ok(PreparedPqSingleAttestation {
+        single_attestation,
+        prepared_attestation,
     })
 }
 

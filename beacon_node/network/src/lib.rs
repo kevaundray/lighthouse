@@ -25,7 +25,10 @@ pub use lighthouse_network::NetworkConfig;
 #[cfg(not(feature = "pq-devnet"))]
 pub use network_beacon_processor::NetworkBeaconProcessor;
 #[cfg(feature = "pq-devnet")]
-pub use pq_runtime::{PqGossipBlockDisposition, PqNetworkBlockProcessor};
+pub use pq_runtime::{
+    PqGossipAggregateDisposition, PqGossipAttestationDisposition, PqGossipBlockDisposition,
+    PqNetworkBlockProcessor,
+};
 #[cfg(not(feature = "pq-devnet"))]
 pub use service::{
     NetworkMessage, NetworkReceivers, NetworkSenders, NetworkService, ValidatorSubscriptionMessage,

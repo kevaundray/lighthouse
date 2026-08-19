@@ -671,6 +671,12 @@ impl<E: EthSpec> VerifiedPqAggregateAndProof<E> {
     pub fn into_aggregate(self) -> Arc<SignedAggregateAndProof<E>> {
         self.aggregate
     }
+
+    /// Consumes the sealed aggregate while preserving both its exact outer wire object and the
+    /// authenticated inner attestation for the downstream coordinator.
+    pub fn into_parts(self) -> (Arc<SignedAggregateAndProof<E>>, VerifiedPqAttestation<E>) {
+        (self.aggregate, self.inner_attestation)
+    }
 }
 
 pub fn prepare_pq_block_proposal<E: EthSpec>(
