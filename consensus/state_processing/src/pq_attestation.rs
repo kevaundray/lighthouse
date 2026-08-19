@@ -137,6 +137,7 @@ pub struct PqAttestationContribution<'a, E: EthSpec> {
 pub struct PreparedPqAttestation<E: EthSpec> {
     attestation: Attestation<E>,
     signer_indices: Vec<u64>,
+    signers: Vec<AggregationSigner>,
     claim: SameMessageClaim,
     job: AggregationJob,
 }
@@ -149,6 +150,7 @@ pub struct PreparedPqAttestation<E: EthSpec> {
 pub struct VerifiedPqAttestation<E: EthSpec> {
     attestation: Attestation<E>,
     signer_indices: Vec<u64>,
+    signers: Vec<AggregationSigner>,
     claim: SameMessageClaim,
 }
 
@@ -162,11 +164,12 @@ impl<E: EthSpec> PreparedPqAttestation<E> {
         let Self {
             attestation,
             signer_indices,
+            signers,
             claim,
             job,
         } = self;
         let evidence = verify_pq_attestation_job(service, class, job).await?;
-        Self::seal(attestation, signer_indices, claim, evidence)
+        Self::seal(attestation, signer_indices, signers, claim, evidence)
     }
 
     /// Performs local recursive aggregation and seals the owned candidate on success.
@@ -177,16 +180,18 @@ impl<E: EthSpec> PreparedPqAttestation<E> {
         let Self {
             attestation,
             signer_indices,
+            signers,
             claim,
             job,
         } = self;
         let evidence = aggregate_pq_attestation_job(service, job).await?;
-        Self::seal(attestation, signer_indices, claim, evidence)
+        Self::seal(attestation, signer_indices, signers, claim, evidence)
     }
 
     fn seal(
         mut attestation: Attestation<E>,
         signer_indices: Vec<u64>,
+        signers: Vec<AggregationSigner>,
         claim: SameMessageClaim,
         evidence: SameMessageEvidence,
     ) -> Result<VerifiedPqAttestation<E>, PqAttestationError> {
@@ -201,6 +206,7 @@ impl<E: EthSpec> PreparedPqAttestation<E> {
         Ok(VerifiedPqAttestation {
             attestation,
             signer_indices,
+            signers,
             claim,
         })
     }
@@ -218,6 +224,10 @@ impl<E: EthSpec> VerifiedPqAttestation<E> {
     pub const fn claim(&self) -> SameMessageClaim {
         self.claim
     }
+
+    pub(crate) fn signers(&self) -> &[AggregationSigner] {
+        &self.signers
+    }
 }
 
 /// Prepares an owned verification transition for one Electra candidate.
@@ -232,9 +242,11 @@ pub fn prepare_pq_attestation<E: EthSpec>(
     let contribution = PqAttestationContribution::new(&attestation, &signer_indices);
     let job = build_pq_attestation_job(state, key_cache, &[contribution], spec)?;
     let claim = job.claim;
+    let signers = job.expected_signers.clone();
     Ok(PreparedPqAttestation {
         attestation,
         signer_indices,
+        signers,
         claim,
         job,
     })
@@ -245,6 +257,21 @@ pub(crate) struct PqAttestationPreflight {
     signer_indices: Vec<u64>,
     signers: Vec<AggregationSigner>,
     claim: SameMessageClaim,
+}
+
+#[cfg(feature = "pq-verification")]
+impl PqAttestationPreflight {
+    pub(crate) fn signer_indices(&self) -> &[u64] {
+        &self.signer_indices
+    }
+
+    pub(crate) fn signers(&self) -> &[AggregationSigner] {
+        &self.signers
+    }
+
+    pub(crate) const fn claim(&self) -> SameMessageClaim {
+        self.claim
+    }
 }
 
 #[cfg(feature = "pq-verification")]
@@ -394,6 +421,7 @@ pub(crate) fn materialize_prepared_pq_attestation<E: EthSpec>(
     Ok(PreparedPqAttestation {
         attestation,
         signer_indices: preflight.signer_indices,
+        signers: preflight.signers,
         claim: preflight.claim,
         job,
     })
@@ -438,6 +466,7 @@ pub fn prepare_pq_attestation_aggregate<E: EthSpec>(
         .iter()
         .map(|signer| signer.validator_index)
         .collect::<Vec<_>>();
+    let signers = job.expected_signers.clone();
     let mut contribution_iter = contributions.into_iter();
     let (mut attestation, _) = contribution_iter.next().ok_or(PqAttestationError::Invalid(
         PqAttestationInvalid::EmptySignerSet,
@@ -464,6 +493,7 @@ pub fn prepare_pq_attestation_aggregate<E: EthSpec>(
     Ok(PreparedPqAttestation {
         attestation,
         signer_indices,
+        signers,
         claim,
         job,
     })

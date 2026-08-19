@@ -1832,6 +1832,29 @@ RANDAO claim, V1 proposal-slot RANDAO leaf, signature, key cache, and spec neede
 included attestations retain their own contextual verification tokens. The ordinary BLS
 `ProduceBlockVerification` behavior remains unchanged outside the PQ profile.
 
+#### Task 5.3e-a: Seal local production before BeaconChain wiring
+
+Implement `PreparedPqRandao -> VerifiedPqRandao` with block-class verification and owned immutable
+cache/spec bindings. Derive the proposer from the bound state and slot; do not accept it from the
+caller. A local block seal consumes a unique zero-state-root `BeaconBlock`, the verified RANDAO,
+and exact-order `Arc<VerifiedPqAttestation>` values. Retain the attestation tokens' expected
+`(validator index, public key)` signers so the seal can re-derive and compare bytes, claim, indices,
+and keys without doing cryptographic work.
+
+The consuming transition accepts no cache, spec, context, outer signature, or root-mode arguments.
+It installs the active empty proposal placeholder internally, repeats pre-state and frozen-profile
+preflight, uses the shared private unsigned core with parent-root checking, and returns the unique
+block plus fresh context for post-state-root installation. Keep imported `VerifiedPqBlock`
+unchanged and independently verify the subsequently signed imported block in the real AVX2 test.
+Hash-chain/hash-onion RANDAO remains a future versioned proposal and must not change the V1 claim or
+14-leaf numbering.
+
+```bash
+git add consensus/state_processing testing/pq_devnet docs/pq-devnet-findings.md \
+  docs/plans/2026-08-18-pq-devnet-implementation.md
+git commit -m "feat: seal PQ local block production"
+```
+
 ### Task 5.2b: Wire verified candidates into both beacon-node attestation pools
 
 **Prerequisites:** Tasks 5.2a and 5.3e, including the compiling top-level PQ feature spine for the

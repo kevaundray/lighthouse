@@ -22,6 +22,38 @@
 //!     token.inner_attestation = todo!();
 //! }
 //! ```
+//!
+//! Local-production capabilities are sealed and cannot be forged or converted from an imported
+//! block capability:
+//!
+//! ```compile_fail
+//! use state_processing::{VerifiedPqBlock, VerifiedPqLocalBlock};
+//! use types::MinimalEthSpec;
+//!
+//! fn reuse_imported(token: VerifiedPqBlock<MinimalEthSpec>) -> VerifiedPqLocalBlock<MinimalEthSpec> {
+//!     token.into()
+//! }
+//! ```
+//!
+//! Local sealing accepts neither a caller-controlled outer signature nor a caller-controlled
+//! cache or spec. The active empty outer proposal placeholder is installed only inside the
+//! consuming transition:
+//!
+//! ```compile_fail
+//! use state_processing::{VerifiedPqAttestation, VerifiedPqRandao, prepare_pq_local_block};
+//! use std::sync::Arc;
+//! use types::{BeaconState, ChainSpec, MinimalEthSpec, SignedBeaconBlock};
+//!
+//! fn bypass(
+//!     state: &BeaconState<MinimalEthSpec>,
+//!     signed_block: SignedBeaconBlock<MinimalEthSpec>,
+//!     randao: VerifiedPqRandao<MinimalEthSpec>,
+//!     attestations: Vec<Arc<VerifiedPqAttestation<MinimalEthSpec>>>,
+//!     spec: &ChainSpec,
+//! ) {
+//!     prepare_pq_local_block(state, signed_block, randao, attestations, spec).unwrap();
+//! }
+//! ```
 
 use crate::{
     PqAttestationError, PqAttestationInvalid, PqAttestationLocalError, PqValidatorKeyCache,
@@ -39,8 +71,8 @@ use consensus_signature::{
 };
 use std::sync::Arc;
 use types::{
-    BeaconState, BeaconStateError, ChainSpec, Domain, EthSpec, ForkName, SignedAggregateAndProof,
-    SignedBeaconBlock, SignedRoot, Slot,
+    BeaconBlock, BeaconBlockRef, BeaconState, BeaconStateError, ChainSpec, Domain, EthSpec,
+    ForkName, SignedAggregateAndProof, SignedBeaconBlock, SignedRoot, Slot,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,6 +141,43 @@ pub enum PqConsensusError {
     Local(PqConsensusLocalError),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PqLocalBlockInvalid {
+    NonZeroStateRoot,
+    SlotMismatch { block: Slot, randao: Slot },
+    ProposerMismatch { block: u64, randao: u64 },
+    RandaoMismatch,
+    AttestationCountMismatch { block: usize, tokens: usize },
+    AttestationBytesMismatch(usize),
+    AttestationSignerMismatch(usize),
+    AttestationClaimMismatch(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PqLocalBlockError {
+    PreStateMismatch {
+        expected: types::Hash256,
+        actual: types::Hash256,
+    },
+    Invalid(PqLocalBlockInvalid),
+    Consensus(PqConsensusError),
+}
+
+impl std::fmt::Display for PqLocalBlockError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "PQ local block sealing failed: {self:?}")
+    }
+}
+
+impl std::error::Error for PqLocalBlockError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Consensus(error) => Some(error),
+            Self::PreStateMismatch { .. } | Self::Invalid(_) => None,
+        }
+    }
+}
+
 impl std::fmt::Display for PqConsensusError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "PQ consensus verification failed: {self:?}")
@@ -165,6 +234,39 @@ pub struct VerifiedPqBlock<E: EthSpec> {
     pre_state_root: types::Hash256,
     #[cfg_attr(not(feature = "pq-transition"), allow(dead_code))]
     spec: Arc<ChainSpec>,
+}
+
+pub struct PreparedPqRandao<E: EthSpec> {
+    pre_state_root: types::Hash256,
+    spec: Arc<ChainSpec>,
+    key_cache: Arc<PqValidatorKeyCache>,
+    slot: Slot,
+    proposer_index: u64,
+    signature: consensus_signature::IndividualSignature,
+    job: AggregationJob,
+    _eth_spec: std::marker::PhantomData<E>,
+}
+
+pub struct VerifiedPqRandao<E: EthSpec> {
+    pre_state_root: types::Hash256,
+    spec: Arc<ChainSpec>,
+    key_cache: Arc<PqValidatorKeyCache>,
+    slot: Slot,
+    proposer_index: u64,
+    signature: consensus_signature::IndividualSignature,
+    _eth_spec: std::marker::PhantomData<E>,
+}
+
+pub struct VerifiedPqLocalBlock<E: EthSpec> {
+    block: BeaconBlock<E>,
+    #[cfg_attr(not(feature = "pq-transition"), allow(dead_code))]
+    pre_state_root: types::Hash256,
+    #[cfg_attr(not(feature = "pq-transition"), allow(dead_code))]
+    spec: Arc<ChainSpec>,
+    #[cfg_attr(not(feature = "pq-transition"), allow(dead_code))]
+    randao: VerifiedPqRandao<E>,
+    #[cfg_attr(not(feature = "pq-transition"), allow(dead_code))]
+    attestations: Vec<Arc<VerifiedPqAttestation<E>>>,
 }
 
 pub struct PreparedPqAggregateAndProof<E: EthSpec> {
@@ -264,6 +366,260 @@ impl<E: EthSpec> VerifiedPqBlock<E> {
     ) -> (Arc<SignedBeaconBlock<E>>, types::Hash256, Arc<ChainSpec>) {
         (self.block, self.pre_state_root, self.spec)
     }
+}
+
+impl<E: EthSpec> PreparedPqRandao<E> {
+    pub async fn verify(
+        self,
+        service: &AggregationService,
+    ) -> Result<VerifiedPqRandao<E>, PqConsensusError> {
+        verify_component_job(
+            service,
+            VerificationClass::Block,
+            self.job,
+            PqConsensusComponent::RandaoReveal,
+        )
+        .await?;
+        Ok(VerifiedPqRandao {
+            pre_state_root: self.pre_state_root,
+            spec: self.spec,
+            key_cache: self.key_cache,
+            slot: self.slot,
+            proposer_index: self.proposer_index,
+            signature: self.signature,
+            _eth_spec: std::marker::PhantomData,
+        })
+    }
+}
+
+impl<E: EthSpec> VerifiedPqLocalBlock<E> {
+    pub const fn block(&self) -> &BeaconBlock<E> {
+        &self.block
+    }
+
+    #[cfg(feature = "pq-transition")]
+    pub(crate) fn into_transition_parts(self) -> (BeaconBlock<E>, types::Hash256, Arc<ChainSpec>) {
+        let Self {
+            block,
+            pre_state_root,
+            spec,
+            randao: _verified_randao,
+            attestations: _verified_attestations,
+        } = self;
+        (block, pre_state_root, spec)
+    }
+}
+
+pub fn prepare_pq_randao<E: EthSpec>(
+    state: &BeaconState<E>,
+    key_cache: Arc<PqValidatorKeyCache>,
+    slot: Slot,
+    signature: consensus_signature::IndividualSignature,
+    spec: Arc<ChainSpec>,
+) -> Result<PreparedPqRandao<E>, PqConsensusError> {
+    let mut evidence_work = 0;
+    prepare_pq_randao_inner(state, key_cache, slot, signature, spec, &mut evidence_work)
+}
+
+#[cfg(feature = "pq-verification-testing")]
+#[doc(hidden)]
+pub fn prepare_pq_randao_with_evidence_work_count<E: EthSpec>(
+    state: &BeaconState<E>,
+    key_cache: Arc<PqValidatorKeyCache>,
+    slot: Slot,
+    signature: consensus_signature::IndividualSignature,
+    spec: Arc<ChainSpec>,
+    evidence_work: &mut usize,
+) -> Result<PreparedPqRandao<E>, PqConsensusError> {
+    prepare_pq_randao_inner(state, key_cache, slot, signature, spec, evidence_work)
+}
+
+fn prepare_pq_randao_inner<E: EthSpec>(
+    state: &BeaconState<E>,
+    key_cache: Arc<PqValidatorKeyCache>,
+    slot: Slot,
+    signature: consensus_signature::IndividualSignature,
+    spec: Arc<ChainSpec>,
+    evidence_work: &mut usize,
+) -> Result<PreparedPqRandao<E>, PqConsensusError> {
+    validate_v1_profile(state, &spec, slot)?;
+    if state.slot() != slot {
+        return Err(PqConsensusError::Invalid(
+            PqConsensusInvalid::UnsupportedBlock(PqUnsupportedBlock::StateSlotMismatch {
+                state: state.slot(),
+                block: slot,
+            }),
+        ));
+    }
+    let proposer_index = state
+        .get_beacon_proposer_index(slot, &spec)
+        .map_err(classify_state_error)
+        .and_then(|index| {
+            u64::try_from(index)
+                .map_err(|_| PqConsensusError::Local(PqConsensusLocalError::StateUnavailable))
+        })?;
+    let randao_domain = spec.get_domain(
+        slot.epoch(E::slots_per_epoch()),
+        Domain::Randao,
+        &state.fork(),
+        state.genesis_validators_root(),
+    );
+    let randao_id =
+        OneTimeUseId::for_lean_pq_devnet_v1(slot.as_u64(), SigningDuty::RandaoReveal)
+            .map_err(|error| PqConsensusError::Local(PqConsensusLocalError::SigningId(error)))?;
+    let preflight = preflight_individual(
+        state,
+        &key_cache,
+        proposer_index,
+        slot.epoch(E::slots_per_epoch())
+            .signing_root(randao_domain)
+            .0,
+        randao_id,
+    )?;
+    let pre_state_root = pq_pre_state_root(state)
+        .map_err(|_| PqConsensusError::Local(PqConsensusLocalError::StateUnavailable))?;
+    let job = materialize_individual_job(preflight, &signature, evidence_work);
+    Ok(PreparedPqRandao {
+        pre_state_root,
+        spec,
+        key_cache,
+        slot,
+        proposer_index,
+        signature,
+        job,
+        _eth_spec: std::marker::PhantomData,
+    })
+}
+
+pub fn prepare_pq_local_block<E: EthSpec>(
+    state: &BeaconState<E>,
+    block: BeaconBlock<E>,
+    randao: VerifiedPqRandao<E>,
+    attestations: Vec<Arc<VerifiedPqAttestation<E>>>,
+) -> Result<VerifiedPqLocalBlock<E>, PqLocalBlockError> {
+    preflight_pq_local_block(state, &block, &randao, &attestations)?;
+    Ok(VerifiedPqLocalBlock {
+        block,
+        pre_state_root: randao.pre_state_root,
+        spec: Arc::clone(&randao.spec),
+        randao,
+        attestations,
+    })
+}
+
+#[cfg(feature = "pq-verification-testing")]
+#[doc(hidden)]
+pub fn preflight_pq_local_block_with_sealing_work_count<E: EthSpec>(
+    state: &BeaconState<E>,
+    block: &BeaconBlock<E>,
+    randao: &VerifiedPqRandao<E>,
+    attestations: &[Arc<VerifiedPqAttestation<E>>],
+    sealing_work: &mut usize,
+) -> Result<(), PqLocalBlockError> {
+    preflight_pq_local_block(state, block, randao, attestations)?;
+    *sealing_work = sealing_work.saturating_add(1);
+    Ok(())
+}
+
+fn preflight_pq_local_block<E: EthSpec>(
+    state: &BeaconState<E>,
+    block: &BeaconBlock<E>,
+    randao: &VerifiedPqRandao<E>,
+    attestations: &[Arc<VerifiedPqAttestation<E>>],
+) -> Result<(), PqLocalBlockError> {
+    let actual_pre_state_root = pq_pre_state_root(state).map_err(|_| {
+        PqLocalBlockError::Consensus(PqConsensusError::Local(
+            PqConsensusLocalError::StateUnavailable,
+        ))
+    })?;
+    if actual_pre_state_root != randao.pre_state_root {
+        return Err(PqLocalBlockError::PreStateMismatch {
+            expected: randao.pre_state_root,
+            actual: actual_pre_state_root,
+        });
+    }
+    if block.state_root() != types::Hash256::ZERO {
+        return Err(PqLocalBlockError::Invalid(
+            PqLocalBlockInvalid::NonZeroStateRoot,
+        ));
+    }
+    if block.slot() != randao.slot {
+        return Err(PqLocalBlockError::Invalid(
+            PqLocalBlockInvalid::SlotMismatch {
+                block: block.slot(),
+                randao: randao.slot,
+            },
+        ));
+    }
+    if block.proposer_index() != randao.proposer_index {
+        return Err(PqLocalBlockError::Invalid(
+            PqLocalBlockInvalid::ProposerMismatch {
+                block: block.proposer_index(),
+                randao: randao.proposer_index,
+            },
+        ));
+    }
+    if block.body().randao_reveal() != &randao.signature {
+        return Err(PqLocalBlockError::Invalid(
+            PqLocalBlockInvalid::RandaoMismatch,
+        ));
+    }
+    preflight_pq_transition_block_message(state, block.to_ref(), &randao.spec)
+        .map_err(PqLocalBlockError::Consensus)?;
+
+    let block_attestation_count = block.body().attestations_len();
+    if block_attestation_count != attestations.len() {
+        return Err(PqLocalBlockError::Invalid(
+            PqLocalBlockInvalid::AttestationCountMismatch {
+                block: block_attestation_count,
+                tokens: attestations.len(),
+            },
+        ));
+    }
+    for (position, (block_attestation, token)) in block
+        .body()
+        .attestations()
+        .zip(attestations.iter())
+        .enumerate()
+    {
+        let bytes_match = match (block_attestation, token.attestation()) {
+            (types::AttestationRef::Base(left), types::Attestation::Base(right)) => left == right,
+            (types::AttestationRef::Electra(left), types::Attestation::Electra(right)) => {
+                left == right
+            }
+            _ => false,
+        };
+        if !bytes_match {
+            return Err(PqLocalBlockError::Invalid(
+                PqLocalBlockInvalid::AttestationBytesMismatch(position),
+            ));
+        }
+        let preflight = preflight_pq_attestation_verification_job(
+            state,
+            &randao.key_cache,
+            block_attestation,
+            &randao.spec,
+        )
+        .map_err(|error| {
+            PqLocalBlockError::Consensus(map_attestation_error(
+                PqConsensusComponent::BlockAttestation(position),
+                error,
+            ))
+        })?;
+        if preflight.signer_indices() != token.signer_indices()
+            || preflight.signers() != token.signers()
+        {
+            return Err(PqLocalBlockError::Invalid(
+                PqLocalBlockInvalid::AttestationSignerMismatch(position),
+            ));
+        }
+        if preflight.claim() != token.claim() {
+            return Err(PqLocalBlockError::Invalid(
+                PqLocalBlockInvalid::AttestationClaimMismatch(position),
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl<E: EthSpec> PreparedPqAggregateAndProof<E> {
@@ -435,6 +791,14 @@ pub(crate) fn preflight_pq_transition_block<E: EthSpec>(
     block: &SignedBeaconBlock<E>,
     spec: &ChainSpec,
 ) -> Result<(), PqConsensusError> {
+    preflight_pq_transition_block_message(state, block.message(), spec)
+}
+
+fn preflight_pq_transition_block_message<E: EthSpec>(
+    state: &BeaconState<E>,
+    block: BeaconBlockRef<'_, E>,
+    spec: &ChainSpec,
+) -> Result<(), PqConsensusError> {
     validate_v1_profile(state, spec, block.slot())?;
     if state.slot() != block.slot() {
         return Err(PqConsensusError::Invalid(
@@ -445,7 +809,7 @@ pub(crate) fn preflight_pq_transition_block<E: EthSpec>(
         ));
     }
 
-    let types::BeaconBlockRef::Electra(electra) = block.message() else {
+    let types::BeaconBlockRef::Electra(electra) = block else {
         return Err(PqConsensusError::Invalid(
             PqConsensusInvalid::InconsistentBlockFork,
         ));

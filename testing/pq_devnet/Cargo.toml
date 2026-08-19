@@ -96,6 +96,11 @@ path = "tests/pq_transition.rs"
 required-features = ["pq-transition-testing"]
 
 [[test]]
+name = "pq_local_transition"
+path = "tests/pq_local_transition.rs"
+required-features = ["pq-transition-testing"]
+
+[[test]]
 name = "pq_randao_transport"
 path = "tests/pq_randao_transport.rs"
 required-features = ["pq-randao-transport-testing"]

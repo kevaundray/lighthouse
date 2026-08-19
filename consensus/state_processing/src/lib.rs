@@ -108,20 +108,25 @@ pub use pq_attestation::{
     prepare_pq_attestation, prepare_pq_attestation_aggregate, verify_pq_attestation_job,
 };
 #[cfg(feature = "pq-transition")]
-pub use pq_transition::{PqTransitionError, per_block_processing_pq, per_slot_processing_pq};
+pub use pq_transition::{
+    PqLocalTransitionOutput, PqTransitionError, per_block_processing_pq,
+    per_block_processing_pq_local, per_slot_processing_pq,
+};
 #[cfg(feature = "pq-verification")]
 pub use pq_verification::{
     PqConsensusComponent, PqConsensusError, PqConsensusInvalid, PqConsensusLocalError,
-    PqUnsupportedBlock, PreparedPqAggregateAndProof, PreparedPqBlock, PreparedPqBlockProposal,
-    VerifiedPqAggregateAndProof, VerifiedPqBlock, VerifiedPqBlockProposal,
+    PqLocalBlockError, PqLocalBlockInvalid, PqUnsupportedBlock, PreparedPqAggregateAndProof,
+    PreparedPqBlock, PreparedPqBlockProposal, PreparedPqRandao, VerifiedPqAggregateAndProof,
+    VerifiedPqBlock, VerifiedPqBlockProposal, VerifiedPqLocalBlock, VerifiedPqRandao,
     prepare_pq_aggregate_and_proof, prepare_pq_block, prepare_pq_block_proposal,
+    prepare_pq_local_block, prepare_pq_randao,
 };
 #[cfg(feature = "pq-verification-testing")]
 #[doc(hidden)]
 pub use pq_verification::{
-    classify_pq_consensus_aggregation_error,
+    classify_pq_consensus_aggregation_error, preflight_pq_local_block_with_sealing_work_count,
     prepare_pq_aggregate_and_proof_with_evidence_work_count,
-    prepare_pq_block_with_evidence_work_count,
+    prepare_pq_block_with_evidence_work_count, prepare_pq_randao_with_evidence_work_count,
 };
 #[cfg(feature = "pq-transition")]
 pub use types::{EpochCache, EpochCacheError, EpochCacheKey};

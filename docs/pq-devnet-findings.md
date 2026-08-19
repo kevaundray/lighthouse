@@ -1153,3 +1153,39 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   v2/v3/v4 empty-value parameter to a key-only parameter and failed the exact BLS URL assertion.
   Hash-chain/hash-onion RANDAO remains only a future versioned profile: V1 retains its epoch-bound
   signing root, proposal-slot leaf, and frozen 14-leaf allocation.
+
+### 2026-08-19: Sealed PQ local-production transition implemented
+
+- Local production has a distinct `PreparedPqRandao -> VerifiedPqRandao` capability. Preparation
+  derives the proposer from the exact state and proposal slot, validates the immutable
+  `Arc<PqValidatorKeyCache>`, binds the canonical pre-state root and an owned `Arc<ChainSpec>`, and
+  materializes the epoch-bound RANDAO claim with the frozen proposal-slot RANDAO leaf. Verification
+  is hardcoded to `VerificationClass::Block`; neither token is cloneable or constructible outside
+  `state_processing`.
+- `prepare_pq_local_block` consumes a unique plain `BeaconBlock`, the RANDAO capability, and
+  exact-order `Arc<VerifiedPqAttestation>` provenance. It accepts no independent cache, spec,
+  proposer, outer signature, context, or root-verification policy. The seal requires a zero state
+  root, exact slot/proposer/RANDAO bytes, canonical empty sync data, and the same frozen V1 body
+  restrictions as imported blocks. It compares every included attestation byte-for-byte and
+  cheaply re-derives its claim, indices, and `(validator index, public key)` signers from the bound
+  state/cache/spec. Retaining those signer records in attestation tokens closes contextual reuse
+  against a changed registry.
+- `per_block_processing_pq_local` consumes the local token, repeats the pre-state and full body
+  preflight, installs the active backend's empty outer proposal placeholder internally, creates a
+  fresh `ConsensusContext`, and calls the same private unsigned transition core with parent-root
+  verification hardcoded. It returns the unique block and context in `PqLocalTransitionOutput` so
+  block production can install the computed post-state root before proposal signing. There is no
+  conversion from a local token to `VerifiedPqBlock`, no raw-block transition, and no
+  `NoVerification` path.
+- A testing-only work counter proves wrong slot, future schedule, and stale proposer cache are
+  rejected before RANDAO evidence materialization. The serialized AVX2 journal test uses two real
+  attestation signatures plus a real RANDAO, rejects nonzero state root, RANDAO substitution,
+  unsupported body data, wrong pre-state, missing/reordered/substituted attestation tokens, and
+  advances sealing work only after the complete preflight. It then processes the unsigned local
+  block, installs its computed root, signs the final proposal, independently verifies the complete
+  imported block, and obtains the identical post-state root. The final run passed 1/1 in 185.02
+  seconds (3:08.83 command wall), peaked at 1,304,244 KiB RSS, and used no swap; canonical empty
+  sync bytes were retained through both paths.
+- Hash-chain/hash-onion RANDAO remains future-only. It would require a versioned genesis
+  commitment, state and wire changes, and explicit rollback/reorg/backup rules; this local
+  capability neither changes the V1 epoch signing root nor renumbers the frozen 14-leaf layout.
