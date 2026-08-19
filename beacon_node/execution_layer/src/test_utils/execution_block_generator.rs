@@ -20,7 +20,6 @@ use ssz_types::VariableList;
 use state_processing::kzg_commitment_to_versioned_hash;
 #[cfg(not(feature = "pq-devnet"))]
 use state_processing::per_block_processing::deneb::kzg_commitment_to_versioned_hash;
-use std::cmp::max;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::warn;
@@ -157,6 +156,7 @@ pub struct ExecutionBlockGenerator<E: EthSpec> {
     pub next_payload_id: u64,
     pub payload_ids: HashMap<PayloadId, ExecutionPayload<E>>,
     min_blobs_count: usize,
+    max_blobs_count: usize,
     /*
      * Post-merge fork triggers
      */
@@ -209,6 +209,7 @@ impl<E: EthSpec> ExecutionBlockGenerator<E> {
             next_payload_id: 0,
             payload_ids: <_>::default(),
             min_blobs_count: 0,
+            max_blobs_count: 1,
             shanghai_time,
             cancun_time,
             prague_time,
@@ -328,6 +329,13 @@ impl<E: EthSpec> ExecutionBlockGenerator<E> {
 
     pub fn set_min_blob_count(&mut self, count: usize) {
         self.min_blobs_count = count;
+        self.max_blobs_count = self.max_blobs_count.max(count);
+    }
+
+    pub fn set_blob_count_range(&mut self, minimum: usize, maximum: usize) {
+        assert!(minimum <= maximum, "minimum blob count exceeds maximum");
+        self.min_blobs_count = minimum;
+        self.max_blobs_count = maximum;
     }
 
     pub fn insert_pow_block(&mut self, block_number: u64) -> Result<(), String> {
@@ -815,8 +823,7 @@ impl<E: EthSpec> ExecutionBlockGenerator<E> {
             // get random number between 0 and 1 blobs by default
             // For tests that need higher blob count, consider adding a `set_max_blob_count` method
             let mut rng = self.rng.lock();
-            let max_blobs = max(1, self.min_blobs_count);
-            let num_blobs = rng.random_range(self.min_blobs_count..=max_blobs);
+            let num_blobs = rng.random_range(self.min_blobs_count..=self.max_blobs_count);
             let (bundle, transactions) = generate_blobs(num_blobs, fork_name)?;
             for tx in Vec::from(transactions) {
                 execution_payload
@@ -827,8 +834,31 @@ impl<E: EthSpec> ExecutionBlockGenerator<E> {
             self.blobs_bundles.insert(id, bundle);
         }
 
-        *execution_payload.block_hash_mut() =
-            ExecutionBlockHash::from_root(execution_payload.tree_hash_root());
+        #[cfg(feature = "pq-devnet")]
+        {
+            if fork_name == ForkName::Electra {
+                let parent_beacon_block_root = attributes
+                    .parent_beacon_block_root()
+                    .map_err(|error| format!("missing parent beacon root: {error:?}"))?;
+                let empty_requests = ExecutionRequests::default();
+                let execution_requests =
+                    self.execution_requests.get(&id).unwrap_or(&empty_requests);
+                *execution_payload.block_hash_mut() = crate::calculate_execution_block_hash(
+                    execution_payload.to_ref(),
+                    Some(parent_beacon_block_root),
+                    Some(execution_requests),
+                )
+                .0;
+            } else {
+                *execution_payload.block_hash_mut() =
+                    ExecutionBlockHash::from_root(execution_payload.tree_hash_root());
+            }
+        }
+        #[cfg(not(feature = "pq-devnet"))]
+        {
+            *execution_payload.block_hash_mut() =
+                ExecutionBlockHash::from_root(execution_payload.tree_hash_root());
+        }
         Ok(execution_payload)
     }
 }

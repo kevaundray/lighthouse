@@ -141,5 +141,10 @@ path = "tests/pq_beacon_import.rs"
 required-features = ["pq-beacon-import-testing"]
 
 [[test]]
+name = "pq_block_production"
+path = "tests/pq_block_production.rs"
+required-features = ["pq-beacon-import-testing"]
+
+[[test]]
 name = "pq_api_privacy"
 path = "tests/pq_api_privacy.rs"

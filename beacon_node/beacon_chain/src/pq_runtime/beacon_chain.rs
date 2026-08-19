@@ -76,7 +76,7 @@ impl std::fmt::Display for PqRuntimeError {
             }
             Self::MissingTaskExecutor => formatter.write_str("PQ task executor was not installed"),
             Self::DeferredRuntimeIntegration => formatter.write_str(
-                "lean PQ devnet network-service assembly, HTTP, timers, production and validator duties are deferred",
+                "lean PQ devnet network-service assembly, HTTP, timers and validator duties are deferred",
             ),
         }
     }
@@ -115,6 +115,7 @@ pub struct BeaconChain<T: BeaconChainTypes> {
     pub(crate) observed_pq_blocks: Arc<Mutex<crate::pq_import::PqGossipObservationCache>>,
     pub(crate) pq_import_gate: Arc<tokio::sync::Semaphore>,
     pub(crate) pq_import_admission: Arc<tokio::sync::Semaphore>,
+    pub(crate) pq_block_production_admission: Arc<tokio::sync::Semaphore>,
     pub(crate) pq_attestation_gossip_admission: Arc<tokio::sync::Semaphore>,
     pub(crate) pq_attestation_gossip_observations:
         Arc<Mutex<crate::pq_attestation_gossip::PqAttestationGossipObservationCache<T::EthSpec>>>,
@@ -157,6 +158,9 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             pq_import_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             pq_import_admission: Arc::new(tokio::sync::Semaphore::new(
                 crate::PQ_BLOCK_IMPORT_ADMISSION_CAPACITY,
+            )),
+            pq_block_production_admission: Arc::new(tokio::sync::Semaphore::new(
+                crate::PQ_BLOCK_PRODUCTION_ADMISSION_CAPACITY,
             )),
             pq_attestation_gossip_admission: Arc::new(tokio::sync::Semaphore::new(
                 crate::PQ_ATTESTATION_GOSSIP_ADMISSION_CAPACITY,

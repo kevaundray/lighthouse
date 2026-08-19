@@ -103,6 +103,8 @@ pub use per_block_processing::{
     block_signature_verifier, errors::BlockProcessingError, per_block_processing, signature_sets,
 };
 #[cfg(feature = "pq-transition")]
+pub use per_block_processing::{compute_timestamp_at_slot, get_expected_withdrawals};
+#[cfg(feature = "pq-transition")]
 pub use per_epoch_processing::{EpochProcessingSummary, errors::EpochProcessingError};
 #[cfg(not(any(feature = "pq-genesis", feature = "pq-attestation")))]
 pub use per_epoch_processing::{

@@ -42,7 +42,6 @@ pub use verify_deposit::{
 };
 #[cfg(not(feature = "pq-transition"))]
 pub use verify_exit::verify_exit;
-#[cfg(not(feature = "pq-transition"))]
 pub use withdrawals::get_expected_withdrawals;
 
 pub mod altair;

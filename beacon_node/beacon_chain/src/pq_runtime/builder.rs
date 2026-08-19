@@ -341,8 +341,18 @@ where
         execution_layer: Arc<execution_layer::ExecutionLayer<E>>,
     ) -> Self {
         self.execution_notifier =
-            crate::pq_import::PqExecutionNotifier::Production(execution_layer);
+            crate::pq_import::PqExecutionNotifier::production(execution_layer);
         self
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_pq_production_payload_observer(
+        mut self,
+        observer: crate::pq_production::TestingPqPayloadBuildObserver<E>,
+    ) -> Result<Self, PqRuntimeError> {
+        self.execution_notifier.set_payload_observer(observer)?;
+        Ok(self)
     }
 
     #[cfg(feature = "pq-startup-testing")]

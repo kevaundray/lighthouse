@@ -1030,6 +1030,21 @@ impl<E: EthSpec> ExecutionLayer<E> {
         }
     }
 
+    /// Fetches only a locally-built full payload for the lean PQ V1 production path.
+    ///
+    /// This deliberately bypasses the builder-selection branch used by ordinary V3 production.
+    /// The caller remains responsible for enforcing the narrower PQ body profile.
+    #[cfg(feature = "pq-devnet")]
+    pub async fn get_full_payload_for_pq_v3(
+        &self,
+        payload_parameters: PayloadParameters<'_>,
+    ) -> Result<BlockProposalContents<E, FullPayload<E>>, Error> {
+        match self.get_full_payload_caching(payload_parameters).await? {
+            GetPayloadResponseType::Full(response) => response.try_into(),
+            GetPayloadResponseType::Blinded(_) => Err(Error::PayloadTypeMismatch),
+        }
+    }
+
     /// Fetches local and builder paylaods concurrently, Logs and returns results.
     async fn fetch_builder_and_local_payloads(
         &self,

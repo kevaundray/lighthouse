@@ -117,6 +117,20 @@ impl<E: EthSpec> PqBlockImportRequest<E> {
     }
 }
 
+/// Boxed test-only local-payload future returned by the deterministic execution seam.
+#[cfg(feature = "pq-startup-testing")]
+pub type PqFullPayloadFuture<'a, E> = Pin<
+    Box<
+        dyn Future<
+                Output = Result<
+                    execution_layer::BlockProposalContents<E, types::FullPayload<E>>,
+                    execution_layer::Error,
+                >,
+            > + Send
+            + 'a,
+    >,
+>;
+
 /// Small asynchronous seam implemented by the real execution layer and deterministic tests.
 #[cfg(feature = "pq-startup-testing")]
 pub trait PqNewPayloadTransport<E: EthSpec>: Send + Sync {
@@ -124,16 +138,51 @@ pub trait PqNewPayloadTransport<E: EthSpec>: Send + Sync {
         &'a self,
         request: NewPayloadRequest<'a, E>,
     ) -> Pin<Box<dyn Future<Output = Result<PayloadStatus, execution_layer::Error>> + Send + 'a>>;
+
+    fn get_full_payload<'a>(
+        &'a self,
+        _request: crate::pq_production::PqPayloadBuildRequest<E>,
+    ) -> PqFullPayloadFuture<'a, E> {
+        Box::pin(async { Err(execution_layer::Error::NoEngine) })
+    }
 }
 
 pub(crate) enum PqExecutionNotifier<E: EthSpec> {
     Deferred,
-    Production(Arc<ExecutionLayer<E>>),
+    Production {
+        execution_layer: Arc<ExecutionLayer<E>>,
+        #[cfg(feature = "pq-startup-testing")]
+        payload_observer: Option<crate::pq_production::TestingPqPayloadBuildObserver<E>>,
+    },
     #[cfg(feature = "pq-startup-testing")]
     Testing(Arc<dyn PqNewPayloadTransport<E>>),
 }
 
 impl<E: EthSpec> PqExecutionNotifier<E> {
+    pub(crate) fn production(execution_layer: Arc<ExecutionLayer<E>>) -> Self {
+        Self::Production {
+            execution_layer,
+            #[cfg(feature = "pq-startup-testing")]
+            payload_observer: None,
+        }
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    pub(crate) fn set_payload_observer(
+        &mut self,
+        observer: crate::pq_production::TestingPqPayloadBuildObserver<E>,
+    ) -> Result<(), PqRuntimeError> {
+        match self {
+            Self::Production {
+                payload_observer, ..
+            } => {
+                *payload_observer = Some(observer);
+                Ok(())
+            }
+            Self::Deferred | Self::Testing(_) => Err(PqRuntimeError::MissingExecutionNotifier),
+        }
+    }
+
     #[cfg(not(feature = "pq-startup-testing"))]
     pub(crate) const fn is_deferred(&self) -> bool {
         matches!(self, Self::Deferred)
@@ -145,10 +194,69 @@ impl<E: EthSpec> PqExecutionNotifier<E> {
     ) -> Result<PayloadStatus, execution_layer::Error> {
         match self {
             Self::Deferred => Err(execution_layer::Error::NoEngine),
-            Self::Production(execution_layer) => execution_layer.notify_new_payload(request).await,
+            Self::Production {
+                execution_layer, ..
+            } => execution_layer.notify_new_payload(request).await,
             #[cfg(feature = "pq-startup-testing")]
             Self::Testing(notifier) => notifier.notify_new_payload(request).await,
         }
+    }
+
+    pub(crate) async fn get_full_payload(
+        &self,
+        request: crate::pq_production::PqPayloadBuildRequest<E>,
+    ) -> Result<crate::pq_production::PqFullPayloadResponse<E>, execution_layer::Error> {
+        let expectation = crate::pq_production::PqPayloadExpectation::from_request(&request);
+        let contents = match self {
+            Self::Deferred => Err(execution_layer::Error::NoEngine),
+            Self::Production {
+                execution_layer,
+                #[cfg(feature = "pq-startup-testing")]
+                payload_observer,
+            } => {
+                let suggested_fee_recipient = execution_layer
+                    .get_suggested_fee_recipient(request.proposer_index)
+                    .await;
+                let proposer_gas_limit = execution_layer
+                    .get_proposer_gas_limit(request.proposer_index)
+                    .await;
+                let payload_attributes = execution_layer::PayloadAttributes::new(
+                    request.timestamp,
+                    request.prev_randao,
+                    suggested_fee_recipient,
+                    Some(request.withdrawals.clone()),
+                    Some(request.parent_beacon_block_root),
+                    None,
+                    None,
+                );
+                let payload_parameters = execution_layer::PayloadParameters {
+                    parent_hash: request.parent_hash,
+                    parent_gas_limit: Some(request.parent_gas_limit),
+                    proposer_gas_limit,
+                    payload_attributes: &payload_attributes,
+                    forkchoice_update_params: &request.forkchoice_update_parameters,
+                    current_fork: types::ForkName::Electra,
+                };
+                #[cfg(feature = "pq-startup-testing")]
+                if let Some(observer) = payload_observer {
+                    observer(
+                        crate::pq_production::TestingPqPayloadBuildObservation::from_payload_parameters(
+                            request.proposer_index,
+                            &payload_parameters,
+                        ),
+                    );
+                }
+                execution_layer
+                    .get_full_payload_for_pq_v3(payload_parameters)
+                    .await
+            }
+            #[cfg(feature = "pq-startup-testing")]
+            Self::Testing(notifier) => notifier.get_full_payload(request).await,
+        }?;
+        crate::pq_production::PqFullPayloadResponse::try_from_execution_contents(
+            contents,
+            &expectation,
+        )
     }
 }
 

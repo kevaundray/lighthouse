@@ -1980,6 +1980,111 @@ aggregate-index lifecycle checks in the runnable `pq_devnet` route. Local servic
 typed no-peer-penalty mapping; this slice does not claim an operation-pool/fork-choice insertion or
 local production/API result.
 
+#### Task 5.3e-e1: Produce a sealed local full block from the chain-owned execution layer
+
+Restore only the BeaconChain local-production core in this slice. Do not enable the ordinary HTTP
+API, validator-services, validator-client process, network service, builders, registration, sync
+duties, or the top-level runtime. Those graphs remain intentionally deferred to e-e2 through e-e4.
+
+Acquire one chain-owned non-waiting production admission before cloning the canonical snapshot or
+doing proof work. On the process-owned blocking executor, clone the exact head state, advance it
+sequentially to the requested proposal slot with `per_slot_processing_pq`, derive the proposer, and
+call `prepare_pq_randao`. Reject a past/future or excessively distant request without touching the
+execution layer. Await `PreparedPqRandao::verify` on the process-owned `AggregationService`; this is
+the only RANDAO verifier and it submits at `VerificationClass::Block`. An invalid reveal is a typed
+request error, while proof-service, executor, clock, or admission failures are local and retryable.
+No state, head, cache, or admission borrow is held across the proof await.
+
+Only after RANDAO verification succeeds may production request payload/body data. Extend the one
+execution capability injected into `BeaconChainBuilder` so production uses its immutable
+`Arc<ExecutionLayer>` to request a **local full** Electra payload. It must not consult a builder or
+accept a per-call payload strategy. A deterministic fake may be injected only through the existing
+`pq-startup-testing` builder seam. Derive timestamp, previous RANDAO, parent execution hash/gas
+limit, withdrawals, proposer fee-recipient/gas-limit lookup, and fork-choice parameters from the
+owned advanced state and exact canonical parent. The execution-layer entry point must force the
+local `engine_forkchoiceUpdated`/`engine_getPayload` path and return full payload contents; blinded,
+builder, Gloas, and wrong-fork contents are rejected.
+
+On the blocking executor, assemble one unique Electra `BeaconBlock` with zero `state_root`, the
+exact verified RANDAO, exact canonical parent, requested graffiti, unchanged zero-deposit eth1 data,
+canonical empty sync aggregate, empty unsupported operations, and only attestations accompanied by
+their sealed `Arc<VerifiedPqAttestation>` provenance. The initial slice passes zero attestations.
+Consume the block, `VerifiedPqRandao`, and provenance in `prepare_pq_local_block`, then consume the
+result in `per_block_processing_pq_local` against the owned advanced state. Compute the post-state
+root, install it into the unique returned block, and return full V3-compatible block contents with
+the exact empty blob/proof lists from the local payload. Do not sign, persist, publish, or mutate the
+canonical head. Recheck the exact canonical parent before returning so a head change during proof
+or Engine work produces a terminal stale-production result rather than a misleading proposal.
+
+Write RED tests before each production change. Pin RANDAO-Block-priority-before-payload ordering,
+invalid RANDAO failures with zero payload calls, unique zero-root sealing, canonical empty
+sync, zero-attestation provenance, full local payload only, post-state-root correctness, stale-head
+recheck, admission release on cancellation, blocking-executor heartbeat behavior, and a real AVX
+round trip in which the returned unsigned block is proposal-signed and accepted by the existing
+Task 5.3e-c imported-block path. Preserve all default BLS tests and feature selection.
+
+Review follow-up evidence (2026-08-19): RED tests exposed a caller-thread state clone, a nonzero
+`blob_gas_used` payload accepted after recomputing its execution hash, ambiguous initial/late slot
+outcomes, missing exact-request response binding, and a wrong-fork response admitted by the common
+payload validator. The production branch now uses the real `Arc<ExecutionLayer>` local FCU/getPayload
+path with a test-only adjacent input observer; the MockEngine sees the exact parent while a configured
+builder sees zero calls. The scalar focused command passed 1/1. The AVX2 focused
+`pq_block_production` test file passed 16/16 in 541.92 seconds, including the real Engine path,
+blocking heartbeat, cancellation/admission, typed slot outcomes, pure mutation matrix, and sealed RPC
+import. A final warning-denied AVX2 `--no-run` compile of that same target completed successfully in
+47.98 seconds. Parent verification additionally passed warning-denied default state-processing,
+execution-layer, and BeaconChain checks; scalar and AVX2 top-level PQ checks; the default
+state-processing tests; the execution-layer generator regression; focused BeaconChain and
+execution-layer Clippy with only documented baseline allowances; formatting, dependency sorting,
+diff hygiene, and the PQ graph-exclusion audit. The final Rust 1.88 warning-denied workspace check
+passed after this documentation update.
+
+Final re-review sensitivity (2026-08-19): the test-only observer is constructed only after the real
+`PayloadParameters` exists and reads the fork, FCU, payload attributes, and gas inputs from that
+object. Temporarily changing the actual parameter fork to Fulu made the observer's Electra assertion
+fail before Engine handling; restoring Electra passed the exact real-Engine test 1/1. Invalid RANDAO
+and stale-head behavior tests now explicitly assert terminal classification; a temporary retryable
+mutation failed the shared classifier test. Those two exact behavior tests passed 1/1 each, and the
+focused warning-denied AVX2 `--no-run` compile passed. The full 16-test file was not rerun because
+neither final change alters the proof or Engine behavior already covered above.
+
+#### Task 5.3e-e2: Expose the narrow PQ full-V3 HTTP production and publish routes
+
+Compile a PQ-specific HTTP surface instead of enabling the ordinary BLS/full-runtime module graph.
+Expose only `GET /eth/v3/validator/blocks/{slot}` for local full production and the standard full
+signed-block publish route needed by a validator client. Decode the active PQ RANDAO transport and
+always verify it; reject `skip_randao_verification`, V2/V4 production, blinded endpoints,
+builder-boost/builder selection, Gloas, registration, and sync-service endpoints. Return the normal
+full V3 JSON/SSZ shape and metadata with `execution_payload_blinded = false`.
+
+The publish handler must decode full signed block contents, enter the existing e-c full verification
+boundary, propagate through an immutable process-owned broadcaster, then consume the exact
+post-propagation capability for Engine notification and atomic import. It must never call raw
+persistence or mark propagation without a successful broadcaster result. Cover actual awaited HTTP
+filters, serialization headers, unsupported routes/options, propagation-before-Engine ordering,
+and retry/terminal mappings.
+
+#### Task 5.3e-e3: Add a proposer-only PQ validator-client service
+
+Compile a dedicated PQ proposer service instead of the ordinary validator-services duty graph.
+For an assigned local validator, create the slot-bound RANDAO reveal through the existing journal
+authority, request full V3 SSZ with JSON fallback, reject blinded/wrong-version/Gloas responses,
+check the proposer index, sign the returned full block with the existing slashing-protected PQ block
+path, and publish full signed contents. Do not compile or start builder registration, remote signing,
+distributed selection, attestation, aggregation, sync-committee, preparation, payload-attestation,
+or proposer-preference services in this slice. Exercise the real `BeaconNodeHttpClient` against the
+e-e2 test server, including byte-identical retry and full propose/sign/publish import.
+
+#### Task 5.3e-e4: Assemble the PQ network, HTTP, and proposer runtime
+
+Replace the top-level `DeferredRuntimeIntegration` boundary only after e-e1 through e-e3 are green.
+Construct exactly one aggregation service, task executor, execution layer, bounded BeaconChain,
+network processor/broadcaster, narrow HTTP server, and proposer-only validator service in fail-closed
+order. Keep ordinary router/sync/backfill/history, builders, registration, sync duties, slasher,
+checkpoint modes, and all unsupported APIs absent. Add startup/shutdown/restart and multi-slot AVX
+tests proving a locally produced, HTTP-returned, validator-signed, propagated block commits through
+the same e-c import path and survives restart.
+
 ### Task 5.2b: Wire verified candidates into both beacon-node attestation pools
 
 **Prerequisites:** Tasks 5.2a and 5.3e, including the compiling top-level PQ feature spine for the

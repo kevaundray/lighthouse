@@ -1399,3 +1399,47 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   checks, focused state-processing/network/beacon-chain Clippy, formatting, dependency ordering,
   and diff hygiene also pass. Hash-chain/hash-onion RANDAO remains future-only; the V1 14-leaf
   allocation is unchanged.
+
+### 2026-08-19: Sealed PQ local full-block production implemented (Task 5.3e-e1)
+
+- `BeaconChain::produce_pq_block_v3` acquires one of two non-waiting, chain-owned production
+  admissions before snapshot or proof work. The permit moves into a detached chain task, so caller
+  cancellation cannot free capacity while proof, Engine, or blocking transition work is still
+  retained. Initial future slots are explicitly retryable; initial past, at-or-behind-head,
+  expired-after-work, and stale-parent outcomes are terminal. State advancement uses checked
+  subtraction and accepts at most eight slots.
+- The canonical head state is cloned and advanced on the process-owned blocking executor. The
+  proposer-bound RANDAO job is prepared there and verified at `VerificationClass::Block` before any
+  payload call. Payload-request derivation and the sealed local transition also run as named
+  blocking tasks; a deterministic barrier/heartbeat regression makes an inline async-executor
+  clone or derivation visible.
+- The production notifier owns the immutable `Arc<ExecutionLayer>` and exposes a local-only full
+  Electra path. It constructs an exact-parent FCU with no fabricated safe or finalized hash,
+  performs the real local `forkchoiceUpdated`/`getPayloadV4` flow, and bypasses builder selection.
+  The testing transport remains feature-isolated; a separate production-branch MockEngine test
+  observes the actual assembled `PayloadParameters` and proves that a configured builder receives
+  zero header calls.
+- The shared payload validator requires `PayloadAndBlobs` with explicit empty commitments, blobs,
+  proofs, and all three execution-request lists. It rejects the wrong fork, nonzero
+  `blob_gas_used`, request mismatch, parent/timestamp/RANDAO/withdrawal mismatch, and a noncanonical
+  execution block hash while preserving the typed `BlockHashMismatch`; nonzero
+  `excess_blob_gas` remains valid. The same validator is exercised by a fast mutation matrix and by
+  both the testing and production Engine paths.
+- Assembly creates one unique zero-state-root Electra message with the verified RANDAO, exact
+  proposer and parent, requested graffiti, unchanged zero-deposit eth1 data, canonical absent
+  sync evidence, zero attestations, and empty unsupported operations. It consumes
+  `VerifiedPqRandao` through the sealed local transition, installs the computed post-state root,
+  and returns only full V3 contents plus the execution value. It does not sign, publish, persist,
+  mutate the canonical head, or expose a temporary verification capability. A proposal-signed
+  result is accepted by the existing sealed RPC import path.
+- Strict RED-to-GREEN evidence covered the real production Engine branch, recomputed-hash nonzero
+  blob gas, blocking placement, slot classification, wrong fork, each blob/proof/commitment/request
+  class, exact payload request fields, distinctive graffiti/value, and the eight/nine-slot bound.
+  The serialized AVX2 `pq_block_production` file passed 16/16 in 541.92 seconds; the scalar fallback
+  passed 1/1. Final observer and terminal-classification mutations passed their focused restored
+  runs, and the warning-denied AVX2 target compiled after the last change. Parent verification also
+  passed warning-denied default and PQ scalar/AVX2 checks, fast AVX mutation tests, focused Clippy,
+  formatting, sorting, diff hygiene, and the default state-processing and execution-layer
+  regressions. The final Rust 1.88 warning-denied workspace check also passed. Hash-chain/hash-onion
+  RANDAO remains a future versioned proposal; V1 retains the signature-derived duty and frozen
+  14-leaf allocation.

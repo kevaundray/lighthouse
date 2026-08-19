@@ -21,7 +21,10 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 use task_executor::TaskExecutor;
 use tempfile::NamedTempFile;
@@ -315,6 +318,7 @@ pub struct MockBuilder<E: EthSpec> {
     broadcast_to_bn: bool,
     /// A cache that stores the proposers index for a given epoch
     proposers_cache: Arc<RwLock<HashMap<Epoch, Vec<ProposerData>>>>,
+    get_header_calls: Arc<AtomicUsize>,
 }
 
 impl<E: EthSpec> MockBuilder<E> {
@@ -393,6 +397,7 @@ impl<E: EthSpec> MockBuilder<E> {
             invalidate_signatures: Arc::new(RwLock::new(false)),
             payload_id_cache: Arc::new(RwLock::new(HashMap::new())),
             proposers_cache: Arc::new(RwLock::new(HashMap::new())),
+            get_header_calls: Arc::new(AtomicUsize::new(0)),
             apply_operations,
             max_bid,
             broadcast_to_bn,
@@ -404,6 +409,10 @@ impl<E: EthSpec> MockBuilder<E> {
         // Insert operations at the front of the vec to make sure `apply_operations` applies them
         // in the order they are added.
         self.operations.write().insert(0, op);
+    }
+
+    pub fn get_header_call_count(&self) -> usize {
+        self.get_header_calls.load(Ordering::SeqCst)
     }
 
     pub fn invalid_signatures(&self) {
@@ -529,6 +538,7 @@ impl<E: EthSpec> MockBuilder<E> {
         parent_hash: ExecutionBlockHash,
         pubkey: PublicKeyBytes,
     ) -> Result<SignedBuilderBid<E>, String> {
+        self.get_header_calls.fetch_add(1, Ordering::SeqCst);
         info!("In get_header");
         // Check if the pubkey has registered with the builder if required
         if self.validate_pubkey && !self.val_registration_cache.read().contains_key(&pubkey) {

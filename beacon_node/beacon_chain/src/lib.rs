@@ -121,6 +121,9 @@ mod pq_attestation_gossip;
 #[cfg(feature = "pq-devnet")]
 #[path = "pq_runtime/import.rs"]
 mod pq_import;
+#[cfg(feature = "pq-devnet")]
+#[path = "pq_runtime/production.rs"]
+mod pq_production;
 #[cfg(not(feature = "pq-devnet"))]
 mod pre_finalization_cache;
 #[cfg(not(feature = "pq-devnet"))]
@@ -194,6 +197,20 @@ pub use self::pq_import::{
 pub use self::pq_import::{
     PqNewPayloadTransport, TestingPqBlockingHook, TestingPqExternalReservation,
     TestingPqGossipClaim, TestingPqGossipFinish, TestingPqGossipObservationCache,
+};
+#[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
+#[doc(hidden)]
+pub use self::pq_production::PqPayloadBuildRequest;
+#[cfg(feature = "pq-devnet")]
+pub use self::pq_production::{
+    PQ_BLOCK_PRODUCTION_ADMISSION_CAPACITY, PqBlockProductionError, PqBlockProductionLocalError,
+    PqProducedBlockV3,
+};
+#[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
+#[doc(hidden)]
+pub use self::pq_production::{
+    TestingPqPayloadBuildObservation, TestingPqPayloadExpectation,
+    testing_only_validate_pq_full_payload, testing_only_validate_pq_production_advance,
 };
 #[cfg(not(feature = "pq-devnet"))]
 pub use attestation_verification::Error as AttestationError;
