@@ -14,6 +14,7 @@ pq-devnet = ["pq-wire"]
 
 [dependencies]
 bls = { workspace = true }
+bytes = { workspace = true }
 consensus_signature = { workspace = true }
 context_deserialize = { workspace = true }
 educe = { workspace = true }

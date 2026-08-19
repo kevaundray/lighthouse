@@ -633,7 +633,7 @@ impl InitializedValidators {
                     return Err(Error::DuplicatePublicKey);
                 }
                 let mut validators = HashMap::with_capacity(expected_public_keys.len());
-                for public_key in expected_public_keys {
+                for (index, public_key) in (0_u64..).zip(expected_public_keys) {
                     let signer = authority.signer(&public_key)?;
                     let initialized = InitializedValidator {
                         signing_method: Arc::new(SigningMethod::pq_local(signer)),
@@ -643,7 +643,7 @@ impl InitializedValidators {
                         builder_proposals: Some(false),
                         builder_boost_factor: None,
                         prefer_builder_proposals: Some(false),
-                        index: None,
+                        index: Some(index),
                     };
                     if validators.insert(public_key, initialized).is_some() {
                         return Err(Error::DuplicatePublicKey);
@@ -1570,7 +1570,32 @@ impl InitializedValidators {
         self.validators.get(pubkey).and_then(|val| val.index)
     }
 
+    /// Returns the immutable manifest-derived PQ identities in canonical validator-index order.
+    #[cfg(feature = "pq-devnet")]
+    pub fn pq_validator_identity_snapshot(&self) -> Option<Vec<(PublicKeyBytes, u64)>> {
+        let mut identities = self
+            .validators
+            .iter()
+            .map(|(public_key, validator)| validator.index.map(|index| (*public_key, index)))
+            .collect::<Option<Vec<_>>>()?;
+        identities.sort_unstable_by_key(|(_, index)| *index);
+        if identities
+            .iter()
+            .zip(0_u64..)
+            .all(|((_, actual), expected)| *actual == expected)
+        {
+            Some(identities)
+        } else {
+            None
+        }
+    }
+
     pub fn set_index(&mut self, pubkey: &PublicKeyBytes, index: u64) {
+        #[cfg(feature = "pq-devnet")]
+        {
+            let _ = (pubkey, index);
+        }
+        #[cfg(not(feature = "pq-devnet"))]
         if let Some(val) = self.validators.get_mut(pubkey) {
             val.index = Some(index);
         }

@@ -116,6 +116,7 @@ pub struct BeaconChain<T: BeaconChainTypes> {
     pub(crate) pq_import_gate: Arc<tokio::sync::Semaphore>,
     pub(crate) pq_import_admission: Arc<tokio::sync::Semaphore>,
     pub(crate) pq_block_production_admission: Arc<tokio::sync::Semaphore>,
+    pub(crate) pq_proposer_duty_admission: Arc<tokio::sync::Semaphore>,
     pub(crate) pq_attestation_gossip_admission: Arc<tokio::sync::Semaphore>,
     pub(crate) pq_attestation_gossip_observations:
         Arc<Mutex<crate::pq_attestation_gossip::PqAttestationGossipObservationCache<T::EthSpec>>>,
@@ -125,6 +126,8 @@ pub struct BeaconChain<T: BeaconChainTypes> {
     pub(crate) pq_blocking_test_hook: Option<Arc<crate::TestingPqBlockingHook>>,
     #[cfg(feature = "pq-startup-testing")]
     pub(crate) pq_persistence_test_hook: Option<Arc<crate::TestingPqBlockingHook>>,
+    #[cfg(feature = "pq-startup-testing")]
+    pub(crate) pq_proposer_duties_test_hook: Option<Arc<crate::TestingPqBlockingHook>>,
     pub pq_validator_key_cache: Arc<PqValidatorKeyCache>,
     pub pq_aggregation_service: Arc<AggregationService>,
     pub slot_clock: T::SlotClock,
@@ -146,6 +149,9 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         #[cfg(feature = "pq-startup-testing")] pq_persistence_test_hook: Option<
             Arc<crate::TestingPqBlockingHook>,
         >,
+        #[cfg(feature = "pq-startup-testing")] pq_proposer_duties_test_hook: Option<
+            Arc<crate::TestingPqBlockingHook>,
+        >,
         slot_clock: T::SlotClock,
     ) -> Self {
         Self {
@@ -162,6 +168,9 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             pq_block_production_admission: Arc::new(tokio::sync::Semaphore::new(
                 crate::PQ_BLOCK_PRODUCTION_ADMISSION_CAPACITY,
             )),
+            pq_proposer_duty_admission: Arc::new(tokio::sync::Semaphore::new(
+                crate::PQ_PROPOSER_DUTY_ADMISSION_CAPACITY,
+            )),
             pq_attestation_gossip_admission: Arc::new(tokio::sync::Semaphore::new(
                 crate::PQ_ATTESTATION_GOSSIP_ADMISSION_CAPACITY,
             )),
@@ -174,6 +183,8 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             pq_blocking_test_hook,
             #[cfg(feature = "pq-startup-testing")]
             pq_persistence_test_hook,
+            #[cfg(feature = "pq-startup-testing")]
+            pq_proposer_duties_test_hook,
             pq_validator_key_cache,
             pq_aggregation_service,
             slot_clock,

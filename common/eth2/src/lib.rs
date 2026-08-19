@@ -219,6 +219,94 @@ pub struct BeaconNodeHttpClient {
     timeouts: Timeouts,
 }
 
+/// A PQ proposer client whose transport is constructed with redirects disabled.
+///
+/// Callers supply the `ClientBuilder`, so TLS roots, proxies, identities, and other accepted
+/// transport configuration are retained when the mandatory redirect policy is applied.
+#[cfg(feature = "pq-devnet")]
+#[derive(Clone, Debug)]
+pub struct StrictBeaconNodeHttpClient {
+    inner: BeaconNodeHttpClient,
+}
+
+#[cfg(feature = "pq-devnet")]
+impl StrictBeaconNodeHttpClient {
+    pub fn from_builder(
+        server: SensitiveUrl,
+        timeouts: Timeouts,
+        builder: reqwest::ClientBuilder,
+    ) -> Result<Self, Error> {
+        let client = builder
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        Ok(Self {
+            inner: BeaconNodeHttpClient::from_components(server, client, timeouts),
+        })
+    }
+
+    /// Submit an already-serialized full PQ block without parsing an untrusted error body.
+    ///
+    /// The caller owns exact status classification and must drop or explicitly bound the body.
+    pub async fn post_pq_beacon_blocks_v2_ssz_bytes_raw(
+        &self,
+        body: bytes::Bytes,
+        fork: ForkName,
+    ) -> Result<Response, Error> {
+        self.post_pq_beacon_blocks_v2_bytes_raw(
+            body,
+            fork,
+            HeaderValue::from_static("application/octet-stream"),
+        )
+        .await
+    }
+
+    /// Submit an already-serialized full PQ block as JSON without parsing an untrusted error body.
+    ///
+    /// The caller owns exact status classification and must drop or explicitly bound the body.
+    pub async fn post_pq_beacon_blocks_v2_json_bytes_raw(
+        &self,
+        body: bytes::Bytes,
+        fork: ForkName,
+    ) -> Result<Response, Error> {
+        self.post_pq_beacon_blocks_v2_bytes_raw(
+            body,
+            fork,
+            HeaderValue::from_static("application/json"),
+        )
+        .await
+    }
+
+    async fn post_pq_beacon_blocks_v2_bytes_raw(
+        &self,
+        body: bytes::Bytes,
+        fork: ForkName,
+        content_type: HeaderValue,
+    ) -> Result<Response, Error> {
+        let path = self.inner.post_beacon_blocks_v2_path(None)?;
+        let consensus_version = HeaderValue::from_str(&fork.to_string())
+            .map_err(|error| Error::InvalidHeaders(error.to_string()))?;
+        self.inner
+            .client
+            .post(path)
+            .timeout(self.inner.timeouts.proposal)
+            .header(CONSENSUS_VERSION_HEADER, consensus_version)
+            .header("Content-Type", content_type)
+            .body(body)
+            .send()
+            .await
+            .map_err(Error::from)
+    }
+}
+
+#[cfg(feature = "pq-devnet")]
+impl std::ops::Deref for StrictBeaconNodeHttpClient {
+    type Target = BeaconNodeHttpClient;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
 impl Eq for BeaconNodeHttpClient {}
 
 impl fmt::Display for BeaconNodeHttpClient {
@@ -247,6 +335,7 @@ impl BeaconNodeHttpClient {
             timeouts,
         }
     }
+
     // Returns a reference to the `SensitiveUrl` of the server.
     pub fn server(&self) -> &SensitiveUrl {
         &self.server
@@ -555,6 +644,28 @@ impl BeaconNodeHttpClient {
             "Content-Type",
             HeaderValue::from_static("application/octet-stream"),
         );
+        let response = builder.headers(headers).body(body).send().await?;
+        success_or_error(response).await
+    }
+
+    /// Generic POST function for a pre-serialized JSON body with a consensus-version header.
+    async fn post_generic_with_consensus_version_and_json_body<T: Into<Body>, U: IntoUrl>(
+        &self,
+        url: U,
+        body: T,
+        timeout: Option<Duration>,
+        fork: ForkName,
+    ) -> Result<Response, Error> {
+        let builder = self
+            .client
+            .post(url)
+            .timeout(timeout.unwrap_or(self.timeouts.default));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONSENSUS_VERSION_HEADER,
+            HeaderValue::from_str(&fork.to_string()).expect("Failed to create header value"),
+        );
+        headers.insert("Content-Type", HeaderValue::from_static("application/json"));
         let response = builder.headers(headers).body(body).send().await?;
         success_or_error(response).await
     }
@@ -1332,6 +1443,38 @@ impl BeaconNodeHttpClient {
             .await?;
 
         Ok(response)
+    }
+
+    /// `POST v2/beacon/blocks` using an already serialized SSZ body.
+    pub async fn post_beacon_blocks_v2_ssz_bytes(
+        &self,
+        body: bytes::Bytes,
+        fork: ForkName,
+        validation_level: Option<BroadcastValidation>,
+    ) -> Result<Response, Error> {
+        self.post_generic_with_consensus_version_and_ssz_body(
+            self.post_beacon_blocks_v2_path(validation_level)?,
+            body,
+            Some(self.timeouts.proposal),
+            fork,
+        )
+        .await
+    }
+
+    /// `POST v2/beacon/blocks` using an already serialized JSON body.
+    pub async fn post_beacon_blocks_v2_json_bytes(
+        &self,
+        body: bytes::Bytes,
+        fork: ForkName,
+        validation_level: Option<BroadcastValidation>,
+    ) -> Result<Response, Error> {
+        self.post_generic_with_consensus_version_and_json_body(
+            self.post_beacon_blocks_v2_path(validation_level)?,
+            body,
+            Some(self.timeouts.proposal),
+            fork,
+        )
+        .await
     }
 
     /// `POST v2/beacon/blinded_blocks`
@@ -2331,6 +2474,31 @@ impl BeaconNodeHttpClient {
             .await
     }
 
+    /// PQ proposer-only duties request returning the raw response before any body buffering.
+    ///
+    /// The isolated PQ proposer applies its own strict byte and fragment bounds before decoding.
+    #[cfg(feature = "pq-devnet")]
+    pub async fn pq_get_validator_duties_proposer_response(
+        &self,
+        epoch: Epoch,
+        timeout: Duration,
+    ) -> Result<Response, Error> {
+        let mut path = self.eth_path(V1)?;
+        path.path_segments_mut()
+            .map_err(|()| Error::InvalidUrl(self.server.clone()))?
+            .push("validator")
+            .push("duties")
+            .push("proposer")
+            .push(&epoch.to_string());
+        self.client
+            .get(path)
+            .accept(Accept::Json)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(Into::into)
+    }
+
     /// `GET v2/validator/duties/proposer/{epoch}`
     pub async fn get_validator_duties_proposer_v2(
         &self,
@@ -2537,6 +2705,25 @@ impl BeaconNodeHttpClient {
             graffiti_policy,
         )
         .await
+    }
+
+    /// PQ proposer-only V3 request returning the raw response before any body buffering.
+    ///
+    /// `path` must be the exact URL produced by [`Self::get_validator_blocks_v3_path`].
+    #[cfg(feature = "pq-devnet")]
+    pub async fn pq_get_validator_blocks_v3_response(
+        &self,
+        path: Url,
+        accept: Accept,
+        timeout: Duration,
+    ) -> Result<Response, Error> {
+        self.client
+            .get(path)
+            .accept(accept)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(Into::into)
     }
 
     /// `GET v3/validator/blocks/{slot}` in ssz format

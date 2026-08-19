@@ -124,6 +124,9 @@ mod pq_import;
 #[cfg(feature = "pq-devnet")]
 #[path = "pq_runtime/production.rs"]
 mod pq_production;
+#[cfg(feature = "pq-devnet")]
+#[path = "pq_runtime/proposer_duties.rs"]
+mod pq_proposer_duties;
 #[cfg(not(feature = "pq-devnet"))]
 mod pre_finalization_cache;
 #[cfg(not(feature = "pq-devnet"))]
@@ -213,6 +216,10 @@ pub use self::pq_production::{
 pub use self::pq_production::{
     TestingPqPayloadBuildObservation, TestingPqPayloadExpectation,
     testing_only_validate_pq_full_payload, testing_only_validate_pq_production_advance,
+};
+#[cfg(feature = "pq-devnet")]
+pub use self::pq_proposer_duties::{
+    PQ_PROPOSER_DUTY_ADMISSION_CAPACITY, PqProposerDuties, PqProposerDutiesError, PqProposerDuty,
 };
 #[cfg(not(feature = "pq-devnet"))]
 pub use attestation_verification::Error as AttestationError;

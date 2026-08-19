@@ -2176,14 +2176,78 @@ pending review and e-e4.
 
 #### Task 5.3e-e3: Add a proposer-only PQ validator-client service
 
-Compile a dedicated PQ proposer service instead of the ordinary validator-services duty graph.
-For an assigned local validator, create the slot-bound RANDAO reveal through the existing journal
-authority, request full V3 SSZ with JSON fallback, reject blinded/wrong-version/Gloas responses,
-check the proposer index, sign the returned full block with the existing slashing-protected PQ block
-path, and publish full signed contents. Do not compile or start builder registration, remote signing,
-distributed selection, attestation, aggregation, sync-committee, preparation, payload-attestation,
-or proposer-preference services in this slice. Exercise the real `BeaconNodeHttpClient` against the
-e-e2 test server, including byte-identical retry and full propose/sign/publish import.
+Compile a dedicated PQ proposer service instead of the ordinary validator-services duty graph. Do
+not accept a caller-supplied slot, public key, validator index, or assignment capability: those
+values could cause an untrusted caller to consume a journal-backed one-time RANDAO or proposal leaf.
+Extend the isolated PQ HTTP facade with the standard bounded
+`GET /eth/v1/validator/duties/proposer/{epoch}` route. It serves only the current or next epoch,
+derives every `(slot, validator_index, pubkey)` tuple from one exact canonical PQ snapshot on the
+chain-owned blocking executor, reports Electra and `execution_optimistic = false`, binds the
+dependent root to that snapshot, and rechecks the head before returning. A changed head or local
+clock/state failure is a retryable `503`; malformed, past, or too-far-future requests are rejected
+without state work.
+
+The proposer service owns one configured `BeaconNodeHttpClient`, an immutable provisioning-derived
+map of local `(pubkey, validator_index)` pairs, its slot clock, validator store, task executor, and a
+nonwaiting capacity-one admission. Its only scheduling entry point is
+`try_propose_current_slot()`: it reads the current slot itself, fetches fresh standard duties, and
+intersects an exact current-slot duty against the immutable local map. Repeated same-slot calls
+coalesce; no caller can select a signing identity and no admission waiter queue is permitted. The
+admitted operation is detached and retains its permit across all proof, HTTP, signing, and publish
+work, so dropping the caller cannot free capacity or abandon an in-flight journal operation.
+
+The production profile requires a 300-second slot and uses one absolute deadline at 285 seconds
+after slot start, leaving a 15-second safety margin. Duty fetch, journal-backed RANDAO signing, and
+SSZ-first/full-V3 production share a 120-second phase budget; slashing-protected block signing has a
+second 120-second phase budget; exact signed publication retries use the remaining time, capped at
+45 seconds. The journal-backed RANDAO and proposal-signing futures are never wrapped in cancelling
+timeouts: check the phase/global deadline before starting, await them non-cancellably in the detached
+operation, record an overrun, and do not start the next phase after expiry. Production HTTP calls are
+bounded, but JSON fallback is initially allowlisted only after a completed successful response whose
+SSZ or response decoding is incompatible, plus a connection failure proven to precede request
+transmission. Never fall back after a timeout, ambiguous transport failure, semantic metadata/body
+error, or any HTTP status including 400, 406, 409, 415, 429, and 503. Require
+Electra/full/unblinded/zero-consensus metadata and the exact duty proposer index, sign through the
+existing slashing-protected PQ full-block path with its database transaction offloaded to a
+PQ-owned blocking task, then publish the same signed contents through V2 SSZ with an allowlisted JSON
+fallback. Do not compile or start builder registration, remote signing, distributed selection,
+attestation, aggregation, sync-committee, preparation, payload-attestation, or proposer-preference
+services in this slice.
+
+Exercise the real `BeaconNodeHttpClient` against the e-e2 ephemeral server. Cover truthful
+current/next duties and stale-head suppression; a caller's inability to select slot/key/index;
+capacity-one cancellation and same-slot coalescing; deadline expiry at every stateful boundary;
+byte-identical RANDAO and signed-block fallback/retry; invalid, wrong-version, blinded, nonzero
+consensus-value, and wrong-proposer responses; publication retry/disposition mapping; and a complete
+propose/sign/publish import. The current V1 profile continues to use the signature-derived,
+proposal-slot-bound RANDAO leaf. A hash-chain/hash-onion RANDAO remains a future versioned proposal
+that would require a committed seed and new state/wire transition.
+
+Focused implementation evidence (2026-08-19): the warning-denied proposer-service suite passed
+37/37 unit tests plus the downstream typed-error visibility test. The real current-thread
+store/client tracer passed 1/1 in 143.24 seconds and exercised
+SSZ-invalid-to-JSON V3 production, exact RANDAO and proposal signing, direct intended-URL connection
+fallback from V2 SSZ to one retained JSON encoding, byte-identical `202` to `200` JSON retries,
+and the no-reproduce/no-resign boundary. The same tracer paused inside the real blocking publication
+encoder, observed an unrelated async heartbeat, retained cap-one admission, and rejected HTTP work
+after the already-captured 45-second deadline expired. Redirects are disabled for the service-owned
+client constructed from the caller's configured builder, so a redirect cannot turn a transmitted
+request into purported pre-send fallback evidence. Endpoint-specific duties and V3 response paths
+bound declared bytes, streamed bytes, and fragment count before coalescing and contextual decoding
+on the owned blocking executor; JSON body metadata must agree exactly with independent response
+headers. A real authenticated 16-validator composition passed 1/1 in 2288.49 seconds through the
+actual PQ HTTP GET/POST routes, acknowledged broadcaster, sealed verification, Engine `VALID`,
+atomic database/head commit, exact signed restart restoration, and idempotent restart publication
+without a second broadcast or Engine call. Publication now uses closed strict-client raw POSTs,
+classifies only the actual HTTP status, and drops the untrusted response body without generic
+`ErrorMessage` parsing. Preparation timeouts cover only bounded HTTP streaming; coalescing and
+decode are awaited non-cancellably while the detached operation retains cap-one admission, then the
+same slot-clock deadline classifies any overrun. Signing-method shutdown/join failures remain typed
+transient executor failures, while context, signing-ID, and invalid-signing-request failures are
+typed terminal errors nameable from the crate root. The PQ proposer dependency graph excludes
+`beacon_node_fallback`, while the default validator-store graph continues to include ordinary
+doppelganger polling. Warning-denied PQ-production, default-validator-store, and default `eth2`
+checks passed; broad workspace gates remain deferred until independent review.
 
 #### Task 5.3e-e4: Assemble the PQ network, HTTP, and proposer runtime
 

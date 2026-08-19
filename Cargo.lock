@@ -3220,6 +3220,7 @@ version = "0.1.0"
 dependencies = [
  "arbitrary",
  "bls",
+ "bytes",
  "consensus_signature",
  "context_deserialize",
  "educe",
@@ -5835,7 +5836,6 @@ name = "lighthouse_validator_store"
 version = "0.1.0"
 dependencies = [
  "account_utils",
- "beacon_node_fallback",
  "bls",
  "consensus_signature",
  "doppelganger_service",
@@ -7254,13 +7254,18 @@ dependencies = [
  "execution_layer",
  "futures",
  "hex",
+ "initialized_validators",
+ "lighthouse_validator_store",
  "network",
  "pq_http_api",
+ "pq_proposer_service",
  "pq_signing",
+ "reqwest",
  "rustix",
  "serde",
  "serde_json",
  "sha2",
+ "slashing_protection",
  "slot_clock",
  "ssz_types",
  "state_processing",
@@ -7293,6 +7298,28 @@ dependencies = [
  "tokio",
  "types",
  "warp",
+]
+
+[[package]]
+name = "pq_proposer_service"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "consensus_signature",
+ "eth2",
+ "ethereum_ssz",
+ "futures",
+ "lighthouse_validator_store",
+ "pq_signing",
+ "reqwest",
+ "serde_json",
+ "signing_method",
+ "slot_clock",
+ "ssz_types",
+ "task_executor",
+ "tokio",
+ "types",
+ "validator_store",
 ]
 
 [[package]]

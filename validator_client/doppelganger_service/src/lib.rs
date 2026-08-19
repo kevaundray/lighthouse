@@ -29,22 +29,41 @@
 //!
 //! Doppelganger protection is a best-effort, last-line-of-defence mitigation. Do not rely upon it.
 
+#[cfg(feature = "beacon-node-fallback")]
 use beacon_node_fallback::BeaconNodeFallback;
 use consensus_signature::ValidatorPublicKeyBytes as PublicKeyBytes;
+#[cfg(feature = "beacon-node-fallback")]
 use environment::RuntimeContext;
+#[cfg(feature = "beacon-node-fallback")]
 use eth2::types::LivenessResponseData;
 use logging::crit;
 use parking_lot::RwLock;
 use slot_clock::SlotClock;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(feature = "beacon-node-fallback")]
+use std::collections::HashSet;
+#[cfg(feature = "beacon-node-fallback")]
 use std::future::Future;
+#[cfg(feature = "beacon-node-fallback")]
 use std::sync::Arc;
+#[cfg(feature = "beacon-node-fallback")]
 use task_executor::ShutdownReason;
+#[cfg(feature = "beacon-node-fallback")]
 use tokio::time::sleep;
-use tracing::{error, info};
-use types::{Epoch, EthSpec, Slot};
-use validator_store::{DoppelgangerStatus, ValidatorStore};
+#[cfg(feature = "beacon-node-fallback")]
+use tracing::error;
+#[cfg(feature = "beacon-node-fallback")]
+use tracing::info;
+use types::Epoch;
+#[cfg(feature = "beacon-node-fallback")]
+use types::EthSpec;
+#[cfg(feature = "beacon-node-fallback")]
+use types::Slot;
+use validator_store::DoppelgangerStatus;
+#[cfg(feature = "beacon-node-fallback")]
+use validator_store::ValidatorStore;
 
+#[cfg(feature = "beacon-node-fallback")]
 struct LivenessResponses {
     current_epoch_responses: Vec<LivenessResponseData>,
     previous_epoch_responses: Vec<LivenessResponseData>,
@@ -80,6 +99,7 @@ impl DoppelgangerState {
 
     /// Updates the `DoppelgangerState` to consider the given `Epoch`'s doppelganger checks
     /// completed.
+    #[cfg(feature = "beacon-node-fallback")]
     fn complete_detection_in_epoch(&mut self, epoch: Epoch) {
         // The validator has successfully completed doppelganger checks for a new epoch.
         self.remaining_epochs = self.remaining_epochs.saturating_sub(1);
@@ -96,6 +116,7 @@ impl DoppelgangerState {
 /// If the BN fails to respond to either of these requests, simply return an empty response.
 /// This behaviour is to help prevent spurious failures on the BN from needlessly preventing
 /// doppelganger progression.
+#[cfg(feature = "beacon-node-fallback")]
 async fn beacon_node_liveness<T: 'static + SlotClock>(
     beacon_nodes: Arc<BeaconNodeFallback<T>>,
     current_epoch: Epoch,
@@ -209,6 +230,7 @@ pub struct DoppelgangerService {
 impl DoppelgangerService {
     /// Starts a reoccurring future which will try to keep the doppelganger service updated each
     /// slot.
+    #[cfg(feature = "beacon-node-fallback")]
     pub fn start_update_service<E, T, V>(
         service: Arc<Self>,
         context: RuntimeContext<E>,
@@ -355,6 +377,7 @@ impl DoppelgangerService {
     /// This function is relatively complex when it comes to generic parameters. This is to allow
     /// for simple unit testing. Using these generics, we can test the `DoppelgangerService` without
     /// needing a BN API or a `ValidatorStore`.
+    #[cfg(feature = "beacon-node-fallback")]
     async fn detect_doppelgangers<E, I, L, F, S>(
         &self,
         request_slot: Slot,
@@ -397,6 +420,7 @@ impl DoppelgangerService {
     /// further doppelganger checks.
     ///
     /// Any validator with an unknown index will be omitted from these results.
+    #[cfg(feature = "beacon-node-fallback")]
     fn compute_detection_indices_map<F>(&self, get_index: &F) -> HashMap<u64, PublicKeyBytes>
     where
         F: Fn(PublicKeyBytes) -> Option<u64>,
@@ -431,6 +455,7 @@ impl DoppelgangerService {
 
     /// Process the liveness responses from the BN, potentially updating doppelganger states or
     /// shutting down the VC.
+    #[cfg(feature = "beacon-node-fallback")]
     fn process_liveness_responses<E: EthSpec, S>(
         &self,
         request_slot: Slot,

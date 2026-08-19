@@ -743,6 +743,14 @@ impl<E: EthSpec> MockBuilder<E> {
                             }
                         }
                     };
+                    #[cfg(feature = "pq-devnet")]
+                    {
+                        drop(proposer_data);
+                        return Err(
+                            "builder execution preparation is unavailable in the PQ profile".into(),
+                        );
+                    }
+                    #[cfg(not(feature = "pq-devnet"))]
                     self.prepare_execution_layer_internal(
                         head.slot,
                         head.block,
@@ -762,6 +770,7 @@ impl<E: EthSpec> MockBuilder<E> {
         Ok(())
     }
 
+    #[cfg(not(feature = "pq-devnet"))]
     async fn prepare_execution_layer_internal(
         &self,
         current_slot: Slot,

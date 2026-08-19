@@ -1,0 +1,53 @@
+[package]
+name = "pq_proposer_service"
+version = "0.1.0"
+edition = { workspace = true }
+
+[features]
+default = []
+pq-devnet = [
+    "dep:consensus_signature",
+    "dep:bytes",
+    "dep:eth2",
+    "dep:ethereum_ssz",
+    "dep:futures",
+    "dep:lighthouse_validator_store",
+    "dep:pq_signing",
+    "dep:reqwest",
+    "dep:slot_clock",
+    "dep:serde_json",
+    "dep:signing_method",
+    "dep:task_executor",
+    "dep:tokio",
+    "dep:types",
+    "dep:validator_store",
+    "consensus_signature/pq-wire",
+    "eth2/pq-devnet",
+    "lighthouse_validator_store/pq-devnet",
+    "pq_signing/pq-devnet",
+    "signing_method/pq-devnet",
+    "types/pq-devnet",
+    "validator_store/pq-devnet",
+]
+pq-startup-testing = ["pq-devnet"]
+
+[dependencies]
+bytes = { workspace = true, optional = true }
+consensus_signature = { workspace = true, optional = true }
+eth2 = { workspace = true, optional = true }
+ethereum_ssz = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+lighthouse_validator_store = { path = "../lighthouse_validator_store", default-features = false, optional = true }
+pq_signing = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+signing_method = { path = "../signing_method", default-features = false, optional = true }
+slot_clock = { workspace = true, optional = true }
+task_executor = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+types = { workspace = true, optional = true }
+validator_store = { workspace = true, optional = true }
+
+[dev-dependencies]
+ssz_types = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }

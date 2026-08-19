@@ -5,7 +5,8 @@ edition = { workspace = true }
 authors = ["Sigma Prime <contact@sigmaprime.io>"]
 
 [features]
-default = []
+default = ["beacon-node-fallback"]
+beacon-node-fallback = ["dep:beacon_node_fallback"]
 pq-devnet = [
     "consensus_signature/pq-wire",
     "eth2/pq-devnet",
@@ -14,7 +15,7 @@ pq-devnet = [
 ]
 
 [dependencies]
-beacon_node_fallback = { workspace = true }
+beacon_node_fallback = { workspace = true, optional = true }
 bls = { workspace = true }
 consensus_signature = { workspace = true }
 environment = { workspace = true }

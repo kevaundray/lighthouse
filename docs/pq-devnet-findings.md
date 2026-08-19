@@ -1521,3 +1521,54 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   terminal rejection also passed. The real server/network adapter remains deferred to e-e4.
 - Hash-chain/hash-onion RANDAO remains a future versioned proposal. V1 retains the signature-derived,
   slot-bound RANDAO duty and frozen 14-leaf allocation.
+
+### 2026-08-19: Dedicated PQ proposer service implemented (Task 5.3e-e3)
+
+- The feature-empty `pq_proposer_service` crate owns one configured beacon-node client, validator
+  store, slot clock, task executor, immutable authenticated-manifest-derived set of at most 16 local
+  identities, and a nonwaiting cap-one scheduler. The validator store seals each PQ index to the
+  manifest's canonical derivation order, and the ordinary index setter cannot substitute a PQ
+  identity. Callers can only request the current slot; they cannot supply a slot, key, index, duty,
+  or signing strategy. Same-slot callers share a cloneable final receipt, while genesis, rollback,
+  and concurrent later-slot requests fail before stateful work.
+- Fresh standard proposer duties are bounded by the 120-second preparation deadline and must contain
+  exactly one total current-slot assignment. The service requires the exact provisioned key/index,
+  non-optimistic metadata, the doppelganger signing gate, and the exact slot again immediately before
+  each signing boundary. Journal-backed RANDAO and slashing-protected proposal signing are awaited
+  non-cancellably; their completion is classified against deadlines captured before each operation.
+- Full V3 production is SSZ-first with JSON fallback only for completed SSZ incompatibility or a
+  connection failure to the exact intended URL. Before signing, the service exhaustively enforces
+  Electra/full/unblinded/zero-consensus metadata, exact slot/proposer/RANDAO/graffiti, nonzero state
+  root, canonical empty sync/attestation data, zero deposit count, and every unsupported operation,
+  request, blob, and proof family empty. Dedicated raw-response paths bound declared bytes, streamed
+  bytes, and fragment count for duties, V3 SSZ, V3 JSON, and non-success bodies; coalescing and
+  contextual decoding run only on the owned blocking executor. For JSON, body metadata must agree
+  exactly with the independently parsed response headers.
+- Publication captures its 45-second deadline before blocking serialization. One blocking task
+  builds immutable SSZ and JSON `Bytes`; retries clone them in O(1). V2 starts with SSZ, switches at
+  most once to the retained JSON body only after an exact intended-URL connect failure, and then
+  retries that encoding unchanged for `202`, `408`, `429`, `503`, or ambiguous transport. Only 200
+  succeeds; terminal rejections and non-200 success protocol errors are nonretryable. Redirects are
+  disabled on the service-owned client, closing the redirected-connect ambiguity. Closed raw POST
+  methods expose the actual response status without generic `ErrorMessage` parsing; the service
+  classifies that header status and immediately drops the untrusted response body, including
+  oversized or highly fragmented bodies.
+- Preparation timeouts wrap only bounded request/body streaming. The owned blocking coalesce and
+  contextual decode task is awaited non-cancellably with cap-one admission retained even if the
+  caller drops or the deadline passes; only after the decoder joins does the slot clock classify a
+  phase overrun. Public read-only error types preserve signing sources: shutdown/join failures are
+  transient executor-unavailable errors, while signing context, signing-ID, and invalid-request
+  failures are terminal.
+- The PQ-only dependency edges disable ordinary beacon-node fallback polling. The inverse PQ graph
+  contains no `beacon_node_fallback`, while the default validator-store graph still includes it via
+  the default doppelganger feature.
+- Focused evidence passed 37/37 warning-denied proposer unit tests plus the downstream typed-error
+  visibility test. The real current-thread client/store
+  tracer passed 1/1 in 143.24 seconds, including production fallback, exact JSON publication bytes
+  across `202` to `200`, fixed production call counts, blocking-encoder heartbeat, admission
+  retention, deadline expiry before HTTP, SQLite offload, exact retry, and out-of-range failure.
+  A second real authenticated 16-validator composition passed 1/1 in 2288.49 seconds through the
+  actual PQ HTTP API, exact broadcaster acknowledgement, sealed block verification, Engine `VALID`,
+  atomic database/head commit, persisted restart identity, and idempotent restart duplicate without
+  another broadcast or Engine call. Warning-denied PQ production, default validator-store, and
+  default `eth2` checks passed. No broad workspace gate was run before independent review.

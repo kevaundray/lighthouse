@@ -44,6 +44,22 @@ use validator_store::{
 
 pub type Error = ValidatorStoreError<SigningError>;
 
+#[cfg(feature = "pq-devnet")]
+async fn pq_run_block_slashing_check<R, F>(
+    task_executor: &TaskExecutor,
+    check: F,
+) -> Result<R, Error>
+where
+    R: Send + 'static,
+    F: FnOnce() -> R + Send + 'static,
+{
+    task_executor
+        .spawn_blocking_handle(check, "pq_block_slashing_protection")
+        .ok_or(Error::ExecutorError)?
+        .await
+        .map_err(|_| Error::ExecutorError)
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Fallback fee recipient address.
@@ -86,6 +102,58 @@ pub struct LighthouseValidatorStore<T, E> {
     builder_boost_factor: Option<u64>,
     task_executor: TaskExecutor,
     _phantom: PhantomData<E>,
+}
+
+#[cfg(all(test, feature = "pq-devnet"))]
+mod pq_blocking_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn block_slashing_sqlite_work_does_not_block_the_async_worker() {
+        let runtime = task_executor::test_utils::TestRuntime::default();
+        let executor = runtime.task_executor.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let (cancel_watchdog_tx, cancel_watchdog_rx) = std::sync::mpsc::sync_channel(0);
+        let watchdog_release_tx = release_tx.clone();
+        let watchdog_fired = Arc::new(AtomicBool::new(false));
+        let watchdog_fired_for_thread = Arc::clone(&watchdog_fired);
+        let watchdog = std::thread::spawn(move || {
+            if cancel_watchdog_rx
+                .recv_timeout(Duration::from_secs(5))
+                .is_err()
+            {
+                watchdog_fired_for_thread.store(true, Ordering::SeqCst);
+                let _ = watchdog_release_tx.send(());
+            }
+        });
+        let work = tokio::spawn(async move {
+            pq_run_block_slashing_check(&executor, move || {
+                let _ = entered_tx.send(());
+                release_rx.recv().expect("release blocking SQLite work");
+                17usize
+            })
+            .await
+        });
+        entered_rx.await.expect("blocking work entered");
+        let heartbeat = tokio::spawn(async { 23usize });
+        assert_eq!(heartbeat.await.expect("async heartbeat"), 23);
+        assert!(
+            !watchdog_fired.load(Ordering::SeqCst),
+            "SQLite work regressed onto the current-thread async worker",
+        );
+        release_tx.send(()).expect("release blocking work");
+        cancel_watchdog_tx.send(()).expect("cancel watchdog");
+        assert_eq!(
+            work.await
+                .expect("slashing-check task")
+                .expect("blocking executor"),
+            17,
+        );
+        watchdog.join().expect("watchdog");
+    }
 }
 
 impl<T: SlotClock + 'static, E: EthSpec> LighthouseValidatorStore<T, E> {
@@ -146,6 +214,12 @@ impl<T: SlotClock + 'static, E: EthSpec> LighthouseValidatorStore<T, E> {
 
     pub fn initialized_validators(&self) -> Arc<RwLock<InitializedValidators>> {
         self.validators.clone()
+    }
+
+    /// Returns the immutable manifest-derived PQ validator identities.
+    #[cfg(feature = "pq-devnet")]
+    pub fn pq_validator_identity_snapshot(&self) -> Option<Vec<(PublicKeyBytes, u64)>> {
+        self.validators.read().pq_validator_identity_snapshot()
     }
 
     /// Indicates if the `voting_public_key` exists in self and is enabled.
@@ -482,6 +556,20 @@ impl<T: SlotClock + 'static, E: EthSpec> LighthouseValidatorStore<T, E> {
         let slashing_status = if signing_method
             .requires_local_slashing_protection(self.enable_web3signer_slashing_protection)
         {
+            #[cfg(feature = "pq-devnet")]
+            {
+                let slashing_protection = self.slashing_protection.clone();
+                let block_header = block.block_header();
+                pq_run_block_slashing_check(&self.task_executor, move || {
+                    slashing_protection.check_and_insert_block_proposal(
+                        &validator_pubkey,
+                        &block_header,
+                        domain_hash,
+                    )
+                })
+                .await?
+            }
+            #[cfg(not(feature = "pq-devnet"))]
             self.slashing_protection.check_and_insert_block_proposal(
                 &validator_pubkey,
                 &block.block_header(),

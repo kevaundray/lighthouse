@@ -5,7 +5,8 @@ edition = { workspace = true }
 authors = ["Sigma Prime <contact@sigmaprime.io>"]
 
 [features]
-default = []
+default = ["beacon-node-fallback"]
+beacon-node-fallback = ["doppelganger_service/beacon-node-fallback"]
 pq-devnet = [
     "consensus_signature/pq-wire",
     "doppelganger_service/pq-devnet",
@@ -19,10 +20,9 @@ pq-devnet = [
 
 [dependencies]
 account_utils = { workspace = true }
-beacon_node_fallback = { workspace = true }
 bls = { workspace = true }
 consensus_signature = { workspace = true }
-doppelganger_service = { workspace = true }
+doppelganger_service = { path = "../doppelganger_service", default-features = false }
 either = { workspace = true }
 environment = { workspace = true }
 eth2 = { workspace = true }

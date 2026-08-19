@@ -1,5 +1,6 @@
 use beacon_chain::{
     BeaconChain, BeaconChainTypes, PqBlockProductionError, PqBlockProductionLocalError,
+    PqProposerDuties, PqProposerDutiesError,
 };
 use bytes::{Buf, Bytes};
 use consensus_signature::{SerializedIndividualSignature, decode_individual_signature};
@@ -8,7 +9,7 @@ use eth2::{
     CONSENSUS_BLOCK_VALUE_HEADER, CONSENSUS_VERSION_HEADER, CONTENT_TYPE_HEADER,
     EXECUTION_PAYLOAD_BLINDED_HEADER, EXECUTION_PAYLOAD_VALUE_HEADER, ForkVersionedResponse,
     JSON_CONTENT_TYPE_HEADER, SSZ_CONTENT_TYPE_HEADER,
-    types::{Accept, ProduceBlockV3Metadata, PublishBlockRequest},
+    types::{Accept, DutiesResponse, ProduceBlockV3Metadata, ProposerData, PublishBlockRequest},
 };
 use futures::{Stream, StreamExt};
 use network::{
@@ -26,7 +27,7 @@ use std::sync::{
 use std::{convert::Infallible, str::FromStr, sync::Arc, time::Duration};
 use task_executor::TaskExecutor;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use types::{ForkName, Graffiti, SignedBeaconBlock, Slot, Uint256};
+use types::{Epoch, ForkName, Graffiti, SignedBeaconBlock, Slot, Uint256};
 use warp::{Filter, Rejection, Reply, filters::BoxedFilter, hyper::Body, reply::Response};
 
 const PQ_HTTP_QUERY_CAPACITY_BYTES: usize = 4096;
@@ -169,6 +170,7 @@ enum PqPublishOperationResult {
 struct PqResponseBodyOwner {
     bytes: Vec<u8>,
     _permit: OwnedSemaphorePermit,
+    _duties: Option<PqProposerDuties>,
 }
 
 impl PqResponseBodyOwner {
@@ -176,6 +178,19 @@ impl PqResponseBodyOwner {
         Self {
             bytes,
             _permit: permit,
+            _duties: None,
+        }
+    }
+
+    const fn with_duties(
+        bytes: Vec<u8>,
+        permit: OwnedSemaphorePermit,
+        duties: PqProposerDuties,
+    ) -> Self {
+        Self {
+            bytes,
+            _permit: permit,
+            _duties: Some(duties),
         }
     }
 }
@@ -236,7 +251,7 @@ impl<T: BeaconChainTypes> PqHttpApi<T> {
         self
     }
 
-    /// Returns only the two routes supported by the first PQ proposer profile.
+    /// Returns only the three routes supported by the first PQ proposer profile.
     pub fn routes(&self) -> BoxedFilter<(Response,)> {
         let chain = Arc::clone(&self.chain);
         let produce_task_executor = self.task_executor.clone();
@@ -330,8 +345,34 @@ impl<T: BeaconChainTypes> PqHttpApi<T> {
             .and(warp::body::stream())
             .and_then(|admitted, body| publish_block::<T, _, _>(admitted, body));
 
+        let duty_chain = Arc::clone(&self.chain);
+        let duty_task_executor = self.task_executor.clone();
+        let duty_response_admission = Arc::clone(&self.response_admission);
+        let duties = warp::path!("eth" / "v1" / "validator" / "duties" / "proposer" / String)
+            .and(warp::path::end())
+            .and(warp::get())
+            .and_then(parse_epoch)
+            .and(empty_raw_query())
+            .and(warp::any().map(move || Arc::clone(&duty_chain)))
+            .and(warp::any().map(move || duty_task_executor.clone()))
+            .and_then(
+                move |epoch: Epoch,
+                      _query_guard: (),
+                      chain: Arc<BeaconChain<T>>,
+                      task_executor: TaskExecutor| {
+                    proposer_duties(
+                        epoch,
+                        chain,
+                        task_executor,
+                        Arc::clone(&duty_response_admission),
+                    )
+                },
+            );
+
         produce
             .or(publish)
+            .unify()
+            .or(duties)
             .unify()
             .recover(handle_rejection)
             .unify()
@@ -345,6 +386,90 @@ async fn parse_slot(raw: String) -> Result<Slot, Rejection> {
             "slot must be an unsigned 64-bit integer",
         ))
     })
+}
+
+async fn parse_epoch(raw: String) -> Result<Epoch, Rejection> {
+    raw.parse::<u64>().map(Epoch::new).map_err(|_| {
+        warp::reject::custom(PqHttpRejection::BadRequest(
+            "epoch must be an unsigned 64-bit integer",
+        ))
+    })
+}
+
+async fn proposer_duties<T: BeaconChainTypes>(
+    epoch: Epoch,
+    chain: Arc<BeaconChain<T>>,
+    task_executor: TaskExecutor,
+    response_admission: Arc<Semaphore>,
+) -> Result<Response, Rejection> {
+    let response_permit = response_admission
+        .try_acquire_owned()
+        .map_err(|_| warp::reject::custom(PqHttpRejection::Capacity))?;
+    let duties = chain
+        .pq_proposer_duties(epoch)
+        .await
+        .map_err(map_proposer_duties_error)?;
+    let encode = task_executor
+        .spawn_blocking_handle(
+            move || encode_proposer_duties(duties, response_permit),
+            "pq-http-encode-proposer-duties",
+        )
+        .ok_or_else(|| warp::reject::custom(PqHttpRejection::ServiceUnavailable))?;
+    encode
+        .await
+        .map_err(|_| warp::reject::custom(PqHttpRejection::ServiceUnavailable))?
+}
+
+fn map_proposer_duties_error(error: PqProposerDutiesError) -> Rejection {
+    match error {
+        PqProposerDutiesError::Capacity => warp::reject::custom(PqHttpRejection::Capacity),
+        PqProposerDutiesError::EpochOutsideWindow { .. } => warp::reject::custom(
+            PqHttpRejection::BadRequest("proposer duty epoch is outside the current/next window"),
+        ),
+        PqProposerDutiesError::ClockUnavailable
+        | PqProposerDutiesError::HeadOutsideWindow { .. }
+        | PqProposerDutiesError::WrongFork(_)
+        | PqProposerDutiesError::State(_)
+        | PqProposerDutiesError::Transition(_)
+        | PqProposerDutiesError::ValidatorIndexOverflow(_)
+        | PqProposerDutiesError::SlotOverflow
+        | PqProposerDutiesError::BlockingTask
+        | PqProposerDutiesError::StaleHead { .. } => {
+            warp::reject::custom(PqHttpRejection::ServiceUnavailable)
+        }
+    }
+}
+
+fn encode_proposer_duties(
+    duties: PqProposerDuties,
+    response_permit: OwnedSemaphorePermit,
+) -> Result<Response, Rejection> {
+    let response: DutiesResponse<Vec<ProposerData>> = DutiesResponse {
+        dependent_root: duties.dependent_root(),
+        execution_optimistic: Some(false),
+        data: duties
+            .entries()
+            .iter()
+            .map(|entry| ProposerData {
+                pubkey: entry.pubkey(),
+                validator_index: entry.validator_index(),
+                slot: entry.slot(),
+            })
+            .collect(),
+    };
+    let bytes = serde_json::to_vec(&response)
+        .map_err(|_| warp::reject::custom(PqHttpRejection::ServiceUnavailable))?;
+    let body = Bytes::from_owner(PqResponseBodyOwner::with_duties(
+        bytes,
+        response_permit,
+        duties,
+    ));
+    warp::http::Response::builder()
+        .status(warp::http::StatusCode::OK)
+        .header(CONTENT_TYPE_HEADER, JSON_CONTENT_TYPE_HEADER)
+        .header(CONSENSUS_VERSION_HEADER, "electra")
+        .body(Body::from(body))
+        .map_err(|_| warp::reject::custom(PqHttpRejection::ServiceUnavailable))
 }
 
 fn bounded_raw_query() -> impl Filter<Extract = ((),), Error = Rejection> + Clone {

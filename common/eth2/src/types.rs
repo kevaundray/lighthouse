@@ -12,7 +12,7 @@ use bls::SecretKey;
 use bls::{PublicKeyBytes, Signature, SignatureBytes};
 use consensus_signature::{
     IndividualSignature, IndividualSignatureTransportError, SerializedIndividualSignature,
-    decode_individual_signature, is_verification_skip_placeholder,
+    ValidatorPublicKeyBytes, decode_individual_signature, is_verification_skip_placeholder,
 };
 use context_deserialize::ContextDeserialize;
 #[cfg(feature = "network")]
@@ -758,7 +758,7 @@ impl AttesterData {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProposerData {
-    pub pubkey: PublicKeyBytes,
+    pub pubkey: ValidatorPublicKeyBytes,
     #[serde(with = "serde_utils::quoted_u64")]
     pub validator_index: u64,
     pub slot: Slot,

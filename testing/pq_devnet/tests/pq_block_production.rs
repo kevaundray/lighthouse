@@ -1,7 +1,7 @@
 #[cfg(target_feature = "avx2")]
 use beacon_chain::{
     PQ_BLOCK_PRODUCTION_ADMISSION_CAPACITY, PqBlockProductionError, PqBlockProductionLocalError,
-    PqNewPayloadTransport, PqPayloadBuildRequest, TestingPqBlockingHook,
+    PqNewPayloadTransport, PqPayloadBuildRequest, PqProposerDutiesError, TestingPqBlockingHook,
     TestingPqPayloadBuildObservation, TestingPqPayloadExpectation,
     builder::{BeaconChainBuilder, Witness},
     testing_only_validate_pq_full_payload, testing_only_validate_pq_production_advance,
@@ -12,7 +12,11 @@ use consensus_signature::{
     ValidatorPublicKeyBytes, serialize_individual_signature,
 };
 #[cfg(target_feature = "avx2")]
-use eth2::{BeaconNodeHttpClient, SensitiveUrl, Timeouts};
+use eth2::{BeaconNodeHttpClient, SensitiveUrl, StrictBeaconNodeHttpClient, Timeouts};
+#[cfg(target_feature = "avx2")]
+use initialized_validators::InitializedValidators;
+#[cfg(target_feature = "avx2")]
+use lighthouse_validator_store::{Config as ValidatorStoreConfig, LighthouseValidatorStore};
 #[cfg(target_feature = "avx2")]
 use network::PqNetworkBlockProcessor;
 #[cfg(target_feature = "avx2")]
@@ -24,11 +28,21 @@ use network::{
 #[cfg(target_feature = "avx2")]
 use pq_http_api::{PqHttpApi, TestingPqHttpBlockingHook};
 #[cfg(target_feature = "avx2")]
+use pq_proposer_service::{PqProposalCompletion, PqProposerService};
+#[cfg(target_feature = "avx2")]
 use pq_signing::{PqKeyUnlock, PqKeystore, PqSigningAuthority, provision_usage_journal};
+#[cfg(target_feature = "avx2")]
+use slashing_protection::SlashingDatabase;
+#[cfg(target_feature = "avx2")]
+use slot_clock::SlotClock;
 #[cfg(target_feature = "avx2")]
 use ssz::{Decode, Encode};
 #[cfg(target_feature = "avx2")]
 use std::collections::VecDeque;
+#[cfg(target_feature = "avx2")]
+use std::fs;
+#[cfg(all(target_feature = "avx2", unix))]
+use std::os::unix::fs::PermissionsExt;
 #[cfg(target_feature = "avx2")]
 use std::sync::{
     Arc, Mutex,
@@ -575,12 +589,175 @@ fn valid_production_fixture(
 }
 
 #[cfg(target_feature = "avx2")]
+#[tokio::test]
+async fn proposer_duties_are_derived_from_the_exact_current_or_next_snapshot() {
+    let fixture = valid_production_fixture(false, false);
+    let current = fixture
+        .chain
+        .pq_proposer_duties(Epoch::new(0))
+        .await
+        .expect("current-epoch proposer duties");
+    let expected = fixture
+        .proposal_state
+        .get_beacon_proposer_indices(Epoch::new(0), &fixture.spec)
+        .expect("current proposer indices");
+    assert_eq!(
+        current.entries().len(),
+        MinimalEthSpec::slots_per_epoch() as usize
+    );
+    for (offset, (entry, expected_index)) in current.entries().iter().zip(expected).enumerate() {
+        assert_eq!(
+            entry.slot(),
+            Epoch::new(0).start_slot(MinimalEthSpec::slots_per_epoch()) + offset as u64
+        );
+        assert_eq!(entry.validator_index(), expected_index as u64);
+        assert_eq!(
+            entry.pubkey(),
+            fixture
+                .proposal_state
+                .get_validator(expected_index)
+                .expect("proposer validator")
+                .pubkey,
+        );
+    }
+    assert_eq!(current.bound_head_root(), fixture.genesis_root);
+    assert_eq!(current.testing_only_advanced_slots(), 0);
+
+    let next = fixture
+        .chain
+        .pq_proposer_duties(Epoch::new(1))
+        .await
+        .expect("next-epoch proposer duties");
+    let mut advanced = fixture.proposal_state.clone();
+    while advanced.slot() < Epoch::new(1).start_slot(MinimalEthSpec::slots_per_epoch()) {
+        state_processing::per_slot_processing_pq(&mut advanced, &fixture.spec)
+            .expect("bounded independent next-epoch advance");
+    }
+    let expected_next = advanced
+        .get_beacon_proposer_indices(Epoch::new(1), &fixture.spec)
+        .expect("next proposer indices");
+    assert_eq!(
+        next.entries()
+            .iter()
+            .map(|entry| entry.validator_index())
+            .collect::<Vec<_>>(),
+        expected_next
+            .iter()
+            .map(|index| *index as u64)
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        next.dependent_root(),
+        advanced
+            .legacy_proposer_shuffling_decision_root_at_epoch(Epoch::new(1), fixture.genesis_root)
+            .expect("next dependent root"),
+    );
+    assert_eq!(next.bound_head_root(), fixture.genesis_root);
+    assert_eq!(
+        next.testing_only_advanced_slots(),
+        MinimalEthSpec::slots_per_epoch()
+    );
+
+    let capacity = fixture
+        .chain
+        .pq_proposer_duties(Epoch::new(0))
+        .await
+        .expect_err("two retained duty responses must exhaust admission");
+    assert!(matches!(capacity, PqProposerDutiesError::Capacity));
+    drop(current);
+    drop(next);
+
+    let error = fixture
+        .chain
+        .pq_proposer_duties(Epoch::new(2))
+        .await
+        .expect_err("too-far-future duties must fail before derivation");
+    assert!(matches!(
+        error,
+        PqProposerDutiesError::EpochOutsideWindow { .. }
+    ));
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn proposer_duties_reject_clock_rollover_and_head_change_after_derivation_starts() {
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    let hook = TestingPqBlockingHook::blocking();
+    let fixture = valid_production_fixture_with_duties_hook(Arc::clone(&hook));
+
+    let rollover_chain = Arc::clone(&fixture.chain);
+    let rollover =
+        tokio::spawn(async move { rollover_chain.pq_proposer_duties(Epoch::new(0)).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while hook.entered() < 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("duty derivation entered blocking executor");
+    fixture.chain.slot_clock.set_slot(
+        Epoch::new(1)
+            .start_slot(MinimalEthSpec::slots_per_epoch())
+            .as_u64(),
+    );
+    hook.release();
+    assert!(matches!(
+        rollover.await.expect("rollover task"),
+        Err(PqProposerDutiesError::EpochOutsideWindow {
+            current,
+            requested,
+        }) if current == Epoch::new(1) && requested == Epoch::new(0)
+    ));
+
+    fixture.chain.slot_clock.set_slot(1);
+    let produced = fixture
+        .chain
+        .produce_pq_block_v3(Slot::new(1), fixture.randao.clone(), Graffiti::default())
+        .await
+        .expect("canonical candidate before stale duty race");
+    let signed = sign_produced_block(&fixture, produced);
+    hook.block();
+    let stale_chain = Arc::clone(&fixture.chain);
+    let stale = tokio::spawn(async move { stale_chain.pq_proposer_duties(Epoch::new(0)).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while hook.entered() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("second duty derivation entered blocking executor");
+    PqNetworkBlockProcessor::new(Arc::clone(&fixture.chain))
+        .import_rpc_block(Arc::clone(&signed))
+        .await
+        .expect("canonical import while duty derivation is paused");
+    hook.release();
+    assert!(matches!(
+        stale.await.expect("stale-head task"),
+        Err(PqProposerDutiesError::StaleHead { expected, actual })
+            if expected == fixture.genesis_root && actual == signed.canonical_root()
+    ));
+}
+
+#[cfg(target_feature = "avx2")]
 fn valid_production_fixture_with_blocking_hook(
     stall_payload: bool,
     omit_payload_bundle: bool,
     blocking_hook: Option<Arc<TestingPqBlockingHook>>,
 ) -> ValidProductionFixture {
-    valid_production_fixture_with_hooks(stall_payload, omit_payload_bundle, blocking_hook, None)
+    valid_production_fixture_with_hooks(
+        stall_payload,
+        omit_payload_bundle,
+        blocking_hook,
+        None,
+        None,
+    )
+}
+
+#[cfg(target_feature = "avx2")]
+fn valid_production_fixture_with_duties_hook(
+    duties_hook: Arc<TestingPqBlockingHook>,
+) -> ValidProductionFixture {
+    valid_production_fixture_with_hooks(false, false, None, None, Some(duties_hook))
 }
 
 #[cfg(target_feature = "avx2")]
@@ -589,6 +766,7 @@ fn valid_production_fixture_with_hooks(
     omit_payload_bundle: bool,
     blocking_hook: Option<Arc<TestingPqBlockingHook>>,
     persistence_hook: Option<Arc<TestingPqBlockingHook>>,
+    duties_hook: Option<Arc<TestingPqBlockingHook>>,
 ) -> ValidProductionFixture {
     const PASSWORD: &[u8] = b"correct horse battery staple";
 
@@ -665,6 +843,9 @@ fn valid_production_fixture_with_hooks(
     }
     if let Some(persistence_hook) = persistence_hook {
         builder = builder.testing_only_pq_persistence_hook(persistence_hook);
+    }
+    if let Some(duties_hook) = duties_hook {
+        builder = builder.testing_only_pq_proposer_duties_hook(duties_hook);
     }
     let chain = Arc::new(builder.build().expect("PQ chain"));
     chain.slot_clock.set_slot(1);
@@ -1656,6 +1837,7 @@ async fn canceled_persistence_failure_retries_commit_without_rebroadcast() {
         false,
         None,
         Some(Arc::clone(&persistence_hook)),
+        None,
     );
     let produced = fixture
         .chain
@@ -2392,7 +2574,6 @@ async fn pq_http_surface_exposes_only_full_v3_production_and_full_v2_publication
         ("GET", "/eth/v1/validator/blinded_blocks/1"),
         ("POST", "/eth/v2/beacon/blinded_blocks"),
         ("POST", "/eth/v1/beacon/blocks"),
-        ("GET", "/eth/v1/validator/duties/proposer/0"),
     ] {
         let response = warp::test::request()
             .method(method)
@@ -2412,6 +2593,103 @@ async fn pq_http_surface_exposes_only_full_v3_production_and_full_v2_publication
             .await;
         assert_eq!(response.status(), 405, "wrong method {method} {path}");
     }
+
+    let duties = warp::test::request()
+        .method("GET")
+        .path("/eth/v1/validator/duties/proposer/0")
+        .reply(&routes)
+        .await;
+    assert_eq!(duties.status(), 200, "standard PQ proposer duties route");
+    assert_eq!(
+        duties
+            .headers()
+            .get("eth-consensus-version")
+            .expect("duty fork header"),
+        "electra",
+    );
+    let duties: eth2::types::DutiesResponse<Vec<eth2::types::ProposerData>> =
+        serde_json::from_slice(duties.body()).expect("standard proposer duties JSON");
+    assert_eq!(duties.execution_optimistic, Some(false));
+    assert_eq!(
+        duties.data.len(),
+        MinimalEthSpec::slots_per_epoch() as usize
+    );
+    let duties_query = warp::test::request()
+        .method("GET")
+        .path("/eth/v1/validator/duties/proposer/0?unexpected=true")
+        .reply(&routes)
+        .await;
+    assert_eq!(duties_query.status(), 400, "duty query options are absent");
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn proposer_duty_http_bodies_and_clones_retain_exact_chain_admission() {
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    let fixture = valid_production_fixture(false, false);
+    let (broadcast_sender, _broadcast_receiver) = pq_block_broadcast_channel();
+    let routes = PqHttpApi::new(
+        Arc::clone(&fixture.chain),
+        fixture._runtime.task_executor.clone(),
+        broadcast_sender,
+    )
+    .expect("PQ HTTP API")
+    .routes();
+
+    let mut retained = Vec::new();
+    for _ in 0..beacon_chain::PQ_PROPOSER_DUTY_ADMISSION_CAPACITY {
+        let response = warp::test::request()
+            .method("GET")
+            .path("/eth/v1/validator/duties/proposer/0")
+            .reply(&routes)
+            .await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response
+                .headers()
+                .get("eth-consensus-version")
+                .expect("duty fork header"),
+            "electra",
+        );
+        retained.push(response);
+    }
+    assert_eq!(
+        fixture
+            .chain
+            .testing_only_pq_proposer_duty_available_permits(),
+        0,
+        "slow HTTP bodies must retain the chain duty capabilities",
+    );
+    let third = warp::test::request()
+        .method("GET")
+        .path("/eth/v1/validator/duties/proposer/0")
+        .reply(&routes)
+        .await;
+    assert_eq!(third.status(), 429);
+
+    let clone = retained[0].body().clone();
+    retained.remove(0);
+    assert_eq!(
+        fixture
+            .chain
+            .testing_only_pq_proposer_duty_available_permits(),
+        0,
+        "a body clone must retain the exact owned duty capability",
+    );
+    drop(clone);
+    assert_eq!(
+        fixture
+            .chain
+            .testing_only_pq_proposer_duty_available_permits(),
+        1,
+    );
+    drop(retained);
+    assert_eq!(
+        fixture
+            .chain
+            .testing_only_pq_proposer_duty_available_permits(),
+        beacon_chain::PQ_PROPOSER_DUTY_ADMISSION_CAPACITY,
+    );
 }
 
 #[cfg(target_feature = "avx2")]
@@ -2716,6 +2994,243 @@ async fn pq_http_publication_admission_precedes_stream_polling_and_recovers_afte
     assert_eq!(
         body_collections_started.load(Ordering::SeqCst),
         PQ_BLOCK_PUBLICATION_ADMISSION_CAPACITY + 1,
+    );
+    server.abort();
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn pq_proposer_service_composes_with_real_http_import_and_restart() {
+    run_real_pq_proposer_http_composition().await;
+}
+
+#[cfg(target_feature = "avx2")]
+async fn run_real_pq_proposer_http_composition() {
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    let started = std::time::Instant::now();
+    eprintln!("PQ composition: provisioning 16 authenticated validators");
+    let root = tempfile::TempDir::new().expect("composition root");
+    let seed_path = root.path().join("seed");
+    let password_path = root.path().join("password");
+    fs::write(&seed_path, [0x63; 32]).expect("seed");
+    fs::write(&password_path, b"composition password").expect("password");
+    #[cfg(unix)]
+    {
+        fs::set_permissions(&seed_path, fs::Permissions::from_mode(0o600)).expect("seed mode");
+        fs::set_permissions(&password_path, fs::Permissions::from_mode(0o600))
+            .expect("password mode");
+    }
+    let bundle_path = root.path().join("bundle");
+    let provisioned = pq_devnet::provision_devnet(
+        pq_devnet::ProvisionConfig::for_test(bundle_path.clone(), 16, 0..=125, 0x63),
+        &seed_path,
+        &password_path,
+    )
+    .expect("authenticated 16-validator bundle");
+    eprintln!(
+        "PQ composition: provisioning complete after {:?}",
+        started.elapsed()
+    );
+    let spec = Arc::new(
+        ForkName::Electra
+            .make_genesis_spec(MinimalEthSpec::default_spec())
+            .set_slot_duration_ms::<MinimalEthSpec>(300_000),
+    );
+    let mut genesis =
+        BeaconState::<MinimalEthSpec>::from_ssz_bytes(provisioned.genesis_state_bytes(), &spec)
+            .expect("provisioned genesis");
+    genesis
+        .build_all_committee_caches(&spec)
+        .expect("genesis committee caches");
+    let runtime = task_executor::test_utils::TestRuntime::default();
+    let initialized = InitializedValidators::from_pq_bundle(
+        bundle_path,
+        provisioned.genesis_validators_root(),
+        runtime.task_executor.clone(),
+    )
+    .await
+    .expect("sealed manifest identities");
+    eprintln!(
+        "PQ composition: authenticated authority open after {:?}",
+        started.elapsed()
+    );
+    let slashing =
+        SlashingDatabase::create(&root.path().join("slashing.sqlite")).expect("slashing database");
+    for public_key in provisioned.public_keys() {
+        slashing
+            .register_validator(public_key)
+            .expect("register provisioned validator");
+    }
+    let proposer_clock =
+        slot_clock::TestingSlotClock::new(Slot::new(0), Duration::ZERO, Duration::from_secs(300));
+    proposer_clock.set_slot(1);
+    let validator_store = Arc::new(LighthouseValidatorStore::new(
+        initialized,
+        slashing,
+        Hash256::from(provisioned.genesis_validators_root()),
+        Arc::clone(&spec),
+        None,
+        proposer_clock.clone(),
+        &ValidatorStoreConfig::default(),
+        runtime.task_executor.clone(),
+    ));
+
+    let execution = Arc::new(RecordingExecution {
+        new_payload_calls: AtomicUsize::new(0),
+        new_payload_responses: Mutex::new(VecDeque::new()),
+        stall_new_payload: AtomicBool::new(false),
+        new_payload_release: tokio::sync::Semaphore::new(0),
+        payload_calls: AtomicUsize::new(0),
+        stall_payload: AtomicBool::new(false),
+        omit_payload_bundle: AtomicBool::new(false),
+        invalid_payload_block_hash: AtomicBool::new(false),
+        nonzero_blob_gas: AtomicBool::new(false),
+        payload_release: tokio::sync::Semaphore::new(0),
+    });
+    let store = exact_snapshot_store(Arc::clone(&spec));
+    let aggregation_service = Arc::new(AggregationService::new().expect("aggregation service"));
+    let chain = Arc::new(
+        BeaconChainBuilder::<TestWitness>::pq_new(MinimalEthSpec)
+            .store(Arc::clone(&store))
+            .custom_spec(Arc::clone(&spec))
+            .genesis_state(genesis)
+            .expect("persist composition genesis")
+            .pq_aggregation_service(Arc::clone(&aggregation_service))
+            .task_executor(runtime.task_executor.clone())
+            .testing_only_pq_execution_notifier(execution.clone())
+            .build()
+            .expect("composition chain"),
+    );
+    chain.slot_clock.set_slot(1);
+    let (broadcast_sender, mut broadcast_receiver) = pq_block_broadcast_channel();
+    let routes = PqHttpApi::new(
+        Arc::clone(&chain),
+        runtime.task_executor.clone(),
+        broadcast_sender,
+    )
+    .expect("real PQ HTTP API")
+    .routes();
+    let (address, server) = warp::serve(routes).bind_ephemeral(([127, 0, 0, 1], 0));
+    let server = tokio::spawn(server);
+    eprintln!(
+        "PQ composition: real HTTP API listening after {:?}",
+        started.elapsed()
+    );
+    let beacon_node = StrictBeaconNodeHttpClient::from_builder(
+        SensitiveUrl::parse(&format!("http://{address}/")).expect("composition HTTP URL"),
+        Timeouts::set_all(Duration::from_secs(180)),
+        reqwest::Client::builder(),
+    )
+    .expect("strict composition client");
+    let service = Arc::new(
+        PqProposerService::new(
+            proposer_clock,
+            runtime.task_executor.clone(),
+            Arc::clone(&validator_store),
+            beacon_node,
+        )
+        .expect("concrete proposer service"),
+    );
+    let execution_for_broadcast = Arc::clone(&execution);
+    let (broadcasted_tx, broadcasted_rx) = tokio::sync::oneshot::channel();
+    let broadcast_task = tokio::spawn(async move {
+        let command = broadcast_receiver
+            .recv()
+            .await
+            .expect("exact broadcast command");
+        assert_eq!(
+            execution_for_broadcast
+                .new_payload_calls
+                .load(Ordering::SeqCst),
+            0,
+            "broadcast acknowledgement must precede Engine notification",
+        );
+        let block = Arc::clone(command.block());
+        command.acknowledge(Ok(()));
+        broadcasted_tx.send(block).expect("record broadcast block");
+    });
+    let receipt = service
+        .try_propose_current_slot()
+        .expect("start current-slot proposal");
+    eprintln!(
+        "PQ composition: current-slot proposal admitted after {:?}",
+        started.elapsed()
+    );
+    let completion = tokio::time::timeout(Duration::from_secs(180), receipt.completion())
+        .await
+        .expect("proposal completion timeout")
+        .expect("published proposal");
+    broadcast_task.await.expect("broadcast task");
+    let broadcasted = broadcasted_rx.await.expect("broadcast block");
+    eprintln!(
+        "PQ composition: broadcast acknowledged and import committed after {:?}",
+        started.elapsed()
+    );
+    let PqProposalCompletion::Published { slot, block_root } = completion else {
+        panic!("local current-slot duty must publish")
+    };
+    assert_eq!(slot, Slot::new(1));
+    assert_eq!(block_root, broadcasted.canonical_root());
+    assert_eq!(execution.payload_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(execution.new_payload_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        chain.head_snapshot().beacon_block.as_ref(),
+        broadcasted.as_ref()
+    );
+
+    let restarted = Arc::new(
+        BeaconChainBuilder::<TestWitness>::pq_new(MinimalEthSpec)
+            .store(Arc::clone(&store))
+            .custom_spec(Arc::clone(&spec))
+            .resume_from_db()
+            .expect("resume exact proposer publication")
+            .pq_aggregation_service(Arc::clone(&aggregation_service))
+            .task_executor(runtime.task_executor.clone())
+            .testing_only_pq_execution_notifier(execution.clone())
+            .build()
+            .expect("restart composition chain"),
+    );
+    assert_eq!(
+        restarted.head_snapshot().beacon_block.as_ref(),
+        broadcasted.as_ref(),
+        "restart must restore the exact signed persisted identity",
+    );
+    eprintln!(
+        "PQ composition: persisted signed head restored after {:?}",
+        started.elapsed()
+    );
+    let (restart_sender, mut restart_receiver) = pq_block_broadcast_channel();
+    let restart_routes = PqHttpApi::new(restarted, runtime.task_executor.clone(), restart_sender)
+        .expect("restart HTTP API")
+        .routes();
+    let duplicate = eth2::types::PublishBlockRequest::new(
+        Arc::clone(&broadcasted),
+        Some((
+            types::KzgProofs::<MinimalEthSpec>::default(),
+            types::BlobsList::<MinimalEthSpec>::default(),
+        )),
+    );
+    let duplicate_body = duplicate.as_ssz_bytes();
+    let response = warp::test::request()
+        .method("POST")
+        .path("/eth/v2/beacon/blocks")
+        .header("content-length", duplicate_body.len().to_string())
+        .header("content-type", "application/octet-stream")
+        .header("eth-consensus-version", "electra")
+        .body(duplicate_body)
+        .reply(&restart_routes)
+        .await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(execution.new_payload_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), restart_receiver.recv())
+            .await
+            .is_err(),
+        "restart duplicate must not rebroadcast",
+    );
+    eprintln!(
+        "PQ composition: restart duplicate remained idempotent after {:?}",
+        started.elapsed()
     );
     server.abort();
 }
