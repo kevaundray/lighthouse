@@ -16,6 +16,31 @@ pub type VerificationKey = bls::PublicKey;
 /// Evidence produced by one validator for one signing claim.
 pub type IndividualSignature = bls::Signature;
 
+/// Serialized form used to carry an individual signature across HTTP.
+pub type SerializedIndividualSignature = bls::SignatureBytes;
+
+/// Serializes an individual signature without changing the BLS wire representation.
+pub fn serialize_individual_signature(
+    signature: &IndividualSignature,
+) -> SerializedIndividualSignature {
+    signature.clone().into()
+}
+
+/// Decodes the HTTP transport form into an individual signature.
+pub fn decode_individual_signature(
+    signature: &SerializedIndividualSignature,
+) -> Result<IndividualSignature, crate::IndividualSignatureTransportError> {
+    signature
+        .decompress()
+        .map_err(|_| crate::IndividualSignatureTransportError::InvalidEncoding)
+}
+
+/// Returns whether this is the legacy BLS infinity value accepted when RANDAO verification is
+/// explicitly skipped.
+pub fn is_verification_skip_placeholder(signature: &IndividualSignature) -> bool {
+    signature.is_infinity()
+}
+
 /// Evidence authorizing one signing claim for one or more validators.
 ///
 /// In the BLS profile this is an aggregate signature, including the one-signer aggregate used by

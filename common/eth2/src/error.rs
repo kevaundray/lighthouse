@@ -47,6 +47,8 @@ pub enum Error {
     NoServerPubkey,
     /// The client has been configured without an API token, but requires one for this request.
     NoToken,
+    /// The active consensus-signature backend does not support skipping RANDAO verification.
+    UnsupportedRandaoVerificationSkip,
 }
 
 /// An API error serializable to JSON.
@@ -116,7 +118,9 @@ impl Error {
             Error::InvalidServerSentEvent(_) => None,
             Error::InvalidHeaders(_) => None,
             Error::TokenReadError(..) => None,
-            Error::NoServerPubkey | Error::NoToken => None,
+            Error::NoServerPubkey | Error::NoToken | Error::UnsupportedRandaoVerificationSkip => {
+                None
+            }
         }
     }
 }

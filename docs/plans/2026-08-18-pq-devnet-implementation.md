@@ -1803,6 +1803,15 @@ Introduce an active-backend serialized individual-signature transport: BLS remai
 and validator block-service callers. Keep builder/relay registration keys BLS-specific. In PQ mode
 reject `skip_randao_verification`; never substitute an empty PQ signature for BLS infinity.
 
+Use backend-owned serialize/decode/skip-placeholder functions rather than a signature trait or
+runtime backend enum. Centralize the v2/v3/v4/blinded query policy so default BLS URL ordering and
+empty-parameter spelling stay byte-compatible, while PQ rejects verification skipping before URL
+construction or network I/O. The HTTP server must use the same decoded-query policy at one source
+boundary. If the full validator-services or BeaconChain PQ feature graph exposes deferred,
+unrelated BLS-only services, verify this slice through the isolated normal-dependency `pq_devnet`
+RANDAO transport harness and record the blockers; do not gate unrelated production modules merely
+to manufacture a package-level green build.
+
 ### Task 5.3e: Integrate sealed PQ verification into BeaconChain
 
 **Prerequisites:** Tasks 5.3b-d and the top-level PQ feature spine.
@@ -1814,6 +1823,14 @@ domain APIs, and preserve local failures as no-peer-penalty retryable outcomes. 
 sync duty polling/gossip/contribution pools, slasher, light-client, checkpoint sync/backfill,
 external builders/registrations, and unsupported APIs. Only after this slice is green wire both
 attestation pools in Task 5.2b.
+
+Local block production must use a separate sealed local-production RANDAO capability together with
+sealed verified included attestations. It must never manufacture or reuse `VerifiedPqBlock`, which
+authenticates a complete externally supplied signed block, and it must never enter the legacy
+`NoVerification` path. The local capability binds the exact proposal slot, proposer, epoch-bound
+RANDAO claim, V1 proposal-slot RANDAO leaf, signature, key cache, and spec needed by block assembly;
+included attestations retain their own contextual verification tokens. The ordinary BLS
+`ProduceBlockVerification` behavior remains unchanged outside the PQ profile.
 
 ### Task 5.2b: Wire verified candidates into both beacon-node attestation pools
 

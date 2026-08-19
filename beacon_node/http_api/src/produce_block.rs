@@ -26,22 +26,24 @@ use warp::{
 /// to keep the precision.
 const DEFAULT_BOOST_FACTOR: u64 = 100;
 
-pub fn get_randao_verification(
+fn decode_randao_reveal(
     query: &api_types::ValidatorBlocksQuery,
-    randao_reveal_infinity: bool,
-) -> Result<ProduceBlockVerification, warp::Rejection> {
-    let randao_verification = if query.skip_randao_verification == SkipRandaoVerification::Yes {
-        if !randao_reveal_infinity {
-            return Err(warp_utils::reject::custom_bad_request(
-                "randao_reveal must be point-at-infinity if verification is skipped".into(),
-            ));
-        }
+) -> Result<
+    (
+        consensus_signature::IndividualSignature,
+        ProduceBlockVerification,
+    ),
+    warp::Rejection,
+> {
+    let randao_reveal = query.decode_randao_reveal().map_err(|error| {
+        warp_utils::reject::custom_bad_request(format!("invalid randao_reveal: {error}"))
+    })?;
+    let verification = if query.skip_randao_verification == SkipRandaoVerification::Yes {
         ProduceBlockVerification::NoVerification
     } else {
         ProduceBlockVerification::VerifyRandao
     };
-
-    Ok(randao_verification)
+    Ok((randao_reveal, verification))
 }
 
 #[instrument(
@@ -55,14 +57,7 @@ pub async fn produce_block_v4<T: BeaconChainTypes>(
     slot: Slot,
     query: api_types::ValidatorBlocksQuery,
 ) -> Result<Response<Body>, warp::Rejection> {
-    let randao_reveal = query.randao_reveal.decompress().map_err(|e| {
-        warp_utils::reject::custom_bad_request(format!(
-            "randao reveal is not a valid BLS signature: {:?}",
-            e
-        ))
-    })?;
-
-    let randao_verification = get_randao_verification(&query, randao_reveal.is_infinity())?;
+    let (randao_reveal, randao_verification) = decode_randao_reveal(&query)?;
     let builder_boost_factor = if query.builder_boost_factor == Some(DEFAULT_BOOST_FACTOR) {
         None
     } else {
@@ -107,14 +102,7 @@ pub async fn produce_block_v3<T: BeaconChainTypes>(
     slot: Slot,
     query: api_types::ValidatorBlocksQuery,
 ) -> Result<Response<Body>, warp::Rejection> {
-    let randao_reveal = query.randao_reveal.decompress().map_err(|e| {
-        warp_utils::reject::custom_bad_request(format!(
-            "randao reveal is not a valid BLS signature: {:?}",
-            e
-        ))
-    })?;
-
-    let randao_verification = get_randao_verification(&query, randao_reveal.is_infinity())?;
+    let (randao_reveal, randao_verification) = decode_randao_reveal(&query)?;
     let builder_boost_factor = if query.builder_boost_factor == Some(DEFAULT_BOOST_FACTOR) {
         None
     } else {
@@ -238,14 +226,7 @@ pub async fn produce_blinded_block_v2<T: BeaconChainTypes>(
     slot: Slot,
     query: api_types::ValidatorBlocksQuery,
 ) -> Result<Response<Body>, warp::Rejection> {
-    let randao_reveal = query.randao_reveal.decompress().map_err(|e| {
-        warp_utils::reject::custom_bad_request(format!(
-            "randao reveal is not a valid BLS signature: {:?}",
-            e
-        ))
-    })?;
-
-    let randao_verification = get_randao_verification(&query, randao_reveal.is_infinity())?;
+    let (randao_reveal, randao_verification) = decode_randao_reveal(&query)?;
     let graffiti_settings = GraffitiSettings::new(query.graffiti, query.graffiti_policy);
 
     let block_response_type = chain
@@ -274,14 +255,7 @@ pub async fn produce_block_v2<T: BeaconChainTypes>(
     slot: Slot,
     query: api_types::ValidatorBlocksQuery,
 ) -> Result<Response<Body>, warp::Rejection> {
-    let randao_reveal = query.randao_reveal.decompress().map_err(|e| {
-        warp_utils::reject::custom_bad_request(format!(
-            "randao reveal is not a valid BLS signature: {:?}",
-            e
-        ))
-    })?;
-
-    let randao_verification = get_randao_verification(&query, randao_reveal.is_infinity())?;
+    let (randao_reveal, randao_verification) = decode_randao_reveal(&query)?;
     let graffiti_settings = GraffitiSettings::new(query.graffiti, query.graffiti_policy);
 
     let block_response_type = chain

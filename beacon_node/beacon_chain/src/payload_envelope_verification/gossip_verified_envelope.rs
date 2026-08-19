@@ -311,7 +311,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
 mod tests {
     use std::marker::PhantomData;
 
-    use bls::Signature;
+    use consensus_signature::IndividualSignature;
     use ssz_types::VariableList;
     use types::{
         BeaconBlock, BeaconBlockBodyGloas, BeaconBlockGloas, Eth1Data, ExecutionBlockHash,
@@ -350,7 +350,7 @@ mod tests {
             parent_root: Hash256::ZERO,
             state_root: Hash256::ZERO,
             body: BeaconBlockBodyGloas {
-                randao_reveal: Signature::empty(),
+                randao_reveal: IndividualSignature::empty(),
                 eth1_data: Eth1Data {
                     deposit_root: Hash256::ZERO,
                     block_hash: Hash256::ZERO,
@@ -370,7 +370,7 @@ mod tests {
                 _phantom: PhantomData,
             },
         });
-        SignedBeaconBlock::from_block(block, Signature::empty())
+        SignedBeaconBlock::from_block(block, IndividualSignature::empty())
     }
 
     fn make_bid(builder_index: u64, block_hash: ExecutionBlockHash) -> ExecutionPayloadBid<E> {

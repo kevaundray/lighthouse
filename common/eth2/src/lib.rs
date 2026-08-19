@@ -26,7 +26,7 @@ pub use sensitive_url::SensitiveUrl;
 
 use self::mixin::{RequestAccept, ResponseOptional};
 use self::types::*;
-use bls::SignatureBytes;
+use consensus_signature::SerializedIndividualSignature;
 use context_deserialize::ContextDeserialize;
 use educe::Educe;
 #[cfg(feature = "events")]
@@ -65,6 +65,56 @@ pub const CONSENSUS_BLOCK_VALUE_HEADER: &str = "Eth-Consensus-Block-Value";
 pub const CONTENT_TYPE_HEADER: &str = "Content-Type";
 pub const SSZ_CONTENT_TYPE_HEADER: &str = "application/octet-stream";
 pub const JSON_CONTENT_TYPE_HEADER: &str = "application/json";
+
+#[derive(Clone, Copy)]
+enum EmptySkipRandaoQuery {
+    EmptyValue,
+    KeyOnly,
+}
+
+#[cfg(feature = "pq-wire")]
+fn validate_randao_verification_policy(
+    skip_randao_verification: SkipRandaoVerification,
+) -> Result<(), Error> {
+    if skip_randao_verification == SkipRandaoVerification::Yes {
+        Err(Error::UnsupportedRandaoVerificationSkip)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(feature = "pq-wire"))]
+fn validate_randao_verification_policy(
+    _skip_randao_verification: SkipRandaoVerification,
+) -> Result<(), Error> {
+    Ok(())
+}
+
+fn append_randao_query(
+    path: &mut Url,
+    randao_reveal: &SerializedIndividualSignature,
+    graffiti: Option<&Graffiti>,
+    skip_randao_verification: SkipRandaoVerification,
+    empty_skip_query: EmptySkipRandaoQuery,
+) {
+    let mut query = path.query_pairs_mut();
+    query.append_pair("randao_reveal", &randao_reveal.to_string());
+
+    if let Some(graffiti) = graffiti {
+        query.append_pair("graffiti", &graffiti.to_string());
+    }
+
+    if skip_randao_verification == SkipRandaoVerification::Yes {
+        match empty_skip_query {
+            EmptySkipRandaoQuery::EmptyValue => {
+                query.append_pair("skip_randao_verification", "");
+            }
+            EmptySkipRandaoQuery::KeyOnly => {
+                query.append_key_only("skip_randao_verification");
+            }
+        }
+    }
+}
 
 /// Specific optimized timeout constants for HTTP requests involved in different validator duties.
 /// This can help ensure that proper endpoint fallback occurs.
@@ -2303,7 +2353,7 @@ impl BeaconNodeHttpClient {
     pub async fn get_validator_blocks<E: EthSpec>(
         &self,
         slot: Slot,
-        randao_reveal: &SignatureBytes,
+        randao_reveal: &SerializedIndividualSignature,
         graffiti: Option<&Graffiti>,
     ) -> Result<BeaconResponse<FullBlockContents<E>>, Error> {
         self.get_validator_blocks_modular(slot, randao_reveal, graffiti, SkipRandaoVerification::No)
@@ -2314,7 +2364,7 @@ impl BeaconNodeHttpClient {
     pub async fn get_validator_blocks_modular<E: EthSpec>(
         &self,
         slot: Slot,
-        randao_reveal: &SignatureBytes,
+        randao_reveal: &SerializedIndividualSignature,
         graffiti: Option<&Graffiti>,
         skip_randao_verification: SkipRandaoVerification,
     ) -> Result<BeaconResponse<FullBlockContents<E>>, Error> {
@@ -2329,10 +2379,11 @@ impl BeaconNodeHttpClient {
     pub async fn get_validator_blocks_path<E: EthSpec>(
         &self,
         slot: Slot,
-        randao_reveal: &SignatureBytes,
+        randao_reveal: &SerializedIndividualSignature,
         graffiti: Option<&Graffiti>,
         skip_randao_verification: SkipRandaoVerification,
     ) -> Result<Url, Error> {
+        validate_randao_verification_policy(skip_randao_verification)?;
         let mut path = self.eth_path(V2)?;
 
         path.path_segments_mut()
@@ -2341,18 +2392,13 @@ impl BeaconNodeHttpClient {
             .push("blocks")
             .push(&slot.to_string());
 
-        path.query_pairs_mut()
-            .append_pair("randao_reveal", &randao_reveal.to_string());
-
-        if let Some(graffiti) = graffiti {
-            path.query_pairs_mut()
-                .append_pair("graffiti", &graffiti.to_string());
-        }
-
-        if skip_randao_verification == SkipRandaoVerification::Yes {
-            path.query_pairs_mut()
-                .append_pair("skip_randao_verification", "");
-        }
+        append_randao_query(
+            &mut path,
+            randao_reveal,
+            graffiti,
+            skip_randao_verification,
+            EmptySkipRandaoQuery::EmptyValue,
+        );
 
         Ok(path)
     }
@@ -2361,12 +2407,13 @@ impl BeaconNodeHttpClient {
     pub async fn get_validator_blocks_v3_path(
         &self,
         slot: Slot,
-        randao_reveal: &SignatureBytes,
+        randao_reveal: &SerializedIndividualSignature,
         graffiti: Option<&Graffiti>,
         skip_randao_verification: SkipRandaoVerification,
         builder_booster_factor: Option<u64>,
         graffiti_policy: Option<GraffitiPolicy>,
     ) -> Result<Url, Error> {
+        validate_randao_verification_policy(skip_randao_verification)?;
         let mut path = self.eth_path(V3)?;
 
         path.path_segments_mut()
@@ -2375,18 +2422,13 @@ impl BeaconNodeHttpClient {
             .push("blocks")
             .push(&slot.to_string());
 
-        path.query_pairs_mut()
-            .append_pair("randao_reveal", &randao_reveal.to_string());
-
-        if let Some(graffiti) = graffiti {
-            path.query_pairs_mut()
-                .append_pair("graffiti", &graffiti.to_string());
-        }
-
-        if skip_randao_verification == SkipRandaoVerification::Yes {
-            path.query_pairs_mut()
-                .append_pair("skip_randao_verification", "");
-        }
+        append_randao_query(
+            &mut path,
+            randao_reveal,
+            graffiti,
+            skip_randao_verification,
+            EmptySkipRandaoQuery::EmptyValue,
+        );
 
         if let Some(builder_booster_factor) = builder_booster_factor {
             path.query_pairs_mut()
@@ -2408,7 +2450,7 @@ impl BeaconNodeHttpClient {
     pub async fn get_validator_blocks_v3<E: EthSpec>(
         &self,
         slot: Slot,
-        randao_reveal: &SignatureBytes,
+        randao_reveal: &SerializedIndividualSignature,
         graffiti: Option<&Graffiti>,
         builder_booster_factor: Option<u64>,
         graffiti_policy: Option<GraffitiPolicy>,
@@ -2428,7 +2470,7 @@ impl BeaconNodeHttpClient {
     pub async fn get_validator_blocks_v3_modular<E: EthSpec>(
         &self,
         slot: Slot,
-        randao_reveal: &SignatureBytes,
+        randao_reveal: &SerializedIndividualSignature,
         graffiti: Option<&Graffiti>,
         skip_randao_verification: SkipRandaoVerification,
         builder_booster_factor: Option<u64>,
@@ -2481,7 +2523,7 @@ impl BeaconNodeHttpClient {
     pub async fn get_validator_blocks_v3_ssz<E: EthSpec>(
         &self,
         slot: Slot,
-        randao_reveal: &SignatureBytes,
+        randao_reveal: &SerializedIndividualSignature,
         graffiti: Option<&Graffiti>,
         builder_booster_factor: Option<u64>,
         graffiti_policy: Option<GraffitiPolicy>,
@@ -2501,7 +2543,7 @@ impl BeaconNodeHttpClient {
     pub async fn get_validator_blocks_v3_modular_ssz<E: EthSpec>(
         &self,
         slot: Slot,
-        randao_reveal: &SignatureBytes,
+        randao_reveal: &SerializedIndividualSignature,
         graffiti: Option<&Graffiti>,
         skip_randao_verification: SkipRandaoVerification,
         builder_booster_factor: Option<u64>,
@@ -2562,13 +2604,14 @@ impl BeaconNodeHttpClient {
     pub async fn get_validator_blocks_v4_path(
         &self,
         slot: Slot,
-        randao_reveal: &SignatureBytes,
+        randao_reveal: &SerializedIndividualSignature,
         graffiti: Option<&Graffiti>,
         skip_randao_verification: SkipRandaoVerification,
         include_payload: Option<bool>,
         builder_booster_factor: Option<u64>,
         graffiti_policy: Option<GraffitiPolicy>,
     ) -> Result<Url, Error> {
+        validate_randao_verification_policy(skip_randao_verification)?;
         let mut path = self.eth_path(V4)?;
 
         path.path_segments_mut()
@@ -2577,18 +2620,13 @@ impl BeaconNodeHttpClient {
             .push("blocks")
             .push(&slot.to_string());
 
-        path.query_pairs_mut()
-            .append_pair("randao_reveal", &randao_reveal.to_string());
-
-        if let Some(graffiti) = graffiti {
-            path.query_pairs_mut()
-                .append_pair("graffiti", &graffiti.to_string());
-        }
-
-        if skip_randao_verification == SkipRandaoVerification::Yes {
-            path.query_pairs_mut()
-                .append_pair("skip_randao_verification", "");
-        }
+        append_randao_query(
+            &mut path,
+            randao_reveal,
+            graffiti,
+            skip_randao_verification,
+            EmptySkipRandaoQuery::EmptyValue,
+        );
 
         if let Some(include_payload) = include_payload {
             path.query_pairs_mut()
@@ -2615,7 +2653,7 @@ impl BeaconNodeHttpClient {
     pub async fn get_validator_blocks_v4<E: EthSpec>(
         &self,
         slot: Slot,
-        randao_reveal: &SignatureBytes,
+        randao_reveal: &SerializedIndividualSignature,
         graffiti: Option<&Graffiti>,
         include_payload: Option<bool>,
         builder_booster_factor: Option<u64>,
@@ -2644,7 +2682,7 @@ impl BeaconNodeHttpClient {
     pub async fn get_validator_blocks_v4_modular<E: EthSpec>(
         &self,
         slot: Slot,
-        randao_reveal: &SignatureBytes,
+        randao_reveal: &SerializedIndividualSignature,
         graffiti: Option<&Graffiti>,
         skip_randao_verification: SkipRandaoVerification,
         include_payload: Option<bool>,
@@ -2692,7 +2730,7 @@ impl BeaconNodeHttpClient {
     pub async fn get_validator_blocks_v4_ssz<E: EthSpec>(
         &self,
         slot: Slot,
-        randao_reveal: &SignatureBytes,
+        randao_reveal: &SerializedIndividualSignature,
         graffiti: Option<&Graffiti>,
         include_payload: Option<bool>,
         builder_booster_factor: Option<u64>,
@@ -2715,7 +2753,7 @@ impl BeaconNodeHttpClient {
     pub async fn get_validator_blocks_v4_modular_ssz<E: EthSpec>(
         &self,
         slot: Slot,
-        randao_reveal: &SignatureBytes,
+        randao_reveal: &SerializedIndividualSignature,
         graffiti: Option<&Graffiti>,
         skip_randao_verification: SkipRandaoVerification,
         include_payload: Option<bool>,
@@ -2945,7 +2983,7 @@ impl BeaconNodeHttpClient {
     pub async fn get_validator_blocks_ssz<E: EthSpec>(
         &self,
         slot: Slot,
-        randao_reveal: &SignatureBytes,
+        randao_reveal: &SerializedIndividualSignature,
         graffiti: Option<&Graffiti>,
     ) -> Result<Option<Vec<u8>>, Error> {
         self.get_validator_blocks_modular_ssz::<E>(
@@ -2961,7 +2999,7 @@ impl BeaconNodeHttpClient {
     pub async fn get_validator_blocks_modular_ssz<E: EthSpec>(
         &self,
         slot: Slot,
-        randao_reveal: &SignatureBytes,
+        randao_reveal: &SerializedIndividualSignature,
         graffiti: Option<&Graffiti>,
         skip_randao_verification: SkipRandaoVerification,
     ) -> Result<Option<Vec<u8>>, Error> {
@@ -2977,7 +3015,7 @@ impl BeaconNodeHttpClient {
     pub async fn get_validator_blinded_blocks<E: EthSpec>(
         &self,
         slot: Slot,
-        randao_reveal: &SignatureBytes,
+        randao_reveal: &SerializedIndividualSignature,
         graffiti: Option<&Graffiti>,
     ) -> Result<BeaconResponse<BlindedBeaconBlock<E>>, Error> {
         self.get_validator_blinded_blocks_modular(
@@ -2993,10 +3031,11 @@ impl BeaconNodeHttpClient {
     pub async fn get_validator_blinded_blocks_path<E: EthSpec>(
         &self,
         slot: Slot,
-        randao_reveal: &SignatureBytes,
+        randao_reveal: &SerializedIndividualSignature,
         graffiti: Option<&Graffiti>,
         skip_randao_verification: SkipRandaoVerification,
     ) -> Result<Url, Error> {
+        validate_randao_verification_policy(skip_randao_verification)?;
         let mut path = self.eth_path(V1)?;
 
         path.path_segments_mut()
@@ -3005,18 +3044,13 @@ impl BeaconNodeHttpClient {
             .push("blinded_blocks")
             .push(&slot.to_string());
 
-        path.query_pairs_mut()
-            .append_pair("randao_reveal", &randao_reveal.to_string());
-
-        if let Some(graffiti) = graffiti {
-            path.query_pairs_mut()
-                .append_pair("graffiti", &graffiti.to_string());
-        }
-
-        if skip_randao_verification == SkipRandaoVerification::Yes {
-            path.query_pairs_mut()
-                .append_key_only("skip_randao_verification");
-        }
+        append_randao_query(
+            &mut path,
+            randao_reveal,
+            graffiti,
+            skip_randao_verification,
+            EmptySkipRandaoQuery::KeyOnly,
+        );
 
         Ok(path)
     }
@@ -3025,7 +3059,7 @@ impl BeaconNodeHttpClient {
     pub async fn get_validator_blinded_blocks_modular<E: EthSpec>(
         &self,
         slot: Slot,
-        randao_reveal: &SignatureBytes,
+        randao_reveal: &SerializedIndividualSignature,
         graffiti: Option<&Graffiti>,
         skip_randao_verification: SkipRandaoVerification,
     ) -> Result<BeaconResponse<BlindedBeaconBlock<E>>, Error> {
@@ -3045,7 +3079,7 @@ impl BeaconNodeHttpClient {
     pub async fn get_validator_blinded_blocks_ssz<E: EthSpec>(
         &self,
         slot: Slot,
-        randao_reveal: &SignatureBytes,
+        randao_reveal: &SerializedIndividualSignature,
         graffiti: Option<&Graffiti>,
     ) -> Result<Option<Vec<u8>>, Error> {
         self.get_validator_blinded_blocks_modular_ssz::<E>(
@@ -3060,7 +3094,7 @@ impl BeaconNodeHttpClient {
     pub async fn get_validator_blinded_blocks_modular_ssz<E: EthSpec>(
         &self,
         slot: Slot,
-        randao_reveal: &SignatureBytes,
+        randao_reveal: &SerializedIndividualSignature,
         graffiti: Option<&Graffiti>,
         skip_randao_verification: SkipRandaoVerification,
     ) -> Result<Option<Vec<u8>>, Error> {

@@ -18,14 +18,17 @@ pub mod pq;
 #[cfg(not(feature = "pq-wire"))]
 pub use bls::{
     AggregateSignature, AggregateVerificationRequest, BatchVerificationRequest, Hash256,
-    IndividualSignature, RawSignature, RawVerificationRequest, SameMessageEvidence, SigningClaim,
-    ValidatorPublicKeyBytes, VerificationKey, VerificationRequest, VerifyError, verify, verify_all,
+    IndividualSignature, RawSignature, RawVerificationRequest, SameMessageEvidence,
+    SerializedIndividualSignature, SigningClaim, ValidatorPublicKeyBytes, VerificationKey,
+    VerificationRequest, VerifyError, decode_individual_signature,
+    is_verification_skip_placeholder, serialize_individual_signature, verify, verify_all,
     verify_batch,
 };
 #[cfg(feature = "pq-wire")]
 pub use pq_wire::{
     PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN, PQ_PUBLIC_KEY_LEN, PQ_RAW_SIGNATURE_LEN, PqPublicKey,
-    PqRawSignature, PqSameMessageEvidence, PqWireError,
+    PqRawSignature, PqSameMessageEvidence, PqWireError, SerializedIndividualSignature,
+    decode_individual_signature, is_verification_skip_placeholder, serialize_individual_signature,
 };
 #[cfg(feature = "pq-wire")]
 pub type ValidatorPublicKeyBytes = PqPublicKey;
@@ -51,3 +54,21 @@ pub use signing_id::{
     LEAN_PQ_DEVNET_V1_LEAVES_PER_SLOT, LEAN_PQ_DEVNET_V1_MAX_SLOT, OneTimeUseId, SigningDuty,
     SigningIdError, SyncSubcommittee,
 };
+
+/// Failure to decode the HTTP transport form of an individual consensus signature.
+///
+/// This error deliberately does not expose backend-library error details so API behavior remains
+/// stable when the compile-time consensus-signature backend changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndividualSignatureTransportError {
+    /// The serialized value is not a valid individual signature for the active backend.
+    InvalidEncoding,
+}
+
+impl std::fmt::Display for IndividualSignatureTransportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("invalid individual signature encoding")
+    }
+}
+
+impl std::error::Error for IndividualSignatureTransportError {}

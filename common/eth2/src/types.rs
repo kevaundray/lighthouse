@@ -7,9 +7,13 @@ use crate::{
     CONSENSUS_BLOCK_VALUE_HEADER, CONSENSUS_VERSION_HEADER, EXECUTION_PAYLOAD_BLINDED_HEADER,
     EXECUTION_PAYLOAD_INCLUDED_HEADER, EXECUTION_PAYLOAD_VALUE_HEADER, Error as ServerError,
 };
-#[cfg(not(feature = "pq-devnet"))]
+#[cfg(not(any(feature = "pq-wire", feature = "pq-devnet")))]
 use bls::SecretKey;
 use bls::{PublicKeyBytes, Signature, SignatureBytes};
+use consensus_signature::{
+    IndividualSignature, IndividualSignatureTransportError, SerializedIndividualSignature,
+    decode_individual_signature, is_verification_skip_placeholder,
+};
 use context_deserialize::ContextDeserialize;
 #[cfg(feature = "network")]
 use enr::{CombinedKey, Enr};
@@ -777,12 +781,55 @@ pub struct PtcDuty {
 
 #[derive(Clone, Deserialize)]
 pub struct ValidatorBlocksQuery {
-    pub randao_reveal: SignatureBytes,
+    pub randao_reveal: SerializedIndividualSignature,
     pub graffiti: Option<Graffiti>,
     pub skip_randao_verification: SkipRandaoVerification,
     pub include_payload: Option<bool>,
     pub builder_boost_factor: Option<u64>,
     pub graffiti_policy: Option<GraffitiPolicy>,
+}
+
+/// Failure to decode or authorize the RANDAO reveal in a block-production query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RandaoRevealQueryError {
+    /// The active backend rejected the serialized individual signature.
+    InvalidSignature(IndividualSignatureTransportError),
+    /// The active backend has no valid placeholder for skipping RANDAO verification.
+    UnsupportedVerificationSkip,
+}
+
+impl std::fmt::Display for RandaoRevealQueryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSignature(error) => error.fmt(formatter),
+            Self::UnsupportedVerificationSkip => formatter.write_str(
+                "the active consensus-signature backend does not support skipping RANDAO verification",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RandaoRevealQueryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidSignature(error) => Some(error),
+            Self::UnsupportedVerificationSkip => None,
+        }
+    }
+}
+
+impl ValidatorBlocksQuery {
+    /// Decodes the RANDAO reveal and applies the active backend's verification-skip policy.
+    pub fn decode_randao_reveal(&self) -> Result<IndividualSignature, RandaoRevealQueryError> {
+        let signature = decode_individual_signature(&self.randao_reveal)
+            .map_err(RandaoRevealQueryError::InvalidSignature)?;
+        if self.skip_randao_verification == SkipRandaoVerification::Yes
+            && !is_verification_skip_placeholder(&signature)
+        {
+            return Err(RandaoRevealQueryError::UnsupportedVerificationSkip);
+        }
+        Ok(signature)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -1768,7 +1815,7 @@ mod tests {
 
         let block: PublishBlockRequest<E> = Arc::new(SignedBeaconBlock::from_block(
             BeaconBlock::<E>::Capella(BeaconBlockCapella::empty(&spec)),
-            Signature::empty(),
+            IndividualSignature::empty(),
         ))
         .try_into()
         .expect("should convert into signed block contents");
@@ -1786,7 +1833,7 @@ mod tests {
 
         let block = SignedBeaconBlock::from_block(
             BeaconBlock::<E>::Deneb(BeaconBlockDeneb::empty(&spec)),
-            Signature::empty(),
+            IndividualSignature::empty(),
         );
         let blobs = BlobsList::<E>::try_from(vec![Blob::<E>::default()]).unwrap();
         let kzg_proofs = KzgProofs::<E>::try_from(vec![KzgProof::empty()]).unwrap();
@@ -1933,7 +1980,7 @@ impl<E: EthSpec> FullBlockContents<E> {
     }
 
     /// Signs `self`, producing a `SignedBlockContents`.
-    #[cfg(not(feature = "pq-devnet"))]
+    #[cfg(not(any(feature = "pq-wire", feature = "pq-devnet")))]
     pub fn sign(
         self,
         secret_key: &SecretKey,

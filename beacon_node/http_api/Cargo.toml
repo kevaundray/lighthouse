@@ -5,12 +5,22 @@ authors = ["Paul Hauner <paul@paulhauner.com>"]
 edition = { workspace = true }
 autotests = false                               # using a single test binary compiles faster
 
+[features]
+default = []
+pq-wire = [
+    "beacon_chain/pq-wire",
+    "consensus_signature/pq-wire",
+    "eth2/pq-wire",
+    "types/pq-devnet",
+]
+
 [dependencies]
 beacon_chain = { workspace = true }
 beacon_processor = { workspace = true }
 bls = { workspace = true }
 bs58 = "0.4.0"
 bytes = { workspace = true }
+consensus_signature = { workspace = true }
 context_deserialize = { workspace = true }
 directory = { workspace = true }
 either = { workspace = true }

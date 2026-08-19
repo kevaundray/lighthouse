@@ -1117,3 +1117,39 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
 - This task retains the existing in-state execution payload checks only. Engine API `newPayload`
   is deliberately deferred to Task 5.3e. Hash-chain/hash-onion RANDAO remains a future versioned
   proposal; frozen V1 continues to use the signature-derived RANDAO claim and leaf.
+
+### 2026-08-19: Active-backend RANDAO HTTP transport implemented
+
+- `consensus_signature::SerializedIndividualSignature` is selected at compile time: the default is
+  exactly `bls::SignatureBytes`, while `pq-wire` selects the already strict `PqRawSignature`.
+  Backend-owned serialize, decode, and verification-skip-placeholder functions avoid both a
+  universal signature trait and a runtime scheme enum. Decode failures collapse backend-library
+  details into the stable typed `IndividualSignatureTransportError`, and the query-level error
+  preserves that source. BLS infinity remains the only valid verification-skip placeholder; PQ
+  has none, including the canonical zero-payload raw XMSS envelope.
+- All v2/v3/v4 and blinded validator-block client/path arguments use the active serialized type.
+  One query helper preserves the existing BLS parameter order and the historical spelling:
+  v2/v3/v4 encode `skip_randao_verification=`, while the blinded route uses the key-only form. PQ
+  rejects `SkipRandaoVerification::Yes` with a typed client error before constructing a URL or
+  performing I/O. `ValidatorBlocksQuery` strictly deserializes PQ input and centrally decodes the
+  reveal plus skip policy for every HTTP block-production handler. Validator block service now
+  calls the backend serializer explicitly rather than relying on an inferred conversion.
+- BeaconChain block-production RANDAO fields, parameters, and unsigned-block placeholders use the
+  active `IndividualSignature`. Builder/public relay keys, execution-payload bids, and payload
+  envelopes remain explicitly BLS. Gloas RANDAO plumbing is type-correct but the frozen PQ V1
+  profile continues to reject Gloas.
+- Full `validator_services` and `beacon_chain` PQ package builds remain intentionally deferred to
+  the Task 5.3e top-level feature spine. Enabling the wire type today also exposes unrelated
+  BLS-only duties, sync, slasher, deposit, Gloas, and ordinary state-processing paths. The first
+  direct checks surfaced 33 validator-service active-key/proof mismatches and state-processing plus
+  slasher mismatches before BeaconChain itself compiled. This slice therefore uses the isolated
+  normal-dependency `pq_devnet` RANDAO transport feature rather than hiding those modules with
+  ad-hoc gates.
+- The isolated transport tests cover exact PQ URL round trips for v2/v3/v4/blinded paths,
+  malformed/uppercase/wrong-kind inputs, skip rejection for every path, query-level skip rejection
+  for the canonical empty raw signature, stable BLS byte/query compatibility, BLS infinity decode,
+  and backend serialization round trips. A deliberate mutation that allowed PQ skip requests made
+  the all-path test fail at its typed-error assertion; a second mutation changed the historical
+  v2/v3/v4 empty-value parameter to a key-only parameter and failed the exact BLS URL assertion.
+  Hash-chain/hash-onion RANDAO remains only a future versioned profile: V1 retains its epoch-bound
+  signing root, proposal-slot leaf, and frozen 14-leaf allocation.

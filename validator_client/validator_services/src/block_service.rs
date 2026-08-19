@@ -1,5 +1,7 @@
 use beacon_node_fallback::{ApiTopic, BeaconNodeFallback, Error as FallbackError, Errors};
-use bls::PublicKeyBytes;
+use consensus_signature::{
+    ValidatorPublicKeyBytes as PublicKeyBytes, serialize_individual_signature,
+};
 use eth2::BeaconNodeHttpClient;
 use eth2::types::GraffitiPolicy;
 use graffiti_file::{GraffitiFile, determine_graffiti};
@@ -423,7 +425,7 @@ impl<S: ValidatorStore + 'static, T: SlotClock + 'static> BlockService<S, T> {
             .randao_reveal(validator_pubkey, slot)
             .await
         {
-            Ok(signature) => signature.into(),
+            Ok(signature) => serialize_individual_signature(&signature),
             Err(ValidatorStoreError::UnknownPubkey(pubkey)) => {
                 // A pubkey can be missing when a validator was recently removed
                 // via the API.

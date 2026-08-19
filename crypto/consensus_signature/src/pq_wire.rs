@@ -77,6 +77,26 @@ impl PqPublicKey {
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct PqRawSignature(Box<[u8; PQ_RAW_SIGNATURE_LEN]>);
 
+/// Serialized form used to carry an individual signature across HTTP.
+pub type SerializedIndividualSignature = PqRawSignature;
+
+/// Serializes an individual signature without changing the strict PQ envelope.
+pub fn serialize_individual_signature(signature: &PqRawSignature) -> SerializedIndividualSignature {
+    signature.clone()
+}
+
+/// Decodes the already strictly parsed HTTP transport form into an individual signature.
+pub fn decode_individual_signature(
+    signature: &SerializedIndividualSignature,
+) -> Result<PqRawSignature, crate::IndividualSignatureTransportError> {
+    Ok(signature.clone())
+}
+
+/// PQ has no signature value that authorizes skipping RANDAO verification.
+pub const fn is_verification_skip_placeholder(_signature: &PqRawSignature) -> bool {
+    false
+}
+
 impl PqRawSignature {
     /// Parses only the raw individual-signature form of the V1 envelope.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, PqWireError> {

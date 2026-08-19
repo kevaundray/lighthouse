@@ -9,7 +9,8 @@ default = []
 lighthouse = ["proto_array", "eth2_keystore", "eip_3076", "zeroize"]
 events = ["reqwest-eventsource", "futures", "futures-util"]
 network = ["libp2p-identity", "enr", "multiaddr"]
-pq-devnet = ["types/pq-devnet"]
+pq-wire = ["consensus_signature/pq-wire", "types/pq-devnet"]
+pq-devnet = ["pq-wire"]
 
 [dependencies]
 bls = { workspace = true }

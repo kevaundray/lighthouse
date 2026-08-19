@@ -28,6 +28,16 @@ pq-devnet = [
     "dep:types",
     "dep:validator_dir",
     "dep:zeroize",
+    "consensus_signature/pq-devnet",
+]
+pq-randao-transport-testing = [
+    "dep:consensus_signature",
+    "dep:eth2",
+    "dep:serde_json",
+    "dep:types",
+    "consensus_signature/pq-wire",
+    "eth2/pq-wire",
+    "types/pq-devnet",
 ]
 pq-verification-testing = ["pq-devnet", "state_processing/pq-verification-testing"]
 pq-transition-testing = ["pq-verification-testing", "state_processing/pq-transition"]
@@ -35,7 +45,8 @@ pq-transition-testing = ["pq-verification-testing", "state_processing/pq-transit
 [dependencies]
 attestation_aggregation = { workspace = true, optional = true, features = ["pq-attestation"] }
 clap = { workspace = true, features = ["derive"], optional = true }
-consensus_signature = { workspace = true, optional = true, features = ["pq-devnet"] }
+consensus_signature = { workspace = true, optional = true }
+eth2 = { workspace = true, optional = true }
 ethereum_ssz = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
@@ -52,6 +63,7 @@ zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [[test]]
 name = "direct_genesis"
@@ -82,3 +94,8 @@ required-features = ["pq-verification-testing"]
 name = "pq_transition"
 path = "tests/pq_transition.rs"
 required-features = ["pq-transition-testing"]
+
+[[test]]
+name = "pq_randao_transport"
+path = "tests/pq_randao_transport.rs"
+required-features = ["pq-randao-transport-testing"]

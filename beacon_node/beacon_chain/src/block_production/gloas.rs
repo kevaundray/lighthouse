@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use proto_array::PayloadStatus;
 
-use bls::{PublicKeyBytes, Signature};
+use bls::{PublicKeyBytes, Signature as BlsSignature};
+use consensus_signature::IndividualSignature;
 use execution_layer::{
     BlockProposalContentsGloas, BuilderParams, DEFAULT_GAS_LIMIT, PayloadAttributes,
     PayloadParameters,
@@ -57,7 +58,7 @@ pub struct PartialBeaconBlock<E: EthSpec> {
     slot: Slot,
     proposer_index: u64,
     parent_root: Hash256,
-    randao_reveal: Signature,
+    randao_reveal: IndividualSignature,
     eth1_data: Eth1Data,
     graffiti: Graffiti,
     proposer_slashings: Vec<ProposerSlashing>,
@@ -93,7 +94,7 @@ pub struct LocalBuildResult<E: EthSpec> {
 impl<T: BeaconChainTypes> BeaconChain<T> {
     pub async fn produce_block_with_verification_gloas(
         self: &Arc<Self>,
-        randao_reveal: Signature,
+        randao_reveal: IndividualSignature,
         slot: Slot,
         graffiti_settings: GraffitiSettings,
         verification: ProduceBlockVerification,
@@ -147,7 +148,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         parent_payload_status: PayloadStatus,
         parent_envelope: Option<Arc<SignedExecutionPayloadEnvelope<T::EthSpec>>>,
         produce_at_slot: Slot,
-        randao_reveal: Signature,
+        randao_reveal: IndividualSignature,
         graffiti_settings: GraffitiSettings,
         verification: ProduceBlockVerification,
         builder_boost_factor: Option<u64>,
@@ -257,7 +258,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         mut state: BeaconState<T::EthSpec>,
         state_root_opt: Option<Hash256>,
         produce_at_slot: Slot,
-        randao_reveal: Signature,
+        randao_reveal: IndividualSignature,
         graffiti: Graffiti,
         parent_execution_requests: &ExecutionRequests<T::EthSpec>,
     ) -> Result<(PartialBeaconBlock<T::EthSpec>, BeaconState<T::EthSpec>), BlockProductionError>
@@ -605,7 +606,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         let signed_beacon_block = SignedBeaconBlock::from_block(
             beacon_block,
             // The block is not signed here, that is the task of a validator client.
-            Signature::empty(),
+            IndividualSignature::empty(),
         );
 
         let block_size = signed_beacon_block.ssz_bytes_len();
@@ -666,7 +667,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
 
             let signed_envelope = SignedExecutionPayloadEnvelope {
                 message: execution_payload_envelope,
-                signature: Signature::empty(),
+                signature: BlsSignature::empty(),
             };
 
             // Verify the envelope against the state. This performs no state mutation.
@@ -838,7 +839,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         Ok((
             SignedExecutionPayloadBid {
                 message: bid,
-                signature: Signature::infinity().map_err(BlockProductionError::BlsError)?,
+                signature: BlsSignature::infinity().map_err(BlockProductionError::BlsError)?,
             },
             state,
             LocalBuildResult {
@@ -1154,7 +1155,7 @@ mod tests {
                 epoch: Epoch::new(0),
                 validator_index,
             },
-            signature: Signature::empty(),
+            signature: IndividualSignature::empty(),
         }
     }
 
@@ -1288,7 +1289,7 @@ mod tests {
                 builder_index: BUILDER_INDEX_SELF_BUILD,
                 ..Default::default()
             },
-            signature: Signature::empty(),
+            signature: BlsSignature::empty(),
         }
     }
 
@@ -1299,7 +1300,7 @@ mod tests {
                 value: value_gwei,
                 ..Default::default()
             },
-            signature: Signature::empty(),
+            signature: BlsSignature::empty(),
         })
     }
 

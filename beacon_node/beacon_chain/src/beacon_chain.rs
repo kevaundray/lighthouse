@@ -87,7 +87,8 @@ use crate::{
     AvailabilityPendingExecutedBlock, BeaconChainError, BeaconForkChoiceStore, BeaconSnapshot,
     CachedHead, metrics,
 };
-use bls::{PublicKey, PublicKeyBytes, Signature};
+use bls::{PublicKey, PublicKeyBytes};
+use consensus_signature::IndividualSignature;
 use eth2::beacon_response::ForkVersionedResponse;
 use eth2::types::{
     EventKind, PtcDuty, SseBlobSidecar, SseBlock, SseDataColumnSidecar,
@@ -334,7 +335,7 @@ struct PartialBeaconBlock<E: EthSpec> {
     slot: Slot,
     proposer_index: u64,
     parent_root: Hash256,
-    randao_reveal: Signature,
+    randao_reveal: IndividualSignature,
     eth1_data: Eth1Data,
     graffiti: Graffiti,
     proposer_slashings: Vec<ProposerSlashing>,
@@ -4873,7 +4874,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
 
     pub async fn produce_block_with_verification(
         self: &Arc<Self>,
-        randao_reveal: Signature,
+        randao_reveal: IndividualSignature,
         slot: Slot,
         graffiti_settings: GraffitiSettings,
         verification: ProduceBlockVerification,
@@ -5365,7 +5366,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         state: BeaconState<T::EthSpec>,
         state_root_opt: Option<Hash256>,
         produce_at_slot: Slot,
-        randao_reveal: Signature,
+        randao_reveal: IndividualSignature,
         graffiti_settings: GraffitiSettings,
         verification: ProduceBlockVerification,
         builder_boost_factor: Option<u64>,
@@ -5486,7 +5487,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         mut state: BeaconState<T::EthSpec>,
         state_root_opt: Option<Hash256>,
         produce_at_slot: Slot,
-        randao_reveal: Signature,
+        randao_reveal: IndividualSignature,
         graffiti: Graffiti,
         builder_boost_factor: Option<u64>,
         block_production_version: BlockProductionVersion,
@@ -6099,7 +6100,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         let block = SignedBeaconBlock::from_block(
             inner_block,
             // The block is not signed here, that is the task of a validator client.
-            Signature::empty(),
+            IndividualSignature::empty(),
         );
 
         let block_size = block.ssz_bytes_len();

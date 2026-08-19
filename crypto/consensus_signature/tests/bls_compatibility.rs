@@ -2,8 +2,10 @@
 
 use bls::SecretKey;
 use consensus_signature::{
-    AggregateSignature, AggregateVerificationRequest, Hash256, RawVerificationRequest,
-    SigningClaim, VerificationRequest, VerifyError, verify, verify_all,
+    AggregateSignature, AggregateVerificationRequest, Hash256, IndividualSignatureTransportError,
+    RawVerificationRequest, SerializedIndividualSignature, SigningClaim, VerificationRequest,
+    VerifyError, decode_individual_signature, is_verification_skip_placeholder,
+    serialize_individual_signature, verify, verify_all,
 };
 
 fn deterministic_secret_key(value: u64) -> SecretKey {
@@ -88,4 +90,31 @@ fn verification_errors_distinguish_invalid_evidence_from_local_failures() {
     ] {
         assert_ne!(VerifyError::InvalidEvidence, local_failure);
     }
+}
+
+#[test]
+fn bls_individual_signature_transport_is_byte_compatible() {
+    let secret_key = deterministic_secret_key(9);
+    let signature = secret_key.sign(Hash256::repeat_byte(7));
+    let serialized = serialize_individual_signature(&signature);
+    let expected = SerializedIndividualSignature::from(signature.clone());
+
+    assert_eq!(serialized, expected);
+    assert_eq!(
+        decode_individual_signature(&serialized),
+        Ok(signature.clone())
+    );
+    assert!(!is_verification_skip_placeholder(&signature));
+
+    let infinity = bls::Signature::infinity().expect("BLS infinity signature");
+    assert!(is_verification_skip_placeholder(&infinity));
+}
+
+#[test]
+fn bls_individual_signature_transport_has_a_stable_decode_error() {
+    let malformed = SerializedIndividualSignature::empty();
+    assert_eq!(
+        decode_individual_signature(&malformed),
+        Err(IndividualSignatureTransportError::InvalidEncoding)
+    );
 }
