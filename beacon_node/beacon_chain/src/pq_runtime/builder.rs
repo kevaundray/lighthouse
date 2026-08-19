@@ -1,23 +1,61 @@
-use crate::{BeaconChain, BeaconChainTypes, BeaconSnapshot, PqRuntimeError};
+use crate::{BeaconChain, BeaconChainTypes, BeaconSnapshot, BeaconStore, PqRuntimeError};
 use consensus_signature::{AggregationService, IndividualSignature};
 use kzg::Kzg;
 use slot_clock::SlotClock;
 use ssz::{Decode, Encode};
 use ssz_derive::{Decode, Encode};
-use state_processing::{PqValidatorKeyCache, validate_lean_pq_devnet_v1};
+use state_processing::{
+    PqImportedTransitionOutput, PqValidatorKeyCache, validate_lean_pq_devnet_v1,
+};
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::time::Duration;
 use store::metadata::ANCHOR_UNINITIALIZED;
 use store::{DBColumn, HotColdDB, ItemStore, StoreItem, StoreOp};
+use task_executor::TaskExecutor;
 use types::{BeaconState, ChainSpec, EthSpec, Hash256, SignedBeaconBlock, Slot};
 
-const PQ_HEAD_DB_KEY: Hash256 = Hash256::repeat_byte(0x51);
+pub(crate) const PQ_HEAD_DB_KEY: Hash256 = Hash256::repeat_byte(0x51);
 
 #[derive(Clone, Encode, Decode)]
-struct PersistedPqHead {
+pub(crate) struct PersistedPqHead {
     block_root: Hash256,
     state_root: Hash256,
     slot: Slot,
+}
+
+pub(crate) fn persist_pq_imported_transition<T: BeaconChainTypes>(
+    store: &BeaconStore<T>,
+    output: PqImportedTransitionOutput<T::EthSpec>,
+) -> Result<BeaconSnapshot<T::EthSpec>, PqRuntimeError> {
+    let (block, mut state, _context) = output.into_parts();
+    let state_root = state.update_tree_hash_cache().map_err(store::Error::from)?;
+    if state_root != block.message().state_root() {
+        return Err(PqRuntimeError::HeadStateRootMismatch {
+            block: block.message().state_root(),
+            state: state_root,
+        });
+    }
+    let block_root = block.canonical_root();
+    let snapshot = BeaconSnapshot {
+        beacon_block: block,
+        beacon_block_root: block_root,
+        beacon_state: state,
+    };
+    let store_ops = vec![
+        StoreOp::PutState(state_root, &snapshot.beacon_state),
+        StoreOp::PutBlock(block_root, Arc::clone(&snapshot.beacon_block)),
+        StoreOp::KeyValueOp(
+            PersistedPqHead {
+                block_root,
+                state_root,
+                slot: snapshot.beacon_state.slot(),
+            }
+            .as_kv_store_op(PQ_HEAD_DB_KEY),
+        ),
+    ];
+    store.do_atomically_with_block_and_blobs_cache(store_ops)?;
+    Ok(snapshot)
 }
 
 impl StoreItem for PersistedPqHead {
@@ -56,14 +94,20 @@ where
 /// Builder for the real, deliberately narrow Task 5.3e-b PQ ownership core.
 ///
 /// Production callers cannot persist an arbitrary raw state and signed block as the canonical
-/// head. Non-genesis persistence will consume a sealed transition output when import wiring is
-/// added in Task 5.3e-c.
+/// head. Non-genesis persistence consumes only a sealed imported transition output.
 pub struct BeaconChainBuilder<T: BeaconChainTypes> {
-    store: Option<Arc<HotColdDB<T::EthSpec, T::HotStore, T::ColdStore>>>,
+    store: Option<BeaconStore<T>>,
     spec: Arc<ChainSpec>,
     snapshot: Option<BeaconSnapshot<T::EthSpec>>,
     key_cache: Option<Arc<PqValidatorKeyCache>>,
     aggregation_service: Option<Arc<AggregationService>>,
+    execution_notifier: crate::pq_import::PqExecutionNotifier<T::EthSpec>,
+    task_executor: Option<TaskExecutor>,
+    #[cfg(feature = "pq-startup-testing")]
+    pq_blocking_test_hook: Option<Arc<crate::TestingPqBlockingHook>>,
+    #[cfg(feature = "pq-startup-testing")]
+    pq_persistence_test_hook: Option<Arc<crate::TestingPqBlockingHook>>,
+    slot_clock: Option<T::SlotClock>,
     marker: PhantomData<T>,
 }
 
@@ -82,6 +126,13 @@ where
             snapshot: None,
             key_cache: None,
             aggregation_service: None,
+            execution_notifier: crate::pq_import::PqExecutionNotifier::Deferred,
+            task_executor: None,
+            #[cfg(feature = "pq-startup-testing")]
+            pq_blocking_test_hook: None,
+            #[cfg(feature = "pq-startup-testing")]
+            pq_persistence_test_hook: None,
+            slot_clock: None,
             marker: PhantomData,
         }
     }
@@ -121,6 +172,11 @@ where
             });
         }
         let block_root = block.canonical_root();
+        self.slot_clock = Some(TSlotClock::new(
+            self.spec.genesis_slot,
+            Duration::from_secs(state.genesis_time()),
+            self.spec.get_slot_duration(),
+        ));
         let snapshot = BeaconSnapshot {
             beacon_block: Arc::new(block.clone()),
             beacon_block_root: block_root,
@@ -174,7 +230,7 @@ where
     /// Test-only escape hatch for restart/tamper fixtures.
     ///
     /// This accepts an unsealed raw state/block pair and must never be enabled in a production
-    /// feature graph. Task 5.3e-c will persist non-genesis heads from sealed transition output.
+    /// feature graph. Production non-genesis persistence accepts only sealed transition output.
     #[cfg(feature = "pq-startup-testing")]
     pub fn testing_only_persist_unverified_canonical_snapshot(
         self,
@@ -231,6 +287,11 @@ where
         }
         validate_lean_pq_devnet_v1(&state, &self.spec, state.slot())
             .map_err(PqRuntimeError::InvalidState)?;
+        self.slot_clock = Some(TSlotClock::new(
+            self.spec.genesis_slot,
+            Duration::from_secs(state.genesis_time()),
+            self.spec.get_slot_duration(),
+        ));
         let key_cache = Arc::new(
             PqValidatorKeyCache::from_state(&state).map_err(PqRuntimeError::InvalidKeyCache)?,
         );
@@ -248,9 +309,59 @@ where
         self
     }
 
+    /// Installs the process-owned executor used for all synchronous PQ import phases.
+    pub fn task_executor(mut self, task_executor: TaskExecutor) -> Self {
+        self.task_executor = Some(task_executor);
+        self
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_pq_blocking_hook(
+        mut self,
+        hook: Arc<crate::TestingPqBlockingHook>,
+    ) -> Self {
+        self.pq_blocking_test_hook = Some(hook);
+        self
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_pq_persistence_hook(
+        mut self,
+        hook: Arc<crate::TestingPqBlockingHook>,
+    ) -> Self {
+        self.pq_persistence_test_hook = Some(hook);
+        self
+    }
+
+    /// Installs the process-owned execution layer once during runtime construction.
+    pub fn pq_execution_layer(
+        mut self,
+        execution_layer: Arc<execution_layer::ExecutionLayer<E>>,
+    ) -> Self {
+        self.execution_notifier =
+            crate::pq_import::PqExecutionNotifier::Production(execution_layer);
+        self
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_pq_execution_notifier(
+        mut self,
+        notifier: Arc<dyn crate::PqNewPayloadTransport<E>>,
+    ) -> Self {
+        self.execution_notifier = crate::pq_import::PqExecutionNotifier::Testing(notifier);
+        self
+    }
+
     pub fn build(
         self,
     ) -> Result<BeaconChain<Witness<TSlotClock, E, THotStore, TColdStore>>, PqRuntimeError> {
+        #[cfg(not(feature = "pq-startup-testing"))]
+        if self.execution_notifier.is_deferred() {
+            return Err(PqRuntimeError::MissingExecutionNotifier);
+        }
         Ok(BeaconChain::new(
             self.spec,
             self.store.ok_or(PqRuntimeError::MissingHeadState)?,
@@ -259,6 +370,14 @@ where
             self.aggregation_service.ok_or(PqRuntimeError::Aggregation(
                 consensus_signature::AggregationError::Unavailable,
             ))?,
+            self.execution_notifier,
+            self.task_executor
+                .ok_or(PqRuntimeError::MissingTaskExecutor)?,
+            #[cfg(feature = "pq-startup-testing")]
+            self.pq_blocking_test_hook,
+            #[cfg(feature = "pq-startup-testing")]
+            self.pq_persistence_test_hook,
+            self.slot_clock.ok_or(PqRuntimeError::MissingHeadState)?,
         ))
     }
 }

@@ -125,8 +125,9 @@ pub use pq_profile::{
 };
 #[cfg(feature = "pq-transition")]
 pub use pq_transition::{
-    PqLocalTransitionOutput, PqTransitionError, per_block_processing_pq,
-    per_block_processing_pq_local, per_slot_processing_pq,
+    PqImportedTransitionOutput, PqLocalTransitionOutput, PqTransitionError,
+    per_block_processing_pq, per_block_processing_pq_local, per_slot_processing_pq,
+    transition_pq_imported_block,
 };
 #[cfg(feature = "pq-verification")]
 pub use pq_verification::{

@@ -4,9 +4,9 @@ use consensus_signature::{
 use ssz::Decode;
 use state_processing::{
     DirectGenesisValidator, PqConsensusError, PqConsensusInvalid, PqConsensusLocalError,
-    PqTransitionError, PqUnsupportedBlock, PqValidatorKeyCache, VerifiedPqBlock,
-    initialize_beacon_state_from_validators, per_block_processing_pq, per_slot_processing_pq,
-    prepare_pq_block_with_evidence_work_count,
+    PqImportedTransitionOutput, PqTransitionError, PqUnsupportedBlock, PqValidatorKeyCache,
+    VerifiedPqBlock, initialize_beacon_state_from_validators, per_block_processing_pq,
+    per_slot_processing_pq, prepare_pq_block_with_evidence_work_count,
 };
 use std::sync::Arc;
 use types::{
@@ -21,6 +21,7 @@ use types::{
 fn sealed_pq_transition_entry_point_exists() {
     let _ = per_block_processing_pq::<MinimalEthSpec>;
     let _ = std::mem::size_of::<VerifiedPqBlock<MinimalEthSpec>>();
+    let _ = std::mem::size_of::<PqImportedTransitionOutput<MinimalEthSpec>>();
 }
 
 fn electra_spec() -> ChainSpec {

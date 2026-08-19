@@ -875,8 +875,11 @@ where
             .map_err(|error| format!("PQ aggregation service init task failed: {error}"))?
             .map_err(|error| format!("PQ aggregation service init failed: {error}"))?;
 
-        self.beacon_chain_builder =
-            Some(beacon_chain_builder.pq_aggregation_service(Arc::new(service)));
+        self.beacon_chain_builder = Some(
+            beacon_chain_builder
+                .task_executor(executor)
+                .pq_aggregation_service(Arc::new(service)),
+        );
         Ok(self)
     }
 

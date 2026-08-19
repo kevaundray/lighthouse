@@ -1884,6 +1884,49 @@ git add consensus/state_processing testing/pq_devnet docs/pq-devnet-findings.md 
 git commit -m "feat: seal PQ local block production"
 ```
 
+#### Task 5.3e-c: Import external blocks through one sealed PQ boundary
+
+Keep the ordinary BLS router, batch verifier, backfill, and historical-replay modules omitted.
+Restore a PQ-only block processor whose gossip, RPC, lookup, and forward-range ingress all construct
+an explicit source request and enter the same complete verification path. Advance an owned clone of
+the exact canonical parent state, run deterministic execution-payload checks, prepare and verify the
+full block (proposal, RANDAO, and every included attestation) with the process-owned aggregation
+service, and consume `VerifiedPqBlock` in a transition that owns the advanced state and internally
+checks the signed post-state root. No observed or canonical state changes before this output exists.
+Acquire one of two chain-owned import admissions with a non-waiting `try_acquire` before any of
+that work. Keep the admission alive through proof, Engine, and persistence, including any detached
+blocking phase after async cancellation. Run skipped-slot advancement, payload/job preparation,
+post-proof transition/root hashing, range hashing, and atomic database persistence on the required
+process-owned blocking executor. A forward range holds one admission, is capped at eight raw
+blocks, and never verifies more than one block at a time.
+
+For gossip, begin a generation-bound `(slot, proposer) -> block root` lifecycle only after the
+sealed output exists. The unique first capability is pending propagation; concurrent duplicates
+cannot commit. Dropping it permits a new propagation claim, while only a failure after propagation
+permits a commit-only retry. A different root is an equivocation and is not propagated in V1. Call
+the chain-owned Engine notifier after an accepted gossip block has been forwarded. Under the same
+single-writer gate, every gossip/RPC/lookup/range commit rechecks exact root/generation authority;
+external roots reserve bounded observation capacity before Engine, without evicting terminal
+evidence. Only `VALID` can commit. `INVALID` and `INVALID_BLOCK_HASH` are exact-root terminal without
+peer downscore, while `SYNCING`, `ACCEPTED`, transport, and database failures are retryable local
+outcomes. Successful commits install the current root as committed and prune older slots while
+retaining the current-slot equivocation boundary. Atomically persist the sealed block, exact state
+snapshot, and head metadata before swapping the in-memory canonical head. Forward ranges preflight
+their entire parent/slot chain, then verify, execute, and commit blocks strictly sequentially and
+return the exact imported prefix on failure.
+
+After Engine returns `VALID`, transfer the import gate, admission, exact observation authority, and
+sealed output into one owned blocking completion. That completion must finish the atomic database
+write, in-memory head publication, and committed-observation pruning even if its awaiting network
+caller is canceled. A database failure performs no head swap and restores retryable observation
+state before releasing either permit.
+
+The selected top-level binary remains at its explicit deferred-runtime boundary until the remaining
+network-service, local-production/API, and validator-duty slices are assembled. This task provides
+the real consuming BeaconChain and PQ network-processor call chains without exposing raw transition,
+raw persistence, `NoVerification`, per-call Engine substitution, BLS batch verification, checkpoint
+sync, backfill, or historical reconstruction.
+
 ### Task 5.2b: Wire verified candidates into both beacon-node attestation pools
 
 **Prerequisites:** Tasks 5.2a and 5.3e, including the compiling top-level PQ feature spine for the

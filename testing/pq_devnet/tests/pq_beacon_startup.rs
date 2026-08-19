@@ -225,6 +225,7 @@ fn signed_head(
 #[test]
 #[cfg(target_feature = "avx2")]
 fn startup_owns_one_cache_and_service_and_restart_ignores_bls_records() {
+    let test_runtime = task_executor::test_utils::TestRuntime::default();
     let spec = Arc::new(electra_spec());
     let store = exact_snapshot_store(spec.clone());
     let mut state = valid_state(&spec);
@@ -257,8 +258,19 @@ fn startup_owns_one_cache_and_service_and_restart_ignores_bls_records() {
         Err(error) => assert_eq!(error, AggregationError::AlreadyActive),
         Ok(_) => panic!("second singleton must fail explicitly"),
     }
+    assert!(matches!(
+        BeaconChainBuilder::<TestWitness>::pq_new(MinimalEthSpec)
+            .store(store.clone())
+            .custom_spec(spec.clone())
+            .resume_from_db()
+            .expect("load persisted head for missing-executor check")
+            .pq_aggregation_service(service.clone())
+            .build(),
+        Err(PqRuntimeError::MissingTaskExecutor)
+    ));
     let chain = builder
         .pq_aggregation_service(service.clone())
+        .task_executor(test_runtime.task_executor.clone())
         .build()
         .expect("valid PQ ownership core");
     assert!(Arc::ptr_eq(&chain.pq_aggregation_service, &service));
@@ -284,6 +296,7 @@ fn startup_owns_one_cache_and_service_and_restart_ignores_bls_records() {
         .resume_from_db()
         .expect("exact non-epoch snapshot restart")
         .pq_aggregation_service(service.clone())
+        .task_executor(test_runtime.task_executor.clone())
         .build()
         .expect("restart reuses the sole service");
     assert_eq!(*restarted.pq_validator_key_cache, *cache_before);

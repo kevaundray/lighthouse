@@ -37,8 +37,15 @@ pq-beacon-startup-testing = [
     "dep:environment",
     "dep:slot_clock",
     "dep:store",
+    "dep:task_executor",
     "beacon_chain/pq-startup-testing",
     "store/pq-devnet",
+]
+pq-beacon-import-testing = [
+    "pq-beacon-startup-testing",
+    "pq-transition-testing",
+    "dep:execution_layer",
+    "dep:network",
 ]
 pq-randao-transport-testing = [
     "dep:consensus_signature",
@@ -61,8 +68,10 @@ consensus_signature = { workspace = true, optional = true }
 environment = { workspace = true, optional = true }
 eth2 = { workspace = true, optional = true }
 ethereum_ssz = { workspace = true, optional = true }
+execution_layer = { workspace = true, optional = true, features = ["pq-devnet"] }
 futures = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
+network = { path = "../../beacon_node/network", optional = true, default-features = false, features = ["pq-devnet"] }
 pq_signing = { workspace = true, optional = true, features = ["pq-devnet"] }
 rustix = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
@@ -72,6 +81,7 @@ slot_clock = { workspace = true, optional = true }
 ssz_types = { workspace = true, optional = true }
 state_processing = { workspace = true, optional = true, features = ["pq-genesis", "pq-verification"] }
 store = { workspace = true, optional = true }
+task_executor = { workspace = true, optional = true }
 types = { workspace = true, optional = true, features = ["pq-devnet"] }
 validator_dir = { workspace = true, optional = true, features = ["pq-devnet"] }
 zeroize = { workspace = true, optional = true }
@@ -124,6 +134,11 @@ required-features = ["pq-randao-transport-testing"]
 name = "pq_beacon_startup"
 path = "tests/pq_beacon_startup.rs"
 required-features = ["pq-beacon-startup-testing"]
+
+[[test]]
+name = "pq_beacon_import"
+path = "tests/pq_beacon_import.rs"
+required-features = ["pq-beacon-import-testing"]
 
 [[test]]
 name = "pq_api_privacy"

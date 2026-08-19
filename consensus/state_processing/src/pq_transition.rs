@@ -7,6 +7,7 @@ use crate::{
     pq_verification::preflight_pq_transition_block,
 };
 use consensus_signature::IndividualSignature;
+use std::sync::Arc;
 use types::{BeaconBlock, BeaconState, ChainSpec, EthSpec, Hash256, SignedBeaconBlock};
 
 #[derive(Debug, PartialEq)]
@@ -15,6 +16,39 @@ pub enum PqTransitionError {
     Invalidated(PqConsensusError),
     BlockProcessing(BlockProcessingError),
     SlotProcessing(SlotProcessingError),
+    PostStateRootMismatch { expected: Hash256, actual: Hash256 },
+}
+
+/// Unique output of consuming an imported-block verification capability and its exact parent
+/// state. Persistence APIs accept this type instead of a raw block/state pair.
+pub struct PqImportedTransitionOutput<E: EthSpec> {
+    block: Arc<SignedBeaconBlock<E>>,
+    post_state: BeaconState<E>,
+    context: ConsensusContext<E>,
+}
+
+impl<E: EthSpec> PqImportedTransitionOutput<E> {
+    pub const fn block(&self) -> &Arc<SignedBeaconBlock<E>> {
+        &self.block
+    }
+
+    pub const fn post_state(&self) -> &BeaconState<E> {
+        &self.post_state
+    }
+
+    pub const fn context(&self) -> &ConsensusContext<E> {
+        &self.context
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        Arc<SignedBeaconBlock<E>>,
+        BeaconState<E>,
+        ConsensusContext<E>,
+    ) {
+        (self.block, self.post_state, self.context)
+    }
 }
 
 pub struct PqLocalTransitionOutput<E: EthSpec> {
@@ -76,6 +110,28 @@ pub fn per_block_processing_pq<E: EthSpec>(
     process_verified_pq_block(state, &block, &mut context, &spec)
         .map_err(PqTransitionError::BlockProcessing)?;
     Ok(context)
+}
+
+/// Consumes both the exact advanced parent state and a full-block verification capability.
+/// The signed post-state root is checked before the sealed result can reach persistence.
+pub fn transition_pq_imported_block<E: EthSpec>(
+    mut state: BeaconState<E>,
+    verified_block: VerifiedPqBlock<E>,
+) -> Result<PqImportedTransitionOutput<E>, PqTransitionError> {
+    let block = Arc::clone(verified_block.block());
+    let context = per_block_processing_pq(&mut state, verified_block)?;
+    let actual = state.canonical_root().map_err(|error| {
+        PqTransitionError::BlockProcessing(BlockProcessingError::BeaconStateError(error))
+    })?;
+    let expected = block.message().state_root();
+    if actual != expected {
+        return Err(PqTransitionError::PostStateRootMismatch { expected, actual });
+    }
+    Ok(PqImportedTransitionOutput {
+        block,
+        post_state: state,
+        context,
+    })
 }
 
 pub fn per_block_processing_pq_local<E: EthSpec>(

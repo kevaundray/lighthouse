@@ -1,0 +1,1576 @@
+use crate::{BeaconChain, BeaconChainTypes, PqRuntimeError};
+use execution_layer::{ExecutionLayer, NewPayloadRequest, PayloadStatus};
+use slot_clock::SlotClock;
+use state_processing::{
+    BlockProcessingError, PqConsensusError, PqConsensusLocalError, PqTransitionError,
+    per_slot_processing_pq, prepare_pq_block, transition_pq_imported_block,
+};
+use std::collections::HashMap;
+use std::error::Error;
+#[cfg(feature = "pq-startup-testing")]
+use std::future::Future;
+#[cfg(feature = "pq-startup-testing")]
+use std::pin::Pin;
+use std::sync::Arc;
+#[cfg(feature = "pq-startup-testing")]
+use std::sync::{
+    Condvar, Mutex as StdMutex,
+    atomic::{AtomicUsize, Ordering},
+};
+use types::{EthSpec, Hash256, SignedBeaconBlock, Slot};
+
+/// At most two imported blocks may retain advanced state, proof evidence, or a commit waiter.
+/// A forward range consumes one permit and processes its blocks sequentially under that permit.
+pub const PQ_BLOCK_IMPORT_ADMISSION_CAPACITY: usize = 2;
+
+/// A single admitted forward-range request retains at most this many raw PQ blocks. They are
+/// verified and committed strictly one at a time, so the global verified-state bound remains the
+/// admission capacity above.
+pub const PQ_FORWARD_RANGE_BLOCK_CAPACITY: usize = 8;
+
+/// Test barrier proving that synchronous preparation executes away from the async worker.
+#[cfg(feature = "pq-startup-testing")]
+pub struct TestingPqBlockingHook {
+    entered: AtomicUsize,
+    released: StdMutex<bool>,
+    release: Condvar,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+impl TestingPqBlockingHook {
+    pub fn blocking() -> Arc<Self> {
+        Arc::new(Self {
+            entered: AtomicUsize::new(0),
+            released: StdMutex::new(false),
+            release: Condvar::new(),
+        })
+    }
+
+    pub fn counting() -> Arc<Self> {
+        Arc::new(Self {
+            entered: AtomicUsize::new(0),
+            released: StdMutex::new(true),
+            release: Condvar::new(),
+        })
+    }
+
+    pub fn entered(&self) -> usize {
+        self.entered.load(Ordering::SeqCst)
+    }
+
+    pub fn release(&self) {
+        *self.released.lock().expect("PQ blocking test hook lock") = true;
+        self.release.notify_all();
+    }
+
+    fn run(&self) {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        let mut released = self.released.lock().expect("PQ blocking test hook lock");
+        while !*released {
+            released = self
+                .release
+                .wait(released)
+                .expect("PQ blocking test hook wait");
+        }
+    }
+}
+
+/// The external route which supplied a block to the single sealed PQ import boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PqBlockImportSource {
+    Gossip,
+    Rpc,
+    Lookup,
+    ForwardRange,
+}
+
+impl PqBlockImportSource {
+    pub const ALL: [Self; 4] = [Self::Gossip, Self::Rpc, Self::Lookup, Self::ForwardRange];
+}
+
+/// Raw wire ownership at an explicit ingress boundary. Only this type can enter verification;
+/// transition and persistence never accept a raw `SignedBeaconBlock`.
+pub struct PqBlockImportRequest<E: EthSpec> {
+    source: PqBlockImportSource,
+    block: Arc<SignedBeaconBlock<E>>,
+}
+
+impl<E: EthSpec> PqBlockImportRequest<E> {
+    pub fn gossip(block: Arc<SignedBeaconBlock<E>>) -> Self {
+        Self::new(PqBlockImportSource::Gossip, block)
+    }
+
+    pub fn rpc(block: Arc<SignedBeaconBlock<E>>) -> Self {
+        Self::new(PqBlockImportSource::Rpc, block)
+    }
+
+    pub fn lookup(block: Arc<SignedBeaconBlock<E>>) -> Self {
+        Self::new(PqBlockImportSource::Lookup, block)
+    }
+
+    pub fn forward_range(block: Arc<SignedBeaconBlock<E>>) -> Self {
+        Self::new(PqBlockImportSource::ForwardRange, block)
+    }
+
+    fn new(source: PqBlockImportSource, block: Arc<SignedBeaconBlock<E>>) -> Self {
+        Self { source, block }
+    }
+}
+
+/// Small asynchronous seam implemented by the real execution layer and deterministic tests.
+#[cfg(feature = "pq-startup-testing")]
+pub trait PqNewPayloadTransport<E: EthSpec>: Send + Sync {
+    fn notify_new_payload<'a>(
+        &'a self,
+        request: NewPayloadRequest<'a, E>,
+    ) -> Pin<Box<dyn Future<Output = Result<PayloadStatus, execution_layer::Error>> + Send + 'a>>;
+}
+
+pub(crate) enum PqExecutionNotifier<E: EthSpec> {
+    Deferred,
+    Production(Arc<ExecutionLayer<E>>),
+    #[cfg(feature = "pq-startup-testing")]
+    Testing(Arc<dyn PqNewPayloadTransport<E>>),
+}
+
+impl<E: EthSpec> PqExecutionNotifier<E> {
+    #[cfg(not(feature = "pq-startup-testing"))]
+    pub(crate) const fn is_deferred(&self) -> bool {
+        matches!(self, Self::Deferred)
+    }
+
+    async fn notify_new_payload(
+        &self,
+        request: NewPayloadRequest<'_, E>,
+    ) -> Result<PayloadStatus, execution_layer::Error> {
+        match self {
+            Self::Deferred => Err(execution_layer::Error::NoEngine),
+            Self::Production(execution_layer) => execution_layer.notify_new_payload(request).await,
+            #[cfg(feature = "pq-startup-testing")]
+            Self::Testing(notifier) => notifier.notify_new_payload(request).await,
+        }
+    }
+}
+
+/// Typed Engine response class. V1 persists only `Valid`; `Syncing` is retry-only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PqEnginePayloadStatus {
+    Valid,
+    Syncing,
+}
+
+impl PqEnginePayloadStatus {
+    pub const fn would_require_optimistic_import(self) -> bool {
+        matches!(self, Self::Syncing)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PqEnginePayloadDisposition {
+    CommitValid,
+    Retry(PqEnginePayloadStatus),
+    Reject,
+}
+
+pub fn classify_pq_engine_payload_status(status: &PayloadStatus) -> PqEnginePayloadDisposition {
+    match status {
+        PayloadStatus::Valid => PqEnginePayloadDisposition::CommitValid,
+        PayloadStatus::Syncing | PayloadStatus::Accepted => {
+            PqEnginePayloadDisposition::Retry(PqEnginePayloadStatus::Syncing)
+        }
+        PayloadStatus::Invalid { .. } | PayloadStatus::InvalidBlockHash { .. } => {
+            PqEnginePayloadDisposition::Reject
+        }
+    }
+}
+
+/// Errors attributable to hostile or malformed remote block data.
+#[derive(Debug)]
+pub enum PqImportPeerInvalid {
+    NonLinearRange { expected: Hash256, actual: Hash256 },
+    Equivocation { previous: Hash256, actual: Hash256 },
+    NonAdvancingSlot { parent: Slot, block: Slot },
+    FutureSlot { current: Slot, block: Slot },
+    Consensus(PqConsensusError),
+    Transition(PqTransitionError),
+    ExecutionPayload(execution_layer::Error),
+}
+
+/// Retryable local failures which must never penalize the supplying peer.
+#[derive(Debug)]
+pub enum PqImportLocalError {
+    Invariant(&'static str),
+    ClockUnavailable,
+    ParentUnavailable { parent_root: Hash256 },
+    ObservationCapacity,
+    IngressCapacity,
+    ForwardRangeCapacity { supplied: usize, maximum: usize },
+    BlockingTask(&'static str),
+    Consensus(PqConsensusError),
+    Transition(PqTransitionError),
+    ExecutionUnavailable(PqEnginePayloadStatus),
+    Transport(execution_layer::Error),
+    Persistence(PqRuntimeError),
+}
+
+/// Stable peer-scoring boundary for all PQ block ingress routes.
+#[derive(Debug)]
+pub enum PqImportError {
+    PeerInvalid(PqImportPeerInvalid),
+    /// The remote execution engine rejected the payload. An honest peer can have relayed it, so
+    /// this is terminal but does not incur a peer penalty.
+    ExecutionRejected(PayloadStatus),
+    /// A prior Engine rejection or canonical commit invalidated this observation generation.
+    TerminalObservation {
+        block_root: Hash256,
+    },
+    /// Verification completed against a parent that ceased to be canonical before commit.
+    StaleHeadAfterVerification {
+        expected_parent: Hash256,
+        actual_head: Hash256,
+    },
+    Local(PqImportLocalError),
+}
+
+impl PqImportError {
+    pub const fn should_penalize_peer(&self) -> bool {
+        matches!(self, Self::PeerInvalid(_))
+    }
+
+    pub const fn is_retryable(&self) -> bool {
+        matches!(self, Self::Local(_))
+    }
+}
+
+impl std::fmt::Display for PqImportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PeerInvalid(error) => write!(formatter, "invalid PQ block: {error:?}"),
+            Self::ExecutionRejected(status) => {
+                write!(formatter, "PQ execution payload rejected: {status:?}")
+            }
+            Self::TerminalObservation { block_root } => {
+                write!(
+                    formatter,
+                    "PQ block observation is terminal: {block_root:?}"
+                )
+            }
+            Self::StaleHeadAfterVerification {
+                expected_parent,
+                actual_head,
+            } => write!(
+                formatter,
+                "PQ verified block parent became stale: expected {expected_parent:?}, head {actual_head:?}"
+            ),
+            Self::Local(PqImportLocalError::ParentUnavailable { parent_root }) => {
+                write!(formatter, "PQ block parent is unavailable: {parent_root:?}")
+            }
+            Self::Local(PqImportLocalError::Invariant(reason)) => {
+                write!(formatter, "PQ import invariant failed: {reason}")
+            }
+            Self::Local(PqImportLocalError::ClockUnavailable) => {
+                formatter.write_str("PQ slot clock is unavailable")
+            }
+            Self::Local(PqImportLocalError::ObservationCapacity) => {
+                formatter.write_str("PQ gossip observation capacity is exhausted")
+            }
+            Self::Local(PqImportLocalError::IngressCapacity) => {
+                formatter.write_str("PQ imported-block admission capacity is exhausted")
+            }
+            Self::Local(PqImportLocalError::ForwardRangeCapacity { supplied, maximum }) => write!(
+                formatter,
+                "PQ forward range has {supplied} blocks, exceeding the {maximum}-block bound"
+            ),
+            Self::Local(PqImportLocalError::BlockingTask(phase)) => {
+                write!(formatter, "PQ blocking task failed during {phase}")
+            }
+            Self::Local(PqImportLocalError::Consensus(error)) => error.fmt(formatter),
+            Self::Local(PqImportLocalError::Transition(error)) => error.fmt(formatter),
+            Self::Local(PqImportLocalError::ExecutionUnavailable(status)) => {
+                write!(formatter, "PQ execution engine is not ready: {status:?}")
+            }
+            Self::Local(PqImportLocalError::Transport(error)) => {
+                write!(formatter, "PQ execution transport failed: {error:?}")
+            }
+            Self::Local(PqImportLocalError::Persistence(error)) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for PqImportError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::PeerInvalid(PqImportPeerInvalid::Consensus(error)) => Some(error),
+            Self::PeerInvalid(PqImportPeerInvalid::Transition(error)) => Some(error),
+            Self::Local(PqImportLocalError::Consensus(error)) => Some(error),
+            Self::Local(PqImportLocalError::Transition(error)) => Some(error),
+            Self::Local(PqImportLocalError::Persistence(error)) => Some(error),
+            Self::PeerInvalid(
+                PqImportPeerInvalid::NonLinearRange { .. }
+                | PqImportPeerInvalid::Equivocation { .. }
+                | PqImportPeerInvalid::NonAdvancingSlot { .. }
+                | PqImportPeerInvalid::FutureSlot { .. }
+                | PqImportPeerInvalid::ExecutionPayload(_),
+            )
+            | Self::ExecutionRejected(_)
+            | Self::TerminalObservation { .. }
+            | Self::StaleHeadAfterVerification { .. }
+            | Self::Local(
+                PqImportLocalError::Invariant(_)
+                | PqImportLocalError::ClockUnavailable
+                | PqImportLocalError::ParentUnavailable { .. }
+                | PqImportLocalError::ObservationCapacity
+                | PqImportLocalError::IngressCapacity
+                | PqImportLocalError::ForwardRangeCapacity { .. }
+                | PqImportLocalError::BlockingTask(_)
+                | PqImportLocalError::Transport(_)
+                | PqImportLocalError::ExecutionUnavailable(_),
+            ) => None,
+        }
+    }
+}
+
+/// Fully authenticated, transitioned and locally payload-checked block. Network code may mark a
+/// gossip block observed and propagate it at this point; Engine notification and canonical commit
+/// still require consuming this capability.
+pub struct PqVerifiedBlockImport<E: EthSpec> {
+    source: PqBlockImportSource,
+    expected_parent_root: Hash256,
+    observation_key: PqGossipObservationKey,
+    block_root: Hash256,
+    output: state_processing::PqImportedTransitionOutput<E>,
+    _admission: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+}
+
+impl<E: EthSpec> PqVerifiedBlockImport<E> {
+    pub const fn source(&self) -> PqBlockImportSource {
+        self.source
+    }
+
+    pub fn block(&self) -> &Arc<SignedBeaconBlock<E>> {
+        self.output.block()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PqBlockImportOutcome {
+    pub source: PqBlockImportSource,
+    pub block_root: Hash256,
+    pub state_root: Hash256,
+    pub payload_status: PqEnginePayloadStatus,
+}
+
+pub(crate) const PQ_GOSSIP_OBSERVATION_CAPACITY: usize = 128;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PqGossipObservationKey {
+    slot: Slot,
+    proposer: u64,
+}
+
+impl PqGossipObservationKey {
+    pub(crate) const fn new(slot: Slot, proposer: u64) -> Self {
+        Self { slot, proposer }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PqGossipLifecycle {
+    PendingPropagation,
+    PendingCommit,
+    PendingExternal,
+    RetryablePropagation,
+    RetryableCommit,
+    Terminal,
+    Committed,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PqGossipObservationRecord {
+    root: Hash256,
+    generation: u64,
+    lifecycle: PqGossipLifecycle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PqGossipClaim {
+    Propagate { generation: u64 },
+    Retry { generation: u64 },
+    Pending,
+    Terminal,
+    Equivocation { previous: Hash256 },
+    Capacity,
+}
+
+impl PqGossipClaim {
+    #[cfg(test)]
+    fn propagation_generation(self) -> Option<u64> {
+        match self {
+            Self::Propagate { generation } => Some(generation),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn retry_generation(self) -> Option<u64> {
+        match self {
+            Self::Retry { generation } => Some(generation),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PqGossipClaimFinish {
+    Retryable,
+    Terminal,
+}
+
+#[derive(Clone, Copy)]
+struct PqGossipClaimBinding {
+    key: PqGossipObservationKey,
+    generation: u64,
+}
+
+enum PqExternalReservationClaim {
+    Authorized(Option<PqGossipClaimBinding>),
+    Terminal,
+    Equivocation { previous: Hash256 },
+    Capacity,
+}
+
+struct PqExternalObservationReservation {
+    observations: Arc<parking_lot::Mutex<PqGossipObservationCache>>,
+    binding: Option<PqGossipClaimBinding>,
+    armed: bool,
+}
+
+impl PqExternalObservationReservation {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PqExternalObservationReservation {
+    fn drop(&mut self) {
+        if self.armed
+            && let Some(binding) = self.binding
+        {
+            self.observations
+                .lock()
+                .cancel_external(binding.key, binding.generation);
+        }
+    }
+}
+
+/// The unique capability allowed to cross the external gossipsub propagation boundary.
+/// Dropping it makes the same verified block retryable instead of leaving a permanent pending
+/// entry.
+pub struct PqGossipPropagationToken<T: BeaconChainTypes> {
+    chain: Arc<BeaconChain<T>>,
+    verified: Option<PqVerifiedBlockImport<T::EthSpec>>,
+    binding: PqGossipClaimBinding,
+    armed: bool,
+}
+
+impl<T: BeaconChainTypes> PqGossipPropagationToken<T> {
+    /// Call only after gossipsub has propagated the block. The exact first claim then becomes the
+    /// only commit-ready capability for its generation.
+    pub fn after_propagation(mut self) -> Result<PqGossipCommitToken<T>, PqImportError> {
+        let promoted = self
+            .chain
+            .observed_pq_blocks
+            .lock()
+            .mark_propagated(self.binding.key, self.binding.generation);
+        if !promoted {
+            return Err(PqImportError::Local(PqImportLocalError::Invariant(
+                "PQ gossip propagation claim is no longer current",
+            )));
+        }
+        let verified =
+            self.verified
+                .take()
+                .ok_or(PqImportError::Local(PqImportLocalError::Invariant(
+                    "PQ gossip propagation capability was consumed",
+                )))?;
+        self.armed = false;
+        Ok(PqGossipCommitToken {
+            chain: Arc::clone(&self.chain),
+            verified: Some(verified),
+            binding: self.binding,
+            armed: true,
+        })
+    }
+}
+
+impl<T: BeaconChainTypes> Drop for PqGossipPropagationToken<T> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.chain
+                .observed_pq_blocks
+                .lock()
+                .cancel(self.binding.key, self.binding.generation);
+        }
+    }
+}
+
+/// A generation-bound gossip import capability. Only a propagated first block or a claimed
+/// retryable-local failure can construct it.
+pub struct PqGossipCommitToken<T: BeaconChainTypes> {
+    chain: Arc<BeaconChain<T>>,
+    verified: Option<PqVerifiedBlockImport<T::EthSpec>>,
+    binding: PqGossipClaimBinding,
+    armed: bool,
+}
+
+impl<T: BeaconChainTypes> PqGossipCommitToken<T> {
+    pub async fn commit(mut self) -> Result<PqBlockImportOutcome, PqImportError> {
+        let verified =
+            self.verified
+                .take()
+                .ok_or(PqImportError::Local(PqImportLocalError::Invariant(
+                    "PQ gossip commit capability was consumed",
+                )))?;
+        let result = self
+            .chain
+            .commit_verified_pq_block(verified, Some(self.binding))
+            .await;
+        let finish = match &result {
+            Ok(_) => None,
+            Err(PqImportError::Local(
+                PqImportLocalError::ExecutionUnavailable(_)
+                | PqImportLocalError::Transport(_)
+                | PqImportLocalError::BlockingTask(_)
+                | PqImportLocalError::Persistence(_),
+            )) => Some(PqGossipClaimFinish::Retryable),
+            Err(
+                PqImportError::PeerInvalid(_)
+                | PqImportError::ExecutionRejected(_)
+                | PqImportError::TerminalObservation { .. }
+                | PqImportError::StaleHeadAfterVerification { .. }
+                | PqImportError::Local(_),
+            ) => Some(PqGossipClaimFinish::Terminal),
+        };
+        if let Some(finish) = finish {
+            let mut observations = self.chain.observed_pq_blocks.lock();
+            observations.finish(self.binding.key, self.binding.generation, finish);
+        }
+        self.armed = false;
+        result
+    }
+}
+
+impl<T: BeaconChainTypes> Drop for PqGossipCommitToken<T> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.chain
+                .observed_pq_blocks
+                .lock()
+                .cancel(self.binding.key, self.binding.generation);
+        }
+    }
+}
+
+pub enum PqGossipObservation<T: BeaconChainTypes> {
+    New(PqGossipPropagationToken<T>),
+    Retry(PqGossipCommitToken<T>),
+    Pending,
+    Terminal,
+    Equivocation { previous: Hash256 },
+    NotGossip,
+    Capacity,
+}
+
+#[derive(Default)]
+pub(crate) struct PqGossipObservationCache {
+    entries: HashMap<PqGossipObservationKey, PqGossipObservationRecord>,
+    next_generation: u64,
+}
+
+impl PqGossipObservationCache {
+    #[cfg(feature = "pq-startup-testing")]
+    fn is_committed(&self, key: PqGossipObservationKey, root: Hash256) -> bool {
+        self.entries.get(&key).is_some_and(|record| {
+            record.root == root && record.lifecycle == PqGossipLifecycle::Committed
+        })
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    fn is_absent(&self, key: PqGossipObservationKey) -> bool {
+        !self.entries.contains_key(&key)
+    }
+
+    pub(crate) fn claim(
+        &mut self,
+        key: PqGossipObservationKey,
+        root: Hash256,
+        retained_head_slot: Slot,
+    ) -> PqGossipClaim {
+        self.entries.retain(|key, _| key.slot >= retained_head_slot);
+        if let Some(record) = self.entries.get(&key).copied() {
+            if record.root != root {
+                return PqGossipClaim::Equivocation {
+                    previous: record.root,
+                };
+            }
+            return match record.lifecycle {
+                PqGossipLifecycle::PendingPropagation | PqGossipLifecycle::PendingCommit => {
+                    PqGossipClaim::Pending
+                }
+                PqGossipLifecycle::PendingExternal => PqGossipClaim::Pending,
+                PqGossipLifecycle::Terminal | PqGossipLifecycle::Committed => {
+                    PqGossipClaim::Terminal
+                }
+                PqGossipLifecycle::RetryablePropagation | PqGossipLifecycle::RetryableCommit => {
+                    let Some(generation) = self.allocate_generation() else {
+                        return PqGossipClaim::Capacity;
+                    };
+                    if let Some(record) = self.entries.get_mut(&key) {
+                        record.generation = generation;
+                        if record.lifecycle == PqGossipLifecycle::RetryablePropagation {
+                            record.lifecycle = PqGossipLifecycle::PendingPropagation;
+                            PqGossipClaim::Propagate { generation }
+                        } else {
+                            record.lifecycle = PqGossipLifecycle::PendingCommit;
+                            PqGossipClaim::Retry { generation }
+                        }
+                    } else {
+                        PqGossipClaim::Capacity
+                    }
+                }
+            };
+        }
+        if self.entries.len() >= PQ_GOSSIP_OBSERVATION_CAPACITY {
+            return PqGossipClaim::Capacity;
+        }
+        let Some(generation) = self.allocate_generation() else {
+            return PqGossipClaim::Capacity;
+        };
+        self.entries.insert(
+            key,
+            PqGossipObservationRecord {
+                root,
+                generation,
+                lifecycle: PqGossipLifecycle::PendingPropagation,
+            },
+        );
+        PqGossipClaim::Propagate { generation }
+    }
+
+    pub(crate) fn mark_propagated(&mut self, key: PqGossipObservationKey, generation: u64) -> bool {
+        self.transition(
+            key,
+            generation,
+            PqGossipLifecycle::PendingPropagation,
+            PqGossipLifecycle::PendingCommit,
+        )
+    }
+
+    pub(crate) fn cancel(&mut self, key: PqGossipObservationKey, generation: u64) -> bool {
+        let pending = self
+            .entries
+            .get(&key)
+            .filter(|record| record.generation == generation)
+            .map(|record| record.lifecycle);
+        match pending {
+            Some(PqGossipLifecycle::PendingPropagation) => {
+                if let Some(record) = self.entries.get_mut(&key) {
+                    record.lifecycle = PqGossipLifecycle::RetryablePropagation;
+                    true
+                } else {
+                    false
+                }
+            }
+            Some(PqGossipLifecycle::PendingCommit) => {
+                if let Some(record) = self.entries.get_mut(&key) {
+                    record.lifecycle = PqGossipLifecycle::RetryableCommit;
+                    true
+                } else {
+                    false
+                }
+            }
+            Some(
+                PqGossipLifecycle::RetryablePropagation
+                | PqGossipLifecycle::RetryableCommit
+                | PqGossipLifecycle::PendingExternal
+                | PqGossipLifecycle::Terminal
+                | PqGossipLifecycle::Committed,
+            )
+            | None => false,
+        }
+    }
+
+    pub(crate) fn finish(
+        &mut self,
+        key: PqGossipObservationKey,
+        generation: u64,
+        finish: PqGossipClaimFinish,
+    ) -> bool {
+        let lifecycle = match finish {
+            PqGossipClaimFinish::Retryable => PqGossipLifecycle::RetryableCommit,
+            PqGossipClaimFinish::Terminal => PqGossipLifecycle::Terminal,
+        };
+        self.transition(key, generation, PqGossipLifecycle::PendingCommit, lifecycle)
+    }
+
+    pub(crate) fn prune_after_commit(&mut self, committed_slot: Slot) {
+        self.entries.retain(|key, _| key.slot >= committed_slot);
+    }
+
+    pub(crate) fn authorize_gossip_commit(
+        &self,
+        key: PqGossipObservationKey,
+        root: Hash256,
+        generation: u64,
+    ) -> bool {
+        self.entries.get(&key).is_some_and(|record| {
+            record.root == root
+                && record.generation == generation
+                && record.lifecycle == PqGossipLifecycle::PendingCommit
+        })
+    }
+
+    fn reserve_external(
+        &mut self,
+        key: PqGossipObservationKey,
+        root: Hash256,
+        retained_head_slot: Slot,
+    ) -> PqExternalReservationClaim {
+        self.entries.retain(|key, _| key.slot >= retained_head_slot);
+        if let Some(record) = self.entries.get(&key) {
+            if record.root != root {
+                return PqExternalReservationClaim::Equivocation {
+                    previous: record.root,
+                };
+            }
+            if record.root == root
+                && matches!(
+                    record.lifecycle,
+                    PqGossipLifecycle::Terminal | PqGossipLifecycle::Committed
+                )
+            {
+                return PqExternalReservationClaim::Terminal;
+            }
+            return PqExternalReservationClaim::Authorized(None);
+        }
+        if self.entries.len() >= PQ_GOSSIP_OBSERVATION_CAPACITY {
+            return PqExternalReservationClaim::Capacity;
+        }
+        let Some(generation) = self.allocate_generation() else {
+            return PqExternalReservationClaim::Capacity;
+        };
+        self.entries.insert(
+            key,
+            PqGossipObservationRecord {
+                root,
+                generation,
+                lifecycle: PqGossipLifecycle::PendingExternal,
+            },
+        );
+        PqExternalReservationClaim::Authorized(Some(PqGossipClaimBinding { key, generation }))
+    }
+
+    fn cancel_external(&mut self, key: PqGossipObservationKey, generation: u64) -> bool {
+        if self.entries.get(&key).is_some_and(|record| {
+            record.generation == generation
+                && record.lifecycle == PqGossipLifecycle::PendingExternal
+        }) {
+            self.entries.remove(&key);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn record_commit(
+        &mut self,
+        key: PqGossipObservationKey,
+        root: Hash256,
+        committed_slot: Slot,
+    ) {
+        self.prune_after_commit(committed_slot);
+        self.install_terminal_record(key, root, PqGossipLifecycle::Committed);
+    }
+
+    pub(crate) fn record_terminal(&mut self, key: PqGossipObservationKey, root: Hash256) {
+        if let Some(record) = self
+            .entries
+            .get_mut(&key)
+            .filter(|record| record.root == root)
+        {
+            record.lifecycle = PqGossipLifecycle::Terminal;
+        }
+    }
+
+    fn install_terminal_record(
+        &mut self,
+        key: PqGossipObservationKey,
+        root: Hash256,
+        lifecycle: PqGossipLifecycle,
+    ) {
+        self.entries.insert(
+            key,
+            PqGossipObservationRecord {
+                root,
+                generation: self.next_generation,
+                lifecycle,
+            },
+        );
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn transition(
+        &mut self,
+        key: PqGossipObservationKey,
+        generation: u64,
+        from: PqGossipLifecycle,
+        to: PqGossipLifecycle,
+    ) -> bool {
+        if let Some(record) = self
+            .entries
+            .get_mut(&key)
+            .filter(|record| record.generation == generation && record.lifecycle == from)
+        {
+            record.lifecycle = to;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn allocate_generation(&mut self) -> Option<u64> {
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.checked_add(1)?;
+        Some(generation)
+    }
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TestingPqGossipClaim {
+    Propagate(u64),
+    Retry(u64),
+    Pending,
+    Terminal,
+    Equivocation(Hash256),
+    Capacity,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TestingPqGossipFinish {
+    Retryable,
+    Terminal,
+    Committed,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TestingPqExternalReservation {
+    Authorized,
+    Terminal,
+    Equivocation(Hash256),
+    Capacity,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+#[derive(Default)]
+pub struct TestingPqGossipObservationCache(PqGossipObservationCache);
+
+#[cfg(feature = "pq-startup-testing")]
+impl TestingPqGossipObservationCache {
+    pub const CAPACITY: usize = PQ_GOSSIP_OBSERVATION_CAPACITY;
+
+    pub fn claim(
+        &mut self,
+        slot: Slot,
+        proposer: u64,
+        root: Hash256,
+        retained_head_slot: Slot,
+    ) -> TestingPqGossipClaim {
+        match self.0.claim(
+            PqGossipObservationKey::new(slot, proposer),
+            root,
+            retained_head_slot,
+        ) {
+            PqGossipClaim::Propagate { generation } => TestingPqGossipClaim::Propagate(generation),
+            PqGossipClaim::Retry { generation } => TestingPqGossipClaim::Retry(generation),
+            PqGossipClaim::Pending => TestingPqGossipClaim::Pending,
+            PqGossipClaim::Terminal => TestingPqGossipClaim::Terminal,
+            PqGossipClaim::Equivocation { previous } => {
+                TestingPqGossipClaim::Equivocation(previous)
+            }
+            PqGossipClaim::Capacity => TestingPqGossipClaim::Capacity,
+        }
+    }
+
+    pub fn mark_propagated(&mut self, slot: Slot, proposer: u64, generation: u64) -> bool {
+        self.0
+            .mark_propagated(PqGossipObservationKey::new(slot, proposer), generation)
+    }
+
+    pub fn cancel(&mut self, slot: Slot, proposer: u64, generation: u64) -> bool {
+        self.0
+            .cancel(PqGossipObservationKey::new(slot, proposer), generation)
+    }
+
+    pub fn finish(
+        &mut self,
+        slot: Slot,
+        proposer: u64,
+        generation: u64,
+        finish: TestingPqGossipFinish,
+    ) -> bool {
+        let key = PqGossipObservationKey::new(slot, proposer);
+        if finish == TestingPqGossipFinish::Committed {
+            let Some(root) = self.0.entries.get(&key).map(|record| record.root) else {
+                return false;
+            };
+            self.0.record_commit(key, root, slot);
+            return true;
+        }
+        self.0.finish(
+            key,
+            generation,
+            match finish {
+                TestingPqGossipFinish::Retryable => PqGossipClaimFinish::Retryable,
+                TestingPqGossipFinish::Terminal => PqGossipClaimFinish::Terminal,
+                TestingPqGossipFinish::Committed => return false,
+            },
+        )
+    }
+
+    pub fn prune_after_commit(&mut self, committed_slot: Slot) {
+        self.0.prune_after_commit(committed_slot);
+    }
+
+    pub fn authorize_commit(
+        &self,
+        slot: Slot,
+        proposer: u64,
+        root: Hash256,
+        generation: u64,
+    ) -> bool {
+        self.0.authorize_gossip_commit(
+            PqGossipObservationKey::new(slot, proposer),
+            root,
+            generation,
+        )
+    }
+
+    pub fn reserve_external(
+        &mut self,
+        slot: Slot,
+        proposer: u64,
+        root: Hash256,
+        retained_head_slot: Slot,
+    ) -> TestingPqExternalReservation {
+        match self.0.reserve_external(
+            PqGossipObservationKey::new(slot, proposer),
+            root,
+            retained_head_slot,
+        ) {
+            PqExternalReservationClaim::Authorized(_) => TestingPqExternalReservation::Authorized,
+            PqExternalReservationClaim::Terminal => TestingPqExternalReservation::Terminal,
+            PqExternalReservationClaim::Equivocation { previous } => {
+                TestingPqExternalReservation::Equivocation(previous)
+            }
+            PqExternalReservationClaim::Capacity => TestingPqExternalReservation::Capacity,
+        }
+    }
+
+    pub fn record_commit(&mut self, slot: Slot, proposer: u64, root: Hash256) {
+        self.0
+            .record_commit(PqGossipObservationKey::new(slot, proposer), root, slot);
+    }
+
+    pub fn record_terminal(&mut self, slot: Slot, proposer: u64, root: Hash256) {
+        self.0
+            .record_terminal(PqGossipObservationKey::new(slot, proposer), root);
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.entries.is_empty()
+    }
+}
+
+#[derive(Debug)]
+pub struct PqForwardRangeError {
+    pub imported: Vec<PqBlockImportOutcome>,
+    pub error: PqImportError,
+}
+
+impl std::fmt::Display for PqForwardRangeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "PQ forward range stopped after {} imports: {}",
+            self.imported.len(),
+            self.error
+        )
+    }
+}
+
+impl Error for PqForwardRangeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+impl<T: BeaconChainTypes> BeaconChain<T> {
+    async fn run_pq_blocking<F, R>(&self, phase: &'static str, task: F) -> Result<R, PqImportError>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.task_executor
+            .spawn_blocking_handle(task, phase)
+            .ok_or(PqImportError::Local(PqImportLocalError::BlockingTask(
+                phase,
+            )))?
+            .await
+            .map_err(|_| PqImportError::Local(PqImportLocalError::BlockingTask(phase)))
+    }
+
+    /// Performs the same complete PQ verification and consuming state transition for every source.
+    /// It makes no observed-block, fork-choice or persistence mutation and holds no lock or
+    /// state/cache borrow across the proof-worker await.
+    pub async fn verify_pq_block(
+        &self,
+        request: PqBlockImportRequest<T::EthSpec>,
+    ) -> Result<PqVerifiedBlockImport<T::EthSpec>, PqImportError> {
+        let admission = Arc::clone(&self.pq_import_admission)
+            .try_acquire_owned()
+            .map_err(|_| PqImportError::Local(PqImportLocalError::IngressCapacity))?;
+        self.verify_pq_block_admitted(request, Some(Arc::new(admission)))
+            .await
+    }
+
+    async fn verify_pq_block_admitted(
+        &self,
+        request: PqBlockImportRequest<T::EthSpec>,
+        admission: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    ) -> Result<PqVerifiedBlockImport<T::EthSpec>, PqImportError> {
+        let head = self.head_snapshot();
+        let actual_parent = request.block.message().parent_root();
+        if actual_parent != head.beacon_block_root {
+            return Err(match request.source {
+                PqBlockImportSource::ForwardRange => {
+                    PqImportError::PeerInvalid(PqImportPeerInvalid::NonLinearRange {
+                        expected: head.beacon_block_root,
+                        actual: actual_parent,
+                    })
+                }
+                PqBlockImportSource::Gossip
+                | PqBlockImportSource::Rpc
+                | PqBlockImportSource::Lookup => {
+                    PqImportError::Local(PqImportLocalError::ParentUnavailable {
+                        parent_root: actual_parent,
+                    })
+                }
+            });
+        }
+        if request.block.slot() <= head.beacon_state.slot() {
+            return Err(PqImportError::PeerInvalid(
+                PqImportPeerInvalid::NonAdvancingSlot {
+                    parent: head.beacon_state.slot(),
+                    block: request.block.slot(),
+                },
+            ));
+        }
+        let current_slot = self
+            .slot_clock
+            .now_with_future_tolerance(self.spec.maximum_gossip_clock_disparity())
+            .ok_or(PqImportError::Local(PqImportLocalError::ClockUnavailable))?;
+        if request.block.slot() > current_slot {
+            return Err(PqImportError::PeerInvalid(
+                PqImportPeerInvalid::FutureSlot {
+                    current: current_slot,
+                    block: request.block.slot(),
+                },
+            ));
+        }
+
+        let source = request.source;
+        let expected_parent_root = head.beacon_block_root;
+        let spec = Arc::clone(&self.spec);
+        let key_cache = Arc::clone(&self.pq_validator_key_cache);
+        let prepare_admission = admission.clone();
+        #[cfg(feature = "pq-startup-testing")]
+        let blocking_test_hook = self.pq_blocking_test_hook.clone();
+        let (advanced_parent, prepared) = self
+            .run_pq_blocking("pq-import-prepare", move || {
+                let _admission = prepare_admission;
+                #[cfg(feature = "pq-startup-testing")]
+                if let Some(hook) = blocking_test_hook {
+                    hook.run();
+                }
+                let mut advanced_parent = head.beacon_state.clone();
+                while advanced_parent.slot() < request.block.slot() {
+                    per_slot_processing_pq(&mut advanced_parent, &spec)
+                        .map_err(classify_transition_error)?;
+                }
+                let payload_request = NewPayloadRequest::try_from(request.block.message())
+                    .map_err(|error| {
+                        PqImportError::PeerInvalid(PqImportPeerInvalid::ExecutionPayload(
+                            error.into(),
+                        ))
+                    })?;
+                payload_request
+                    .perform_optimistic_sync_verifications()
+                    .map_err(|error| {
+                        PqImportError::PeerInvalid(PqImportPeerInvalid::ExecutionPayload(error))
+                    })?;
+                let prepared = prepare_pq_block(&advanced_parent, &key_cache, request.block, &spec)
+                    .map_err(classify_consensus_error)?;
+                Ok::<_, PqImportError>((advanced_parent, prepared))
+            })
+            .await??;
+        let service = Arc::clone(&self.pq_aggregation_service);
+        let verified = prepared
+            .verify(&service)
+            .await
+            .map_err(classify_consensus_error)?;
+        let transition_admission = admission.clone();
+        let (output, observation_key, block_root) = self
+            .run_pq_blocking("pq-import-transition", move || {
+                let _admission = transition_admission;
+                let output = transition_pq_imported_block(advanced_parent, verified)
+                    .map_err(classify_transition_error)?;
+                let block = output.block();
+                let observation_key =
+                    PqGossipObservationKey::new(block.slot(), block.message().proposer_index());
+                let block_root = block.canonical_root();
+                Ok::<_, PqImportError>((output, observation_key, block_root))
+            })
+            .await??;
+        Ok(PqVerifiedBlockImport {
+            source,
+            expected_parent_root,
+            observation_key,
+            block_root,
+            output,
+            _admission: admission,
+        })
+    }
+
+    /// Records a fully verified gossip block only after the sealed boundary has succeeded.
+    /// Reports duplicate/equivocation semantics or a non-gossip capability invariant.
+    pub fn observe_verified_pq_gossip_block(
+        self: &Arc<Self>,
+        verified: PqVerifiedBlockImport<T::EthSpec>,
+    ) -> PqGossipObservation<T> {
+        if verified.source != PqBlockImportSource::Gossip {
+            return PqGossipObservation::NotGossip;
+        }
+        let key = verified.observation_key;
+        let root = verified.block_root;
+        let retained_head_slot = self.head_snapshot().beacon_state.slot();
+        let claim = self
+            .observed_pq_blocks
+            .lock()
+            .claim(key, root, retained_head_slot);
+        match claim {
+            PqGossipClaim::Propagate { generation } => {
+                PqGossipObservation::New(PqGossipPropagationToken {
+                    chain: Arc::clone(self),
+                    verified: Some(verified),
+                    binding: PqGossipClaimBinding { key, generation },
+                    armed: true,
+                })
+            }
+            PqGossipClaim::Retry { generation } => {
+                PqGossipObservation::Retry(PqGossipCommitToken {
+                    chain: Arc::clone(self),
+                    verified: Some(verified),
+                    binding: PqGossipClaimBinding { key, generation },
+                    armed: true,
+                })
+            }
+            PqGossipClaim::Pending => PqGossipObservation::Pending,
+            PqGossipClaim::Terminal => PqGossipObservation::Terminal,
+            PqGossipClaim::Equivocation { previous } => {
+                PqGossipObservation::Equivocation { previous }
+            }
+            PqGossipClaim::Capacity => PqGossipObservation::Capacity,
+        }
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_fill_pq_observation_capacity(&self) -> bool {
+        let head_slot = self.head_snapshot().beacon_state.slot();
+        let mut observations = self.observed_pq_blocks.lock();
+        for offset in 0..PQ_GOSSIP_OBSERVATION_CAPACITY {
+            let Ok(offset_u64) = u64::try_from(offset) else {
+                return false;
+            };
+            let Some(slot_u64) = head_slot
+                .as_u64()
+                .checked_add(offset_u64)
+                .and_then(|slot| slot.checked_add(2))
+            else {
+                return false;
+            };
+            let Ok(root_byte) = u8::try_from(offset % 251) else {
+                return false;
+            };
+            observations.install_terminal_record(
+                PqGossipObservationKey::new(Slot::new(slot_u64), offset_u64 % 16),
+                Hash256::with_last_byte(root_byte),
+                PqGossipLifecycle::Terminal,
+            );
+        }
+        observations.entries.len() == PQ_GOSSIP_OBSERVATION_CAPACITY
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_pq_import_available_permits(&self) -> usize {
+        self.pq_import_admission.available_permits()
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_pq_observation_is_committed(
+        &self,
+        slot: Slot,
+        proposer: u64,
+        root: Hash256,
+    ) -> bool {
+        self.observed_pq_blocks
+            .lock()
+            .is_committed(PqGossipObservationKey::new(slot, proposer), root)
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_pq_observation_is_absent(&self, slot: Slot, proposer: u64) -> bool {
+        self.observed_pq_blocks
+            .lock()
+            .is_absent(PqGossipObservationKey::new(slot, proposer))
+    }
+
+    /// Calls Engine after full PQ verification (and, for gossip, after caller propagation), then
+    /// atomically persists the sealed transition output before publishing the new head.
+    async fn commit_verified_pq_block(
+        &self,
+        verified: PqVerifiedBlockImport<T::EthSpec>,
+        gossip_binding: Option<PqGossipClaimBinding>,
+    ) -> Result<PqBlockImportOutcome, PqImportError> {
+        let observation_key = verified.observation_key;
+        let block_root = verified.block_root;
+        // This owned permit queues commit attempts without holding a borrowed lock, state or cache
+        // reference across the Engine await.
+        let commit_permit = Arc::clone(&self.pq_import_gate)
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                PqImportError::Local(PqImportLocalError::Transport(
+                    execution_layer::Error::ShuttingDown,
+                ))
+            })?;
+        let head = self.head_snapshot();
+        if gossip_binding.is_none() && head.beacon_block_root != verified.expected_parent_root {
+            return Err(PqImportError::StaleHeadAfterVerification {
+                expected_parent: verified.expected_parent_root,
+                actual_head: head.beacon_block_root,
+            });
+        }
+        let mut external_reservation = match gossip_binding {
+            Some(binding)
+                if binding.key == observation_key
+                    && self.observed_pq_blocks.lock().authorize_gossip_commit(
+                        observation_key,
+                        block_root,
+                        binding.generation,
+                    ) =>
+            {
+                None
+            }
+            Some(_) => return Err(PqImportError::TerminalObservation { block_root }),
+            None => {
+                let claim = self.observed_pq_blocks.lock().reserve_external(
+                    observation_key,
+                    block_root,
+                    head.beacon_state.slot(),
+                );
+                match claim {
+                    PqExternalReservationClaim::Authorized(binding) => {
+                        Some(PqExternalObservationReservation {
+                            observations: Arc::clone(&self.observed_pq_blocks),
+                            binding,
+                            armed: true,
+                        })
+                    }
+                    PqExternalReservationClaim::Terminal => {
+                        return Err(PqImportError::TerminalObservation { block_root });
+                    }
+                    PqExternalReservationClaim::Equivocation { previous } => {
+                        return Err(PqImportError::PeerInvalid(
+                            PqImportPeerInvalid::Equivocation {
+                                previous,
+                                actual: block_root,
+                            },
+                        ));
+                    }
+                    PqExternalReservationClaim::Capacity => {
+                        return Err(PqImportError::Local(
+                            PqImportLocalError::ObservationCapacity,
+                        ));
+                    }
+                }
+            }
+        };
+        if head.beacon_block_root != verified.expected_parent_root {
+            return Err(PqImportError::StaleHeadAfterVerification {
+                expected_parent: verified.expected_parent_root,
+                actual_head: head.beacon_block_root,
+            });
+        }
+        let payload_status = {
+            let request = NewPayloadRequest::try_from(verified.output.block().message()).map_err(
+                |error| {
+                    PqImportError::PeerInvalid(PqImportPeerInvalid::ExecutionPayload(error.into()))
+                },
+            )?;
+            self.pq_execution_notifier
+                .notify_new_payload(request)
+                .await
+                .map_err(|error| PqImportError::Local(PqImportLocalError::Transport(error)))?
+        };
+        match classify_pq_engine_payload_status(&payload_status) {
+            PqEnginePayloadDisposition::CommitValid => {}
+            PqEnginePayloadDisposition::Retry(status) => {
+                return Err(PqImportError::Local(
+                    PqImportLocalError::ExecutionUnavailable(status),
+                ));
+            }
+            PqEnginePayloadDisposition::Reject => {
+                self.observed_pq_blocks
+                    .lock()
+                    .record_terminal(observation_key, block_root);
+                if let Some(reservation) = &mut external_reservation {
+                    reservation.disarm();
+                }
+                return Err(PqImportError::ExecutionRejected(payload_status));
+            }
+        }
+
+        let store = Arc::clone(&self.store);
+        let canonical_head = Arc::clone(&self.canonical_head);
+        let observations = Arc::clone(&self.observed_pq_blocks);
+        #[cfg(feature = "pq-startup-testing")]
+        let persistence_test_hook = self.pq_persistence_test_hook.clone();
+        self.run_pq_blocking("pq-import-persist-and-publish", move || {
+            // The closure owns both permits, the sealed output and observation authority. Once
+            // Engine returns VALID, dropping the async caller cannot split durable persistence
+            // from in-memory publication or permit a second commit to pass this one.
+            let _commit_permit = commit_permit;
+            let PqVerifiedBlockImport {
+                source,
+                output,
+                _admission,
+                ..
+            } = verified;
+            #[cfg(feature = "pq-startup-testing")]
+            if let Some(hook) = persistence_test_hook {
+                hook.run();
+            }
+            let snapshot = match crate::builder::persist_pq_imported_transition::<T>(&store, output)
+            {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    if let Some(binding) = gossip_binding {
+                        observations.lock().finish(
+                            binding.key,
+                            binding.generation,
+                            PqGossipClaimFinish::Retryable,
+                        );
+                    }
+                    return Err(PqImportError::Local(PqImportLocalError::Persistence(error)));
+                }
+            };
+            let outcome = PqBlockImportOutcome {
+                source,
+                block_root: snapshot.beacon_block_root,
+                state_root: snapshot.beacon_block.message().state_root(),
+                payload_status: PqEnginePayloadStatus::Valid,
+            };
+            let committed_slot = snapshot.beacon_state.slot();
+            *canonical_head.write() = Arc::new(snapshot);
+            observations
+                .lock()
+                .record_commit(observation_key, outcome.block_root, committed_slot);
+            if let Some(reservation) = &mut external_reservation {
+                reservation.disarm();
+            }
+            drop(_admission);
+            Ok(outcome)
+        })
+        .await?
+    }
+
+    /// Imports an RPC or lookup block through the full sealed boundary. Gossip requires the
+    /// propagation capability, while forward ranges use their sequential batch entry point.
+    pub async fn import_pq_block(
+        &self,
+        request: PqBlockImportRequest<T::EthSpec>,
+    ) -> Result<PqBlockImportOutcome, PqImportError> {
+        if !matches!(
+            request.source,
+            PqBlockImportSource::Rpc | PqBlockImportSource::Lookup
+        ) {
+            return Err(PqImportError::Local(PqImportLocalError::Invariant(
+                "PQ direct import accepts only RPC or lookup sources",
+            )));
+        }
+        let verified = self.verify_pq_block(request).await?;
+        self.commit_verified_pq_block(verified, None).await
+    }
+
+    /// Validates and imports a forward range strictly sequentially, stopping at the first error.
+    pub async fn import_pq_forward_range(
+        &self,
+        requests: Vec<PqBlockImportRequest<T::EthSpec>>,
+    ) -> Result<Vec<PqBlockImportOutcome>, PqForwardRangeError> {
+        if requests.len() > PQ_FORWARD_RANGE_BLOCK_CAPACITY {
+            return Err(PqForwardRangeError {
+                imported: vec![],
+                error: PqImportError::Local(PqImportLocalError::ForwardRangeCapacity {
+                    supplied: requests.len(),
+                    maximum: PQ_FORWARD_RANGE_BLOCK_CAPACITY,
+                }),
+            });
+        }
+        let admission = Arc::new(
+            Arc::clone(&self.pq_import_admission)
+                .try_acquire_owned()
+                .map_err(|_| PqForwardRangeError {
+                    imported: vec![],
+                    error: PqImportError::Local(PqImportLocalError::IngressCapacity),
+                })?,
+        );
+        let mut imported = Vec::with_capacity(requests.len());
+        let head = self.head_snapshot();
+        let preflight_admission = Arc::clone(&admission);
+        let requests = match self
+            .run_pq_blocking("pq-range-preflight", move || {
+                let _admission = preflight_admission;
+                let mut expected_parent = head.beacon_block_root;
+                let mut previous_slot = head.beacon_state.slot();
+                for request in &requests {
+                    let actual_parent = request.block.message().parent_root();
+                    if request.source != PqBlockImportSource::ForwardRange
+                        || actual_parent != expected_parent
+                    {
+                        return Err(PqImportError::PeerInvalid(
+                            PqImportPeerInvalid::NonLinearRange {
+                                expected: expected_parent,
+                                actual: actual_parent,
+                            },
+                        ));
+                    }
+                    if request.block.slot() <= previous_slot {
+                        return Err(PqImportError::PeerInvalid(
+                            PqImportPeerInvalid::NonAdvancingSlot {
+                                parent: previous_slot,
+                                block: request.block.slot(),
+                            },
+                        ));
+                    }
+                    expected_parent = request.block.canonical_root();
+                    previous_slot = request.block.slot();
+                }
+                Ok::<_, PqImportError>(requests)
+            })
+            .await
+        {
+            Ok(Ok(requests)) => requests,
+            Ok(Err(error)) | Err(error) => return Err(PqForwardRangeError { imported, error }),
+        };
+        for request in requests {
+            let verified = match self
+                .verify_pq_block_admitted(request, Some(Arc::clone(&admission)))
+                .await
+            {
+                Ok(verified) => verified,
+                Err(error) => {
+                    return Err(PqForwardRangeError { imported, error });
+                }
+            };
+            match self.commit_verified_pq_block(verified, None).await {
+                Ok(outcome) => imported.push(outcome),
+                Err(error) => return Err(PqForwardRangeError { imported, error }),
+            }
+        }
+        Ok(imported)
+    }
+}
+
+fn classify_consensus_error(error: PqConsensusError) -> PqImportError {
+    match error {
+        PqConsensusError::Invalid(_) => {
+            PqImportError::PeerInvalid(PqImportPeerInvalid::Consensus(error))
+        }
+        PqConsensusError::Local(PqConsensusLocalError::UnsupportedProfile) => {
+            PqImportError::Local(PqImportLocalError::Consensus(error))
+        }
+        PqConsensusError::Local(_) => PqImportError::Local(PqImportLocalError::Consensus(error)),
+    }
+}
+
+fn classify_transition_error(error: PqTransitionError) -> PqImportError {
+    match &error {
+        PqTransitionError::Invalidated(PqConsensusError::Invalid(_))
+        | PqTransitionError::PostStateRootMismatch { .. } => {
+            PqImportError::PeerInvalid(PqImportPeerInvalid::Transition(error))
+        }
+        PqTransitionError::BlockProcessing(block_error)
+            if !block_processing_error_is_local(block_error) =>
+        {
+            PqImportError::PeerInvalid(PqImportPeerInvalid::Transition(error))
+        }
+        PqTransitionError::PreStateMismatch { .. }
+        | PqTransitionError::Invalidated(PqConsensusError::Local(_))
+        | PqTransitionError::SlotProcessing(_)
+        | PqTransitionError::BlockProcessing(_) => {
+            PqImportError::Local(PqImportLocalError::Transition(error))
+        }
+    }
+}
+
+fn block_processing_error_is_local(error: &BlockProcessingError) -> bool {
+    matches!(
+        error,
+        BlockProcessingError::IncorrectStateType
+            | BlockProcessingError::BeaconStateError(_)
+            | BlockProcessingError::SignatureSetError(_)
+            | BlockProcessingError::SszTypesError(_)
+            | BlockProcessingError::SszDecodeError(_)
+            | BlockProcessingError::BitfieldError(_)
+            | BlockProcessingError::MerkleTreeError(_)
+            | BlockProcessingError::ArithError(_)
+            | BlockProcessingError::InconsistentStateFork(_)
+            | BlockProcessingError::ConsensusContext(_)
+            | BlockProcessingError::MilhouseError(_)
+            | BlockProcessingError::EpochCacheError(_)
+            | BlockProcessingError::WithdrawalsLimitExceeded { .. }
+            | BlockProcessingError::IncorrectExpectedWithdrawalsVariant
+            | BlockProcessingError::MissingLastWithdrawal
+            | BlockProcessingError::PendingAttestationInElectra
+            | BlockProcessingError::BuilderPaymentIndexOutOfBounds(_)
+    )
+}

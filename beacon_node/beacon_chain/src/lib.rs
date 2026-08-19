@@ -115,6 +115,9 @@ pub mod persisted_beacon_chain;
 pub mod persisted_custody;
 #[cfg(not(feature = "pq-devnet"))]
 mod persisted_fork_choice;
+#[cfg(feature = "pq-devnet")]
+#[path = "pq_runtime/import.rs"]
+mod pq_import;
 #[cfg(not(feature = "pq-devnet"))]
 mod pre_finalization_cache;
 #[cfg(not(feature = "pq-devnet"))]
@@ -164,6 +167,19 @@ pub use self::chain_config::ChainConfig;
 pub use self::errors::{BeaconChainError, BlockProductionError};
 #[cfg(not(feature = "pq-devnet"))]
 pub use self::historical_blocks::HistoricalBlockError;
+#[cfg(feature = "pq-devnet")]
+pub use self::pq_import::{
+    PQ_BLOCK_IMPORT_ADMISSION_CAPACITY, PQ_FORWARD_RANGE_BLOCK_CAPACITY, PqBlockImportOutcome,
+    PqBlockImportRequest, PqBlockImportSource, PqEnginePayloadDisposition, PqEnginePayloadStatus,
+    PqForwardRangeError, PqGossipCommitToken, PqGossipObservation, PqGossipPropagationToken,
+    PqImportError, PqImportLocalError, PqImportPeerInvalid, PqVerifiedBlockImport,
+    classify_pq_engine_payload_status,
+};
+#[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
+pub use self::pq_import::{
+    PqNewPayloadTransport, TestingPqBlockingHook, TestingPqExternalReservation,
+    TestingPqGossipClaim, TestingPqGossipFinish, TestingPqGossipObservationCache,
+};
 #[cfg(not(feature = "pq-devnet"))]
 pub use attestation_verification::Error as AttestationError;
 #[cfg(not(feature = "pq-devnet"))]

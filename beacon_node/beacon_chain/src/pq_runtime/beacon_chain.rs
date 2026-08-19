@@ -1,9 +1,11 @@
 use consensus_signature::AggregationService;
+use parking_lot::{Mutex, RwLock};
 use slot_clock::SlotClock;
 use state_processing::PqValidatorKeyCache;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use store::{HotColdDB, ItemStore};
+use task_executor::TaskExecutor;
 use types::{BeaconState, ChainSpec, EthSpec, Hash256, SignedBeaconBlock};
 
 /// The minimal type family required by the Task 5.3e-b PQ startup core.
@@ -42,6 +44,8 @@ pub enum PqRuntimeError {
     HeadStateRootMismatch { block: Hash256, state: Hash256 },
     Store(store::Error),
     Aggregation(consensus_signature::AggregationError),
+    MissingExecutionNotifier,
+    MissingTaskExecutor,
     DeferredRuntimeIntegration,
 }
 
@@ -67,8 +71,12 @@ impl std::fmt::Display for PqRuntimeError {
             ),
             Self::Store(error) => write!(formatter, "PQ store error: {error:?}"),
             Self::Aggregation(error) => write!(formatter, "PQ aggregation startup error: {error}"),
+            Self::MissingExecutionNotifier => {
+                formatter.write_str("PQ execution notifier was not installed")
+            }
+            Self::MissingTaskExecutor => formatter.write_str("PQ task executor was not installed"),
             Self::DeferredRuntimeIntegration => formatter.write_str(
-                "lean PQ devnet networking, HTTP, timers, import and production are deferred",
+                "lean PQ devnet network-service assembly, HTTP, timers, production and validator duties are deferred",
             ),
         }
     }
@@ -86,6 +94,8 @@ impl std::error::Error for PqRuntimeError {
             | Self::PersistedHeadBinding(_)
             | Self::HeadStateRootMismatch { .. }
             | Self::Store(_)
+            | Self::MissingExecutionNotifier
+            | Self::MissingTaskExecutor
             | Self::DeferredRuntimeIntegration => None,
         }
     }
@@ -101,9 +111,19 @@ impl From<store::Error> for PqRuntimeError {
 pub struct BeaconChain<T: BeaconChainTypes> {
     pub spec: Arc<ChainSpec>,
     pub store: BeaconStore<T>,
-    canonical_head: Arc<BeaconSnapshot<T::EthSpec>>,
+    pub(crate) canonical_head: Arc<RwLock<Arc<BeaconSnapshot<T::EthSpec>>>>,
+    pub(crate) observed_pq_blocks: Arc<Mutex<crate::pq_import::PqGossipObservationCache>>,
+    pub(crate) pq_import_gate: Arc<tokio::sync::Semaphore>,
+    pub(crate) pq_import_admission: Arc<tokio::sync::Semaphore>,
+    pub(crate) pq_execution_notifier: crate::pq_import::PqExecutionNotifier<T::EthSpec>,
+    pub(crate) task_executor: TaskExecutor,
+    #[cfg(feature = "pq-startup-testing")]
+    pub(crate) pq_blocking_test_hook: Option<Arc<crate::TestingPqBlockingHook>>,
+    #[cfg(feature = "pq-startup-testing")]
+    pub(crate) pq_persistence_test_hook: Option<Arc<crate::TestingPqBlockingHook>>,
     pub pq_validator_key_cache: Arc<PqValidatorKeyCache>,
     pub pq_aggregation_service: Arc<AggregationService>,
+    pub slot_clock: T::SlotClock,
     marker: PhantomData<T>,
 }
 
@@ -114,19 +134,42 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         canonical_head: BeaconSnapshot<T::EthSpec>,
         pq_validator_key_cache: Arc<PqValidatorKeyCache>,
         pq_aggregation_service: Arc<AggregationService>,
+        pq_execution_notifier: crate::pq_import::PqExecutionNotifier<T::EthSpec>,
+        task_executor: TaskExecutor,
+        #[cfg(feature = "pq-startup-testing")] pq_blocking_test_hook: Option<
+            Arc<crate::TestingPqBlockingHook>,
+        >,
+        #[cfg(feature = "pq-startup-testing")] pq_persistence_test_hook: Option<
+            Arc<crate::TestingPqBlockingHook>,
+        >,
+        slot_clock: T::SlotClock,
     ) -> Self {
         Self {
             spec,
             store,
-            canonical_head: Arc::new(canonical_head),
+            canonical_head: Arc::new(RwLock::new(Arc::new(canonical_head))),
+            observed_pq_blocks: Arc::new(Mutex::new(
+                crate::pq_import::PqGossipObservationCache::default(),
+            )),
+            pq_import_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            pq_import_admission: Arc::new(tokio::sync::Semaphore::new(
+                crate::PQ_BLOCK_IMPORT_ADMISSION_CAPACITY,
+            )),
+            pq_execution_notifier,
+            task_executor,
+            #[cfg(feature = "pq-startup-testing")]
+            pq_blocking_test_hook,
+            #[cfg(feature = "pq-startup-testing")]
+            pq_persistence_test_hook,
             pq_validator_key_cache,
             pq_aggregation_service,
+            slot_clock,
             marker: PhantomData,
         }
     }
 
     /// Returns the exact snapshot which was strictly validated before worker construction.
     pub fn head_snapshot(&self) -> Arc<BeaconSnapshot<T::EthSpec>> {
-        self.canonical_head.clone()
+        self.canonical_head.read().clone()
     }
 }

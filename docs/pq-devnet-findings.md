@@ -1290,3 +1290,77 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   19 integration tests. Topic assertions require the core set to contain only blocks,
   aggregate-and-proof, and attestation subnets, and allow only attestation subnets as non-core
   subscriptions; sync-committee subnets are explicitly rejected.
+
+### 2026-08-19: Sealed PQ external-block import pipeline implemented (Task 5.3e-c)
+
+- `PqBlockImportRequest` is the sole raw wire-ingress owner for gossip, RPC, lookup, and forward
+  range. `BeaconChain::verify_pq_block` clones the exact canonical parent snapshot, rejects unknown
+  or non-advancing parents before proof work, advances missed slots on the owned state, validates
+  the `NewPayloadRequest` deterministically, performs the complete Block-class proposal/RANDAO/all-
+  attestation proof, and consumes `VerifiedPqBlock`. The new consuming transition output owns the
+  exact post-state, signed block, and fresh context and checks the signed post-state root internally.
+- The PQ builder also constructs and owns its `SlotClock` from the bound genesis time and spec.
+  Future blocks are rejected before slot advancement or evidence work, while legitimate long gaps
+  are not rejected by an arbitrary fixed gap limit.
+- The builder now requires the process-owned `TaskExecutor`; startup fails if it is absent.
+  Skipped-slot advancement, deterministic payload/job preparation, post-proof transition and root
+  hashing, whole-range hashing, and atomic persistence run as named blocking tasks. The async worker
+  retains no state/cache lock or borrow across those tasks, proof verification, or Engine awaits.
+- Raw ingress uses two non-waiting, chain-owned admission permits before proof or commit queueing.
+  Each permit remains owned through the full pipeline and through a detached blocking closure after
+  caller cancellation, bounding retained advanced states/proof outputs to two. A forward range uses
+  one permit, processes sequentially, and rejects more than eight raw blocks before hashing.
+- Verification returns a non-forgeable `PqVerifiedBlockImport` and makes no observed, Engine,
+  database, or head mutation. Gossip observation is keyed by `(slot, proposer)` and uses explicit
+  pending-propagation, pending-commit, retryable-propagation, retryable-commit, external-reservation,
+  terminal, and committed states. A generation-bound RAII token ensures that only the exact first
+  capability can cross propagation; concurrent duplicates cannot commit, and a dropped token
+  restores the appropriate propagation or commit retry. A different root is reported as an
+  equivocation without overwriting the first observation.
+- The Engine notifier is fixed once in `BeaconChainBuilder`; import callers cannot supply a
+  verification strategy. An owned async single-writer permit queues the Engine/commit phase without
+  retaining state/cache or a borrowed lock across await. The parent is rechecked after queueing.
+  Exact root/generation authority is rechecked under that permit before Engine. RPC, lookup, and
+  range imports reserve an exact bounded observation entry there too; capacity exhaustion is local
+  and occurs before Engine, with no evidence eviction. Only `VALID` reaches persistence.
+  `INVALID`/`INVALID_BLOCK_HASH` install an exact-root terminal result but do not downscore an honest
+  optimistic relay; `SYNCING`/`ACCEPTED` and transport failures are retryable local errors.
+- Non-genesis persistence now consumes only `PqImportedTransitionOutput`. State, block, and PQ head
+  metadata form one atomic hot-database batch; the in-memory head changes only afterward. Restart
+  reuses the strict metadata/block/state root and slot binding from the startup slice. The raw
+  persistence method remains test-feature-only. Every successful source installs/replaces the
+  current committed observation root, invalidates queued generations, and prunes older slots. The
+  current slot remains retained for equivocation/terminal suppression, and the hard 128-entry cap
+  also bounds retryable and invalid entries.
+- Once Engine returns `VALID`, persistence and publication are cancellation-independent. One owned
+  blocking completion retains the import gate, admission, sealed output, and exact observation
+  authority through the atomic database batch, then swaps the in-memory head and records/prunes the
+  committed observation. Canceling the awaiting network request cannot expose a second commit or
+  leave durable and in-memory heads split; database failure leaves memory untouched and restores a
+  retryable observation before releasing ownership.
+- The PQ network processor maps full verification to gossipsub accept/reject/ignore dispositions,
+  commits accepted gossip only after caller propagation, and routes RPC and lookup through the same
+  consuming path. Forward ranges preflight the whole parent/slot chain before work, then process
+  sequentially with no epoch BLS batch verifier and return the exact committed prefix on failure.
+  Ordinary backfill, checkpoint, and historical reconstruction stay compile-time omitted.
+- Ten scalar tests cover the concrete Engine/scoring table, generation lifecycle, pending
+  duplicate exclusion, dropped-capability recovery, retryable versus terminal completion,
+  same/different-root cross-source authority, long-chain pruning, current-slot retention, and the
+  no-eviction capacity boundary. The real journal-backed AVX2 test additionally uses awaited
+  `PqNetworkBlockProcessor` calls for gossip, RPC, lookup, and forward range, and covers deterministic
+  payload rejection before Engine, unknown-parent handling, whole-range preflight, full gossip proof
+  before observation, a concurrent pending duplicate, RAII propagation retry, `SYNCING`, atomic
+  database failure, a range commit invalidating a held gossip token, exact imported prefix and
+  restart, RPC `INVALID_BLOCK_HASH` invalidating a queued gossip generation with no second Engine
+  call, a full cache returning local capacity with zero Engine calls, blocking-executor heartbeat,
+  exact two-import admission with a third rejected before preparation, cancellation cleanup,
+  pending-Engine cancellation/retry, an eight-block range bound, and terminal post-verification
+  stale-head classification. The final fixture also separately asserts exact successful RPC and
+  lookup source attribution, rejects a separately proposal-signed wrong post-state root before
+  Engine, and cancels at a deterministic post-`VALID` persistence barrier before proving database,
+  head, observation, and restart convergence. A second canceled barrier forces the atomic database
+  failure and proves no head publication, retryable reservation cleanup, permit release, and genesis
+  restart consistency. Refreshed warning-denied scalar and AVX2 results are recorded in the Task
+  5.3e-c handoff.
+- Hash-chain/hash-onion RANDAO remains a future versioned proposal. V1 continues to authenticate the
+  epoch signing root with the proposal-slot RANDAO leaf and retains the frozen 14-leaf allocation.
