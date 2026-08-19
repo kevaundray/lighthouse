@@ -1189,3 +1189,104 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
 - Hash-chain/hash-onion RANDAO remains future-only. It would require a versioned genesis
   commitment, state and wire changes, and explicit rollback/reorg/backup rules; this local
   capability neither changes the V1 epoch signing root nor renumbers the frozen 14-leaf layout.
+
+### 2026-08-19: PQ BeaconChain startup ownership spine implemented (Task 5.3e-b)
+
+- The first strict top-level RED had no `lighthouse/pq-devnet`; forwarding it next exposed the
+  absent `beacon_node` feature, then 6 slasher type mismatches, 16 store/genesis/fork-choice
+  blockers, and finally 89 ordinary BeaconChain BLS/deferred-runtime errors. This evidence drove a
+  bounded beacon-node-only `--no-default-features` profile instead of pulling the known
+  validator-client duty migration into this slice.
+- The real lower-level PQ BeaconChain startup core owns exactly one immutable
+  `Arc<PqValidatorKeyCache>` rebuilt from the strict 16-validator head state and one injected
+  `Arc<AggregationService>`. Its serialized startup test constructs the real service, observes an
+  explicit `AlreadyActive` from a second construction attempt, proves pointer identity between the
+  injected and chain-owned service, and proves the rebuilt cache is a distinct but equal `Arc` on
+  restart.
+- Canonical startup never rewrites an already-signed head. It recomputes the state root and rejects
+  a mismatch. Restart additionally requires persisted metadata, state, and block slots to agree,
+  recomputes both canonical roots, and verifies the block's state root. Regression tests reject a
+  tampered metadata slot, a block stored under the wrong root, and an unrelated otherwise-valid
+  state before cache or worker initialization.
+- Production code can persist only the slot-zero genesis snapshot; the raw unsealed state/block
+  persistence escape hatch exists solely behind the dedicated `pq-startup-testing` feature and is
+  explicitly named test-only. An automated test invokes a root-lockfile-pinned workspace fixture
+  and requires the exact E0599/missing-`canonical_head` diagnostic; temporarily restoring the raw
+  method makes that test fail because the fixture compiles. Its pure-Rust redb graph contains no
+  `leveldb-sys`. Task 5.3e-c must persist non-genesis heads from sealed transition output rather
+  than restoring this raw API.
+- Genesis/test snapshot persistence converts the anchor, state snapshot, signed block, and PQ head
+  metadata into one hot-database atomic batch. The test-only memory-store fault seam rejects that
+  batch at its block operation and proves the in-memory anchor is rolled back and that no anchor,
+  state, block, or PQ-head database record was partially committed.
+- PQ stores require hierarchy exponents `[0]`, so every hot state is an exact snapshot and restart
+  at slot 7 does not invoke BLS `BlockReplayer`. PQ replay/historical reconstruction entry points
+  are compile-time omitted or return the typed unsupported-store error at an unavoidable storage
+  strategy boundary. Startup does not load, top up, create, reinterpret, or persist `pkc`; it also
+  does not restore/persist `opo`. The restart test proves initial `pkc` absence and byte identity of
+  subsequently seeded legacy `pkc` and `opo` records.
+- `ClientConfig::validate_pq_devnet` is a side-effect-free programmatic guard called before
+  `ProductionBeaconNode::new` can touch directories, databases, network, execution clients, or
+  workers. A direct rejection-table test covers every unsupported genesis family, builder URL,
+  weak-subjectivity checkpoint, archive, both backfill flags, chain and network light-client flags,
+  optimistic finalized sync, validator monitoring, non-`[0]` hierarchy, wrong fork, Fulu, and
+  Gloas; it also proves the configured absent data directory remains absent. Slasher is absent from
+  the PQ dependency graph and its CLI option is rejected. The selected CLI path returns
+  `DeferredRuntimeIntegration` immediately after argument-only validation, before calling the
+  ordinary `get_config` path that can read, create, or purge files. Explicit root-level
+  `compile_error!` guards reject `pq-devnet` combined with `full-cli`, `beacon-node-runtime`, or any
+  slasher backend or Lighthouse integration-harness feature.
+- The selected PQ network topic policy contains only beacon blocks, aggregate-and-proof, and
+  subscribed attestation subnets. Sync contributions, exits, slashings, BLS changes, light-client,
+  and Gloas topics are excluded. The network service/router/sync/subnet processors themselves are
+  deliberately not started in 5.3e-b.
+- Exact compile-time omission inventory for restoration: ordinary BeaconChain attestation and
+  block verification/import, rewards, proposer/shuffling/observed caches, fork choice, KZG/data
+  availability/blob and data-column paths, block/payload production and builder/payload-envelope
+  paths, execution readiness, operation persistence, naive aggregation, sync committee,
+  light-client, historical/backfill/migration, timers/events/metrics, slashing/exits/BLS changes,
+  monitoring, and testing utilities; network service, router, beacon processor, status, sync,
+  subnet, NAT, DHT, and metrics modules; client notifier/metrics/ordinary builder; HTTP API,
+  metrics, and timer dependencies; validator-client, account-manager, database-manager, and other
+  top-level subcommands. Task 5.3e-c restores gossip/import/range-sync call chains, 5.3e-d restores
+  local production and supported APIs, and 5.3e-e restores PQ validator duties. No omitted API has
+  an empty/success behavior stub: the surviving production boundary returns the explicit typed
+  `DeferredRuntimeIntegration` before side effects.
+- Verification evidence: Rust 1.88 warning-denied scalar and AVX2 checks of
+  `lighthouse --no-default-features --features pq-devnet,beacon-node-leveldb` pass; the real AVX2
+  startup suite passes 9/9 under AVX2 (including typed-boundary, atomic persistence, slot-7
+  restart, and singleton tests), while its eight typed/state/profile/restart-binding regressions
+  also pass 8/8 under scalar; the direct client preflight test passes 1/1; and ordinary
+  `cargo +1.88 check -p lighthouse` passes with the default full runtime, slasher service, HTTP,
+  timer, account/database-manager, and validator-client graph. Hash-chain RANDAO remains a future
+  versioned proposal and is not part of this startup spine.
+
+#### Local startup feature profiles and typed boundary
+
+- `client` and `beacon_node` each require exactly one local runtime profile. Ordinary direct-crate
+  checks use `--no-default-features --features full-runtime`; the staged PQ spine uses
+  `--no-default-features --features pq-devnet`. The package defaults continue to select the full
+  runtime plus slasher. Selecting neither profile fails with `requires exactly one runtime
+  profile`; combining the defaults with `pq-devnet` fails with `runtime profiles full-runtime and
+  pq-devnet are mutually exclusive`. These expected-failure commands are checked explicitly for
+  both packages so an incidental unresolved optional dependency cannot define the contract.
+- PQ `ProductionBeaconNode::new` and `new_from_cli` return `PqStartupError`, preserving whether the
+  cause was CLI validation, programmatic `ClientConfig` validation, or the typed
+  `PqRuntimeError::DeferredRuntimeIntegration` boundary. Integration tests pattern-match all three
+  caller-visible categories; only the top-level binary converts the error to display text.
+  `PqRuntimeError` also preserves nested state-profile, key-cache, and aggregation error sources.
+- The ordinary Lighthouse integration harness dependencies are optional and selected explicitly
+  with `--features lighthouse-integration-tests`; they are absent from both the production default
+  graph and the no-default PQ graph. CI's workspace test commands select the package-qualified
+  `lighthouse/lighthouse-integration-tests` feature, and a focused local compile uses
+  `cargo test -p lighthouse --features lighthouse-integration-tests --test lighthouse_tests
+  --no-run`. The root guard rejects combining that feature with `pq-devnet`. The dedicated PQ
+  integration target executes the native binary, observes the deferred error, and proves an
+  explicitly configured absent data directory remains absent. The exact no-default PQ `cargo test
+  --no-run` command therefore compiles both the selected binary and this PQ-only test without
+  weakening the mutually-exclusive runtime guard.
+- PQ network tests use the active `IndividualSignature` fixtures. The exact Rust 1.88 command
+  `cargo test -p lighthouse_network --no-default-features --features pq-devnet` passes 83 unit and
+  19 integration tests. Topic assertions require the core set to contain only blocks,
+  aggregate-and-proof, and attestation subnets, and allow only attestation subnets as non-core
+  subscriptions; sync-committee subnets are explicitly rejected.

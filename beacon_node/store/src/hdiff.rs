@@ -1,6 +1,6 @@
 //! Hierarchical diff implementation.
 use crate::{DBColumn, StoreConfig, StoreItem, metrics};
-use bls::PublicKeyBytes;
+use consensus_signature::ValidatorPublicKeyBytes;
 use itertools::Itertools;
 use milhouse::List;
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,8 @@ use superstruct::superstruct;
 use types::state::HistoricalSummary;
 use types::{BeaconState, ChainSpec, Epoch, EthSpec, Hash256, Slot, Validator};
 
-static EMPTY_PUBKEY: LazyLock<PublicKeyBytes> = LazyLock::new(PublicKeyBytes::empty);
+static EMPTY_PUBKEY: LazyLock<ValidatorPublicKeyBytes> =
+    LazyLock::new(ValidatorPublicKeyBytes::empty);
 
 #[derive(Debug)]
 pub enum Error {
@@ -457,7 +458,7 @@ impl ValidatorsDiff {
                             pubkey: if pubkey_changed {
                                 y.pubkey
                             } else {
-                                PublicKeyBytes::empty()
+                                ValidatorPublicKeyBytes::empty()
                             },
                             // withdrawal_credentials can be set to zero initially but can never be
                             // changed INTO zero. On index re-use it can be set to zero, but in that

@@ -1,0 +1,29 @@
+[package]
+name = "pq-raw-canonical-head-compile-fail"
+version = "0.0.0"
+edition = { workspace = true }
+publish = false
+autobins = false
+
+[[bin]]
+name = "raw-canonical-head-must-not-compile"
+path = "src/main.rs"
+required-features = ["compile-fail"]
+
+[features]
+default = []
+compile-fail = [
+    "dep:beacon_chain",
+    "dep:slot_clock",
+    "dep:store",
+    "dep:types",
+    "beacon_chain/pq-devnet",
+    "store/redb",
+    "types/pq-devnet",
+]
+
+[dependencies]
+beacon_chain = { path = "../../../../beacon_node/beacon_chain", optional = true, default-features = false }
+slot_clock = { workspace = true, optional = true }
+store = { path = "../../../../beacon_node/store", optional = true, default-features = false }
+types = { workspace = true, optional = true }

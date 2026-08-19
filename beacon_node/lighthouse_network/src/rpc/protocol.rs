@@ -1,6 +1,6 @@
 use super::methods::*;
 use crate::rpc::codec::SSZSnappyInboundCodec;
-use bls::Signature;
+use consensus_signature::IndividualSignature;
 use futures::future::BoxFuture;
 use futures::prelude::{AsyncRead, AsyncWrite};
 use futures::{FutureExt, StreamExt};
@@ -32,7 +32,7 @@ pub static SIGNED_BEACON_BLOCK_BASE_MIN: LazyLock<usize> = LazyLock::new(|| {
         BeaconBlock::Base(BeaconBlockBase::<MainnetEthSpec>::empty(
             &MainnetEthSpec::default_spec(),
         )),
-        Signature::empty(),
+        IndividualSignature::empty(),
     )
     .as_ssz_bytes()
     .len()
@@ -40,7 +40,7 @@ pub static SIGNED_BEACON_BLOCK_BASE_MIN: LazyLock<usize> = LazyLock::new(|| {
 pub static SIGNED_BEACON_BLOCK_BASE_MAX: LazyLock<usize> = LazyLock::new(|| {
     SignedBeaconBlock::<MainnetEthSpec>::from_block(
         BeaconBlock::Base(BeaconBlockBase::full(&MainnetEthSpec::default_spec())),
-        Signature::empty(),
+        IndividualSignature::empty(),
     )
     .as_ssz_bytes()
     .len()
@@ -49,7 +49,7 @@ pub static SIGNED_BEACON_BLOCK_BASE_MAX: LazyLock<usize> = LazyLock::new(|| {
 pub static SIGNED_BEACON_BLOCK_ALTAIR_MAX: LazyLock<usize> = LazyLock::new(|| {
     SignedBeaconBlock::<MainnetEthSpec>::from_block(
         BeaconBlock::Altair(BeaconBlockAltair::full(&MainnetEthSpec::default_spec())),
-        Signature::empty(),
+        IndividualSignature::empty(),
     )
     .as_ssz_bytes()
     .len()

@@ -9,18 +9,29 @@ name = "beacon_node"
 path = "src/lib.rs"
 
 [features]
+default = ["full-runtime", "slasher"]
+full-runtime = ["client/full-runtime", "dep:http_api"]
 # Writes debugging .ssz files to /tmp during block processing.
 write_ssz_files = ["beacon_chain/write_ssz_files"]
 # Enables testing-only CLI flags.
-testing = []
+testing = ["full-runtime"]
+slasher = ["full-runtime", "beacon_chain/slasher", "client/slasher", "dep:slasher"]
+# Experimental compile-time-only lean PQ devnet profile.
+pq-devnet = [
+    "beacon_chain/pq-devnet",
+    "client/pq-devnet",
+    "execution_layer/pq-devnet",
+    "lighthouse_network/pq-devnet",
+    "types/pq-devnet",
+]
 
 [dependencies]
 account_utils = { workspace = true }
-beacon_chain = { workspace = true }
+beacon_chain = { path = "beacon_chain", default-features = false }
 bls = { workspace = true }
 clap = { workspace = true }
 clap_utils = { workspace = true }
-client = { path = "client" }
+client = { path = "client", default-features = false }
 directory = { workspace = true }
 dirs = { workspace = true }
 environment = { workspace = true }
@@ -28,14 +39,14 @@ eth2_config = { workspace = true }
 execution_layer = { workspace = true }
 genesis = { workspace = true }
 hex = { workspace = true }
-http_api = { workspace = true }
+http_api = { workspace = true, optional = true }
 hyper = { workspace = true }
 lighthouse_network = { workspace = true }
 monitoring_api = { workspace = true }
 network_utils = { workspace = true }
 sensitive_url = { workspace = true }
 serde_json = { workspace = true }
-slasher = { workspace = true }
+slasher = { workspace = true, optional = true }
 store = { workspace = true }
 strum = { workspace = true }
 task_executor = { workspace = true }

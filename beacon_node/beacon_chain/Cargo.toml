@@ -7,17 +7,36 @@ edition = { workspace = true }
 autotests = false # using a single test binary compiles faster
 
 [features]
-default = ["participation_metrics"]
+default = [
+    "operation_pool/leveldb",
+    "participation_metrics",
+    "slasher",
+    "store/leveldb",
+]
 # Writes debugging .ssz files to /tmp during block processing.
 write_ssz_files = []
 # Exposes validator participation metrics to Prometheus.
 participation_metrics = []
+slasher = ["dep:slasher"]
 # Initialise the harness chain spec from the FORK_NAME env variable
 fork_from_env = []
 portable = ["bls/supranational-portable"]
 test_backfill = []
 arbitrary = ["dep:arbitrary", "types/arbitrary"]
 pq-wire = ["consensus_signature/pq-wire", "eth2/pq-wire", "types/pq-devnet"]
+pq-devnet = [
+    "pq-wire",
+    "consensus_signature/pq-devnet",
+    "execution_layer/pq-devnet",
+    "fork_choice/pq-devnet",
+    "genesis/pq-devnet",
+    "operation_pool/pq-devnet",
+    "state_processing/pq-genesis",
+    "state_processing/pq-transition",
+    "store/pq-devnet",
+]
+# Exposes raw snapshot persistence only to the isolated PQ startup/restart harness.
+pq-startup-testing = ["pq-devnet", "store/pq-startup-testing"]
 
 [dependencies]
 alloy-primitives = { workspace = true }
@@ -49,7 +68,7 @@ metrics = { workspace = true }
 milhouse = { workspace = true }
 once_cell = { workspace = true }
 oneshot_broadcast = { path = "../../common/oneshot_broadcast/" }
-operation_pool = { workspace = true }
+operation_pool = { path = "../operation_pool", default-features = false }
 parking_lot = { workspace = true }
 proto_array = { workspace = true }
 rand = { workspace = true }
@@ -58,12 +77,12 @@ safe_arith = { workspace = true }
 sensitive_url = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-slasher = { workspace = true }
+slasher = { workspace = true, optional = true }
 slot_clock = { workspace = true }
 smallvec = { workspace = true }
 ssz_types = { workspace = true }
 state_processing = { workspace = true }
-store = { workspace = true }
+store = { path = "../store", default-features = false }
 strum = { workspace = true }
 superstruct = { workspace = true }
 task_executor = { workspace = true }
@@ -79,7 +98,7 @@ zstd = { workspace = true }
 
 [dev-dependencies]
 arbitrary = { workspace = true }
-beacon_chain = { path = ".", features = ["arbitrary"] }
+beacon_chain = { path = ".", default-features = false, features = ["arbitrary"] }
 criterion = { workspace = true }
 maplit = { workspace = true }
 mockall = { workspace = true }

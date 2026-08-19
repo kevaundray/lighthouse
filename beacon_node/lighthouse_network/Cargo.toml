@@ -5,11 +5,20 @@ authors = ["Sigma Prime <contact@sigmaprime.io>"]
 edition = { workspace = true }
 autotests = false
 
+[features]
+default = []
+pq-devnet = [
+    "consensus_signature/pq-wire",
+    "eth2/pq-devnet",
+    "types/pq-devnet",
+]
+
 [dependencies]
 alloy-primitives = { workspace = true }
 alloy-rlp = { workspace = true }
 bls = { workspace = true }
 bytes = { workspace = true }
+consensus_signature = { workspace = true }
 delay_map = { workspace = true }
 directory = { workspace = true }
 dirs = { workspace = true }

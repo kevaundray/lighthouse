@@ -49,7 +49,6 @@ pub mod altair;
 #[cfg(not(feature = "pq-transition"))]
 pub mod block_signature_verifier;
 pub mod builder;
-#[cfg(not(feature = "pq-transition"))]
 pub mod deneb;
 pub mod errors;
 mod is_valid_indexed_attestation;

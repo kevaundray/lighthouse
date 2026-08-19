@@ -82,12 +82,15 @@ use crate::sync_committee_verification::{
 use crate::validator_monitor::{
     HISTORIC_EPOCHS as VALIDATOR_MONITOR_HISTORIC_EPOCHS, ValidatorMonitor, get_slot_delay_ms,
 };
+#[cfg(not(feature = "pq-devnet"))]
 use crate::validator_pubkey_cache::ValidatorPubkeyCache;
 use crate::{
     AvailabilityPendingExecutedBlock, BeaconChainError, BeaconForkChoiceStore, BeaconSnapshot,
     CachedHead, metrics,
 };
 use bls::{PublicKey, PublicKeyBytes};
+#[cfg(feature = "pq-devnet")]
+use consensus_signature::AggregationService;
 use consensus_signature::IndividualSignature;
 use eth2::beacon_response::ForkVersionedResponse;
 use eth2::types::{
@@ -108,16 +111,19 @@ use itertools::Itertools;
 use itertools::process_results;
 use kzg::Kzg;
 use logging::crit;
-use operation_pool::{
-    CompactAttestationRef, OperationPool, PersistedOperationPool, ReceivedPreCapella,
-};
+#[cfg(not(feature = "pq-devnet"))]
+use operation_pool::PersistedOperationPool;
+use operation_pool::{CompactAttestationRef, OperationPool, ReceivedPreCapella};
 use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use proto_array::{DoNotReOrg, ProposerHeadError, ReOrgThreshold};
 use rand::RngCore;
 use safe_arith::SafeArith;
+#[cfg(feature = "slasher")]
 use slasher::Slasher;
 use slot_clock::SlotClock;
 use ssz::Encode;
+#[cfg(feature = "pq-devnet")]
+use state_processing::PqValidatorKeyCache;
 use state_processing::{
     BlockSignatureStrategy, ConsensusContext, SigVerifiedOp, VerifyBlockRoot, VerifyOperation,
     common::get_attesting_indices_from_state,
@@ -473,7 +479,14 @@ pub struct BeaconChain<T: BeaconChainTypes> {
     /// Caches the beacon block proposer shuffling for a given epoch and shuffling key root.
     pub beacon_proposer_cache: Arc<Mutex<BeaconProposerCache>>,
     /// Caches a map of `validator_index -> validator_pubkey`.
+    #[cfg(not(feature = "pq-devnet"))]
     pub(crate) validator_pubkey_cache: RwLock<ValidatorPubkeyCache<T>>,
+    /// Immutable registry-order PQ keys rebuilt from the strictly validated startup head.
+    #[cfg(feature = "pq-devnet")]
+    pub pq_validator_key_cache: Arc<PqValidatorKeyCache>,
+    /// The sole process-wide PQ aggregation worker shared by all downstream consumers.
+    #[cfg(feature = "pq-devnet")]
+    pub pq_aggregation_service: Arc<AggregationService>,
     /// A cache used when producing attestations whilst the head block is still being imported.
     pub early_attester_cache: EarlyAttesterCache<T::EthSpec>,
     /// A cache used to keep track of various block timings.
@@ -496,6 +509,7 @@ pub struct BeaconChain<T: BeaconChainTypes> {
     /// Arbitrary bytes included in the blocks.
     pub(crate) graffiti_calculator: GraffitiCalculator<T>,
     /// Optional slasher.
+    #[cfg(feature = "slasher")]
     pub slasher: Option<Arc<Slasher<T::EthSpec>>>,
     /// Provides monitoring of a set of explicitly defined validators.
     pub validator_monitor: RwLock<ValidatorMonitor<T::EthSpec>>,
@@ -3907,6 +3921,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         data_columns: Vec<GossipVerifiedDataColumn<T>>,
         publish_fn: impl FnOnce() -> Result<(), BlockError>,
     ) -> Result<AvailabilityProcessingStatus, BlockError> {
+        #[cfg(feature = "slasher")]
         if let Some(slasher) = self.slasher.as_ref() {
             for data_column in &data_columns {
                 // TODO(gloas) different gossip checks in gloas
@@ -3961,6 +3976,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                     block_root,
                 )
                 .map_err(|e| BlockError::BeaconChainError(Box::new(e.into())))?;
+            #[cfg(feature = "slasher")]
             if let Some(slasher) = self.slasher.as_ref() {
                 slasher.accept_block_header(header);
             }
@@ -4092,6 +4108,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                     block_root,
                 )
                 .map_err(|e| BlockError::BeaconChainError(Box::new(e.into())))?;
+            #[cfg(feature = "slasher")]
             if let Some(slasher) = self.slasher.as_ref() {
                 slasher.accept_block_header(header.clone());
             }
@@ -4743,6 +4760,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         state: &BeaconState<T::EthSpec>,
         ctxt: &mut ConsensusContext<T::EthSpec>,
     ) {
+        #[cfg(feature = "slasher")]
         if let Some(slasher) = self.slasher.as_ref() {
             for attestation in block.body().attestations() {
                 let indexed_attestation = match ctxt.get_indexed_attestation(state, attestation) {
@@ -4760,6 +4778,8 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 slasher.accept_attestation(indexed_attestation.clone_as_indexed_attestation());
             }
         }
+        #[cfg(not(feature = "slasher"))]
+        let _ = (block, state, ctxt);
     }
 
     fn import_block_update_metrics_and_events(

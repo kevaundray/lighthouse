@@ -19,6 +19,7 @@ pub mod invariants;
 mod memory_store;
 pub mod metadata;
 pub mod metrics;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod reconstruct;
 pub mod state_cache;
 

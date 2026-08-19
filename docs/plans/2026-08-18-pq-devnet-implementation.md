@@ -1832,6 +1832,35 @@ RANDAO claim, V1 proposal-slot RANDAO leaf, signature, key cache, and spec neede
 included attestations retain their own contextual verification tokens. The ordinary BLS
 `ProduceBlockVerification` behavior remains unchanged outside the PQ profile.
 
+#### Task 5.3e-b: Establish the PQ startup ownership spine
+
+The first BeaconChain slice is intentionally startup-only. Add a real top-level
+`lighthouse/pq-devnet` beacon-node profile, but stop it at a typed
+`DeferredRuntimeIntegration` boundary before filesystem, database, network, HTTP, timer, execution
+layer, or proof-worker side effects. Reject compile-time combinations with the ordinary full CLI,
+full beacon-node runtime, or slasher backends. Validator-client support remains Task 5.3e-e.
+
+The lower-level startup core must load or persist one exact canonical snapshot, strictly validate
+the frozen 16-validator Electra-from-genesis profile, rebuild one immutable
+`Arc<PqValidatorKeyCache>`, and accept the process's sole `Arc<AggregationService>`. Restart binds
+the metadata, state, and block by slot and by recomputed canonical roots. It uses hierarchy `[0]`
+(a full snapshot every slot), never invokes BLS block replay, and neither reads nor writes the
+legacy `pkc` and `opo` records.
+
+Programmatic `ClientConfig` preflight is required before all startup side effects. Only
+`GenesisState` and `FromStore` are accepted; reject builders, weak-subjectivity/checkpoint modes,
+archive/backfills, light-client service flags, optimistic finalized sync, validator monitoring,
+slasher, Fulu/Gloas, and any store hierarchy other than `[0]`.
+
+For this bounded slice, compile-time omit the ordinary BeaconChain gossip/import/production,
+fork-choice, payload/builder/Gloas, sync-duty, slashing, monitoring, persistence, historical,
+light-client, and worker modules; omit the network service/router/sync/subnet processors; and omit
+HTTP API/metrics/timers and non-beacon-node CLI subcommands. The PQ operation pool is an ephemeral
+ownership root only and exposes no fabricated insertion/retrieval behavior. Task 5.3e-c
+restores network gossip and import callers, Task 5.3e-d restores local production and APIs, and
+Task 5.3e-e restores validator-client duties. Default BLS module selection and behavior remain
+unchanged.
+
 #### Task 5.3e-a: Seal local production before BeaconChain wiring
 
 Implement `PreparedPqRandao -> VerifiedPqRandao` with block-class verification and owned immutable

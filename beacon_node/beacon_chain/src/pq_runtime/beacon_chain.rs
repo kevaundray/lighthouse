@@ -1,0 +1,132 @@
+use consensus_signature::AggregationService;
+use slot_clock::SlotClock;
+use state_processing::PqValidatorKeyCache;
+use std::marker::PhantomData;
+use std::sync::Arc;
+use store::{HotColdDB, ItemStore};
+use types::{BeaconState, ChainSpec, EthSpec, Hash256, SignedBeaconBlock};
+
+/// The minimal type family required by the Task 5.3e-b PQ startup core.
+pub trait BeaconChainTypes: Send + Sync + 'static {
+    type EthSpec: EthSpec;
+    type HotStore: ItemStore + 'static;
+    type ColdStore: ItemStore + 'static;
+    type SlotClock: SlotClock + 'static;
+}
+
+pub type BeaconStore<T> = Arc<
+    HotColdDB<
+        <T as BeaconChainTypes>::EthSpec,
+        <T as BeaconChainTypes>::HotStore,
+        <T as BeaconChainTypes>::ColdStore,
+    >,
+>;
+
+/// An exact canonical block/state snapshot loaded without BLS block replay.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BeaconSnapshot<E: EthSpec> {
+    pub beacon_block: Arc<SignedBeaconBlock<E>>,
+    pub beacon_block_root: Hash256,
+    pub beacon_state: BeaconState<E>,
+}
+
+/// Typed failures from the deliberately narrow PQ startup core.
+#[derive(Debug)]
+pub enum PqRuntimeError {
+    InvalidState(state_processing::PqDevnetStateError),
+    InvalidKeyCache(state_processing::PqAttestationCacheError),
+    MissingPersistedHead,
+    MissingHeadBlock,
+    MissingHeadState,
+    PersistedHeadBinding(&'static str),
+    HeadStateRootMismatch { block: Hash256, state: Hash256 },
+    Store(store::Error),
+    Aggregation(consensus_signature::AggregationError),
+    DeferredRuntimeIntegration,
+}
+
+impl std::fmt::Display for PqRuntimeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidState(error) => write!(formatter, "{error}"),
+            Self::InvalidKeyCache(error) => {
+                write!(formatter, "lean PQ devnet V1 key cache rejected: {error:?}")
+            }
+            Self::MissingPersistedHead => formatter.write_str("PQ canonical head metadata missing"),
+            Self::MissingHeadBlock => formatter.write_str("PQ canonical head block missing"),
+            Self::MissingHeadState => formatter.write_str("PQ canonical head state missing"),
+            Self::PersistedHeadBinding(reason) => {
+                write!(
+                    formatter,
+                    "PQ persisted canonical head binding rejected: {reason}"
+                )
+            }
+            Self::HeadStateRootMismatch { block, state } => write!(
+                formatter,
+                "PQ canonical head state-root mismatch: block {block:?}, state {state:?}"
+            ),
+            Self::Store(error) => write!(formatter, "PQ store error: {error:?}"),
+            Self::Aggregation(error) => write!(formatter, "PQ aggregation startup error: {error}"),
+            Self::DeferredRuntimeIntegration => formatter.write_str(
+                "lean PQ devnet networking, HTTP, timers, import and production are deferred",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PqRuntimeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidState(error) => Some(error),
+            Self::InvalidKeyCache(error) => Some(error),
+            Self::Aggregation(error) => Some(error),
+            Self::MissingPersistedHead
+            | Self::MissingHeadBlock
+            | Self::MissingHeadState
+            | Self::PersistedHeadBinding(_)
+            | Self::HeadStateRootMismatch { .. }
+            | Self::Store(_)
+            | Self::DeferredRuntimeIntegration => None,
+        }
+    }
+}
+
+impl From<store::Error> for PqRuntimeError {
+    fn from(error: store::Error) -> Self {
+        Self::Store(error)
+    }
+}
+
+/// Immutable ownership root for the Task 5.3e-b PQ runtime.
+pub struct BeaconChain<T: BeaconChainTypes> {
+    pub spec: Arc<ChainSpec>,
+    pub store: BeaconStore<T>,
+    canonical_head: Arc<BeaconSnapshot<T::EthSpec>>,
+    pub pq_validator_key_cache: Arc<PqValidatorKeyCache>,
+    pub pq_aggregation_service: Arc<AggregationService>,
+    marker: PhantomData<T>,
+}
+
+impl<T: BeaconChainTypes> BeaconChain<T> {
+    pub(crate) fn new(
+        spec: Arc<ChainSpec>,
+        store: BeaconStore<T>,
+        canonical_head: BeaconSnapshot<T::EthSpec>,
+        pq_validator_key_cache: Arc<PqValidatorKeyCache>,
+        pq_aggregation_service: Arc<AggregationService>,
+    ) -> Self {
+        Self {
+            spec,
+            store,
+            canonical_head: Arc::new(canonical_head),
+            pq_validator_key_cache,
+            pq_aggregation_service,
+            marker: PhantomData,
+        }
+    }
+
+    /// Returns the exact snapshot which was strictly validated before worker construction.
+    pub fn head_snapshot(&self) -> Arc<BeaconSnapshot<T::EthSpec>> {
+        self.canonical_head.clone()
+    }
+}

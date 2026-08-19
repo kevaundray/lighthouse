@@ -2,6 +2,7 @@ use libp2p::gossipsub::{IdentTopic as Topic, TopicHash};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use strum::AsRefStr;
+#[cfg(not(feature = "pq-devnet"))]
 use typenum::Unsigned;
 use types::{
     ChainSpec, EthSpec,
@@ -48,6 +49,19 @@ pub fn core_topics_to_subscribe<E: EthSpec>(
     opts: &TopicConfig,
     spec: &ChainSpec,
 ) -> Vec<GossipKind> {
+    #[cfg(feature = "pq-devnet")]
+    {
+        let _ = fork_name;
+        let mut topics = vec![GossipKind::BeaconBlock, GossipKind::BeaconAggregateAndProof];
+        if opts.subscribe_all_subnets {
+            for index in 0..spec.attestation_subnet_count {
+                topics.push(GossipKind::Attestation(index.into()));
+            }
+        }
+        return topics;
+    }
+
+    #[cfg(not(feature = "pq-devnet"))]
     let mut topics = vec![
         GossipKind::BeaconBlock,
         GossipKind::BeaconAggregateAndProof,
@@ -56,12 +70,14 @@ pub fn core_topics_to_subscribe<E: EthSpec>(
         GossipKind::AttesterSlashing,
     ];
 
+    #[cfg(not(feature = "pq-devnet"))]
     if opts.subscribe_all_subnets {
         for i in 0..spec.attestation_subnet_count {
             topics.push(GossipKind::Attestation(i.into()));
         }
     }
 
+    #[cfg(not(feature = "pq-devnet"))]
     if fork_name.altair_enabled() {
         topics.push(GossipKind::SignedContributionAndProof);
 
@@ -77,16 +93,19 @@ pub fn core_topics_to_subscribe<E: EthSpec>(
         }
     }
 
+    #[cfg(not(feature = "pq-devnet"))]
     if fork_name.capella_enabled() {
         topics.push(GossipKind::BlsToExecutionChange);
     }
 
+    #[cfg(not(feature = "pq-devnet"))]
     if fork_name.fulu_enabled() {
         for subnet in &opts.sampling_subnets {
             topics.push(GossipKind::DataColumnSidecar(*subnet));
         }
     }
 
+    #[cfg(not(feature = "pq-devnet"))]
     if fork_name.gloas_enabled() {
         topics.push(GossipKind::ExecutionPayload);
         topics.push(GossipKind::ExecutionPayloadBid);
@@ -94,6 +113,7 @@ pub fn core_topics_to_subscribe<E: EthSpec>(
         topics.push(GossipKind::ProposerPreferences);
     }
 
+    #[cfg(not(feature = "pq-devnet"))]
     topics
 }
 
@@ -104,9 +124,12 @@ pub fn core_topics_to_subscribe<E: EthSpec>(
 /// boundary if the node is an aggregator.
 pub fn is_fork_non_core_topic(topic: &GossipTopic, _fork_name: ForkName) -> bool {
     match topic.kind() {
-        // Node may be aggregator of attestation and sync_committee_message topics for all known
-        // forks
-        GossipKind::Attestation(_) | GossipKind::SyncCommitteeMessage(_) => true,
+        // A PQ node may aggregate attestations, but sync-committee duties are outside V1.
+        GossipKind::Attestation(_) => true,
+        #[cfg(not(feature = "pq-devnet"))]
+        GossipKind::SyncCommitteeMessage(_) => true,
+        #[cfg(feature = "pq-devnet")]
+        GossipKind::SyncCommitteeMessage(_) => false,
         // All these topics are core-only
         GossipKind::BeaconBlock
         | GossipKind::BeaconAggregateAndProof
@@ -557,6 +580,51 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "pq-devnet")]
+    #[test]
+    fn pq_non_core_topics_allow_attestations_only() {
+        let fork_digest = [1, 2, 3, 4];
+        let attestation = GossipTopic::new(
+            Attestation(SubnetId::new(1)),
+            GossipEncoding::SSZSnappy,
+            fork_digest,
+        );
+        let sync_committee = GossipTopic::new(
+            SyncCommitteeMessage(SyncSubnetId::new(1)),
+            GossipEncoding::SSZSnappy,
+            fork_digest,
+        );
+
+        assert!(is_fork_non_core_topic(&attestation, ForkName::Electra));
+        assert!(!is_fork_non_core_topic(&sync_committee, ForkName::Electra));
+    }
+
+    #[cfg(feature = "pq-devnet")]
+    #[test]
+    fn pq_core_topics_exclude_unsupported_families() {
+        let spec = get_spec();
+        let mut topic_config = get_topic_config(&HashSet::new());
+        topic_config.subscribe_all_subnets = true;
+        topic_config.enable_light_client_server = true;
+        let topics = core_topics_to_subscribe::<E>(ForkName::Electra, &topic_config, &spec);
+
+        assert!(topics.contains(&BeaconBlock));
+        assert!(topics.contains(&BeaconAggregateAndProof));
+        assert!(topics.iter().any(|topic| matches!(topic, Attestation(_))));
+        assert!(!topics.iter().any(|topic| matches!(
+            topic,
+            SyncCommitteeMessage(_)
+                | SignedContributionAndProof
+                | VoluntaryExit
+                | ProposerSlashing
+                | AttesterSlashing
+                | BlsToExecutionChange
+                | LightClientFinalityUpdate
+                | LightClientOptimisticUpdate
+        )));
+    }
+
+    #[cfg(not(feature = "pq-devnet"))]
     #[test]
     fn columns_are_subscribed_in_peerdas() {
         let spec = get_spec();
@@ -568,6 +636,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "pq-devnet"))]
     #[test]
     fn test_core_topics_to_subscribe() {
         let spec = get_spec();

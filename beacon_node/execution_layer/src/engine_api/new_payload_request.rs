@@ -1,6 +1,9 @@
 use crate::{Error, block_hash::calculate_execution_block_hash, metrics};
 
 use crate::versioned_hashes::verify_versioned_hashes;
+#[cfg(feature = "pq-devnet")]
+use state_processing::kzg_commitment_to_versioned_hash;
+#[cfg(not(feature = "pq-devnet"))]
 use state_processing::per_block_processing::deneb::kzg_commitment_to_versioned_hash;
 use superstruct::superstruct;
 use types::{

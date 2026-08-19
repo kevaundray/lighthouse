@@ -4,8 +4,24 @@ version = "0.2.0"
 authors = ["Sigma Prime <contact@sigmaprime.io>"]
 edition = { workspace = true }
 
+[features]
+default = ["full-runtime", "slasher"]
+full-runtime = ["dep:http_api", "dep:http_metrics", "dep:timer"]
+slasher = ["beacon_chain/slasher", "dep:slasher", "dep:slasher_service"]
+pq-devnet = [
+    "beacon_chain/pq-devnet",
+    "beacon_processor/pq-devnet",
+    "eth2/pq-devnet",
+    "execution_layer/pq-devnet",
+    "genesis/pq-devnet",
+    "lighthouse_network/pq-devnet",
+    "network/pq-devnet",
+    "store/pq-devnet",
+    "types/pq-devnet",
+]
+
 [dependencies]
-beacon_chain = { workspace = true }
+beacon_chain = { path = "../beacon_chain", default-features = false }
 beacon_processor = { workspace = true }
 directory = { workspace = true }
 dirs = { workspace = true }
@@ -16,25 +32,26 @@ ethereum_ssz = { workspace = true }
 execution_layer = { workspace = true }
 futures = { workspace = true }
 genesis = { workspace = true }
-http_api = { workspace = true }
-http_metrics = { path = "../http_metrics" }
+http_api = { workspace = true, optional = true }
+http_metrics = { path = "../http_metrics", optional = true }
+hyper = { workspace = true }
 kzg = { workspace = true }
 lighthouse_network = { workspace = true }
 logging = { workspace = true }
 metrics = { workspace = true }
 monitoring_api = { workspace = true }
-network = { workspace = true }
+network = { path = "../network", default-features = false }
 rand = { workspace = true }
 sensitive_url = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-slasher = { workspace = true }
-slasher_service = { path = "../../slasher/service" }
+slasher = { workspace = true, optional = true }
+slasher_service = { path = "../../slasher/service", optional = true }
 slot_clock = { workspace = true }
 store = { workspace = true }
 task_executor = { workspace = true }
 time = "0.3.5"
-timer = { path = "../timer" }
+timer = { path = "../timer", optional = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

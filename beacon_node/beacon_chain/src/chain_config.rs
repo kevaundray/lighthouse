@@ -129,11 +129,17 @@ impl Default for ChainConfig {
             prepare_payload_lookahead: Duration::from_secs(4),
             // This value isn't actually read except in tests.
             optimistic_finalized_sync: true,
+            #[cfg(not(feature = "pq-devnet"))]
             shuffling_cache_size: crate::shuffling_cache::DEFAULT_CACHE_SIZE,
+            #[cfg(feature = "pq-devnet")]
+            shuffling_cache_size: 0,
             genesis_backfill: false,
             complete_blob_backfill: false,
             always_prepare_payload: false,
+            #[cfg(not(feature = "pq-devnet"))]
             epochs_per_migration: crate::migrate::DEFAULT_EPOCHS_PER_MIGRATION,
+            #[cfg(feature = "pq-devnet")]
+            epochs_per_migration: 1,
             enable_light_client_server: true,
             malicious_withhold_count: 0,
             blob_publication_batches: 4,

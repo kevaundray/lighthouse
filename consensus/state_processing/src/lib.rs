@@ -23,7 +23,10 @@ mod macros;
 ))]
 mod metrics;
 
-#[cfg(not(any(feature = "pq-genesis", feature = "pq-attestation")))]
+#[cfg(any(
+    not(any(feature = "pq-genesis", feature = "pq-attestation")),
+    feature = "pq-transition"
+))]
 pub mod all_caches;
 #[cfg(not(any(feature = "pq-genesis", feature = "pq-attestation")))]
 pub mod block_replayer;
@@ -50,7 +53,7 @@ mod per_block_processing;
 #[cfg(not(any(feature = "pq-genesis", feature = "pq-attestation")))]
 pub mod per_epoch_processing;
 #[cfg(all(feature = "pq-transition", feature = "pq-attestation"))]
-mod per_epoch_processing;
+pub mod per_epoch_processing;
 #[cfg(not(any(feature = "pq-genesis", feature = "pq-attestation")))]
 pub mod per_slot_processing;
 #[cfg(all(feature = "pq-transition", feature = "pq-attestation"))]
@@ -70,7 +73,10 @@ pub mod upgrade;
 #[cfg(not(any(feature = "pq-genesis", feature = "pq-attestation")))]
 pub mod verify_operation;
 
-#[cfg(not(any(feature = "pq-genesis", feature = "pq-attestation")))]
+#[cfg(any(
+    not(any(feature = "pq-genesis", feature = "pq-attestation")),
+    feature = "pq-transition"
+))]
 pub use all_caches::AllCaches;
 #[cfg(not(any(feature = "pq-genesis", feature = "pq-attestation")))]
 pub use block_replayer::{BlockReplayError, BlockReplayer};
@@ -86,7 +92,11 @@ pub use genesis::{
     process_activations,
 };
 #[cfg(feature = "pq-transition")]
-pub use per_block_processing::errors::{BlockProcessingError, HeaderInvalid};
+pub use per_block_processing::deneb::kzg_commitment_to_versioned_hash;
+#[cfg(feature = "pq-transition")]
+pub use per_block_processing::errors::{
+    AttesterSlashingValidationError, BlockProcessingError, HeaderInvalid,
+};
 #[cfg(not(any(feature = "pq-genesis", feature = "pq-attestation")))]
 pub use per_block_processing::{
     BlockSignatureStrategy, BlockSignatureVerifier, VerifyBlockRoot, VerifySignatures,
@@ -98,6 +108,8 @@ pub use per_epoch_processing::{EpochProcessingSummary, errors::EpochProcessingEr
 pub use per_epoch_processing::{
     errors::EpochProcessingError, process_epoch as per_epoch_processing,
 };
+#[cfg(feature = "pq-transition")]
+pub use per_slot_processing::Error as SlotProcessingError;
 #[cfg(not(any(feature = "pq-genesis", feature = "pq-attestation")))]
 pub use per_slot_processing::{Error as SlotProcessingError, per_slot_processing};
 #[cfg(feature = "pq-attestation")]
@@ -106,6 +118,10 @@ pub use pq_attestation::{
     PqAttestationLocalError, PqValidatorKeyCache, PreparedPqAttestation, VerifiedPqAttestation,
     aggregate_pq_attestation_job, build_pq_attestation_job, build_pq_single_attestation_job,
     prepare_pq_attestation, prepare_pq_attestation_aggregate, verify_pq_attestation_job,
+};
+#[cfg(feature = "pq-attestation")]
+pub use pq_profile::{
+    LEAN_PQ_DEVNET_V1_VALIDATOR_COUNT, PqDevnetStateError, validate_lean_pq_devnet_v1,
 };
 #[cfg(feature = "pq-transition")]
 pub use pq_transition::{

@@ -1,8 +1,17 @@
+#[cfg(not(any(feature = "full-runtime", feature = "pq-devnet")))]
+compile_error!("client requires exactly one runtime profile: enable full-runtime or pq-devnet");
+#[cfg(all(feature = "full-runtime", feature = "pq-devnet"))]
+compile_error!("client runtime profiles full-runtime and pq-devnet are mutually exclusive");
+
+#[cfg(feature = "full-runtime")]
 mod compute_light_client_updates;
 pub mod config;
+#[cfg(feature = "full-runtime")]
 mod metrics;
+#[cfg(feature = "full-runtime")]
 mod notifier;
 
+#[cfg(feature = "full-runtime")]
 pub mod builder;
 
 use beacon_chain::BeaconChain;
@@ -11,6 +20,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 pub use beacon_chain::BeaconChainTypes;
+#[cfg(feature = "full-runtime")]
 pub use builder::ClientBuilder;
 pub use config::{ClientGenesis, Config as ClientConfig};
 pub use eth2_config::Eth2Config;

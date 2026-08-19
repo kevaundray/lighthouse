@@ -17,26 +17,34 @@ use crate::persisted_beacon_chain::PersistedBeaconChain;
 use crate::persisted_custody::load_custody_context;
 use crate::shuffling_cache::{BlockShufflingIds, ShufflingCache};
 use crate::validator_monitor::{ValidatorMonitor, ValidatorMonitorConfig};
+#[cfg(not(feature = "pq-devnet"))]
 use crate::validator_pubkey_cache::ValidatorPubkeyCache;
 use crate::{
     BeaconChain, BeaconChainTypes, BeaconForkChoiceStore, BeaconSnapshot, ServerSentEventHandler,
 };
 use bls::Signature;
+#[cfg(feature = "pq-devnet")]
+use consensus_signature::AggregationService;
 use execution_layer::ExecutionLayer;
 use fixed_bytes::FixedBytesExtended;
 use fork_choice::{ForkChoice, PayloadStatus, ResetPayloadStatuses};
 use futures::channel::mpsc::Sender;
 use kzg::Kzg;
 use logging::crit;
-use operation_pool::{OperationPool, PersistedOperationPool};
+use operation_pool::OperationPool;
+#[cfg(not(feature = "pq-devnet"))]
+use operation_pool::PersistedOperationPool;
 use parking_lot::{Mutex, RwLock};
 use rand::RngCore;
 use rayon::prelude::*;
+#[cfg(feature = "slasher")]
 use slasher::Slasher;
 use slot_clock::{SlotClock, TestingSlotClock};
 use state_processing::AllCaches;
 use state_processing::genesis::genesis_block;
 use state_processing::per_slot_processing;
+#[cfg(feature = "pq-devnet")]
+use state_processing::{PqValidatorKeyCache, validate_lean_pq_devnet_v1};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
@@ -95,10 +103,16 @@ pub struct BeaconChainBuilder<T: BeaconChainTypes> {
     slot_clock: Option<T::SlotClock>,
     shutdown_sender: Option<Sender<ShutdownReason>>,
     light_client_server_tx: Option<Sender<LightClientProducerEvent<T::EthSpec>>>,
+    #[cfg(not(feature = "pq-devnet"))]
     validator_pubkey_cache: Option<ValidatorPubkeyCache<T>>,
+    #[cfg(feature = "pq-devnet")]
+    pq_validator_key_cache: Option<Arc<PqValidatorKeyCache>>,
+    #[cfg(feature = "pq-devnet")]
+    pq_aggregation_service: Option<Arc<AggregationService>>,
     spec: Arc<ChainSpec>,
     chain_config: ChainConfig,
     beacon_graffiti: GraffitiOrigin,
+    #[cfg(feature = "slasher")]
     slasher: Option<Arc<Slasher<T::EthSpec>>>,
     // Pending I/O batch that is constructed during building and should be executed atomically
     // alongside `PersistedBeaconChain` storage when `BeaconChainBuilder::build` is called.
@@ -137,10 +151,16 @@ where
             slot_clock: None,
             shutdown_sender: None,
             light_client_server_tx: None,
+            #[cfg(not(feature = "pq-devnet"))]
             validator_pubkey_cache: None,
+            #[cfg(feature = "pq-devnet")]
+            pq_validator_key_cache: None,
+            #[cfg(feature = "pq-devnet")]
+            pq_aggregation_service: None,
             spec: Arc::new(E::default_spec()),
             chain_config: ChainConfig::default(),
             beacon_graffiti: GraffitiOrigin::default(),
+            #[cfg(feature = "slasher")]
             slasher: None,
             pending_io_batch: vec![],
             kzg,
@@ -190,6 +210,7 @@ where
     }
 
     /// Sets the slasher.
+    #[cfg(feature = "slasher")]
     pub fn slasher(mut self, slasher: Arc<Slasher<E>>) -> Self {
         self.slasher = Some(slasher);
         self
@@ -259,27 +280,40 @@ where
 
         self.genesis_time = Some(genesis_state.genesis_time());
 
-        self.op_pool = Some(
-            store
-                .get_item::<PersistedOperationPool<E>>(&OP_POOL_DB_KEY)
-                .map_err(|e| format!("DB error whilst reading persisted op pool: {:?}", e))?
-                .map(PersistedOperationPool::into_operation_pool)
-                .transpose()
-                .map_err(|e| {
-                    format!(
-                        "Error while creating the op pool from the persisted op pool: {:?}",
-                        e
-                    )
-                })?
-                .unwrap_or_else(OperationPool::new),
-        );
+        #[cfg(not(feature = "pq-devnet"))]
+        {
+            self.op_pool = Some(
+                store
+                    .get_item::<PersistedOperationPool<E>>(&OP_POOL_DB_KEY)
+                    .map_err(|e| format!("DB error whilst reading persisted op pool: {:?}", e))?
+                    .map(PersistedOperationPool::into_operation_pool)
+                    .transpose()
+                    .map_err(|e| {
+                        format!(
+                            "Error while creating the op pool from the persisted op pool: {:?}",
+                            e
+                        )
+                    })?
+                    .unwrap_or_else(OperationPool::new),
+            );
+        }
+        #[cfg(feature = "pq-devnet")]
+        {
+            // PQ candidates are intentionally ephemeral.  Do not deserialize or modify the
+            // legacy `opo` record during restart.
+            self.op_pool = Some(OperationPool::new());
+        }
 
+        #[cfg(not(feature = "pq-devnet"))]
         let pubkey_cache = ValidatorPubkeyCache::load_from_store(store)
             .map_err(|e| format!("Unable to open persisted pubkey cache: {:?}", e))?;
 
         self.genesis_block_root = Some(chain.genesis_block_root);
         self.genesis_state_root = Some(genesis_block.state_root());
-        self.validator_pubkey_cache = Some(pubkey_cache);
+        #[cfg(not(feature = "pq-devnet"))]
+        {
+            self.validator_pubkey_cache = Some(pubkey_cache);
+        }
         self.fork_choice = Some(fork_choice);
 
         Ok(self)
@@ -346,6 +380,15 @@ where
 
     /// Starts a new chain from a genesis state.
     pub fn genesis_state(mut self, mut beacon_state: BeaconState<E>) -> Result<Self, String> {
+        #[cfg(feature = "pq-devnet")]
+        {
+            validate_lean_pq_devnet_v1(&beacon_state, &self.spec, beacon_state.slot())
+                .map_err(|error| error.to_string())?;
+            self.pq_validator_key_cache = Some(Arc::new(
+                PqValidatorKeyCache::from_state(&beacon_state)
+                    .map_err(|error| format!("lean PQ devnet V1 key cache rejected: {error:?}"))?,
+            ));
+        }
         let store = self.store.clone().ok_or("genesis_state requires a store")?;
 
         // Initialize anchor info before attempting to write the genesis state.
@@ -711,6 +754,58 @@ where
         self
     }
 
+    /// Validates the exact persisted head and rebuilds its ephemeral PQ validator-key cache.
+    ///
+    /// This method starts no worker and performs no writes.  The caller must invoke it before
+    /// constructing the process-wide aggregation service.
+    #[cfg(feature = "pq-devnet")]
+    pub fn prepare_pq_runtime(mut self, slot_clock: &TSlotClock) -> Result<Self, String> {
+        let current_slot = if slot_clock
+            .is_prior_to_genesis()
+            .ok_or("Unable to read slot clock")?
+        {
+            self.spec.genesis_slot
+        } else {
+            slot_clock.now().ok_or("Unable to read slot")?
+        };
+        let fork_choice = self
+            .fork_choice
+            .as_mut()
+            .ok_or("PQ runtime preflight requires fork choice")?;
+        let (head_block_root, _) = fork_choice
+            .get_head(current_slot, &self.spec)
+            .map_err(|error| format!("Unable to get PQ preflight head: {error:?}"))?;
+        let store = self
+            .store
+            .as_ref()
+            .ok_or("PQ runtime preflight requires a store")?;
+        let head_block = store
+            .get_full_block(&head_block_root)
+            .map_err(|error| descriptive_db_error("PQ preflight head block", &error))?
+            .ok_or("PQ preflight head block not found")?;
+        let (_, head_state) = store
+            .get_advanced_hot_state(head_block_root, current_slot, head_block.state_root())
+            .map_err(|error| descriptive_db_error("PQ preflight head state", &error))?
+            .ok_or("PQ preflight head state not found")?;
+
+        validate_lean_pq_devnet_v1(&head_state, &self.spec, current_slot)
+            .map_err(|error| error.to_string())?;
+        if self.pq_validator_key_cache.is_none() {
+            self.pq_validator_key_cache = Some(Arc::new(
+                PqValidatorKeyCache::from_state(&head_state)
+                    .map_err(|error| format!("lean PQ devnet V1 key cache rejected: {error:?}"))?,
+            ));
+        }
+        Ok(self)
+    }
+
+    /// Injects the sole process-wide PQ aggregation-service owner after state preflight.
+    #[cfg(feature = "pq-devnet")]
+    pub fn pq_aggregation_service(mut self, service: Arc<AggregationService>) -> Self {
+        self.pq_aggregation_service = Some(service);
+        self
+    }
+
     /// Consumes `self`, returning a `BeaconChain` if all required parameters have been supplied.
     ///
     /// An error will be returned at runtime if all required parameters have not been configured.
@@ -834,6 +929,7 @@ where
             }
         }
 
+        #[cfg(not(feature = "pq-devnet"))]
         let validator_pubkey_cache = self
             .validator_pubkey_cache
             .map(|mut validator_pubkey_cache| {
@@ -858,6 +954,17 @@ where
                 ValidatorPubkeyCache::new(&head_snapshot.beacon_state, store.clone())
                     .map_err(|e| format!("Unable to init validator pubkey cache: {:?}", e))
             })?;
+
+        #[cfg(feature = "pq-devnet")]
+        let pq_validator_key_cache = self
+            .pq_validator_key_cache
+            .take()
+            .ok_or("Cannot build PQ chain without a validated validator-key cache")?;
+        #[cfg(feature = "pq-devnet")]
+        let pq_aggregation_service = self
+            .pq_aggregation_service
+            .take()
+            .ok_or("Cannot build PQ chain without an aggregation service")?;
 
         let migrator_config = self.store_migrator_config.unwrap_or_default();
         let store_migrator = BackgroundMigrator::new(store.clone(), migrator_config);
@@ -1021,7 +1128,12 @@ where
             block_times_cache: <_>::default(),
             envelope_times_cache: <_>::default(),
             pre_finalization_block_cache: <_>::default(),
+            #[cfg(not(feature = "pq-devnet"))]
             validator_pubkey_cache: RwLock::new(validator_pubkey_cache),
+            #[cfg(feature = "pq-devnet")]
+            pq_validator_key_cache,
+            #[cfg(feature = "pq-devnet")]
+            pq_aggregation_service,
             early_attester_cache: <_>::default(),
             light_client_server_cache: LightClientServerCache::new(),
             light_client_server_tx: self.light_client_server_tx,
@@ -1033,6 +1145,7 @@ where
                 self.execution_layer,
                 slot_clock.slot_duration() * E::slots_per_epoch() as u32,
             ),
+            #[cfg(feature = "slasher")]
             slasher: self.slasher.clone(),
             validator_monitor: RwLock::new(validator_monitor),
             genesis_backfill_slot,

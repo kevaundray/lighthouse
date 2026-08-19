@@ -16,6 +16,9 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
 use ssz::Decode;
 use ssz_types::VariableList;
+#[cfg(feature = "pq-devnet")]
+use state_processing::kzg_commitment_to_versioned_hash;
+#[cfg(not(feature = "pq-devnet"))]
 use state_processing::per_block_processing::deneb::kzg_commitment_to_versioned_hash;
 use std::cmp::max;
 use std::collections::HashMap;

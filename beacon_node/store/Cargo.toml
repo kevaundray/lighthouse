@@ -8,9 +8,16 @@ edition = { workspace = true }
 default = ["leveldb"]
 leveldb = ["dep:leveldb"]
 redb = ["dep:redb"]
+pq-devnet = [
+    "consensus_signature/pq-wire",
+    "state_processing/pq-transition",
+    "types/pq-devnet",
+]
+pq-startup-testing = ["pq-devnet"]
 
 [dependencies]
 bls = { workspace = true }
+consensus_signature = { workspace = true }
 db-key = "0.0.5"
 directory = { workspace = true }
 ethereum_ssz = { workspace = true }

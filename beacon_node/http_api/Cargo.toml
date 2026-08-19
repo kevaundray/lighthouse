@@ -13,6 +13,17 @@ pq-wire = [
     "eth2/pq-wire",
     "types/pq-devnet",
 ]
+pq-devnet = [
+    "pq-wire",
+    "beacon_chain/pq-devnet",
+    "beacon_processor/pq-devnet",
+    "consensus_signature/pq-devnet",
+    "execution_layer/pq-devnet",
+    "lighthouse_network/pq-devnet",
+    "network/pq-devnet",
+    "operation_pool/pq-devnet",
+    "state_processing/pq-transition",
+]
 
 [dependencies]
 beacon_chain = { workspace = true }

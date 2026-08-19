@@ -1967,6 +1967,7 @@ dependencies = [
  "genesis",
  "http_api",
  "http_metrics",
+ "hyper 1.8.1",
  "kzg",
  "lighthouse_network",
  "logging",
@@ -5783,6 +5784,7 @@ dependencies = [
  "async-channel 1.9.0",
  "bls",
  "bytes",
+ "consensus_signature",
  "delay_map",
  "directory",
  "dirs",
@@ -7227,12 +7229,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "pq-raw-canonical-head-compile-fail"
+version = "0.0.0"
+dependencies = [
+ "beacon_chain",
+ "slot_clock",
+ "store",
+ "types",
+]
+
+[[package]]
 name = "pq_devnet"
 version = "0.1.0"
 dependencies = [
  "attestation_aggregation",
+ "beacon_chain",
+ "beacon_node",
  "clap",
  "consensus_signature",
+ "environment",
  "eth2",
  "ethereum_ssz",
  "futures",
@@ -7242,8 +7257,10 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "slot_clock",
  "ssz_types",
  "state_processing",
+ "store",
  "tempfile",
  "tokio",
  "types",
@@ -9052,6 +9069,7 @@ version = "0.2.0"
 dependencies = [
  "beacon_chain",
  "bls",
+ "consensus_signature",
  "criterion",
  "db-key",
  "directory",

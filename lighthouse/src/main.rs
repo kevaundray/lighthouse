@@ -1,20 +1,25 @@
+#[cfg(feature = "full-cli")]
 mod cli;
 mod metrics;
 
 use account_utils::STDIN_INPUTS_FLAG;
 use beacon_node::ProductionBeaconNode;
-use clap::FromArgMatches;
-use clap::Subcommand;
 use clap::{Arg, ArgAction, ArgMatches, Command};
+#[cfg(feature = "full-cli")]
+use clap::{FromArgMatches, Subcommand};
 use clap_utils::{
     FLAG_HEADER, flags::DISABLE_MALLOC_TUNING_FLAG, get_color_style, get_eth2_network_config,
 };
+#[cfg(feature = "full-cli")]
 use cli::LighthouseSubcommands;
-use directory::{DEFAULT_BEACON_NODE_DIR, DEFAULT_VALIDATOR_DIR, parse_path_or_default};
+#[cfg(feature = "full-cli")]
+use directory::DEFAULT_VALIDATOR_DIR;
+use directory::{DEFAULT_BEACON_NODE_DIR, parse_path_or_default};
 use environment::tracing_common;
 use environment::{EnvironmentBuilder, LoggerConfig};
 use eth2_network_config::{DEFAULT_HARDCODED_NETWORK, Eth2NetworkConfig, HARDCODED_NET_NAMES};
 use ethereum_hashing::have_sha_extensions;
+#[cfg(feature = "full-cli")]
 use futures::TryFutureExt;
 use lighthouse_version::VERSION;
 use logging::{MetricsLayer, build_workspace_filter, crit};
@@ -32,6 +37,7 @@ use tracing::{Level, info};
 use tracing_samplers::PrefixBasedSampler;
 use tracing_subscriber::{Layer, filter::EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use types::{EthSpec, EthSpecId};
+#[cfg(feature = "full-cli")]
 use validator_client::ProductionValidatorClient;
 
 pub static SHORT_VERSION: LazyLock<String> = LazyLock::new(|| VERSION.replace("Lighthouse/", ""));
@@ -412,14 +418,32 @@ fn main() {
             .help_heading(FLAG_HEADER)
             .global(true)
         )
-        .subcommand(beacon_node::cli_app())
+        .subcommand(beacon_node::cli_app());
+
+    #[cfg(feature = "full-cli")]
+    let cli = cli
         .subcommand(boot_node::cli_app())
         .subcommand(account_manager::cli_app())
         .subcommand(validator_manager::cli_app());
 
+    #[cfg(feature = "full-cli")]
     let cli = LighthouseSubcommands::augment_subcommands(cli);
 
     let matches = cli.get_matches();
+
+    // Task 5.3e-b is a compile-tested startup profile, not a networked node. Stop before allocator
+    // tuning, network-config reads, logging directories, or runtime construction.
+    #[cfg(feature = "pq-devnet")]
+    if let Some(beacon_node_matches) = matches.subcommand_matches("beacon_node") {
+        let error = match ProductionBeaconNode::<types::MainnetEthSpec>::new_from_cli(
+            beacon_node_matches.clone(),
+        ) {
+            Err(error) => error.to_string(),
+            Ok(_) => "PQ startup unexpectedly crossed its deferred boundary".to_string(),
+        };
+        eprintln!("{error}");
+        exit(1);
+    }
 
     // Configure the allocator early in the process, before it has the chance to use the default values for
     // anything important.
@@ -443,6 +467,7 @@ fn main() {
         let eth_spec_id = eth2_network_config.eth_spec_id()?;
 
         // boot node subcommand circumvents the environment
+        #[cfg(feature = "full-cli")]
         if let Some(bootnode_matches) = matches.subcommand_matches("boot_node") {
             // The bootnode uses the main debug-level flag
             let debug_info = matches
@@ -560,6 +585,7 @@ fn run<E: EthSpec>(
                     .join(DEFAULT_BEACON_NODE_DIR)
                     .join("logs"),
             ),
+            #[cfg(feature = "full-cli")]
             Some(("validator_client", vc_matches)) => {
                 let base_path = if vc_matches.contains_id("validators-dir") {
                     parse_path_or_default(vc_matches, "validators-dir")?
@@ -576,7 +602,9 @@ fn run<E: EthSpec>(
     let sse_logging = {
         if let Some(bn_matches) = matches.subcommand_matches("beacon_node") {
             bn_matches.get_flag("gui")
-        } else if let Some(vc_matches) = matches.subcommand_matches("validator_client") {
+        } else if cfg!(feature = "full-cli")
+            && let Some(vc_matches) = matches.subcommand_matches("validator_client")
+        {
             vc_matches.get_flag("http")
         } else {
             false
@@ -672,6 +700,7 @@ fn run<E: EthSpec>(
                 .cloned()
                 .unwrap_or_else(|| match matches.subcommand() {
                     Some(("beacon_node", _)) => "lighthouse-bn".to_string(),
+                    #[cfg(feature = "full-cli")]
                     Some(("validator_client", _)) => "lighthouse-vc".to_string(),
                     _ => "lighthouse".to_string(),
                 });
@@ -765,6 +794,7 @@ fn run<E: EthSpec>(
         (Some(_), Some(_)) => panic!("CLI prevents both --network and --testnet-dir"),
     };
 
+    #[cfg(feature = "full-cli")]
     if let Some(sub_matches) = matches.subcommand_matches(account_manager::CMD) {
         eprintln!("Running account manager for {} network", network_name);
         // Pass the entire `environment` to the account manager so it can run blocking operations.
@@ -774,6 +804,7 @@ fn run<E: EthSpec>(
         return Ok(());
     }
 
+    #[cfg(feature = "full-cli")]
     if let Some(sub_matches) = matches.subcommand_matches(validator_manager::CMD) {
         eprintln!("Running validator manager for {} network", network_name);
 
@@ -784,6 +815,7 @@ fn run<E: EthSpec>(
         return Ok(());
     }
 
+    #[cfg(feature = "full-cli")]
     match LighthouseSubcommands::from_arg_matches(matches) {
         Ok(LighthouseSubcommands::DatabaseManager(db_manager_config)) => {
             info!("Running database manager for {} network", network_name);
@@ -831,33 +863,52 @@ fn run<E: EthSpec>(
         Some(("beacon_node", matches)) => {
             let context = environment.core_context();
             let executor = context.executor.clone();
-            let mut config = beacon_node::get_config::<E>(matches, &context)?;
-            config.logger_config = logger_config;
-            // Dump configs if `dump-config` or `dump-chain-config` flags are set
-            clap_utils::check_dump_configs::<_, E>(matches, &config, &context.eth2_config.spec)?;
 
-            let shutdown_flag = matches.get_flag("immediate-shutdown");
-            if shutdown_flag {
-                info!("Beacon node immediate shutdown triggered.");
-                return Ok(());
+            #[cfg(feature = "pq-devnet")]
+            {
+                if let Err(error) = ProductionBeaconNode::<E>::new_from_cli(matches.clone()) {
+                    crit!(reason = ?error, "Failed to start beacon node");
+                    let _ = executor
+                        .shutdown_sender()
+                        .try_send(ShutdownReason::Failure("Failed to start beacon node"));
+                }
             }
 
-            executor.clone().spawn(
-                async move {
-                    if let Err(e) = ProductionBeaconNode::new(context.clone(), config).await {
-                        crit!(reason = ?e, "Failed to start beacon node");
-                        // Ignore the error since it always occurs during normal operation when
-                        // shutting down.
-                        let _ = executor
-                            .shutdown_sender()
-                            .try_send(ShutdownReason::Failure("Failed to start beacon node"));
-                    }
-                },
-                "beacon_node",
-            );
+            #[cfg(not(feature = "pq-devnet"))]
+            {
+                let mut config = beacon_node::get_config::<E>(matches, &context)?;
+                config.logger_config = logger_config;
+                // Dump configs if `dump-config` or `dump-chain-config` flags are set
+                clap_utils::check_dump_configs::<_, E>(
+                    matches,
+                    &config,
+                    &context.eth2_config.spec,
+                )?;
+
+                let shutdown_flag = matches.get_flag("immediate-shutdown");
+                if shutdown_flag {
+                    info!("Beacon node immediate shutdown triggered.");
+                    return Ok(());
+                }
+
+                executor.clone().spawn(
+                    async move {
+                        if let Err(e) = ProductionBeaconNode::new(context.clone(), config).await {
+                            crit!(reason = ?e, "Failed to start beacon node");
+                            // Ignore the error since it always occurs during normal operation when
+                            // shutting down.
+                            let _ = executor
+                                .shutdown_sender()
+                                .try_send(ShutdownReason::Failure("Failed to start beacon node"));
+                        }
+                    },
+                    "beacon_node",
+                );
+            }
         }
         // TODO(clap-derive) delete this once we've fully migrated to clap derive.
         // Qt the moment this needs to exist so that we dont trigger a crit.
+        #[cfg(feature = "full-cli")]
         Some(("validator_client", _)) => (),
         _ => {
             crit!("No subcommand supplied. See --help .");
@@ -879,3 +930,18 @@ fn run<E: EthSpec>(
         ShutdownReason::Failure(msg) => Err(msg.to_string()),
     }
 }
+#[cfg(all(
+    feature = "pq-devnet",
+    any(
+        feature = "full-cli",
+        feature = "beacon-node-runtime",
+        feature = "lighthouse-integration-tests",
+        feature = "slasher-lmdb",
+        feature = "slasher-mdbx",
+        feature = "slasher-redb"
+    )
+))]
+compile_error!(
+    "pq-devnet is a beacon-node-only startup profile and is incompatible with full-cli, \
+     beacon-node-runtime, slasher backend features, and lighthouse-integration-tests"
+);

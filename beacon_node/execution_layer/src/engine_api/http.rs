@@ -109,24 +109,40 @@ pub static LIGHTHOUSE_JSON_CLIENT_VERSION: LazyLock<JsonClientVersionV1> =
 
 /// Contains methods to convert arbitrary bytes to an ETH2 deposit contract object.
 pub mod deposit_log {
+    #[cfg(not(feature = "pq-devnet"))]
     use bls::{PublicKeyBytes, SignatureBytes};
+    #[cfg(not(feature = "pq-devnet"))]
     use ssz::Decode;
+    #[cfg(not(feature = "pq-devnet"))]
     use state_processing::per_block_processing::signature_sets::deposit_pubkey_signature_message;
+    #[cfg(feature = "pq-devnet")]
+    use types::ChainSpec;
+    #[cfg(not(feature = "pq-devnet"))]
     use types::{ChainSpec, DepositData, Hash256};
 
     pub use eth2::lighthouse::DepositLog;
 
     /// The following constants define the layout of bytes in the deposit contract `DepositEvent`. The
     /// event bytes are formatted according to the  Ethereum ABI.
+    #[cfg(not(feature = "pq-devnet"))]
     const PUBKEY_START: usize = 192;
+    #[cfg(not(feature = "pq-devnet"))]
     const PUBKEY_LEN: usize = 48;
+    #[cfg(not(feature = "pq-devnet"))]
     const CREDS_START: usize = PUBKEY_START + 64 + 32;
+    #[cfg(not(feature = "pq-devnet"))]
     const CREDS_LEN: usize = 32;
+    #[cfg(not(feature = "pq-devnet"))]
     const AMOUNT_START: usize = CREDS_START + 32 + 32;
+    #[cfg(not(feature = "pq-devnet"))]
     const AMOUNT_LEN: usize = 8;
+    #[cfg(not(feature = "pq-devnet"))]
     const SIG_START: usize = AMOUNT_START + 32 + 32;
+    #[cfg(not(feature = "pq-devnet"))]
     const SIG_LEN: usize = 96;
+    #[cfg(not(feature = "pq-devnet"))]
     const INDEX_START: usize = SIG_START + 96 + 32;
+    #[cfg(not(feature = "pq-devnet"))]
     const INDEX_LEN: usize = 8;
 
     /// A reduced set of fields from an Eth1 contract log.
@@ -139,45 +155,55 @@ pub mod deposit_log {
     impl Log {
         /// Attempts to parse a raw `Log` from the deposit contract into a `DepositLog`.
         pub fn to_deposit_log(&self, spec: &ChainSpec) -> Result<DepositLog, String> {
-            let bytes = &self.data;
+            #[cfg(feature = "pq-devnet")]
+            {
+                let _ = spec;
+                return Err(
+                    "deposit contract logs are unsupported by lean PQ devnet V1".to_string()
+                );
+            }
+            #[cfg(not(feature = "pq-devnet"))]
+            {
+                let bytes = &self.data;
 
-            let pubkey = bytes
-                .get(PUBKEY_START..PUBKEY_START + PUBKEY_LEN)
-                .ok_or("Insufficient bytes for pubkey")?;
-            let withdrawal_credentials = bytes
-                .get(CREDS_START..CREDS_START + CREDS_LEN)
-                .ok_or("Insufficient bytes for withdrawal credential")?;
-            let amount = bytes
-                .get(AMOUNT_START..AMOUNT_START + AMOUNT_LEN)
-                .ok_or("Insufficient bytes for amount")?;
-            let signature = bytes
-                .get(SIG_START..SIG_START + SIG_LEN)
-                .ok_or("Insufficient bytes for signature")?;
-            let index = bytes
-                .get(INDEX_START..INDEX_START + INDEX_LEN)
-                .ok_or("Insufficient bytes for index")?;
+                let pubkey = bytes
+                    .get(PUBKEY_START..PUBKEY_START + PUBKEY_LEN)
+                    .ok_or("Insufficient bytes for pubkey")?;
+                let withdrawal_credentials = bytes
+                    .get(CREDS_START..CREDS_START + CREDS_LEN)
+                    .ok_or("Insufficient bytes for withdrawal credential")?;
+                let amount = bytes
+                    .get(AMOUNT_START..AMOUNT_START + AMOUNT_LEN)
+                    .ok_or("Insufficient bytes for amount")?;
+                let signature = bytes
+                    .get(SIG_START..SIG_START + SIG_LEN)
+                    .ok_or("Insufficient bytes for signature")?;
+                let index = bytes
+                    .get(INDEX_START..INDEX_START + INDEX_LEN)
+                    .ok_or("Insufficient bytes for index")?;
 
-            let deposit_data = DepositData {
-                pubkey: PublicKeyBytes::from_ssz_bytes(pubkey)
-                    .map_err(|e| format!("Invalid pubkey ssz: {:?}", e))?,
-                withdrawal_credentials: Hash256::from_ssz_bytes(withdrawal_credentials)
-                    .map_err(|e| format!("Invalid withdrawal_credentials ssz: {:?}", e))?,
-                amount: u64::from_ssz_bytes(amount)
-                    .map_err(|e| format!("Invalid amount ssz: {:?}", e))?,
-                signature: SignatureBytes::from_ssz_bytes(signature)
-                    .map_err(|e| format!("Invalid signature ssz: {:?}", e))?,
-            };
+                let deposit_data = DepositData {
+                    pubkey: PublicKeyBytes::from_ssz_bytes(pubkey)
+                        .map_err(|e| format!("Invalid pubkey ssz: {:?}", e))?,
+                    withdrawal_credentials: Hash256::from_ssz_bytes(withdrawal_credentials)
+                        .map_err(|e| format!("Invalid withdrawal_credentials ssz: {:?}", e))?,
+                    amount: u64::from_ssz_bytes(amount)
+                        .map_err(|e| format!("Invalid amount ssz: {:?}", e))?,
+                    signature: SignatureBytes::from_ssz_bytes(signature)
+                        .map_err(|e| format!("Invalid signature ssz: {:?}", e))?,
+                };
 
-            let signature_is_valid = deposit_pubkey_signature_message(&deposit_data, spec)
-                .is_some_and(|(public_key, signature, msg)| signature.verify(&public_key, msg));
+                let signature_is_valid = deposit_pubkey_signature_message(&deposit_data, spec)
+                    .is_some_and(|(public_key, signature, msg)| signature.verify(&public_key, msg));
 
-            Ok(DepositLog {
-                deposit_data,
-                block_number: self.block_number,
-                index: u64::from_ssz_bytes(index)
-                    .map_err(|e| format!("Invalid index ssz: {:?}", e))?,
-                signature_is_valid,
-            })
+                Ok(DepositLog {
+                    deposit_data,
+                    block_number: self.block_number,
+                    index: u64::from_ssz_bytes(index)
+                        .map_err(|e| format!("Invalid index ssz: {:?}", e))?,
+                    signature_is_valid,
+                })
+            }
         }
     }
 

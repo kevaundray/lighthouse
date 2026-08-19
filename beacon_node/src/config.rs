@@ -4,14 +4,18 @@ use beacon_chain::chain_config::{
 };
 use beacon_chain::custody_context::NodeCustodyType;
 use beacon_chain::graffiti_calculator::GraffitiOrigin;
+#[cfg(not(feature = "pq-devnet"))]
 use bls::PublicKeyBytes;
 use clap::{ArgMatches, Id, parser::ValueSource};
 use clap_utils::flags::DISABLE_MALLOC_TUNING_FLAG;
 use clap_utils::{parse_flag, parse_optional, parse_required};
+#[cfg(feature = "pq-devnet")]
+use client::config::PqHttpTlsConfig as TlsConfig;
 use client::{ClientConfig, ClientGenesis};
 use directory::{DEFAULT_BEACON_NODE_DIR, DEFAULT_NETWORK_DIR, DEFAULT_ROOT_DIR};
 use environment::RuntimeContext;
 use execution_layer::DEFAULT_JWT_FILE;
+#[cfg(not(feature = "pq-devnet"))]
 use http_api::TlsConfig;
 use lighthouse_network::{Enr, Multiaddr, NetworkConfig, PeerIdSerialized};
 use network_utils::listen_addr::ListenAddress;
@@ -43,6 +47,9 @@ pub fn get_config<E: EthSpec>(
     cli_args: &ArgMatches,
     context: &RuntimeContext<E>,
 ) -> Result<ClientConfig, String> {
+    #[cfg(feature = "pq-devnet")]
+    validate_pq_devnet_cli_profile(cli_args).map_err(|error| error.to_string())?;
+
     let spec = &context.eth2_config.spec;
 
     let mut client_config = ClientConfig::default();
@@ -640,6 +647,7 @@ pub fn get_config<E: EthSpec>(
 
     client_config.chain.max_network_size = spec.max_payload_size as usize;
 
+    #[cfg(feature = "slasher")]
     if cli_args.get_flag("slasher") {
         let slasher_dir = if let Some(slasher_dir) = cli_args.get_one::<String>("slasher-dir") {
             PathBuf::from(slasher_dir)
@@ -706,10 +714,12 @@ pub fn get_config<E: EthSpec>(
         client_config.slasher = Some(slasher_config);
     }
 
+    #[cfg(not(feature = "pq-devnet"))]
     if cli_args.get_flag("validator-monitor-auto") {
         client_config.validator_monitor.auto_register = true;
     }
 
+    #[cfg(not(feature = "pq-devnet"))]
     if let Some(pubkeys) = cli_args.get_one::<String>("validator-monitor-pubkeys") {
         let pubkeys = pubkeys
             .split(',')
@@ -722,6 +732,7 @@ pub fn get_config<E: EthSpec>(
             .extend_from_slice(&pubkeys);
     }
 
+    #[cfg(not(feature = "pq-devnet"))]
     if let Some(path) = cli_args.get_one::<String>("validator-monitor-file") {
         let string = fs::read(path)
             .map_err(|e| format!("Unable to read --validator-monitor-file: {}", e))
@@ -741,6 +752,7 @@ pub fn get_config<E: EthSpec>(
             .extend_from_slice(&pubkeys);
     }
 
+    #[cfg(not(feature = "pq-devnet"))]
     if let Some(count) =
         clap_utils::parse_optional(cli_args, "validator-monitor-individual-tracking-threshold")?
     {
@@ -900,7 +912,87 @@ pub fn get_config<E: EthSpec>(
         client_config.chain.invalid_block_roots = HashSet::from([*INVALID_HOLESKY_BLOCK_ROOT]);
     }
 
+    #[cfg(feature = "pq-devnet")]
+    {
+        // The V1 store never uses block replay: every hot state is an exact snapshot.  Apply the
+        // profile after ordinary CLI parsing so an absent flag cannot retain the BLS default.
+        client_config.store.hierarchy_config.exponents = vec![0];
+        client_config.chain.enable_light_client_server = false;
+        client_config.network.enable_light_client_server = false;
+        client_config.chain.optimistic_finalized_sync = false;
+    }
+
     Ok(client_config)
+}
+
+/// A startup option which is incompatible with the frozen lean PQ devnet V1 profile.
+#[cfg(feature = "pq-devnet")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PqDevnetConfigError {
+    UnsupportedOption(&'static str),
+}
+
+#[cfg(feature = "pq-devnet")]
+impl std::fmt::Display for PqDevnetConfigError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedOption(option) => {
+                write!(formatter, "lean PQ devnet V1 does not support {option}")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "pq-devnet")]
+impl std::error::Error for PqDevnetConfigError {}
+
+/// Rejects unsupported PQ modes before stores, networking, or workers are initialized.
+#[cfg(feature = "pq-devnet")]
+pub fn validate_pq_devnet_cli_profile(cli_args: &ArgMatches) -> Result<(), PqDevnetConfigError> {
+    let unsupported_flag = [
+        ("slasher", "--slasher"),
+        ("genesis-backfill", "--genesis-backfill"),
+        ("complete-blob-backfill", "--complete-blob-backfill"),
+        ("archive", "--archive"),
+        ("validator-monitor-auto", "--validator-monitor-auto"),
+        ("gui", "--gui"),
+    ]
+    .into_iter()
+    .find_map(|(id, option)| cli_args.get_flag(id).then_some(option));
+    if let Some(option) = unsupported_flag {
+        return Err(PqDevnetConfigError::UnsupportedOption(option));
+    }
+
+    for (id, option) in [
+        ("builder", "--builder"),
+        ("checkpoint-sync-url", "--checkpoint-sync-url"),
+        ("checkpoint-state", "--checkpoint-state"),
+        ("checkpoint-block", "--checkpoint-block"),
+        ("checkpoint-blobs", "--checkpoint-blobs"),
+        ("wss-checkpoint", "--wss-checkpoint"),
+        ("validator-monitor-pubkeys", "--validator-monitor-pubkeys"),
+        ("validator-monitor-file", "--validator-monitor-file"),
+    ] {
+        if cli_args.get_raw(id).is_some() {
+            return Err(PqDevnetConfigError::UnsupportedOption(option));
+        }
+    }
+    if cli_args
+        .get_one::<String>("hierarchy-exponents")
+        .is_some_and(|value| value != "0")
+    {
+        return Err(PqDevnetConfigError::UnsupportedOption(
+            "--hierarchy-exponents other than 0",
+        ));
+    }
+    if cli_args.value_source("validator-monitor-individual-tracking-threshold")
+        == Some(ValueSource::CommandLine)
+    {
+        return Err(PqDevnetConfigError::UnsupportedOption(
+            "--validator-monitor-individual-tracking-threshold",
+        ));
+    }
+    Ok(())
 }
 
 /// Gets the listening_addresses for lighthouse based on the cli options.
@@ -1580,4 +1672,60 @@ fn purge_db(chain_db: PathBuf, freezer_db: PathBuf, blobs_db: PathBuf) -> Result
     }
 
     Ok(())
+}
+
+#[cfg(all(test, feature = "pq-devnet"))]
+mod pq_devnet_tests {
+    use super::{PqDevnetConfigError, validate_pq_devnet_cli_profile};
+    use crate::cli::cli_app;
+
+    fn matches(arguments: &[&str]) -> clap::ArgMatches {
+        cli_app()
+            .try_get_matches_from(arguments)
+            .expect("valid beacon-node test arguments")
+    }
+
+    #[test]
+    fn pq_profile_rejects_unsupported_startup_modes() {
+        for (flag, expected) in [
+            ("--slasher", "--slasher"),
+            ("--builder", "--builder"),
+            ("--checkpoint-sync-url", "--checkpoint-sync-url"),
+            ("--wss-checkpoint", "--wss-checkpoint"),
+            ("--genesis-backfill", "--genesis-backfill"),
+            ("--complete-blob-backfill", "--complete-blob-backfill"),
+            ("--archive", "--archive"),
+        ] {
+            let mut arguments = vec!["beacon_node", flag];
+            if matches!(flag, "--builder" | "--checkpoint-sync-url") {
+                arguments.push("http://127.0.0.1:5052");
+            } else if flag == "--wss-checkpoint" {
+                arguments
+                    .push("0:0x0000000000000000000000000000000000000000000000000000000000000000");
+            }
+            let error = validate_pq_devnet_cli_profile(&matches(&arguments))
+                .expect_err("unsupported PQ startup flag");
+            assert_eq!(error, PqDevnetConfigError::UnsupportedOption(expected));
+        }
+
+        let checkpoint_files = matches(&[
+            "beacon_node",
+            "--checkpoint-state",
+            "/path/that/must/not/be/read/state.ssz",
+            "--checkpoint-block",
+            "/path/that/must/not/be/read/block.ssz",
+        ]);
+        assert_eq!(
+            validate_pq_devnet_cli_profile(&checkpoint_files),
+            Err(PqDevnetConfigError::UnsupportedOption("--checkpoint-state"))
+        );
+    }
+
+    #[test]
+    fn pq_profile_accepts_a_plain_startup_and_forces_backfill_off() {
+        let arguments = matches(&["beacon_node"]);
+        validate_pq_devnet_cli_profile(&arguments).expect("plain PQ startup");
+        assert!(cfg!(feature = "pq-devnet"));
+        assert!(cfg!(feature = "network/disable-backfill"));
+    }
 }

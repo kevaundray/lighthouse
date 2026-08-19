@@ -57,6 +57,7 @@ use state_processing::{
 };
 use std::borrow::Cow;
 use strum::AsRefStr;
+#[cfg(feature = "slasher")]
 use tracing::{debug, error};
 use tree_hash::TreeHash;
 use types::{
@@ -439,71 +440,87 @@ fn process_slash_info<T: BeaconChainTypes>(
 ) -> Error {
     use AttestationSlashInfo::*;
 
-    if let Some(slasher) = chain.slasher.as_ref() {
-        let (indexed_attestation, check_signature, err) = match slash_info {
-            SignatureNotChecked(attestation, err) => {
-                if let Error::UnknownHeadBlock { .. } = err
-                    && attestation.data().beacon_block_root == attestation.data().target.root
-                {
-                    return err;
-                }
-
-                match obtain_indexed_attestation_and_committees_per_slot(chain, attestation) {
-                    Ok((indexed, _)) => (indexed, true, err),
-                    Err(e) => {
-                        debug!(
-                            attestation_root = ?attestation.tree_hash_root(),
-                            error =  ?e,
-                            "Unable to obtain indexed form of attestation for slasher"
-                        );
+    #[cfg(feature = "slasher")]
+    {
+        if let Some(slasher) = chain.slasher.as_ref() {
+            let (indexed_attestation, check_signature, err) = match slash_info {
+                SignatureNotChecked(attestation, err) => {
+                    if let Error::UnknownHeadBlock { .. } = err
+                        && attestation.data().beacon_block_root == attestation.data().target.root
+                    {
                         return err;
                     }
-                }
-            }
-            SignatureNotCheckedSingle(attestation, err) => {
-                if let Error::UnknownHeadBlock { .. } = err
-                    && attestation.data.beacon_block_root == attestation.data.target.root
-                {
-                    return err;
-                }
 
-                let fork_name = chain
-                    .spec
-                    .fork_name_at_slot::<T::EthSpec>(attestation.data.slot);
-
-                let indexed_attestation = match attestation.to_indexed(fork_name) {
-                    Ok(indexed) => indexed,
-                    Err(e) => {
-                        error!(
-                            attestation_root = ?attestation.data.tree_hash_root(),
-                            error = ?e,
-                            "Unable to construct VariableList from a single attestation. \
-                             This indicates a serious bug in SSZ handling"
-                        );
-                        return Error::SszTypesError(e);
+                    match obtain_indexed_attestation_and_committees_per_slot(chain, attestation) {
+                        Ok((indexed, _)) => (indexed, true, err),
+                        Err(e) => {
+                            debug!(
+                                attestation_root = ?attestation.tree_hash_root(),
+                                error =  ?e,
+                                "Unable to obtain indexed form of attestation for slasher"
+                            );
+                            return err;
+                        }
                     }
-                };
-                (indexed_attestation, true, err)
+                }
+                SignatureNotCheckedSingle(attestation, err) => {
+                    if let Error::UnknownHeadBlock { .. } = err
+                        && attestation.data.beacon_block_root == attestation.data.target.root
+                    {
+                        return err;
+                    }
+
+                    let fork_name = chain
+                        .spec
+                        .fork_name_at_slot::<T::EthSpec>(attestation.data.slot);
+
+                    let indexed_attestation = match attestation.to_indexed(fork_name) {
+                        Ok(indexed) => indexed,
+                        Err(e) => {
+                            error!(
+                                attestation_root = ?attestation.data.tree_hash_root(),
+                                error = ?e,
+                                "Unable to construct VariableList from a single attestation. \
+                                 This indicates a serious bug in SSZ handling"
+                            );
+                            return Error::SszTypesError(e);
+                        }
+                    };
+                    (indexed_attestation, true, err)
+                }
+                SignatureNotCheckedIndexed(indexed, err) => (indexed, true, err),
+                SignatureInvalid(e) => return e,
+                SignatureValid(indexed, err) => (indexed, false, err),
+            };
+
+            if check_signature
+                && let Err(e) = verify_attestation_signature(chain, &indexed_attestation)
+            {
+                debug!(
+                    error = ?e,
+                    "Signature verification for slasher failed"
+                );
+                return err;
             }
-            SignatureNotCheckedIndexed(indexed, err) => (indexed, true, err),
-            SignatureInvalid(e) => return e,
-            SignatureValid(indexed, err) => (indexed, false, err),
-        };
 
-        if check_signature && let Err(e) = verify_attestation_signature(chain, &indexed_attestation)
-        {
-            debug!(
-                error = ?e,
-                "Signature verification for slasher failed"
-            );
-            return err;
+            // Supply to slasher.
+            slasher.accept_attestation(indexed_attestation);
+
+            err
+        } else {
+            match slash_info {
+                SignatureNotChecked(_, e)
+                | SignatureNotCheckedIndexed(_, e)
+                | SignatureNotCheckedSingle(_, e)
+                | SignatureInvalid(e)
+                | SignatureValid(_, e) => e,
+            }
         }
+    }
 
-        // Supply to slasher.
-        slasher.accept_attestation(indexed_attestation);
-
-        err
-    } else {
+    #[cfg(not(feature = "slasher"))]
+    {
+        let _ = chain;
         match slash_info {
             SignatureNotChecked(_, e)
             | SignatureNotCheckedIndexed(_, e)
@@ -815,9 +832,12 @@ impl<'a, T: BeaconChainTypes> VerifiedAggregatedAttestation<'a, T> {
     }
 
     fn apply_to_slasher(self, chain: &BeaconChain<T>) -> Self {
+        #[cfg(feature = "slasher")]
         if let Some(slasher) = chain.slasher.as_ref() {
             slasher.accept_attestation(self.indexed_attestation.clone());
         }
+        #[cfg(not(feature = "slasher"))]
+        let _ = chain;
         self
     }
 
@@ -1145,9 +1165,12 @@ impl<'a, T: BeaconChainTypes> VerifiedUnaggregatedAttestation<'a, T> {
     }
 
     fn apply_to_slasher(self, chain: &BeaconChain<T>) -> Self {
+        #[cfg(feature = "slasher")]
         if let Some(slasher) = chain.slasher.as_ref() {
             slasher.accept_attestation(self.indexed_attestation.clone());
         }
+        #[cfg(not(feature = "slasher"))]
+        let _ = chain;
         self
     }
 

@@ -1,72 +1,151 @@
+#[cfg(not(feature = "pq-devnet"))]
 pub mod attestation_rewards;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod attestation_simulator;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod attestation_verification;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod beacon_block_reward;
+#[cfg(not(feature = "pq-devnet"))]
 mod beacon_block_streamer;
+#[cfg(not(feature = "pq-devnet"))]
 mod beacon_chain;
+#[cfg(feature = "pq-devnet")]
+#[path = "pq_runtime/beacon_chain.rs"]
+mod beacon_chain;
+#[cfg(not(feature = "pq-devnet"))]
 mod beacon_fork_choice_store;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod beacon_proposer_cache;
+#[cfg(not(feature = "pq-devnet"))]
 mod beacon_snapshot;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod bellatrix_readiness;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod blob_verification;
+#[cfg(not(feature = "pq-devnet"))]
 mod block_production;
+#[cfg(not(feature = "pq-devnet"))]
 mod block_times_cache;
+#[cfg(not(feature = "pq-devnet"))]
 mod block_verification;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod block_verification_types;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod builder;
+#[cfg(feature = "pq-devnet")]
+#[path = "pq_runtime/builder.rs"]
+pub mod builder;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod canonical_head;
 pub mod chain_config;
 pub mod custody_context;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod data_availability_checker;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod data_column_verification;
+#[cfg(not(feature = "pq-devnet"))]
 mod early_attester_cache;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod envelope_times_cache;
+#[cfg(not(feature = "pq-devnet"))]
 mod errors;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod events;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod execution_payload;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod fetch_blobs;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod fork_choice_signal;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod graffiti_calculator;
+#[cfg(feature = "pq-devnet")]
+#[path = "pq_runtime/graffiti_calculator.rs"]
+pub mod graffiti_calculator;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod historical_blocks;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod historical_data_columns;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod invariants;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod kzg_utils;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod light_client_finality_update_verification;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod light_client_optimistic_update_verification;
+#[cfg(not(feature = "pq-devnet"))]
 mod light_client_server_cache;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod metrics;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod migrate;
+#[cfg(not(feature = "pq-devnet"))]
 mod naive_aggregation_pool;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod observed_aggregates;
+#[cfg(not(feature = "pq-devnet"))]
 mod observed_attesters;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod observed_block_producers;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod observed_data_sidecars;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod observed_operations;
+#[cfg(not(feature = "pq-devnet"))]
 mod observed_slashable;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod partial_data_column_assembler;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod payload_attestation_verification;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod payload_bid_verification;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod payload_envelope_streamer;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod payload_envelope_verification;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod pending_payload_cache;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod pending_payload_envelopes;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod persisted_beacon_chain;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod persisted_custody;
+#[cfg(not(feature = "pq-devnet"))]
 mod persisted_fork_choice;
+#[cfg(not(feature = "pq-devnet"))]
 mod pre_finalization_cache;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod proposer_preferences_verification;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod proposer_prep_service;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod schema_change;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod shuffling_cache;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod single_attestation;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod state_advance_timer;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod summaries_dag;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod sync_committee_rewards;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod sync_committee_verification;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod test_utils;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod validator_monitor;
+#[cfg(feature = "pq-devnet")]
+#[path = "pq_runtime/validator_monitor.rs"]
+pub mod validator_monitor;
+#[cfg(not(feature = "pq-devnet"))]
 pub mod validator_pubkey_cache;
 
+#[cfg(not(feature = "pq-devnet"))]
 pub use self::beacon_chain::{
     AttestationProcessingOutcome, AvailabilityProcessingStatus, BeaconBlockResponse,
     BeaconBlockResponseWrapper, BeaconChain, BeaconChainTypes, BeaconStore, BlockProcessStatus,
@@ -74,34 +153,54 @@ pub use self::beacon_chain::{
     INVALID_JUSTIFIED_PAYLOAD_SHUTDOWN_REASON, LightClientProducerEvent, OverrideForkchoiceUpdate,
     ProduceBlockVerification, StateSkipConfig, WhenSlotSkipped,
 };
+#[cfg(feature = "pq-devnet")]
+pub use self::beacon_chain::{
+    BeaconChain, BeaconChainTypes, BeaconSnapshot, BeaconStore, PqRuntimeError,
+};
+#[cfg(not(feature = "pq-devnet"))]
 pub use self::beacon_snapshot::BeaconSnapshot;
 pub use self::chain_config::ChainConfig;
+#[cfg(not(feature = "pq-devnet"))]
 pub use self::errors::{BeaconChainError, BlockProductionError};
+#[cfg(not(feature = "pq-devnet"))]
 pub use self::historical_blocks::HistoricalBlockError;
+#[cfg(not(feature = "pq-devnet"))]
 pub use attestation_verification::Error as AttestationError;
+#[cfg(not(feature = "pq-devnet"))]
 pub use beacon_fork_choice_store::{
     BeaconForkChoiceStore, Error as ForkChoiceStoreError, PersistedForkChoiceStore,
     PersistedForkChoiceStoreV28,
 };
+#[cfg(not(feature = "pq-devnet"))]
 pub use block_verification::{
     BlockError, ExecutionPayloadError, ExecutionPendingBlock, GossipVerifiedBlock,
     IntoExecutionPendingBlock, IntoGossipVerifiedBlock, InvalidSignature, ParentImportStatus,
     PayloadVerificationError, PayloadVerificationOutcome, PayloadVerificationStatus,
     build_blob_data_column_sidecars, get_block_root, signature_verify_chain_segment,
 };
+#[cfg(not(feature = "pq-devnet"))]
 pub use block_verification_types::AvailabilityPendingExecutedBlock;
+#[cfg(not(feature = "pq-devnet"))]
 pub use block_verification_types::ExecutedBlock;
+#[cfg(not(feature = "pq-devnet"))]
 pub use canonical_head::{CachedHead, CanonicalHead, CanonicalHeadRwLock};
 pub use custody_context::CustodyContext;
+#[cfg(not(feature = "pq-devnet"))]
 pub use events::ServerSentEventHandler;
+#[cfg(not(feature = "pq-devnet"))]
 pub use execution_layer::EngineState;
+#[cfg(not(feature = "pq-devnet"))]
 pub use execution_payload::NotifyExecutionLayer;
+#[cfg(not(feature = "pq-devnet"))]
 pub use fork_choice::{ExecutionStatus, ForkchoiceUpdateParameters};
 pub use kzg::{Kzg, TrustedSetup};
+#[cfg(not(feature = "pq-devnet"))]
 pub use metrics::scrape_for_metrics;
+#[cfg(not(feature = "pq-devnet"))]
 pub use migrate::MigratorConfig;
 pub use parking_lot;
 pub use slot_clock;
+#[cfg(not(feature = "pq-devnet"))]
 pub use state_processing::per_block_processing::errors::{
     AttestationValidationError, AttesterSlashingValidationError, DepositValidationError,
     ExitValidationError, ProposerSlashingValidationError,

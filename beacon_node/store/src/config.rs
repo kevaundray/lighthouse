@@ -100,6 +100,8 @@ pub enum StoreConfigError {
     },
     ZeroEpochsPerBlobPrune,
     InvalidVersionByte(Option<u8>),
+    #[cfg(feature = "pq-devnet")]
+    PqSnapshotEverySlotRequired,
 }
 
 impl Default for StoreConfig {
@@ -148,6 +150,10 @@ impl StoreConfig {
 
     /// Check that the configuration is valid.
     pub fn verify<E: EthSpec>(&self) -> Result<(), StoreConfigError> {
+        #[cfg(feature = "pq-devnet")]
+        if self.hierarchy_config.exponents.as_slice() != [0] {
+            return Err(StoreConfigError::PqSnapshotEverySlotRequired);
+        }
         self.verify_compression_level()?;
         self.verify_epochs_per_blob_prune()
     }

@@ -177,7 +177,7 @@ build-release-tarballs:
 # Runs the full workspace tests in **release**, without downloading any additional
 # test vectors.
 test-release:
-	cargo nextest run --workspace --release --features "$(TEST_FEATURES)" \
+	cargo nextest run --workspace --release --features "lighthouse/lighthouse-integration-tests $(TEST_FEATURES)" \
 		--exclude ef_tests --exclude beacon_chain --exclude slasher --exclude network \
 		--exclude http_api
 
@@ -185,7 +185,7 @@ test-release:
 # Runs the full workspace tests in **debug**, without downloading any additional test
 # vectors.
 test-debug:
-	cargo nextest run --workspace --features "$(TEST_FEATURES)" \
+	cargo nextest run --workspace --features "lighthouse/lighthouse-integration-tests $(TEST_FEATURES)" \
 		--exclude ef_tests --exclude beacon_chain --exclude network --exclude http_api
 
 # Runs cargo-fmt (linter).

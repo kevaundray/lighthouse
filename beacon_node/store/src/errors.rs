@@ -4,6 +4,7 @@ use crate::{DBColumn, hdiff};
 #[cfg(feature = "leveldb")]
 use leveldb::error::Error as LevelDBError;
 use ssz::DecodeError;
+#[cfg(not(feature = "pq-devnet"))]
 use state_processing::BlockReplayError;
 use types::{BeaconStateError, EpochCacheError, Hash256, InconsistentFork, Slot};
 
@@ -54,7 +55,11 @@ pub enum Error {
     MissingSnapshot(Slot),
     LoadingHotHdiffBufferError(String, Hash256, Box<Error>),
     LoadingHotStateError(String, Hash256, Box<Error>),
+    #[cfg(not(feature = "pq-devnet"))]
     BlockReplayError(BlockReplayError),
+    /// A corrupt or incompatible PQ database requested a BLS-only state replay path.
+    #[cfg(feature = "pq-devnet")]
+    PqReplayUnsupported(Slot),
     AddPayloadLogicError,
     InvalidKey(String),
     InvalidBytes,
@@ -165,6 +170,7 @@ impl From<hdiff::Error> for Error {
     }
 }
 
+#[cfg(not(feature = "pq-devnet"))]
 impl From<BlockReplayError> for Error {
     fn from(e: BlockReplayError) -> Error {
         Error::BlockReplayError(e)

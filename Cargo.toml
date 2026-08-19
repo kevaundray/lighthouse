@@ -72,6 +72,7 @@ members = [
     "testing/execution_engine_integration",
     "testing/node_test_rig",
     "testing/pq_devnet",
+    "testing/pq_devnet/compile_fail/raw_canonical_head",
     "testing/simulator",
     "testing/state_transition_vectors",
     "testing/validator_test_rig",

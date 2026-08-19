@@ -26,9 +26,10 @@ use safe_arith::SafeArith;
 use serde::{Deserialize, Serialize};
 use ssz::{Decode, Encode};
 use ssz_derive::{Decode, Encode};
+use state_processing::AllCaches;
+#[cfg(not(feature = "pq-devnet"))]
 use state_processing::{
-    AllCaches, BlockProcessingError, BlockReplayer, SlotProcessingError,
-    block_replayer::PreSlotHook,
+    BlockProcessingError, BlockReplayer, SlotProcessingError, block_replayer::PreSlotHook,
 };
 use std::cmp::{Ordering, min};
 use std::collections::{HashMap, HashSet};
@@ -195,8 +196,11 @@ pub enum HotColdDBError {
     BlobsPreviouslyInDefaultStore,
     HdiffGetPriorStateRootError(Slot, Slot),
     RestorePointDecodeError(ssz::DecodeError),
+    #[cfg(not(feature = "pq-devnet"))]
     BlockReplayBeaconError(BeaconStateError),
+    #[cfg(not(feature = "pq-devnet"))]
     BlockReplaySlotError(SlotProcessingError),
+    #[cfg(not(feature = "pq-devnet"))]
     BlockReplayBlockError(BlockProcessingError),
     InvalidSlotsPerRestorePoint {
         slots_per_restore_point: u64,
@@ -1949,6 +1953,8 @@ impl<E: EthSpec, Hot: ItemStore, Cold: ItemStore> HotColdDB<E, Hot, Cold> {
             ..
         }) = self.load_hot_state_summary(state_root)?
         {
+            #[cfg(feature = "pq-devnet")]
+            let _ = (&diff_base_state, update_cache);
             debug!(
                 %slot,
                 ?state_root,
@@ -1979,34 +1985,39 @@ impl<E: EthSpec, Hot: ItemStore, Cold: ItemStore> HotColdDB<E, Hot, Cold> {
                     state
                 }
                 StorageStrategy::ReplayFrom(from_slot) => {
-                    let from_state_root = diff_base_state.get_root(from_slot)?;
+                    #[cfg(feature = "pq-devnet")]
+                    return Err(Error::PqReplayUnsupported(from_slot));
+                    #[cfg(not(feature = "pq-devnet"))]
+                    {
+                        let from_state_root = diff_base_state.get_root(from_slot)?;
 
-                    let (mut base_state, _) = self
-                        .load_hot_state(&from_state_root, update_cache)
-                        .map_err(|e| {
-                            Error::LoadingHotStateError(
-                                format!("load state ReplayFrom {from_slot}"),
-                                *state_root,
-                                e.into(),
-                            )
-                        })?
-                        .ok_or(HotColdDBError::MissingHotState {
-                            state_root: from_state_root,
-                            requested_by_state_summary: (*state_root, slot),
-                        })?;
+                        let (mut base_state, _) = self
+                            .load_hot_state(&from_state_root, update_cache)
+                            .map_err(|e| {
+                                Error::LoadingHotStateError(
+                                    format!("load state ReplayFrom {from_slot}"),
+                                    *state_root,
+                                    e.into(),
+                                )
+                            })?
+                            .ok_or(HotColdDBError::MissingHotState {
+                                state_root: from_state_root,
+                                requested_by_state_summary: (*state_root, slot),
+                            })?;
 
-                    // Immediately rebase the state from disk on the finalized state so that we can
-                    // reuse parts of the tree for state root calculation in `replay_blocks`.
-                    self.state_cache
-                        .lock()
-                        .rebase_on_finalized(&mut base_state, &self.spec)?;
+                        // Immediately rebase the state from disk on the finalized state so that we can
+                        // reuse parts of the tree for state root calculation in `replay_blocks`.
+                        self.state_cache
+                            .lock()
+                            .rebase_on_finalized(&mut base_state, &self.spec)?;
 
-                    self.load_hot_state_using_replay(
-                        base_state,
-                        slot,
-                        latest_block_root,
-                        update_cache,
-                    )?
+                        self.load_hot_state_using_replay(
+                            base_state,
+                            slot,
+                            latest_block_root,
+                            update_cache,
+                        )?
+                    }
                 }
             };
             state.apply_pending_mutations()?;
@@ -2017,6 +2028,7 @@ impl<E: EthSpec, Hot: ItemStore, Cold: ItemStore> HotColdDB<E, Hot, Cold> {
         }
     }
 
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn load_hot_state_using_replay(
         &self,
         base_state: BeaconState<E>,
@@ -2314,6 +2326,9 @@ impl<E: EthSpec, Hot: ItemStore, Cold: ItemStore> HotColdDB<E, Hot, Cold> {
             }
             metrics::inc_counter(&metrics::STORE_BEACON_HISTORIC_STATE_CACHE_MISS);
 
+            #[cfg(feature = "pq-devnet")]
+            return Err(Error::PqReplayUnsupported(cached_state.slot()));
+            #[cfg(not(feature = "pq-devnet"))]
             return self.load_cold_state_by_slot_using_replay(cached_state, slot);
         }
 
@@ -2336,14 +2351,20 @@ impl<E: EthSpec, Hot: ItemStore, Cold: ItemStore> HotColdDB<E, Hot, Cold> {
                 Ok(state)
             }
             StorageStrategy::ReplayFrom(from) => {
-                // No prior state found in cache (above), need to load by diffing and then
-                // replaying.
-                let base_state = self.load_cold_state_by_slot(from)?;
-                self.load_cold_state_by_slot_using_replay(base_state, slot)
+                #[cfg(feature = "pq-devnet")]
+                return Err(Error::PqReplayUnsupported(from));
+                #[cfg(not(feature = "pq-devnet"))]
+                {
+                    // No prior state found in cache (above), need to load by diffing and then
+                    // replaying.
+                    let base_state = self.load_cold_state_by_slot(from)?;
+                    self.load_cold_state_by_slot_using_replay(base_state, slot)
+                }
             }
         }
     }
 
+    #[cfg(not(feature = "pq-devnet"))]
     fn load_cold_state_by_slot_using_replay(
         &self,
         mut base_state: BeaconState<E>,
@@ -2469,7 +2490,12 @@ impl<E: EthSpec, Hot: ItemStore, Cold: ItemStore> HotColdDB<E, Hot, Cold> {
 
                 Ok((slot, buffer))
             }
-            StorageStrategy::ReplayFrom(from) => self.load_hdiff_buffer_for_slot(from),
+            StorageStrategy::ReplayFrom(from) => {
+                #[cfg(feature = "pq-devnet")]
+                return Err(Error::PqReplayUnsupported(from));
+                #[cfg(not(feature = "pq-devnet"))]
+                self.load_hdiff_buffer_for_slot(from)
+            }
         }
     }
 
@@ -2541,6 +2567,7 @@ impl<E: EthSpec, Hot: ItemStore, Cold: ItemStore> HotColdDB<E, Hot, Cold> {
     ///
     /// Will skip slots as necessary. The returned state is not guaranteed
     /// to have any caches built, beyond those immediately required by block processing.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn replay_blocks(
         &self,
         state: BeaconState<E>,
@@ -3759,6 +3786,7 @@ impl StoreItem for Split {
 }
 
 /// Type hint.
+#[cfg(not(feature = "pq-devnet"))]
 fn no_state_root_iter() -> Option<std::iter::Empty<Result<(Hash256, Slot), Error>>> {
     None
 }

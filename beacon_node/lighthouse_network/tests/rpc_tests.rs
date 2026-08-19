@@ -3,7 +3,7 @@
 use crate::common;
 use crate::common::spec_with_all_forks_enabled;
 use crate::common::{Protocol, build_tracing_subscriber};
-use bls::Signature;
+use consensus_signature::IndividualSignature;
 use fixed_bytes::FixedBytesExtended;
 use libp2p::PeerId;
 use lighthouse_network::rpc::{RequestType, methods::*};
@@ -197,15 +197,18 @@ fn test_tcp_blocks_by_range_chunked_rpc() {
 
         // BlocksByRange Response
         let full_block = BeaconBlock::Base(BeaconBlockBase::<E>::full(&spec));
-        let signed_full_block = SignedBeaconBlock::from_block(full_block, Signature::empty());
+        let signed_full_block =
+            SignedBeaconBlock::from_block(full_block, IndividualSignature::empty());
         let rpc_response_base = Response::BlocksByRange(Some(Arc::new(signed_full_block)));
 
         let full_block = BeaconBlock::Altair(BeaconBlockAltair::<E>::full(&spec));
-        let signed_full_block = SignedBeaconBlock::from_block(full_block, Signature::empty());
+        let signed_full_block =
+            SignedBeaconBlock::from_block(full_block, IndividualSignature::empty());
         let rpc_response_altair = Response::BlocksByRange(Some(Arc::new(signed_full_block)));
 
         let full_block = bellatrix_block_small(&spec);
-        let signed_full_block = SignedBeaconBlock::from_block(full_block, Signature::empty());
+        let signed_full_block =
+            SignedBeaconBlock::from_block(full_block, IndividualSignature::empty());
         let rpc_response_bellatrix_small =
             Response::BlocksByRange(Some(Arc::new(signed_full_block)));
 
@@ -469,7 +472,8 @@ fn test_tcp_blocks_by_range_over_limit() {
 
         // BlocksByRange Response
         let full_block = bellatrix_block_large(&spec);
-        let signed_full_block = SignedBeaconBlock::from_block(full_block, Signature::empty());
+        let signed_full_block =
+            SignedBeaconBlock::from_block(full_block, IndividualSignature::empty());
         let rpc_response_bellatrix_large =
             Response::BlocksByRange(Some(Arc::new(signed_full_block)));
 
@@ -574,7 +578,7 @@ fn test_tcp_blocks_by_range_chunked_rpc_terminates_correctly() {
 
         // BlocksByRange Response
         let empty_block = BeaconBlock::empty(&spec);
-        let empty_signed = SignedBeaconBlock::from_block(empty_block, Signature::empty());
+        let empty_signed = SignedBeaconBlock::from_block(empty_block, IndividualSignature::empty());
         let rpc_response = Response::BlocksByRange(Some(Arc::new(empty_signed)));
 
         // keep count of the number of messages received
@@ -707,7 +711,7 @@ fn test_tcp_blocks_by_range_single_empty_rpc() {
 
         // BlocksByRange Response
         let empty_block = BeaconBlock::empty(&spec);
-        let empty_signed = SignedBeaconBlock::from_block(empty_block, Signature::empty());
+        let empty_signed = SignedBeaconBlock::from_block(empty_block, IndividualSignature::empty());
         let rpc_response = Response::BlocksByRange(Some(Arc::new(empty_signed)));
 
         let messages_to_send = 1;
@@ -839,15 +843,18 @@ fn test_tcp_blocks_by_root_chunked_rpc() {
 
         // BlocksByRoot Response
         let full_block = BeaconBlock::Base(BeaconBlockBase::<E>::full(&spec));
-        let signed_full_block = SignedBeaconBlock::from_block(full_block, Signature::empty());
+        let signed_full_block =
+            SignedBeaconBlock::from_block(full_block, IndividualSignature::empty());
         let rpc_response_base = Response::BlocksByRoot(Some(Arc::new(signed_full_block)));
 
         let full_block = BeaconBlock::Altair(BeaconBlockAltair::<E>::full(&spec));
-        let signed_full_block = SignedBeaconBlock::from_block(full_block, Signature::empty());
+        let signed_full_block =
+            SignedBeaconBlock::from_block(full_block, IndividualSignature::empty());
         let rpc_response_altair = Response::BlocksByRoot(Some(Arc::new(signed_full_block)));
 
         let full_block = bellatrix_block_small(&spec);
-        let signed_full_block = SignedBeaconBlock::from_block(full_block, Signature::empty());
+        let signed_full_block =
+            SignedBeaconBlock::from_block(full_block, IndividualSignature::empty());
         let rpc_response_bellatrix_small =
             Response::BlocksByRoot(Some(Arc::new(signed_full_block)));
 
@@ -1019,7 +1026,7 @@ fn test_tcp_columns_by_root_chunked_rpc_for_fork(fork_name: ForkName) {
                         state_root: Hash256::zero(),
                         body_root: Hash256::zero(),
                     },
-                    signature: Signature::empty(),
+                    signature: IndividualSignature::empty(),
                 },
                 column: vec![vec![0; E::bytes_per_cell()].try_into().unwrap()]
                     .try_into()
@@ -1187,7 +1194,7 @@ fn test_tcp_columns_by_range_chunked_rpc_for_fork(fork_name: ForkName) {
                         state_root: Hash256::zero(),
                         body_root: Hash256::zero(),
                     },
-                    signature: Signature::empty(),
+                    signature: IndividualSignature::empty(),
                 },
                 column: vec![vec![0; E::bytes_per_cell()].try_into().unwrap()]
                     .try_into()
@@ -1341,7 +1348,8 @@ fn test_tcp_blocks_by_root_chunked_rpc_terminates_correctly() {
 
         // BlocksByRoot Response
         let full_block = BeaconBlock::Base(BeaconBlockBase::<E>::full(&spec));
-        let signed_full_block = SignedBeaconBlock::from_block(full_block, Signature::empty());
+        let signed_full_block =
+            SignedBeaconBlock::from_block(full_block, IndividualSignature::empty());
         let rpc_response = Response::BlocksByRoot(Some(Arc::new(signed_full_block)));
 
         // keep count of the number of messages received

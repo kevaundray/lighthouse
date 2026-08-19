@@ -988,7 +988,7 @@ mod tests {
     use super::*;
     use crate::rpc::protocol::*;
     use crate::types::{EnrAttestationBitfield, EnrSyncCommitteeBitfield};
-    use bls::Signature;
+    use consensus_signature::IndividualSignature;
     use fixed_bytes::FixedBytesExtended;
     use types::{
         BeaconBlock, BeaconBlockAltair, BeaconBlockBase, BeaconBlockBellatrix, BeaconBlockHeader,
@@ -1034,14 +1034,14 @@ mod tests {
     /// min length check conditions.
     fn empty_base_block(spec: &ChainSpec) -> SignedBeaconBlock<Spec> {
         let empty_block = BeaconBlock::Base(BeaconBlockBase::<Spec>::empty(spec));
-        SignedBeaconBlock::from_block(empty_block, Signature::empty())
+        SignedBeaconBlock::from_block(empty_block, IndividualSignature::empty())
     }
 
     fn altair_block(spec: &ChainSpec) -> SignedBeaconBlock<Spec> {
         // The context bytes are now derived from the block epoch, so we need to have the slot set
         // here.
         let full_block = BeaconBlock::Altair(BeaconBlockAltair::<Spec>::full(spec));
-        SignedBeaconBlock::from_block(full_block, Signature::empty())
+        SignedBeaconBlock::from_block(full_block, IndividualSignature::empty())
     }
 
     fn empty_blob_sidecar(spec: &ChainSpec) -> Arc<BlobSidecar<Spec>> {
@@ -1071,7 +1071,7 @@ mod tests {
                         .start_slot(Spec::slots_per_epoch()),
                     ..BeaconBlockHeader::empty()
                 },
-                signature: Signature::empty(),
+                signature: IndividualSignature::empty(),
             },
             kzg_commitments_inclusion_proof: Default::default(),
         });
@@ -1093,7 +1093,7 @@ mod tests {
 
         let block = BeaconBlock::Bellatrix(block);
         assert!(block.ssz_bytes_len() <= spec.max_payload_size as usize);
-        SignedBeaconBlock::from_block(block, Signature::empty())
+        SignedBeaconBlock::from_block(block, IndividualSignature::empty())
     }
 
     /// Bellatrix block with length > MAX_RPC_SIZE.
@@ -1115,7 +1115,7 @@ mod tests {
 
         let block = BeaconBlock::Bellatrix(block);
         assert!(block.ssz_bytes_len() > spec.max_payload_size as usize);
-        SignedBeaconBlock::from_block(block, Signature::empty())
+        SignedBeaconBlock::from_block(block, IndividualSignature::empty())
     }
 
     fn status_message_v1() -> StatusMessage {
@@ -2216,13 +2216,21 @@ mod tests {
         // byte 1,2,3 are chunk length (little endian)
         let malicious_padding: &'static [u8] = b"\xFE\x00\x00\x00";
 
-        // Full altair block is 157916 bytes uncompressed. `max_compressed_len` is 32 + 157916 + 157916/6 = 184267.
         let block_message_bytes = altair_block(&fork_context.spec).as_ssz_bytes();
 
+        #[cfg(not(feature = "pq-devnet"))]
         assert_eq!(block_message_bytes.len(), 157916);
+        #[cfg(feature = "pq-devnet")]
+        assert_eq!(block_message_bytes.len(), 202565);
+        #[cfg(not(feature = "pq-devnet"))]
         assert_eq!(
             snap::raw::max_compress_len(block_message_bytes.len()),
             184267
+        );
+        #[cfg(feature = "pq-devnet")]
+        assert_eq!(
+            snap::raw::max_compress_len(block_message_bytes.len()),
+            236357
         );
 
         let mut uvi_codec: Uvi<usize> = Uvi::default();
@@ -2240,21 +2248,26 @@ mod tests {
         // Insert snappy stream identifier
         dst.extend_from_slice(stream_identifier);
 
-        // Insert malicious padding of 176156 bytes.
-        for _ in 0..44039 {
-            dst.extend_from_slice(malicious_padding);
-        }
-
-        // Insert payload (8102 bytes compressed)
+        // Encode the active-signature payload before choosing enough padding to exceed its bound.
         let mut writer = FrameEncoder::new(Vec::new());
         writer.write_all(&block_message_bytes).unwrap();
         writer.flush().unwrap();
+        #[cfg(not(feature = "pq-devnet"))]
         assert_eq!(writer.get_ref().len(), 8102);
+
+        let max_compressed_len = snap::raw::max_compress_len(block_message_bytes.len());
+        let unpadded_len = stream_identifier.len() + writer.get_ref().len();
+        let required_padding = max_compressed_len.saturating_sub(unpadded_len) + 1;
+        let padding_chunks = required_padding.div_ceil(malicious_padding.len());
+        for _ in 0..padding_chunks {
+            dst.extend_from_slice(malicious_padding);
+        }
+
         dst.extend_from_slice(writer.get_ref());
 
         let chain_spec = spec_with_all_forks_enabled();
 
-        // 10 (for stream identifier) + 176156 + 8103 = 184269 > `max_compressed_len`. Hence, decoding should fail with `InvalidData`.
+        // The framed stream is greater than `max_compressed_len`, so decoding must fail.
         assert!(matches!(
             decode_response(
                 SupportedProtocol::BlocksByRangeV2,

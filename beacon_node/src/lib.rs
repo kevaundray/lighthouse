@@ -1,26 +1,98 @@
 mod cli;
 mod config;
 
+#[cfg(not(any(feature = "full-runtime", feature = "pq-devnet")))]
+compile_error!(
+    "beacon_node requires exactly one runtime profile: enable full-runtime or pq-devnet"
+);
+#[cfg(all(feature = "full-runtime", feature = "pq-devnet"))]
+compile_error!("beacon_node runtime profiles full-runtime and pq-devnet are mutually exclusive");
+
 pub use beacon_chain;
 use beacon_chain::{builder::Witness, slot_clock::SystemTimeSlotClock};
 use clap::ArgMatches;
 pub use cli::cli_app;
-pub use client::{Client, ClientBuilder, ClientConfig, ClientGenesis};
+#[cfg(not(feature = "pq-devnet"))]
+pub use client::ClientBuilder;
+#[cfg(feature = "pq-devnet")]
+pub use client::config::PqDevnetConfigError as PqClientConfigError;
+pub use client::{Client, ClientConfig, ClientGenesis};
+#[cfg(feature = "pq-devnet")]
+pub use config::PqDevnetConfigError as PqCliConfigError;
 pub use config::{get_config, get_data_dir, set_network_config};
 use environment::RuntimeContext;
 pub use eth2_config::Eth2Config;
+#[cfg(not(feature = "pq-devnet"))]
 use lighthouse_network::load_private_key;
+#[cfg(not(feature = "pq-devnet"))]
 use network_utils::enr_ext::peer_id_to_node_id;
+#[cfg(feature = "slasher")]
 use slasher::{DatabaseBackendOverride, Slasher};
 use std::ops::{Deref, DerefMut};
+#[cfg(not(feature = "pq-devnet"))]
 use std::sync::Arc;
 use store::database::interface::BeaconNodeBackend;
+#[cfg(not(feature = "pq-devnet"))]
 use tracing::{info, warn};
-use types::{ChainSpec, Epoch, EthSpec, ForkName};
+use types::EthSpec;
+#[cfg(not(feature = "pq-devnet"))]
+use types::{ChainSpec, Epoch, ForkName};
 
 /// A type-alias to the tighten the definition of a production-intended `Client`.
 pub type ProductionClient<E> =
     Client<Witness<SystemTimeSlotClock, E, BeaconNodeBackend, BeaconNodeBackend>>;
+
+/// A typed, side-effect-free rejection from the frozen PQ production boundary.
+#[cfg(feature = "pq-devnet")]
+#[derive(Debug)]
+pub enum PqStartupError {
+    CliConfig(PqCliConfigError),
+    ClientConfig(PqClientConfigError),
+    Runtime(beacon_chain::PqRuntimeError),
+}
+
+#[cfg(feature = "pq-devnet")]
+impl std::fmt::Display for PqStartupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CliConfig(error) => error.fmt(formatter),
+            Self::ClientConfig(error) => error.fmt(formatter),
+            Self::Runtime(error) => error.fmt(formatter),
+        }
+    }
+}
+
+#[cfg(feature = "pq-devnet")]
+impl std::error::Error for PqStartupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::CliConfig(error) => Some(error),
+            Self::ClientConfig(error) => Some(error),
+            Self::Runtime(error) => Some(error),
+        }
+    }
+}
+
+#[cfg(feature = "pq-devnet")]
+impl From<PqCliConfigError> for PqStartupError {
+    fn from(error: PqCliConfigError) -> Self {
+        Self::CliConfig(error)
+    }
+}
+
+#[cfg(feature = "pq-devnet")]
+impl From<PqClientConfigError> for PqStartupError {
+    fn from(error: PqClientConfigError) -> Self {
+        Self::ClientConfig(error)
+    }
+}
+
+#[cfg(feature = "pq-devnet")]
+impl From<beacon_chain::PqRuntimeError> for PqStartupError {
+    fn from(error: beacon_chain::PqRuntimeError) -> Self {
+        Self::Runtime(error)
+    }
+}
 
 /// The beacon node `Client` that is used in production.
 ///
@@ -33,6 +105,13 @@ impl<E: EthSpec> ProductionBeaconNode<E> {
     /// Identical to `start_from_client_config`, however the `client_config` is generated from the
     /// given `matches` and potentially configuration files on the local filesystem or other
     /// configurations hosted remotely.
+    #[cfg(feature = "pq-devnet")]
+    pub fn new_from_cli(matches: ArgMatches) -> Result<Self, PqStartupError> {
+        validate_pq_cli_arguments(&matches)?;
+        Err(beacon_chain::PqRuntimeError::DeferredRuntimeIntegration.into())
+    }
+
+    #[cfg(not(feature = "pq-devnet"))]
     pub async fn new_from_cli(
         context: RuntimeContext<E>,
         matches: ArgMatches,
@@ -44,6 +123,17 @@ impl<E: EthSpec> ProductionBeaconNode<E> {
     /// Starts a new beacon node `Client` in the given `environment`.
     ///
     /// Client behaviour is defined by the given `client_config`.
+    #[cfg(feature = "pq-devnet")]
+    pub async fn new(
+        context: RuntimeContext<E>,
+        client_config: ClientConfig,
+    ) -> Result<Self, PqStartupError> {
+        let spec = context.eth2_config().spec.clone();
+        client_config.validate_pq_devnet::<E>(&spec)?;
+        Err(beacon_chain::PqRuntimeError::DeferredRuntimeIntegration.into())
+    }
+
+    #[cfg(not(feature = "pq-devnet"))]
     pub async fn new(
         context: RuntimeContext<E>,
         mut client_config: ClientConfig,
@@ -81,6 +171,7 @@ impl<E: EthSpec> ProductionBeaconNode<E> {
             .http_api_config(client_config.http_api.clone())
             .disk_store(&db_path, &freezer_db_path, &blobs_db_path, store_config)?;
 
+        #[cfg(feature = "slasher")]
         let builder = if let Some(mut slasher_config) = client_config.slasher.clone() {
             match slasher_config.override_backend() {
                 DatabaseBackendOverride::Success(old_backend) => {
@@ -128,6 +219,9 @@ impl<E: EthSpec> ProductionBeaconNode<E> {
 
         let builder = builder.system_time_slot_clock()?;
 
+        #[cfg(feature = "pq-devnet")]
+        let builder = builder.prepare_pq_runtime().await?;
+
         // Inject the executor into the discv5 network config.
         let discv5_executor = Discv5Executor(executor);
         client_config.network.discv5_config.executor = Some(Box::new(discv5_executor));
@@ -147,6 +241,12 @@ impl<E: EthSpec> ProductionBeaconNode<E> {
     }
 }
 
+#[cfg(feature = "pq-devnet")]
+fn validate_pq_cli_arguments(matches: &ArgMatches) -> Result<(), PqCliConfigError> {
+    config::validate_pq_devnet_cli_profile(matches)
+}
+
+#[cfg(not(feature = "pq-devnet"))]
 fn validator_fork_epochs(spec: &ChainSpec) -> Result<(), Vec<(ForkName, Epoch)>> {
     // @dapplion: "We try to schedule forks such that the fork epoch is a multiple of 256, to keep
     // historical vectors in the same fork. Indirectly that makes light client periods align with
@@ -185,15 +285,17 @@ impl<E: EthSpec> DerefMut for ProductionBeaconNode<E> {
 
 // Implements the Discv5 Executor trait over our global executor
 #[derive(Clone)]
+#[cfg(not(feature = "pq-devnet"))]
 struct Discv5Executor(task_executor::TaskExecutor);
 
+#[cfg(not(feature = "pq-devnet"))]
 impl lighthouse_network::discv5::Executor for Discv5Executor {
     fn spawn(&self, future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>) {
         self.0.spawn(future, "discv5")
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "pq-devnet")))]
 mod test {
     use super::*;
     use types::MainnetEthSpec;
@@ -212,5 +314,22 @@ mod test {
             result,
             Err(vec![(ForkName::Deneb, spec.deneb_fork_epoch.unwrap())])
         );
+    }
+}
+
+#[cfg(all(test, feature = "pq-devnet"))]
+mod pq_test {
+    use super::*;
+
+    #[test]
+    fn cli_stops_at_the_deferred_boundary_before_config_io() {
+        let matches = cli_app()
+            .try_get_matches_from([
+                "beacon_node",
+                "--execution-endpoint",
+                "http://127.0.0.1:8551",
+            ])
+            .expect("plain beacon-node arguments");
+        assert_eq!(validate_pq_cli_arguments(&matches), Ok(()));
     }
 }

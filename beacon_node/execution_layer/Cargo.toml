@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = { workspace = true }
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = []
+pq-devnet = ["eth2/pq-devnet", "state_processing/pq-transition", "types/pq-devnet"]
+
 [dependencies]
 alloy-consensus = { workspace = true }
 alloy-primitives = { workspace = true }

@@ -12,7 +12,37 @@ rust-version = "1.88.0"
 normal = ["target_check"]
 
 [features]
-default = ["slasher-lmdb", "beacon-node-leveldb"]
+default = [
+    "beacon-node-runtime",
+    "full-cli",
+    "slasher-lmdb",
+    "beacon-node-leveldb",
+]
+beacon-node-runtime = ["beacon_node/full-runtime"]
+# Compile the ordinary full-runtime integration harness without contaminating no-default profiles.
+lighthouse-integration-tests = [
+    "beacon_node/testing",
+    "dep:beacon_node_fallback",
+    "dep:beacon_processor",
+    "dep:eth2",
+    "dep:initialized_validators",
+    "dep:lighthouse_network",
+    "dep:sensitive_url",
+    "dep:slashing_protection",
+    "dep:tempfile",
+    "dep:validator_dir",
+    "dep:zeroize",
+]
+# The ordinary multi-command Lighthouse binary.
+full-cli = [
+    "dep:account_manager",
+    "dep:boot_node",
+    "dep:database_manager",
+    "dep:validator_client",
+    "dep:validator_manager",
+]
+# Experimental compile-time-only lean PQ devnet profile.
+pq-devnet = ["beacon_node/pq-devnet", "store/pq-devnet", "types/pq-devnet"]
 # Writes debugging .ssz files to /tmp during block processing.
 write_ssz_files = ["beacon_node/write_ssz_files"]
 # Compiles the BLS crypto code so that the binary is portable across machines.
@@ -24,11 +54,11 @@ spec-minimal = []
 # Support Gnosis spec and Gnosis Beacon Chain.
 gnosis = []
 # Support slasher MDBX backend.
-slasher-mdbx = ["slasher/mdbx"]
+slasher-mdbx = ["beacon_node/slasher", "dep:slasher", "slasher/mdbx"]
 # Support slasher LMDB backend.
-slasher-lmdb = ["slasher/lmdb"]
+slasher-lmdb = ["beacon_node/slasher", "dep:slasher", "slasher/lmdb"]
 # Support slasher redb backend.
-slasher-redb = ["slasher/redb"]
+slasher-redb = ["beacon_node/slasher", "dep:slasher", "slasher/redb"]
 # Supports beacon node leveldb backend.
 beacon-node-leveldb = ["store/leveldb"]
 # Supports beacon node redb backend.
@@ -41,20 +71,25 @@ sysmalloc = ["malloc_utils/sysmalloc"]
 jemalloc-profiling = ["malloc_utils/jemalloc-profiling"]
 
 [dependencies]
-account_manager = { "path" = "../account_manager" }
+account_manager = { "path" = "../account_manager", optional = true }
 account_utils = { workspace = true }
-beacon_node = { workspace = true }
+beacon_node = { path = "../beacon_node", default-features = false }
+beacon_node_fallback = { workspace = true, optional = true }
+beacon_processor = { workspace = true, optional = true }
 bls = { workspace = true }
-boot_node = { path = "../boot_node" }
+boot_node = { path = "../boot_node", optional = true }
 clap = { workspace = true }
 clap_utils = { workspace = true }
 console-subscriber = { workspace = true, optional = true }
-database_manager = { path = "../database_manager" }
+database_manager = { path = "../database_manager", optional = true }
 directory = { workspace = true }
 environment = { workspace = true }
+eth2 = { workspace = true, optional = true }
 eth2_network_config = { workspace = true }
 ethereum_hashing = { workspace = true }
 futures = { workspace = true }
+initialized_validators = { workspace = true, optional = true }
+lighthouse_network = { workspace = true, optional = true }
 lighthouse_version = { workspace = true }
 logging = { workspace = true }
 metrics = { workspace = true }
@@ -62,19 +97,24 @@ network_utils = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry_sdk = { workspace = true }
+sensitive_url = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-slasher = { workspace = true }
+slasher = { workspace = true, optional = true }
+slashing_protection = { workspace = true, optional = true }
 store = { workspace = true }
 task_executor = { workspace = true }
+tempfile = { workspace = true, optional = true }
 tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing_samplers = { workspace = true }
 types = { workspace = true }
-validator_client = { workspace = true }
-validator_manager = { path = "../validator_manager" }
+validator_client = { workspace = true, optional = true }
+validator_dir = { workspace = true, optional = true }
+validator_manager = { path = "../validator_manager", optional = true }
 yaml_serde = { workspace = true }
+zeroize = { workspace = true, optional = true }
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 malloc_utils = { workspace = true, features = ["jemalloc"] }
@@ -82,19 +122,12 @@ malloc_utils = { workspace = true, features = ["jemalloc"] }
 [target.'cfg(target_os = "windows")'.dependencies]
 malloc_utils = { workspace = true, features = [] }
 
-[dev-dependencies]
-beacon_node = { workspace = true, features = ["testing"] }
-beacon_node_fallback = { workspace = true }
-beacon_processor = { workspace = true }
-eth2 = { workspace = true }
-initialized_validators = { workspace = true }
-lighthouse_network = { workspace = true }
-sensitive_url = { workspace = true }
-slashing_protection = { workspace = true }
-tempfile = { workspace = true }
-validator_dir = { workspace = true }
-zeroize = { workspace = true }
-
 [[test]]
 name = "lighthouse_tests"
 path = "tests/main.rs"
+required-features = ["lighthouse-integration-tests"]
+
+[[test]]
+name = "pq_early_startup"
+path = "tests/pq_early_startup.rs"
+required-features = ["pq-devnet"]

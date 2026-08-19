@@ -19,14 +19,18 @@ use beacon_chain::{
 use beacon_chain::{Kzg, LightClientProducerEvent};
 use beacon_processor::{BeaconProcessor, BeaconProcessorChannels};
 use beacon_processor::{BeaconProcessorConfig, BeaconProcessorQueueLengths};
+#[cfg(feature = "pq-devnet")]
+use consensus_signature::AggregationService;
 use environment::RuntimeContext;
 use eth2::{
     BeaconNodeHttpClient, Error as ApiError, Timeouts,
     types::{BlockId, StateId},
 };
 use execution_layer::ExecutionLayer;
+#[cfg(not(feature = "pq-devnet"))]
 use execution_layer::test_utils::generate_genesis_header;
 use futures::channel::mpsc::Receiver;
+#[cfg(not(feature = "pq-devnet"))]
 use genesis::{DEFAULT_ETH1_BLOCK_HASH, interop_genesis_state};
 use lighthouse_network::identity::Keypair;
 use lighthouse_network::{NetworkGlobals, prometheus_client::registry::Registry};
@@ -34,7 +38,9 @@ use monitoring_api::{MonitoringHttpClient, ProcessType};
 use network::{NetworkConfig, NetworkSenders, NetworkService};
 use rand::SeedableRng;
 use rand::rngs::{OsRng, StdRng};
+#[cfg(feature = "slasher")]
 use slasher::Slasher;
+#[cfg(feature = "slasher")]
 use slasher_service::SlasherService;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -44,9 +50,11 @@ use store::database::interface::BeaconNodeBackend;
 use timer::spawn_timer;
 use tracing::{debug, info, instrument, warn};
 use types::data::compute_ordered_custody_column_indices;
+#[cfg(not(feature = "pq-devnet"))]
+use types::test_utils::generate_deterministic_keypairs;
 use types::{
     BeaconState, BlobSidecarList, ChainSpec, EthSpec, ExecutionBlockHash, Hash256,
-    SignedBeaconBlock, test_utils::generate_deterministic_keypairs,
+    SignedBeaconBlock,
 };
 
 /// Interval between polling the eth1 node for genesis information.
@@ -85,6 +93,7 @@ pub struct ClientBuilder<T: BeaconChainTypes> {
     freezer_db_path: Option<PathBuf>,
     http_api_config: http_api::Config,
     http_metrics_config: http_metrics::Config,
+    #[cfg(feature = "slasher")]
     slasher: Option<Arc<Slasher<T::EthSpec>>>,
     beacon_processor_config: Option<BeaconProcessorConfig>,
     beacon_processor_channels: Option<BeaconProcessorChannels<T::EthSpec>>,
@@ -118,6 +127,7 @@ where
             freezer_db_path: None,
             http_api_config: <_>::default(),
             http_metrics_config: <_>::default(),
+            #[cfg(feature = "slasher")]
             slasher: None,
             eth_spec_instance,
             beacon_processor_config: None,
@@ -144,6 +154,7 @@ where
         self
     }
 
+    #[cfg(feature = "slasher")]
     pub fn slasher(mut self, slasher: Arc<Slasher<E>>) -> Self {
         self.slasher = Some(slasher);
         self
@@ -218,6 +229,7 @@ where
                     .map_err(|e| format!("Failed to create RNG: {:?}", e))?,
             ));
 
+        #[cfg(feature = "slasher")]
         let builder = if let Some(slasher) = self.slasher.clone() {
             builder.slasher(slasher)
         } else {
@@ -244,9 +256,17 @@ where
         // using it.
         let client_genesis = if matches!(client_genesis, ClientGenesis::FromStore) && !chain_exists
         {
-            info!("Defaulting to deposit contract genesis");
+            #[cfg(feature = "pq-devnet")]
+            return Err(
+                "lean PQ devnet V1 cannot resume: beacon chain is absent from the store"
+                    .to_string(),
+            );
+            #[cfg(not(feature = "pq-devnet"))]
+            {
+                info!("Defaulting to deposit contract genesis");
 
-            ClientGenesis::DepositContract
+                ClientGenesis::DepositContract
+            }
         } else if chain_exists {
             if matches!(client_genesis, ClientGenesis::WeakSubjSszBytes { .. })
                 || matches!(client_genesis, ClientGenesis::CheckpointSyncUrl { .. })
@@ -263,6 +283,7 @@ where
         };
 
         let beacon_chain_builder = match client_genesis {
+            #[cfg(not(feature = "pq-devnet"))]
             ClientGenesis::Interop {
                 validator_count,
                 genesis_time,
@@ -277,6 +298,7 @@ where
                 )?;
                 builder.genesis_state(genesis_state)?
             }
+            #[cfg(not(feature = "pq-devnet"))]
             ClientGenesis::InteropMerge {
                 validator_count,
                 genesis_time,
@@ -340,6 +362,7 @@ where
 
                 builder.genesis_state(genesis_state)?
             }
+            #[cfg(not(feature = "pq-devnet"))]
             ClientGenesis::WeakSubjSszBytes {
                 anchor_state_bytes,
                 anchor_block_bytes,
@@ -375,6 +398,7 @@ where
                     genesis_state,
                 )?
             }
+            #[cfg(not(feature = "pq-devnet"))]
             ClientGenesis::CheckpointSyncUrl { url } => {
                 info!(
                     remote_url = %url,
@@ -456,10 +480,17 @@ where
 
                 builder.weak_subjectivity_state(state, block, blobs, genesis_state)?
             }
+            #[cfg(not(feature = "pq-devnet"))]
             ClientGenesis::DepositContract => {
                 return Err("Loading genesis from deposit contract no longer supported".to_string());
             }
             ClientGenesis::FromStore => builder.resume_from_db()?,
+            #[cfg(feature = "pq-devnet")]
+            _ => {
+                return Err(
+                    "lean PQ devnet V1 supports only GenesisState or FromStore startup".to_string(),
+                );
+            }
         };
 
         self.beacon_chain_builder = Some(beacon_chain_builder);
@@ -544,6 +575,7 @@ where
     /// Immediately start the slasher service.
     ///
     /// Error if no slasher is configured.
+    #[cfg(feature = "slasher")]
     pub fn start_slasher_service(&self) -> Result<(), String> {
         let beacon_chain = self
             .beacon_chain
@@ -689,6 +721,7 @@ where
             None
         };
 
+        #[cfg(feature = "slasher")]
         if self.slasher.is_some() {
             self.start_slasher_service()?;
         }
@@ -816,6 +849,37 @@ where
     THotStore: ItemStore + 'static,
     TColdStore: ItemStore + 'static,
 {
+    /// Strictly validates the persisted/genesis head, then starts and injects the sole PQ worker.
+    #[cfg(feature = "pq-devnet")]
+    pub async fn prepare_pq_runtime(mut self) -> Result<Self, String> {
+        let slot_clock = self
+            .slot_clock
+            .as_ref()
+            .ok_or("PQ runtime preflight requires a slot clock")?;
+        let beacon_chain_builder = self
+            .beacon_chain_builder
+            .take()
+            .ok_or("PQ runtime preflight requires a beacon-chain builder")?
+            .prepare_pq_runtime(slot_clock)?;
+
+        let executor = self
+            .runtime_context
+            .as_ref()
+            .ok_or("PQ runtime preflight requires a runtime context")?
+            .executor
+            .clone();
+        let service = executor
+            .spawn_blocking_handle(AggregationService::new, "pq-aggregation-service-init")
+            .ok_or("PQ aggregation service init could not be spawned")?
+            .await
+            .map_err(|error| format!("PQ aggregation service init task failed: {error}"))?
+            .map_err(|error| format!("PQ aggregation service init failed: {error}"))?;
+
+        self.beacon_chain_builder =
+            Some(beacon_chain_builder.pq_aggregation_service(Arc::new(service)));
+        Ok(self)
+    }
+
     /// Consumes the internal `BeaconChainBuilder`, attaching the resulting `BeaconChain` to self.
     #[instrument(skip_all)]
     pub fn build_beacon_chain(mut self) -> Result<Self, String> {

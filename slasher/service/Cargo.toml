@@ -5,7 +5,7 @@ authors = ["Michael Sproul <michael@sigmaprime.io>"]
 edition = { workspace = true }
 
 [dependencies]
-beacon_chain = { workspace = true }
+beacon_chain = { workspace = true, features = ["slasher"] }
 directory = { workspace = true }
 lighthouse_network = { workspace = true }
 network = { workspace = true }

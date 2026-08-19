@@ -7,9 +7,11 @@ use proto_array::{
     ProposerHeadError, ProposerHeadInfo, ProtoArrayForkChoice, ReOrgThreshold,
 };
 use ssz_derive::{Decode, Encode};
-use state_processing::{
-    per_block_processing::errors::AttesterSlashingValidationError, per_epoch_processing,
-};
+#[cfg(feature = "pq-devnet")]
+use state_processing::AttesterSlashingValidationError;
+#[cfg(not(feature = "pq-devnet"))]
+use state_processing::per_block_processing::errors::AttesterSlashingValidationError;
+use state_processing::per_epoch_processing;
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::marker::PhantomData;

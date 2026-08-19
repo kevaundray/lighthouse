@@ -10,6 +10,8 @@ type DBMap = BTreeMap<BytesKey, Vec<u8>>;
 /// A thread-safe `BTreeMap` wrapper.
 pub struct MemoryStore {
     db: RwLock<DBMap>,
+    #[cfg(feature = "pq-startup-testing")]
+    fail_atomic_batch_column: parking_lot::Mutex<Option<DBColumn>>,
 }
 
 impl MemoryStore {
@@ -17,7 +19,15 @@ impl MemoryStore {
     pub fn open() -> Self {
         Self {
             db: RwLock::new(BTreeMap::new()),
+            #[cfg(feature = "pq-startup-testing")]
+            fail_atomic_batch_column: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Reject the next atomic batch containing `column` before applying any operation.
+    #[cfg(feature = "pq-startup-testing")]
+    pub fn fail_atomic_batch_containing(&self, column: DBColumn) {
+        *self.fail_atomic_batch_column.lock() = Some(column);
     }
 }
 
@@ -58,6 +68,23 @@ impl KeyValueStore for MemoryStore {
     }
 
     fn do_atomically(&self, batch: Vec<KeyValueStoreOp>) -> Result<(), Error> {
+        #[cfg(feature = "pq-startup-testing")]
+        {
+            let mut fail_column = self.fail_atomic_batch_column.lock();
+            let should_fail = fail_column.is_some_and(|column| {
+                batch.iter().any(|op| match op {
+                    KeyValueStoreOp::PutKeyValue(op_column, _, _)
+                    | KeyValueStoreOp::DeleteKey(op_column, _) => *op_column == column,
+                })
+            });
+            if should_fail {
+                *fail_column = None;
+                return Err(Error::DBError {
+                    message: "injected atomic batch failure".to_string(),
+                });
+            }
+        }
+
         for op in batch {
             match op {
                 KeyValueStoreOp::PutKeyValue(col, key, value) => {

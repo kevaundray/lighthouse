@@ -5,18 +5,28 @@ authors = ["Sigma Prime <contact@sigmaprime.io>"]
 edition = { workspace = true }
 
 [features]
+default = ["beacon_chain/default"]
 # NOTE: This can be run via cargo build --bin lighthouse --features network/disable-backfill
 disable-backfill = []
 fork_from_env = ["beacon_chain/fork_from_env"]
 fake_crypto = ["bls/fake_crypto", "kzg/fake_crypto"]
 portable = ["beacon_chain/portable"]
+pq-devnet = [
+    "beacon_chain/pq-devnet",
+    "beacon_processor/pq-devnet",
+    "disable-backfill",
+    "execution_layer/pq-devnet",
+    "lighthouse_network/pq-devnet",
+    "operation_pool/pq-devnet",
+    "types/pq-devnet",
+]
 
 [dependencies]
 alloy-primitives = { workspace = true }
 alloy-rlp = { workspace = true }
 anyhow = { workspace = true }
 async-channel = { workspace = true }
-beacon_chain = { workspace = true }
+beacon_chain = { path = "../beacon_chain", default-features = false }
 beacon_processor = { workspace = true }
 delay_map = { workspace = true }
 educe = { workspace = true }

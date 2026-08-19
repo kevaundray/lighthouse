@@ -5,6 +5,10 @@ authors = ["Paul Hauner <paul@paulhauner.com>"]
 edition = { workspace = true }
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = []
+pq-devnet = ["state_processing/pq-transition", "types/pq-devnet"]
+
 [dependencies]
 ethereum_ssz = { workspace = true }
 ethereum_ssz_derive = { workspace = true }

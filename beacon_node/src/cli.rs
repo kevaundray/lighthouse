@@ -1191,7 +1191,7 @@ pub fn cli_app() -> Command {
                 .value_name("DATABASE")
                 .help("Set the database backend to be used by the slasher.")
                 .action(ArgAction::Set)
-                .value_parser(slasher::DatabaseBackend::VARIANTS.to_vec())
+                .value_parser(slasher_backend_variants())
                 .requires("slasher")
                 .display_order(0)
         )
@@ -1659,4 +1659,15 @@ pub fn cli_app() -> Command {
                 .hide(true)
         )
         .group(ArgGroup::new("enable_http").args(["http", "gui", "staking"]).multiple(true))
+}
+
+fn slasher_backend_variants() -> Vec<&'static str> {
+    #[cfg(feature = "slasher")]
+    {
+        slasher::DatabaseBackend::VARIANTS.to_vec()
+    }
+    #[cfg(not(feature = "slasher"))]
+    {
+        vec!["lmdb", "mdbx", "redb"]
+    }
 }

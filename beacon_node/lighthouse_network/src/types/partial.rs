@@ -271,7 +271,7 @@ impl<E: EthSpec> Partial for OutgoingPartialColumn<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bls::Signature;
+    use consensus_signature::IndividualSignature;
     use fixed_bytes::FixedBytesExtended;
     use libp2p::identity::Keypair;
     use ssz_types::FixedVector;
@@ -301,7 +301,7 @@ mod tests {
                     state_root: Hash256::zero(),
                     body_root: Hash256::zero(),
                 },
-                signature: Signature::empty(),
+                signature: IndividualSignature::empty(),
             },
             kzg_commitments_inclusion_proof: FixedVector::new(
                 vec![Hash256::zero(); E::kzg_commitments_inclusion_proof_depth()],

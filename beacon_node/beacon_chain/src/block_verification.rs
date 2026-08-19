@@ -592,22 +592,35 @@ pub(crate) fn process_block_slash_info<T: BeaconChainTypes, TErr: BlockBlobError
     chain: &BeaconChain<T>,
     slash_info: BlockSlashInfo<TErr>,
 ) -> TErr {
-    if let Some(slasher) = chain.slasher.as_ref() {
-        let (verified_header, error) = match slash_info {
-            BlockSlashInfo::SignatureNotChecked(header, e) => {
-                if verify_header_signature::<_, TErr>(chain, &header).is_ok() {
-                    (header, e)
-                } else {
-                    return e;
+    #[cfg(feature = "slasher")]
+    {
+        if let Some(slasher) = chain.slasher.as_ref() {
+            let (verified_header, error) = match slash_info {
+                BlockSlashInfo::SignatureNotChecked(header, e) => {
+                    if verify_header_signature::<_, TErr>(chain, &header).is_ok() {
+                        (header, e)
+                    } else {
+                        return e;
+                    }
                 }
-            }
-            BlockSlashInfo::SignatureInvalid(e) => return e,
-            BlockSlashInfo::SignatureValid(header, e) => (header, e),
-        };
+                BlockSlashInfo::SignatureInvalid(e) => return e,
+                BlockSlashInfo::SignatureValid(header, e) => (header, e),
+            };
 
-        slasher.accept_block_header(verified_header);
-        error
-    } else {
+            slasher.accept_block_header(verified_header);
+            error
+        } else {
+            match slash_info {
+                BlockSlashInfo::SignatureNotChecked(_, e)
+                | BlockSlashInfo::SignatureInvalid(e)
+                | BlockSlashInfo::SignatureValid(_, e) => e,
+            }
+        }
+    }
+
+    #[cfg(not(feature = "slasher"))]
+    {
+        let _ = chain;
         match slash_info {
             BlockSlashInfo::SignatureNotChecked(_, e)
             | BlockSlashInfo::SignatureInvalid(e)
@@ -818,9 +831,12 @@ pub trait IntoExecutionPendingBlock<T: BeaconChainTypes>: Sized {
         self.into_execution_pending_block_slashable(block_root, chain, notify_execution_layer)
             .inspect(|execution_pending| {
                 // Supply valid block to slasher.
+                #[cfg(feature = "slasher")]
                 if let Some(slasher) = chain.slasher.as_ref() {
                     slasher.accept_block_header(execution_pending.block.signed_block_header());
                 }
+                #[cfg(not(feature = "slasher"))]
+                let _ = execution_pending;
             })
             .map_err(|slash_info| process_block_slash_info::<_, BlockError>(chain, slash_info))
     }

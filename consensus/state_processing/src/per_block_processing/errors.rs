@@ -267,7 +267,6 @@ impl_into_block_processing_error_with_index!(
 
 #[cfg(not(feature = "pq-transition"))]
 pub type HeaderValidationError = BlockOperationError<HeaderInvalid>;
-#[cfg(not(feature = "pq-transition"))]
 pub type AttesterSlashingValidationError = BlockOperationError<AttesterSlashingInvalid>;
 #[cfg(not(feature = "pq-transition"))]
 pub type ProposerSlashingValidationError = BlockOperationError<ProposerSlashingInvalid>;

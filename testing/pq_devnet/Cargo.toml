@@ -30,6 +30,16 @@ pq-devnet = [
     "dep:zeroize",
     "consensus_signature/pq-devnet",
 ]
+pq-beacon-startup-testing = [
+    "pq-devnet",
+    "dep:beacon_node",
+    "dep:beacon_chain",
+    "dep:environment",
+    "dep:slot_clock",
+    "dep:store",
+    "beacon_chain/pq-startup-testing",
+    "store/pq-devnet",
+]
 pq-randao-transport-testing = [
     "dep:consensus_signature",
     "dep:eth2",
@@ -44,8 +54,11 @@ pq-transition-testing = ["pq-verification-testing", "state_processing/pq-transit
 
 [dependencies]
 attestation_aggregation = { workspace = true, optional = true, features = ["pq-attestation"] }
+beacon_chain = { path = "../../beacon_node/beacon_chain", optional = true, default-features = false }
+beacon_node = { path = "../../beacon_node", optional = true, default-features = false, features = ["pq-devnet"] }
 clap = { workspace = true, features = ["derive"], optional = true }
 consensus_signature = { workspace = true, optional = true }
+environment = { workspace = true, optional = true }
 eth2 = { workspace = true, optional = true }
 ethereum_ssz = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
@@ -55,8 +68,10 @@ rustix = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
+slot_clock = { workspace = true, optional = true }
 ssz_types = { workspace = true, optional = true }
 state_processing = { workspace = true, optional = true, features = ["pq-genesis", "pq-verification"] }
+store = { workspace = true, optional = true }
 types = { workspace = true, optional = true, features = ["pq-devnet"] }
 validator_dir = { workspace = true, optional = true, features = ["pq-devnet"] }
 zeroize = { workspace = true, optional = true }
@@ -104,3 +119,12 @@ required-features = ["pq-transition-testing"]
 name = "pq_randao_transport"
 path = "tests/pq_randao_transport.rs"
 required-features = ["pq-randao-transport-testing"]
+
+[[test]]
+name = "pq_beacon_startup"
+path = "tests/pq_beacon_startup.rs"
+required-features = ["pq-beacon-startup-testing"]
+
+[[test]]
+name = "pq_api_privacy"
+path = "tests/pq_api_privacy.rs"

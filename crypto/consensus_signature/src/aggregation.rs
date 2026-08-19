@@ -111,6 +111,8 @@ pub enum AggregationError {
     ResourceExhausted(AggregationResource),
     /// The selected backend is not available in this process or build.
     Unavailable,
+    /// Another owner already holds the process-wide PQ aggregation worker.
+    AlreadyActive,
     /// The owned backend worker stopped before returning a result.
     WorkerStopped,
     /// The backend panicked and permanently poisoned its process-wide worker state.
@@ -130,6 +132,7 @@ impl std::fmt::Display for AggregationError {
                 write!(formatter, "aggregation resources exhausted: {error:?}")
             }
             Self::Unavailable => formatter.write_str("aggregation service unavailable"),
+            Self::AlreadyActive => formatter.write_str("aggregation service already active"),
             Self::WorkerStopped => formatter.write_str("aggregation worker stopped"),
             Self::WorkerPanicked => formatter.write_str("aggregation worker panicked"),
             Self::OutputTooLarge { actual, max } => {
@@ -181,7 +184,13 @@ impl AggregationService {
         {
             crate::pq::PqProver::new()
                 .map(|prover| Self { prover })
-                .map_err(|_| AggregationError::Unavailable)
+                .map_err(|error| match error {
+                    #[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
+                    crate::pq::ProverError::Unavailable(
+                        crate::pq::ProverUnavailable::AlreadyActive,
+                    ) => AggregationError::AlreadyActive,
+                    _ => AggregationError::Unavailable,
+                })
         }
     }
 

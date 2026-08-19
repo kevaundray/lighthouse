@@ -3,6 +3,10 @@ name = "beacon_processor"
 version = "0.1.0"
 edition = { workspace = true }
 
+[features]
+default = []
+pq-devnet = ["lighthouse_network/pq-devnet", "types/pq-devnet"]
+
 [dependencies]
 fnv = { workspace = true }
 futures = { workspace = true }

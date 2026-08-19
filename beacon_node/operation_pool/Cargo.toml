@@ -5,7 +5,10 @@ authors = ["Michael Sproul <michael@sigmaprime.io>"]
 edition = { workspace = true }
 
 [features]
+default = ["leveldb"]
+leveldb = ["store/leveldb"]
 portable = ["beacon_chain/portable"]
+pq-devnet = ["state_processing/pq-transition", "types/pq-devnet"]
 
 [dependencies]
 bitvec = { workspace = true }
@@ -21,7 +24,7 @@ rand = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
 state_processing = { workspace = true }
-store = { workspace = true }
+store = { path = "../store", default-features = false }
 superstruct = { workspace = true }
 typenum = { workspace = true }
 types = { workspace = true }
