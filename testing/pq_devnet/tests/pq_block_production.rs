@@ -14,9 +14,16 @@ use consensus_signature::{
 #[cfg(target_feature = "avx2")]
 use network::PqNetworkBlockProcessor;
 #[cfg(target_feature = "avx2")]
+use network::{
+    PQ_BLOCK_PUBLICATION_ADMISSION_CAPACITY, PqBlockPublicationDisposition,
+    PqBlockPublicationService, PqPublicationCapacity, pq_block_broadcast_channel,
+};
+#[cfg(target_feature = "avx2")]
 use pq_signing::{PqKeyUnlock, PqKeystore, PqSigningAuthority, provision_usage_journal};
 #[cfg(target_feature = "avx2")]
 use ssz::Decode;
+#[cfg(target_feature = "avx2")]
+use std::collections::VecDeque;
 #[cfg(target_feature = "avx2")]
 use std::sync::{
     Arc, Mutex,
@@ -362,12 +369,28 @@ fn invalid_randao_and_stale_head_are_terminal() {
 #[cfg(target_feature = "avx2")]
 struct RecordingExecution {
     new_payload_calls: AtomicUsize,
+    new_payload_responses: Mutex<VecDeque<execution_layer::PayloadStatus>>,
+    stall_new_payload: AtomicBool,
+    new_payload_release: tokio::sync::Semaphore,
     payload_calls: AtomicUsize,
     stall_payload: std::sync::atomic::AtomicBool,
     omit_payload_bundle: std::sync::atomic::AtomicBool,
     invalid_payload_block_hash: std::sync::atomic::AtomicBool,
     nonzero_blob_gas: std::sync::atomic::AtomicBool,
     payload_release: tokio::sync::Semaphore,
+}
+
+#[cfg(target_feature = "avx2")]
+impl RecordingExecution {
+    fn set_new_payload_responses(
+        &self,
+        responses: impl IntoIterator<Item = execution_layer::PayloadStatus>,
+    ) {
+        *self
+            .new_payload_responses
+            .lock()
+            .expect("new-payload response lock") = responses.into_iter().collect();
+    }
 }
 
 #[cfg(target_feature = "avx2")]
@@ -384,7 +407,23 @@ impl PqNewPayloadTransport<MinimalEthSpec> for RecordingExecution {
         >,
     > {
         self.new_payload_calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async { Ok(execution_layer::PayloadStatus::Valid) })
+        let response = self
+            .new_payload_responses
+            .lock()
+            .expect("new-payload response lock")
+            .pop_front()
+            .unwrap_or(execution_layer::PayloadStatus::Valid);
+        Box::pin(async move {
+            if self.stall_new_payload.load(Ordering::SeqCst) {
+                let permit = self.new_payload_release.acquire().await.map_err(|_| {
+                    execution_layer::Error::Unexpected(
+                        "publication new-payload release closed".to_owned(),
+                    )
+                })?;
+                permit.forget();
+            }
+            Ok(response)
+        })
     }
 
     fn get_full_payload<'a>(
@@ -507,6 +546,8 @@ fn exact_snapshot_store(
 #[cfg(target_feature = "avx2")]
 struct ValidProductionFixture {
     chain: Arc<beacon_chain::BeaconChain<TestWitness>>,
+    store: Arc<HotColdDB<MinimalEthSpec, MemoryStore, MemoryStore>>,
+    aggregation_service: Arc<AggregationService>,
     execution: Arc<RecordingExecution>,
     randao: PqRawSignature,
     genesis_root: Hash256,
@@ -531,6 +572,16 @@ fn valid_production_fixture_with_blocking_hook(
     stall_payload: bool,
     omit_payload_bundle: bool,
     blocking_hook: Option<Arc<TestingPqBlockingHook>>,
+) -> ValidProductionFixture {
+    valid_production_fixture_with_hooks(stall_payload, omit_payload_bundle, blocking_hook, None)
+}
+
+#[cfg(target_feature = "avx2")]
+fn valid_production_fixture_with_hooks(
+    stall_payload: bool,
+    omit_payload_bundle: bool,
+    blocking_hook: Option<Arc<TestingPqBlockingHook>>,
+    persistence_hook: Option<Arc<TestingPqBlockingHook>>,
 ) -> ValidProductionFixture {
     const PASSWORD: &[u8] = b"correct horse battery staple";
 
@@ -582,6 +633,9 @@ fn valid_production_fixture_with_blocking_hook(
     .expect("signing authority");
     let execution = Arc::new(RecordingExecution {
         new_payload_calls: AtomicUsize::new(0),
+        new_payload_responses: Mutex::new(VecDeque::new()),
+        stall_new_payload: AtomicBool::new(false),
+        new_payload_release: tokio::sync::Semaphore::new(0),
         payload_calls: AtomicUsize::new(0),
         stall_payload: std::sync::atomic::AtomicBool::new(stall_payload),
         omit_payload_bundle: std::sync::atomic::AtomicBool::new(omit_payload_bundle),
@@ -589,18 +643,21 @@ fn valid_production_fixture_with_blocking_hook(
         nonzero_blob_gas: std::sync::atomic::AtomicBool::new(false),
         payload_release: tokio::sync::Semaphore::new(0),
     });
+    let store = exact_snapshot_store(Arc::clone(&spec));
+    let aggregation_service = Arc::new(AggregationService::new().expect("PQ aggregation service"));
     let mut builder = BeaconChainBuilder::<TestWitness>::pq_new(MinimalEthSpec)
-        .store(exact_snapshot_store(Arc::clone(&spec)))
+        .store(Arc::clone(&store))
         .custom_spec(Arc::clone(&spec))
         .genesis_state(genesis.clone())
         .expect("persist genesis")
-        .pq_aggregation_service(Arc::new(
-            AggregationService::new().expect("PQ aggregation service"),
-        ))
+        .pq_aggregation_service(Arc::clone(&aggregation_service))
         .task_executor(runtime.task_executor.clone())
         .testing_only_pq_execution_notifier(execution.clone());
     if let Some(blocking_hook) = blocking_hook {
         builder = builder.testing_only_pq_blocking_hook(blocking_hook);
+    }
+    if let Some(persistence_hook) = persistence_hook {
+        builder = builder.testing_only_pq_persistence_hook(persistence_hook);
     }
     let chain = Arc::new(builder.build().expect("PQ chain"));
     chain.slot_clock.set_slot(1);
@@ -630,6 +687,8 @@ fn valid_production_fixture_with_blocking_hook(
 
     ValidProductionFixture {
         chain,
+        store,
+        aggregation_service,
         execution,
         randao,
         genesis_root,
@@ -651,6 +710,14 @@ fn sign_produced_block(
     let (proofs, blobs) = blob_data.expect("Electra V3 has explicit blob lists");
     assert!(proofs.is_empty());
     assert!(blobs.is_empty());
+    sign_block(fixture, block)
+}
+
+#[cfg(target_feature = "avx2")]
+fn sign_block(
+    fixture: &ValidProductionFixture,
+    block: BeaconBlock<MinimalEthSpec>,
+) -> Arc<SignedBeaconBlock<MinimalEthSpec>> {
     let proposal_domain = fixture.spec.get_domain(
         fixture.proposal_state.current_epoch(),
         Domain::BeaconProposer,
@@ -673,6 +740,62 @@ fn sign_produced_block(
                 .expect("proposal leaf"),
         ))
         .expect("proposal signature");
+    Arc::new(SignedBeaconBlock::from_block(block, proposal_signature))
+}
+
+#[cfg(target_feature = "avx2")]
+fn sign_equivocating_block(
+    fixture: &ValidProductionFixture,
+    block: BeaconBlock<MinimalEthSpec>,
+) -> Arc<SignedBeaconBlock<MinimalEthSpec>> {
+    const PASSWORD: &[u8] = b"correct horse battery staple";
+    let maximum_leaf = OneTimeUseId::for_lean_pq_devnet_v1(1, SigningDuty::BeaconBlockProposal)
+        .expect("slot-one proposal leaf")
+        .as_u32();
+    let keystore = PqKeystore::from_seed([0xa5; 32], 0..=maximum_leaf, PASSWORD)
+        .expect("equivocation fixture keystore");
+    let authenticated = keystore
+        .authenticate(PASSWORD)
+        .expect("equivocation fixture authentication");
+    let authenticated_public_key = *authenticated.public_key();
+    let journal_path = fixture
+        ._temporary_directory
+        .path()
+        .join("equivocation_usage.sqlite");
+    provision_usage_journal(
+        &journal_path,
+        fixture.proposal_state.genesis_validators_root().0,
+        &[authenticated],
+    )
+    .expect("equivocation usage journal");
+    let authority = PqSigningAuthority::open(
+        &journal_path,
+        fixture.proposal_state.genesis_validators_root().0,
+        vec![PqKeyUnlock::new(keystore, PASSWORD).expect("equivocation unlock")],
+    )
+    .expect("equivocation signing authority");
+    let proposal_domain = fixture.spec.get_domain(
+        fixture.proposal_state.current_epoch(),
+        Domain::BeaconProposer,
+        &fixture.proposal_state.fork(),
+        fixture.proposal_state.genesis_validators_root(),
+    );
+    let proposer_public_key = fixture
+        .proposal_state
+        .validators()
+        .get(fixture.proposer_index)
+        .expect("proposer validator")
+        .pubkey;
+    assert_eq!(authenticated_public_key, proposer_public_key);
+    let proposal_signature = authority
+        .signer(&proposer_public_key)
+        .expect("equivocation proposer signer")
+        .sign(consensus_signature::pq::PqSigningClaim::new(
+            block.signing_root(proposal_domain).0,
+            OneTimeUseId::for_lean_pq_devnet_v1(1, SigningDuty::BeaconBlockProposal)
+                .expect("proposal leaf"),
+        ))
+        .expect("equivocation proposal signature");
     Arc::new(SignedBeaconBlock::from_block(block, proposal_signature))
 }
 
@@ -702,6 +825,9 @@ async fn invalid_randao_is_rejected_before_any_execution_work() {
 
     let execution = Arc::new(RecordingExecution {
         new_payload_calls: AtomicUsize::new(0),
+        new_payload_responses: Mutex::new(VecDeque::new()),
+        stall_new_payload: AtomicBool::new(false),
+        new_payload_release: tokio::sync::Semaphore::new(0),
         payload_calls: AtomicUsize::new(0),
         stall_payload: std::sync::atomic::AtomicBool::new(false),
         omit_payload_bundle: std::sync::atomic::AtomicBool::new(false),
@@ -1100,6 +1226,860 @@ async fn produced_block_can_be_proposal_signed_and_imported_through_the_sealed_r
     assert_eq!(
         fixture.chain.head_snapshot().beacon_block_root,
         signed.canonical_root()
+    );
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn produced_block_publication_broadcasts_exact_verified_block_before_import() {
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    let fixture = valid_production_fixture(false, false);
+    let produced = fixture
+        .chain
+        .produce_pq_block_v3(Slot::new(1), fixture.randao.clone(), Graffiti::default())
+        .await
+        .expect("valid full block production");
+    let signed = sign_produced_block(&fixture, produced);
+    let (broadcast_sender, mut broadcast_receiver) = pq_block_broadcast_channel();
+    let publisher = Arc::new(
+        PqBlockPublicationService::new(
+            Arc::clone(&fixture.chain),
+            fixture._runtime.task_executor.clone(),
+            broadcast_sender,
+        )
+        .expect("publication service"),
+    );
+    let admission = publisher.try_admit().expect("publication admission");
+    let signed_for_publish = Arc::clone(&signed);
+    let publication = tokio::spawn(async move { admission.publish(signed_for_publish).await });
+
+    let command = broadcast_receiver.recv().await.expect("broadcast command");
+    assert!(Arc::ptr_eq(command.block(), &signed));
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        0
+    );
+    command.acknowledge(Ok(()));
+
+    let disposition = publication.await.expect("publication task");
+    let PqBlockPublicationDisposition::Published(outcome) = disposition else {
+        panic!("acknowledged valid block must publish and import")
+    };
+    assert_eq!(outcome.source, beacon_chain::PqBlockImportSource::Publish);
+    assert_eq!(outcome.block_root, signed.canonical_root());
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        1
+    );
+
+    let duplicate = publisher.try_admit().expect("duplicate admission");
+    assert!(matches!(
+        duplicate.publish(Arc::clone(&signed)).await,
+        PqBlockPublicationDisposition::Committed,
+    ));
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(1),
+            broadcast_receiver.recv(),
+        )
+        .await
+        .is_err(),
+        "a committed duplicate must not be broadcast again",
+    );
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        1
+    );
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn post_broadcast_engine_retry_does_not_rebroadcast() {
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    let fixture = valid_production_fixture(false, false);
+    fixture.execution.set_new_payload_responses([
+        execution_layer::PayloadStatus::Syncing,
+        execution_layer::PayloadStatus::Valid,
+    ]);
+    let produced = fixture
+        .chain
+        .produce_pq_block_v3(Slot::new(1), fixture.randao.clone(), Graffiti::default())
+        .await
+        .expect("valid full block production");
+    let signed = sign_produced_block(&fixture, produced);
+    let (broadcast_sender, mut broadcast_receiver) = pq_block_broadcast_channel();
+    let publisher = Arc::new(
+        PqBlockPublicationService::new(
+            Arc::clone(&fixture.chain),
+            fixture._runtime.task_executor.clone(),
+            broadcast_sender,
+        )
+        .expect("publication service"),
+    );
+
+    let first = publisher.try_admit().expect("first admission");
+    let first_block = Arc::clone(&signed);
+    let first = tokio::spawn(async move { first.publish(first_block).await });
+    broadcast_receiver
+        .recv()
+        .await
+        .expect("first broadcast")
+        .acknowledge(Ok(()));
+    assert!(matches!(
+        first.await.expect("first publication"),
+        PqBlockPublicationDisposition::Local(_)
+    ));
+
+    let second = publisher.try_admit().expect("retry admission");
+    let disposition = second.publish(Arc::clone(&signed)).await;
+    assert!(matches!(
+        disposition,
+        PqBlockPublicationDisposition::Published(_)
+    ));
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(1),
+            broadcast_receiver.recv(),
+        )
+        .await
+        .is_err(),
+        "post-broadcast retry must not enqueue a second broadcast",
+    );
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        2
+    );
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn dropped_and_rejected_broadcasts_retry_propagation() {
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    let fixture = valid_production_fixture(false, false);
+    let produced = fixture
+        .chain
+        .produce_pq_block_v3(Slot::new(1), fixture.randao.clone(), Graffiti::default())
+        .await
+        .expect("valid full block production");
+    let signed = sign_produced_block(&fixture, produced);
+    let (broadcast_sender, mut broadcast_receiver) = pq_block_broadcast_channel();
+    let publisher = Arc::new(
+        PqBlockPublicationService::new(
+            Arc::clone(&fixture.chain),
+            fixture._runtime.task_executor.clone(),
+            broadcast_sender,
+        )
+        .expect("publication service"),
+    );
+
+    let first = publisher.try_admit().expect("first admission");
+    let first_block = Arc::clone(&signed);
+    let first = tokio::spawn(async move { first.publish(first_block).await });
+    drop(broadcast_receiver.recv().await.expect("first broadcast"));
+    assert!(matches!(
+        first.await.expect("failed publication"),
+        PqBlockPublicationDisposition::Local(_)
+    ));
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        0
+    );
+
+    let rejected = publisher.try_admit().expect("rejected retry admission");
+    let rejected_block = Arc::clone(&signed);
+    let rejected = tokio::spawn(async move { rejected.publish(rejected_block).await });
+    broadcast_receiver
+        .recv()
+        .await
+        .expect("rejected retry broadcast")
+        .acknowledge(Err(network::PqBlockBroadcastError::Rejected));
+    assert!(matches!(
+        rejected.await.expect("rejected publication"),
+        PqBlockPublicationDisposition::Local(_)
+    ));
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        0
+    );
+
+    let retry = publisher.try_admit().expect("successful retry admission");
+    let retry_block = Arc::clone(&signed);
+    let retry = tokio::spawn(async move { retry.publish(retry_block).await });
+    broadcast_receiver
+        .recv()
+        .await
+        .expect("successful retry broadcast")
+        .acknowledge(Ok(()));
+    assert!(matches!(
+        retry.await.expect("retried publication"),
+        PqBlockPublicationDisposition::Published(_)
+    ));
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        1
+    );
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn engine_invalid_publication_is_terminal_and_never_rebroadcast() {
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    let fixture = valid_production_fixture(false, false);
+    fixture.execution.set_new_payload_responses([
+        execution_layer::PayloadStatus::InvalidBlockHash {
+            validation_error: Some("terminal publication fixture".to_owned()),
+        },
+    ]);
+    let produced = fixture
+        .chain
+        .produce_pq_block_v3(Slot::new(1), fixture.randao.clone(), Graffiti::default())
+        .await
+        .expect("valid full block production");
+    let signed = sign_produced_block(&fixture, produced);
+    let (broadcast_sender, mut broadcast_receiver) = pq_block_broadcast_channel();
+    let publisher = Arc::new(
+        PqBlockPublicationService::new(
+            Arc::clone(&fixture.chain),
+            fixture._runtime.task_executor.clone(),
+            broadcast_sender,
+        )
+        .expect("publication service"),
+    );
+
+    let first = publisher.try_admit().expect("first admission");
+    let first_block = Arc::clone(&signed);
+    let first = tokio::spawn(async move { first.publish(first_block).await });
+    broadcast_receiver
+        .recv()
+        .await
+        .expect("first broadcast")
+        .acknowledge(Ok(()));
+    assert!(matches!(
+        first.await.expect("terminal publication"),
+        PqBlockPublicationDisposition::Terminal(network::PqBlockPublicationTerminal::Rejected)
+    ));
+
+    let duplicate = publisher.try_admit().expect("terminal duplicate admission");
+    assert!(matches!(
+        duplicate.publish(Arc::clone(&signed)).await,
+        PqBlockPublicationDisposition::Terminal(network::PqBlockPublicationTerminal::Rejected)
+    ));
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(1),
+            broadcast_receiver.recv(),
+        )
+        .await
+        .is_err(),
+    );
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        1
+    );
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn canceled_publication_waiter_does_not_cancel_broadcast_or_commit() {
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    let fixture = valid_production_fixture(false, false);
+    let produced = fixture
+        .chain
+        .produce_pq_block_v3(Slot::new(1), fixture.randao.clone(), Graffiti::default())
+        .await
+        .expect("valid full block production");
+    let signed = sign_produced_block(&fixture, produced);
+    fixture
+        .execution
+        .stall_new_payload
+        .store(true, Ordering::SeqCst);
+    let (broadcast_sender, mut broadcast_receiver) = pq_block_broadcast_channel();
+    let publisher = Arc::new(
+        PqBlockPublicationService::new(
+            Arc::clone(&fixture.chain),
+            fixture._runtime.task_executor.clone(),
+            broadcast_sender,
+        )
+        .expect("publication service"),
+    );
+
+    let first = publisher.try_admit().expect("first admission");
+    let first_block = Arc::clone(&signed);
+    let waiter = tokio::spawn(async move { first.publish(first_block).await });
+    let command = broadcast_receiver.recv().await.expect("broadcast command");
+    assert!(Arc::ptr_eq(command.block(), &signed));
+
+    let duplicate = publisher.try_admit().expect("pending duplicate admission");
+    assert!(matches!(
+        duplicate.publish(Arc::clone(&signed)).await,
+        PqBlockPublicationDisposition::Pending
+    ));
+    let second = publisher.try_admit().expect("second exact admission");
+    assert_eq!(publisher.testing_only_available_admission_permits(), 0);
+    assert!(matches!(
+        publisher.try_admit(),
+        Err(PqPublicationCapacity::Admission)
+    ));
+    waiter.abort();
+    assert!(
+        waiter
+            .await
+            .expect_err("publication waiter canceled")
+            .is_cancelled()
+    );
+    assert_eq!(
+        publisher.testing_only_available_admission_permits(),
+        0,
+        "the detached operation retains its admission after caller cancellation"
+    );
+    drop(second);
+    assert_eq!(publisher.testing_only_available_admission_permits(), 1);
+
+    command.acknowledge(Ok(()));
+    tokio::time::timeout(std::time::Duration::from_secs(180), async {
+        while fixture.execution.new_payload_calls.load(Ordering::SeqCst) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached publication reaches the stalled Engine");
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        fixture.chain.head_snapshot().beacon_block_root,
+        fixture.genesis_root
+    );
+    assert_eq!(
+        publisher.testing_only_available_admission_permits(),
+        1,
+        "the detached operation retains admission while Engine is pending"
+    );
+    fixture.execution.new_payload_release.add_permits(1);
+    for _ in 0..10_000 {
+        if fixture.chain.head_snapshot().beacon_block_root == signed.canonical_root()
+            && publisher.testing_only_available_admission_permits()
+                == PQ_BLOCK_PUBLICATION_ADMISSION_CAPACITY
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        fixture.chain.head_snapshot().beacon_block_root,
+        signed.canonical_root(),
+        "detached acknowledged publication commits after its waiter is dropped"
+    );
+    assert_eq!(
+        publisher.testing_only_available_admission_permits(),
+        PQ_BLOCK_PUBLICATION_ADMISSION_CAPACITY
+    );
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        1
+    );
+    let restarted = Arc::new(
+        BeaconChainBuilder::<TestWitness>::pq_new(MinimalEthSpec)
+            .store(Arc::clone(&fixture.store))
+            .custom_spec(Arc::clone(&fixture.spec))
+            .resume_from_db()
+            .expect("resume detached publication")
+            .pq_aggregation_service(Arc::clone(&fixture.aggregation_service))
+            .task_executor(fixture._runtime.task_executor.clone())
+            .testing_only_pq_execution_notifier(fixture.execution.clone())
+            .build()
+            .expect("restart after detached publication"),
+    );
+    assert_eq!(
+        restarted.head_snapshot().beacon_block_root,
+        signed.canonical_root()
+    );
+    let (restart_broadcast, mut restart_receiver) = pq_block_broadcast_channel();
+    let restart_publisher = Arc::new(
+        PqBlockPublicationService::new(
+            Arc::clone(&restarted),
+            fixture._runtime.task_executor.clone(),
+            restart_broadcast,
+        )
+        .expect("restart publication service"),
+    );
+    assert!(matches!(
+        restart_publisher
+            .try_admit()
+            .expect("restart duplicate admission")
+            .publish(Arc::clone(&signed))
+            .await,
+        PqBlockPublicationDisposition::Committed
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(1), restart_receiver.recv(),)
+            .await
+            .is_err(),
+        "an exact persisted-head duplicate must not rebroadcast"
+    );
+
+    let (message, _) = signed.as_ref().clone().deconstruct();
+    let mutated_signature = Arc::new(SignedBeaconBlock::from_block(
+        message,
+        consensus_signature::IndividualSignature::empty(),
+    ));
+    assert_eq!(mutated_signature.canonical_root(), signed.canonical_root());
+    assert_ne!(mutated_signature.as_ref(), signed.as_ref());
+    assert!(
+        !matches!(
+            restart_publisher
+                .try_admit()
+                .expect("mutated-signature admission")
+                .publish(mutated_signature)
+                .await,
+            PqBlockPublicationDisposition::Committed
+        ),
+        "message-root equality must not make a different proposal signature idempotent"
+    );
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn canceled_persistence_failure_retries_commit_without_rebroadcast() {
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    let persistence_hook = TestingPqBlockingHook::blocking();
+    let fixture = valid_production_fixture_with_hooks(
+        false,
+        false,
+        None,
+        Some(Arc::clone(&persistence_hook)),
+    );
+    let produced = fixture
+        .chain
+        .produce_pq_block_v3(Slot::new(1), fixture.randao.clone(), Graffiti::default())
+        .await
+        .expect("valid full block production");
+    let signed = sign_produced_block(&fixture, produced);
+    fixture
+        .store
+        .hot_db
+        .fail_atomic_batch_containing(store::DBColumn::BeaconBlock);
+    let (broadcast_sender, mut broadcast_receiver) = pq_block_broadcast_channel();
+    let publisher = Arc::new(
+        PqBlockPublicationService::new(
+            Arc::clone(&fixture.chain),
+            fixture._runtime.task_executor.clone(),
+            broadcast_sender,
+        )
+        .expect("publication service"),
+    );
+
+    let first = publisher.try_admit().expect("first admission");
+    let first_block = Arc::clone(&signed);
+    let waiter = tokio::spawn(async move { first.publish(first_block).await });
+    broadcast_receiver
+        .recv()
+        .await
+        .expect("first broadcast")
+        .acknowledge(Ok(()));
+    for _ in 0..10_000 {
+        if persistence_hook.entered() == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        persistence_hook.entered(),
+        1,
+        "post-VALID persistence barrier"
+    );
+    waiter.abort();
+    assert!(
+        waiter
+            .await
+            .expect_err("publication waiter canceled")
+            .is_cancelled()
+    );
+    assert_eq!(publisher.testing_only_available_admission_permits(), 1);
+    let second = publisher.try_admit().expect("second exact admission");
+    assert!(matches!(
+        publisher.try_admit(),
+        Err(PqPublicationCapacity::Admission)
+    ));
+    drop(second);
+    persistence_hook.release();
+    for _ in 0..10_000 {
+        if publisher.testing_only_available_admission_permits()
+            == PQ_BLOCK_PUBLICATION_ADMISSION_CAPACITY
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        publisher.testing_only_available_admission_permits(),
+        PQ_BLOCK_PUBLICATION_ADMISSION_CAPACITY
+    );
+    assert_eq!(
+        fixture.chain.head_snapshot().beacon_block_root,
+        fixture.genesis_root
+    );
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        1
+    );
+
+    let retry = publisher.try_admit().expect("persistence retry admission");
+    assert!(matches!(
+        retry.publish(Arc::clone(&signed)).await,
+        PqBlockPublicationDisposition::Published(_)
+    ));
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(1),
+            broadcast_receiver.recv(),
+        )
+        .await
+        .is_err(),
+        "post-broadcast persistence retry must not enqueue another broadcast"
+    );
+    assert_eq!(
+        fixture.chain.head_snapshot().beacon_block_root,
+        signed.canonical_root()
+    );
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        2
+    );
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn proposal_signed_wrong_post_state_root_is_invalid_before_broadcast() {
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    let fixture = valid_production_fixture(false, false);
+    let produced = fixture
+        .chain
+        .produce_pq_block_v3(Slot::new(1), fixture.randao.clone(), Graffiti::default())
+        .await
+        .expect("valid full block production");
+    let (mut block, blob_data) = produced.into_contents().deconstruct();
+    let (proofs, blobs) = blob_data.expect("Electra V3 has explicit blob lists");
+    assert!(proofs.is_empty());
+    assert!(blobs.is_empty());
+    *block.state_root_mut() = Hash256::repeat_byte(0x7d);
+    let signed = sign_block(&fixture, block);
+    let (broadcast_sender, mut broadcast_receiver) = pq_block_broadcast_channel();
+    let publisher = Arc::new(
+        PqBlockPublicationService::new(
+            Arc::clone(&fixture.chain),
+            fixture._runtime.task_executor.clone(),
+            broadcast_sender,
+        )
+        .expect("publication service"),
+    );
+
+    let admission = publisher
+        .try_admit()
+        .expect("invalid publication admission");
+    assert!(matches!(
+        admission.publish(signed).await,
+        PqBlockPublicationDisposition::Invalid(_)
+    ));
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(1),
+            broadcast_receiver.recv(),
+        )
+        .await
+        .is_err(),
+        "post-state-root mismatch must not reach the broadcaster"
+    );
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        fixture.chain.head_snapshot().beacon_block_root,
+        fixture.genesis_root
+    );
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn same_root_rpc_commit_during_publish_ack_is_committed() {
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    let fixture = valid_production_fixture(false, false);
+    let produced = fixture
+        .chain
+        .produce_pq_block_v3(Slot::new(1), fixture.randao.clone(), Graffiti::default())
+        .await
+        .expect("valid full block production");
+    let signed = sign_produced_block(&fixture, produced);
+    let (broadcast_sender, mut broadcast_receiver) = pq_block_broadcast_channel();
+    let publisher = Arc::new(
+        PqBlockPublicationService::new(
+            Arc::clone(&fixture.chain),
+            fixture._runtime.task_executor.clone(),
+            broadcast_sender,
+        )
+        .expect("publication service"),
+    );
+
+    let admission = publisher.try_admit().expect("publication admission");
+    let publish_block = Arc::clone(&signed);
+    let publication = tokio::spawn(async move { admission.publish(publish_block).await });
+    let command = broadcast_receiver.recv().await.expect("broadcast command");
+    let rpc_outcome = PqNetworkBlockProcessor::new(Arc::clone(&fixture.chain))
+        .import_rpc_block(Arc::clone(&signed))
+        .await
+        .expect("same-root RPC commit during broadcast acknowledgement");
+    assert_eq!(rpc_outcome.source, beacon_chain::PqBlockImportSource::Rpc);
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        1
+    );
+
+    command.acknowledge(Ok(()));
+    assert!(matches!(
+        publication.await.expect("publication task"),
+        PqBlockPublicationDisposition::Committed
+    ));
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        fixture.chain.head_snapshot().beacon_block_root,
+        signed.canonical_root()
+    );
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn promoted_publish_queued_behind_same_root_rpc_commit_is_committed() {
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    let fixture = valid_production_fixture(false, false);
+    fixture
+        .execution
+        .stall_new_payload
+        .store(true, Ordering::SeqCst);
+    let produced = fixture
+        .chain
+        .produce_pq_block_v3(Slot::new(1), fixture.randao.clone(), Graffiti::default())
+        .await
+        .expect("valid full block production");
+    let signed = sign_produced_block(&fixture, produced);
+    let (broadcast_sender, mut broadcast_receiver) = pq_block_broadcast_channel();
+    let publisher = Arc::new(
+        PqBlockPublicationService::new(
+            Arc::clone(&fixture.chain),
+            fixture._runtime.task_executor.clone(),
+            broadcast_sender,
+        )
+        .expect("publication service"),
+    );
+
+    let admission = publisher.try_admit().expect("publication admission");
+    let publish_block = Arc::clone(&signed);
+    let publication = tokio::spawn(async move { admission.publish(publish_block).await });
+    let command = broadcast_receiver.recv().await.expect("broadcast command");
+
+    let rpc_chain = Arc::clone(&fixture.chain);
+    let rpc_block = Arc::clone(&signed);
+    let rpc = tokio::spawn(async move {
+        PqNetworkBlockProcessor::new(rpc_chain)
+            .import_rpc_block(rpc_block)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(180), async {
+        while fixture.execution.new_payload_calls.load(Ordering::SeqCst) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("RPC reaches the stalled Engine");
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        1
+    );
+
+    command.acknowledge(Ok(()));
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while !fixture.chain.testing_only_pq_observation_is_pending_commit(
+            signed.slot(),
+            signed.message().proposer_index(),
+            signed.canonical_root(),
+        ) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Publish promotes before RPC leaves the commit gate");
+    assert!(fixture.chain.testing_only_pq_observation_is_pending_commit(
+        signed.slot(),
+        signed.message().proposer_index(),
+        signed.canonical_root(),
+    ));
+
+    fixture.execution.new_payload_release.add_permits(1);
+    assert_eq!(
+        rpc.await
+            .expect("RPC task")
+            .expect("same-root RPC commit")
+            .source,
+        beacon_chain::PqBlockImportSource::Rpc
+    );
+    assert!(matches!(
+        publication.await.expect("publication task"),
+        PqBlockPublicationDisposition::Committed
+    ));
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        fixture.chain.head_snapshot().beacon_block_root,
+        signed.canonical_root()
+    );
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn same_root_lookup_rejection_during_publish_ack_is_terminal() {
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    let fixture = valid_production_fixture(false, false);
+    fixture.execution.set_new_payload_responses([
+        execution_layer::PayloadStatus::InvalidBlockHash {
+            validation_error: Some("lookup race rejection".to_owned()),
+        },
+    ]);
+    let produced = fixture
+        .chain
+        .produce_pq_block_v3(Slot::new(1), fixture.randao.clone(), Graffiti::default())
+        .await
+        .expect("valid full block production");
+    let signed = sign_produced_block(&fixture, produced);
+    let (broadcast_sender, mut broadcast_receiver) = pq_block_broadcast_channel();
+    let publisher = Arc::new(
+        PqBlockPublicationService::new(
+            Arc::clone(&fixture.chain),
+            fixture._runtime.task_executor.clone(),
+            broadcast_sender,
+        )
+        .expect("publication service"),
+    );
+
+    let admission = publisher.try_admit().expect("publication admission");
+    let publish_block = Arc::clone(&signed);
+    let publication = tokio::spawn(async move { admission.publish(publish_block).await });
+    let command = broadcast_receiver.recv().await.expect("broadcast command");
+    assert!(matches!(
+        PqNetworkBlockProcessor::new(Arc::clone(&fixture.chain))
+            .import_lookup_block(Arc::clone(&signed))
+            .await,
+        Err(beacon_chain::PqImportError::ExecutionRejected(
+            execution_layer::PayloadStatus::InvalidBlockHash { .. }
+        ))
+    ));
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        1
+    );
+
+    command.acknowledge(Ok(()));
+    assert!(matches!(
+        publication.await.expect("publication task"),
+        PqBlockPublicationDisposition::Terminal(network::PqBlockPublicationTerminal::Rejected)
+    ));
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        fixture.chain.head_snapshot().beacon_block_root,
+        fixture.genesis_root
+    );
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn different_root_publication_during_publish_ack_is_equivocation() {
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    let fixture = valid_production_fixture(false, false);
+    let first_produced = fixture
+        .chain
+        .produce_pq_block_v3(Slot::new(1), fixture.randao.clone(), Graffiti::default())
+        .await
+        .expect("first valid full block production");
+    let second_produced = fixture
+        .chain
+        .produce_pq_block_v3(Slot::new(1), fixture.randao.clone(), Graffiti([0xe2; 32]))
+        .await
+        .expect("equivocating full block production");
+    let first = sign_produced_block(&fixture, first_produced);
+    let (second_block, second_blob_data) = second_produced.into_contents().deconstruct();
+    let (second_proofs, second_blobs) =
+        second_blob_data.expect("Electra V3 has explicit blob lists");
+    assert!(second_proofs.is_empty());
+    assert!(second_blobs.is_empty());
+    let second = sign_equivocating_block(&fixture, second_block);
+    assert_eq!(first.slot(), second.slot());
+    assert_eq!(
+        first.message().proposer_index(),
+        second.message().proposer_index()
+    );
+    assert_ne!(first.canonical_root(), second.canonical_root());
+
+    let (broadcast_sender, mut broadcast_receiver) = pq_block_broadcast_channel();
+    let publisher = Arc::new(
+        PqBlockPublicationService::new(
+            Arc::clone(&fixture.chain),
+            fixture._runtime.task_executor.clone(),
+            broadcast_sender,
+        )
+        .expect("publication service"),
+    );
+    let first_admission = publisher.try_admit().expect("first admission");
+    let first_for_publish = Arc::clone(&first);
+    let first_publication =
+        tokio::spawn(async move { first_admission.publish(first_for_publish).await });
+    let command = broadcast_receiver
+        .recv()
+        .await
+        .expect("first broadcast command");
+
+    assert!(matches!(
+        publisher
+            .try_admit()
+            .expect("equivocation admission")
+            .publish(Arc::clone(&second))
+            .await,
+        PqBlockPublicationDisposition::Equivocation { previous }
+            if previous == first.canonical_root()
+    ));
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(1),
+            broadcast_receiver.recv(),
+        )
+        .await
+        .is_err(),
+        "a verified equivocation must not enqueue another broadcast"
+    );
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        0
+    );
+
+    command.acknowledge(Ok(()));
+    assert!(matches!(
+        first_publication.await.expect("first publication"),
+        PqBlockPublicationDisposition::Published(_)
+    ));
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        fixture.chain.head_snapshot().beacon_block_root,
+        first.canonical_root()
     );
 }
 

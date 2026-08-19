@@ -1443,3 +1443,42 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   regressions. The final Rust 1.88 warning-denied workspace check also passed. Hash-chain/hash-onion
   RANDAO remains a future versioned proposal; V1 retains the signature-derived duty and frozen
   14-leaf allocation.
+
+### 2026-08-19: Sealed acknowledged PQ block publication implemented (Task 5.3e-e2a)
+
+- Local HTTP publication has a distinct `Publish` provenance and may enter only through the full
+  sealed block verifier. A process-owned service admits at most two retained request bodies without
+  waiting, owns each permit in a detached task, and carries the exact immutable signed block through
+  a bounded two-command broadcaster queue. Only a positive acknowledgment for that exact block
+  promotes the capability; enqueue alone is not propagation. The real gossipsub adapter remains an
+  e-e4 assembly responsibility.
+- Publication ordering is full PQ verification, acknowledged broadcast, Engine notification, then
+  atomic database/head publication. Dropped or negative acknowledgments restore propagation retry;
+  `SYNCING`, transport, and persistence failures after broadcast restore commit-only retry and do
+  not rebroadcast. Engine rejection is exact-root terminal. Caller cancellation cannot release
+  admission or interrupt broadcast, Engine, or post-`VALID` persistence ownership.
+- The shared observation cache distinguishes pending propagation, pending commit, committed,
+  terminal, retryable propagation/commit, and equivocation. Promotion and lifecycle resolution are
+  one cache transition. Cross-source same-root commit/rejection and different-root equivocation are
+  reconciled without repeating Engine work. If Publish has already promoted while RPC owns the
+  commit gate, authorization loss compares the exact signed current persisted head and returns
+  committed; a later head is stale. Durable ordering is database, head swap, then committed cache
+  under the single import gate.
+- Restart idempotence is deliberately limited to full signed equality with the current persisted
+  head because the consensus block root excludes the proposal signature. A signature-mutated block
+  cannot use the committed fast path. Linear V1 stores no historical signed-publication index, so
+  older pruned blocks follow the ordinary stale or parent-unavailable policy.
+- SSZ and JSON body limits use checked arithmetic over the payload cap, the maximum included PQ
+  evidence, both individual signatures, and fixed schema allowance. Two admitted JSON bodies are
+  bounded exactly; overflow is a distinct nonretryable configuration error. Admission and
+  broadcaster capacity errors remain narrow typed results rather than retaining the full
+  publication disposition.
+- Independent review found and the TDD cycles fixed restart cache loss, two same-root cross-source
+  race windows, missing service-level equivocation sensitivity, and body-limit error attribution.
+  Fresh parent verification passed 8/8 warning-denied publication tests, 20/20 import lifecycle
+  tests, warning-denied scalar and AVX2 top-level PQ checks, default Lighthouse/network/beacon-chain
+  checks, and focused warning-denied Clippy for the changed Network and BeaconChain surfaces. The
+  final promoted-Publish-behind-RPC gate race passed 1/1 in 79.51 seconds with one Engine call. The
+  full AVX2 production file was not rerun for this slice; its focused publication cases and mutation
+  runs are recorded in the implementation plan. Hash-chain/hash-onion RANDAO remains future-only,
+  while V1 retains the signature-derived duty and frozen 14-leaf allocation.

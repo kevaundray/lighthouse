@@ -6414,6 +6414,7 @@ dependencies = [
  "beacon_chain",
  "beacon_processor",
  "bls",
+ "consensus_signature",
  "delay_map",
  "educe",
  "eth2",

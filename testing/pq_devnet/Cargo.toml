@@ -46,6 +46,7 @@ pq-beacon-import-testing = [
     "pq-transition-testing",
     "dep:execution_layer",
     "dep:network",
+    "network/pq-startup-testing",
 ]
 pq-randao-transport-testing = [
     "dep:consensus_signature",
@@ -143,6 +144,11 @@ required-features = ["pq-beacon-import-testing"]
 [[test]]
 name = "pq_block_production"
 path = "tests/pq_block_production.rs"
+required-features = ["pq-beacon-import-testing"]
+
+[[test]]
+name = "pq_publication"
+path = "tests/pq_publication.rs"
 required-features = ["pq-beacon-import-testing"]
 
 [[test]]

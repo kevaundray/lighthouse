@@ -26,8 +26,14 @@ pub use lighthouse_network::NetworkConfig;
 pub use network_beacon_processor::NetworkBeaconProcessor;
 #[cfg(feature = "pq-devnet")]
 pub use pq_runtime::{
-    PqGossipAggregateDisposition, PqGossipAttestationDisposition, PqGossipBlockDisposition,
-    PqNetworkBlockProcessor,
+    PQ_BLOCK_BROADCAST_QUEUE_CAPACITY, PQ_BLOCK_PUBLICATION_ADMISSION_CAPACITY,
+    PQ_PUBLICATION_FIXED_BODY_ALLOWANCE_BYTES, PqBlockBroadcastAcknowledgement,
+    PqBlockBroadcastCommand, PqBlockBroadcastError, PqBlockBroadcastReceiver,
+    PqBlockBroadcastSender, PqBlockPublicationAdmission, PqBlockPublicationConfigurationError,
+    PqBlockPublicationDisposition, PqBlockPublicationLocalError, PqBlockPublicationService,
+    PqBlockPublicationTerminal, PqGossipAggregateDisposition, PqGossipAttestationDisposition,
+    PqGossipBlockDisposition, PqNetworkBlockProcessor, PqPublicationBodyLimits,
+    PqPublicationCapacity, pq_block_broadcast_channel,
 };
 #[cfg(not(feature = "pq-devnet"))]
 pub use service::{

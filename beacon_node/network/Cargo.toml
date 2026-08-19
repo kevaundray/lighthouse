@@ -14,12 +14,14 @@ portable = ["beacon_chain/portable"]
 pq-devnet = [
     "beacon_chain/pq-devnet",
     "beacon_processor/pq-devnet",
+    "consensus_signature/pq-devnet",
     "disable-backfill",
     "execution_layer/pq-devnet",
     "lighthouse_network/pq-devnet",
     "operation_pool/pq-devnet",
     "types/pq-devnet",
 ]
+pq-startup-testing = ["pq-devnet", "beacon_chain/pq-startup-testing"]
 
 [dependencies]
 alloy-primitives = { workspace = true }
@@ -28,6 +30,7 @@ anyhow = { workspace = true }
 async-channel = { workspace = true }
 beacon_chain = { path = "../beacon_chain", default-features = false }
 beacon_processor = { workspace = true }
+consensus_signature = { workspace = true }
 delay_map = { workspace = true }
 educe = { workspace = true }
 ethereum_ssz = { workspace = true }

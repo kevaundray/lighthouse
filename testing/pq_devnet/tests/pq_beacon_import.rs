@@ -353,6 +353,7 @@ fn every_external_block_source_uses_the_same_import_boundary() {
         PqBlockImportSource::ALL,
         [
             PqBlockImportSource::Gossip,
+            PqBlockImportSource::Publish,
             PqBlockImportSource::Rpc,
             PqBlockImportSource::Lookup,
             PqBlockImportSource::ForwardRange,
@@ -525,7 +526,7 @@ fn gossip_claim_lifecycle_retries_only_after_retryable_completion() {
     cache.prune_after_commit(slot);
     assert_eq!(
         cache.claim(slot, 2, root, slot),
-        TestingPqGossipClaim::Terminal
+        TestingPqGossipClaim::Committed
     );
     assert_eq!(cache.len(), 1, "the current committed record is retained");
 }
@@ -607,7 +608,7 @@ fn gossip_claim_cache_prunes_long_chains_and_bounds_failed_entries() {
     assert_eq!(cache.len(), TestingPqGossipObservationCache::CAPACITY);
     assert_eq!(
         cache.claim(head, long_chain_end % 16, retained_root, head),
-        TestingPqGossipClaim::Terminal,
+        TestingPqGossipClaim::Committed,
         "capacity eviction must preserve the retained current-head record"
     );
 }
@@ -641,7 +642,7 @@ fn cross_source_equivocation_leaves_the_first_pending_root_authorized() {
     assert!(!same_root.mark_propagated(slot, 4, generation));
     assert_eq!(
         same_root.claim(slot, 4, first_gossip_root, slot),
-        TestingPqGossipClaim::Terminal
+        TestingPqGossipClaim::Committed
     );
 }
 

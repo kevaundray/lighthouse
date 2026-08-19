@@ -6,6 +6,21 @@ use beacon_chain::{
 use std::sync::Arc;
 use types::{SignedAggregateAndProof, SignedBeaconBlock, SingleAttestation, SubnetId};
 
+mod broadcast;
+mod publication;
+
+pub use broadcast::{
+    PQ_BLOCK_BROADCAST_QUEUE_CAPACITY, PqBlockBroadcastAcknowledgement, PqBlockBroadcastCommand,
+    PqBlockBroadcastError, PqBlockBroadcastReceiver, PqBlockBroadcastSender,
+    pq_block_broadcast_channel,
+};
+pub use publication::{
+    PQ_BLOCK_PUBLICATION_ADMISSION_CAPACITY, PQ_PUBLICATION_FIXED_BODY_ALLOWANCE_BYTES,
+    PqBlockPublicationAdmission, PqBlockPublicationConfigurationError,
+    PqBlockPublicationDisposition, PqBlockPublicationLocalError, PqBlockPublicationService,
+    PqBlockPublicationTerminal, PqPublicationBodyLimits, PqPublicationCapacity,
+};
+
 /// Result of full contextual and PQ evidence verification for unaggregated gossip.
 pub enum PqGossipAttestationDisposition<E: types::EthSpec> {
     /// Propagate, then consume with `PqSingleGossipPropagationToken::mark_propagated`.

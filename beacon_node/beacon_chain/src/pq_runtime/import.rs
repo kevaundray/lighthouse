@@ -79,13 +79,20 @@ impl TestingPqBlockingHook {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PqBlockImportSource {
     Gossip,
+    Publish,
     Rpc,
     Lookup,
     ForwardRange,
 }
 
 impl PqBlockImportSource {
-    pub const ALL: [Self; 4] = [Self::Gossip, Self::Rpc, Self::Lookup, Self::ForwardRange];
+    pub const ALL: [Self; 5] = [
+        Self::Gossip,
+        Self::Publish,
+        Self::Rpc,
+        Self::Lookup,
+        Self::ForwardRange,
+    ];
 }
 
 /// Raw wire ownership at an explicit ingress boundary. Only this type can enter verification;
@@ -102,6 +109,10 @@ impl<E: EthSpec> PqBlockImportRequest<E> {
 
     pub fn rpc(block: Arc<SignedBeaconBlock<E>>) -> Self {
         Self::new(PqBlockImportSource::Rpc, block)
+    }
+
+    pub fn publish(block: Arc<SignedBeaconBlock<E>>) -> Self {
+        Self::new(PqBlockImportSource::Publish, block)
     }
 
     pub fn lookup(block: Arc<SignedBeaconBlock<E>>) -> Self {
@@ -468,6 +479,16 @@ pub struct PqBlockImportOutcome {
     pub payload_status: PqEnginePayloadStatus,
 }
 
+enum PqVerifiedCommitOutcome {
+    Imported(PqBlockImportOutcome),
+    Committed,
+}
+
+pub enum PqPublishCommitOutcome {
+    Imported(PqBlockImportOutcome),
+    Committed,
+}
+
 pub(crate) const PQ_GOSSIP_OBSERVATION_CAPACITY: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -493,6 +514,15 @@ enum PqGossipLifecycle {
     Committed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PqPublishPromotionResolution {
+    Promoted,
+    Committed,
+    Terminal,
+    Equivocation { previous: Hash256 },
+    Stale,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PqGossipObservationRecord {
     root: Hash256,
@@ -505,6 +535,7 @@ pub(crate) enum PqGossipClaim {
     Propagate { generation: u64 },
     Retry { generation: u64 },
     Pending,
+    Committed,
     Terminal,
     Equivocation { previous: Hash256 },
     Capacity,
@@ -642,7 +673,15 @@ impl<T: BeaconChainTypes> PqGossipCommitToken<T> {
         let result = self
             .chain
             .commit_verified_pq_block(verified, Some(self.binding))
-            .await;
+            .await
+            .and_then(|outcome| match outcome {
+                PqVerifiedCommitOutcome::Imported(outcome) => Ok(outcome),
+                PqVerifiedCommitOutcome::Committed => {
+                    Err(PqImportError::Local(PqImportLocalError::Invariant(
+                        "non-publication PQ import resolved as an existing committed block",
+                    )))
+                }
+            });
         let finish = match &result {
             Ok(_) => None,
             Err(PqImportError::Local(
@@ -679,6 +718,190 @@ impl<T: BeaconChainTypes> Drop for PqGossipCommitToken<T> {
     }
 }
 
+/// The unique capability allowed to cross the local HTTP publication boundary. It retains the
+/// exact immutable block accepted by full PQ verification.
+pub struct PqPublishPropagationToken<T: BeaconChainTypes> {
+    chain: Arc<BeaconChain<T>>,
+    verified: Option<PqVerifiedBlockImport<T::EthSpec>>,
+    binding: PqGossipClaimBinding,
+    armed: bool,
+}
+
+impl<T: BeaconChainTypes> PqPublishPropagationToken<T> {
+    pub fn block(&self) -> Result<&Arc<SignedBeaconBlock<T::EthSpec>>, PqImportError> {
+        self.verified
+            .as_ref()
+            .map(PqVerifiedBlockImport::block)
+            .ok_or(PqImportError::Local(PqImportLocalError::Invariant(
+                "PQ publication propagation capability was consumed",
+            )))
+    }
+
+    pub fn after_propagation(mut self) -> Result<PqPublishPromotion<T>, PqImportError> {
+        let verified =
+            self.verified
+                .as_ref()
+                .ok_or(PqImportError::Local(PqImportLocalError::Invariant(
+                    "PQ publication propagation capability was consumed",
+                )))?;
+        let resolution = self
+            .chain
+            .observed_pq_blocks
+            .lock()
+            .promote_or_resolve_publish(
+                self.binding.key,
+                verified.block_root,
+                self.binding.generation,
+            );
+        match resolution {
+            PqPublishPromotionResolution::Promoted => {}
+            PqPublishPromotionResolution::Committed => {
+                self.armed = false;
+                // A committed cache record is installed only after the durable write and
+                // canonical-head swap while holding the import gate. After releasing the cache
+                // lock, this exact signed-head read therefore sees either that publication or a
+                // later head; it cannot observe the pre-publication head.
+                return Ok(
+                    if self.chain.known_pq_publish_observation(verified.block())
+                        == Some(PqKnownPublishObservation::Committed)
+                    {
+                        PqPublishPromotion::Committed
+                    } else {
+                        PqPublishPromotion::Stale
+                    },
+                );
+            }
+            PqPublishPromotionResolution::Terminal => {
+                self.armed = false;
+                return Ok(PqPublishPromotion::Terminal);
+            }
+            PqPublishPromotionResolution::Equivocation { previous } => {
+                self.armed = false;
+                return Ok(PqPublishPromotion::Equivocation { previous });
+            }
+            PqPublishPromotionResolution::Stale => {
+                self.armed = false;
+                return Ok(PqPublishPromotion::Stale);
+            }
+        }
+        let verified =
+            self.verified
+                .take()
+                .ok_or(PqImportError::Local(PqImportLocalError::Invariant(
+                    "PQ publication propagation capability was consumed",
+                )))?;
+        self.armed = false;
+        Ok(PqPublishPromotion::Commit(Box::new(PqPublishCommitToken {
+            chain: Arc::clone(&self.chain),
+            verified: Some(verified),
+            binding: self.binding,
+            armed: true,
+        })))
+    }
+}
+
+impl<T: BeaconChainTypes> Drop for PqPublishPropagationToken<T> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.chain
+                .observed_pq_blocks
+                .lock()
+                .cancel(self.binding.key, self.binding.generation);
+        }
+    }
+}
+
+pub struct PqPublishCommitToken<T: BeaconChainTypes> {
+    chain: Arc<BeaconChain<T>>,
+    verified: Option<PqVerifiedBlockImport<T::EthSpec>>,
+    binding: PqGossipClaimBinding,
+    armed: bool,
+}
+
+pub enum PqPublishPromotion<T: BeaconChainTypes> {
+    Commit(Box<PqPublishCommitToken<T>>),
+    Committed,
+    Terminal,
+    Equivocation { previous: Hash256 },
+    Stale,
+}
+
+impl<T: BeaconChainTypes> PqPublishCommitToken<T> {
+    pub async fn commit(mut self) -> Result<PqPublishCommitOutcome, PqImportError> {
+        let verified =
+            self.verified
+                .take()
+                .ok_or(PqImportError::Local(PqImportLocalError::Invariant(
+                    "PQ publication commit capability was consumed",
+                )))?;
+        let result = self
+            .chain
+            .commit_verified_pq_block(verified, Some(self.binding))
+            .await
+            .map(|outcome| match outcome {
+                PqVerifiedCommitOutcome::Imported(outcome) => {
+                    PqPublishCommitOutcome::Imported(outcome)
+                }
+                PqVerifiedCommitOutcome::Committed => PqPublishCommitOutcome::Committed,
+            });
+        let finish = match &result {
+            Ok(_) => None,
+            Err(PqImportError::Local(
+                PqImportLocalError::ExecutionUnavailable(_)
+                | PqImportLocalError::Transport(_)
+                | PqImportLocalError::BlockingTask(_)
+                | PqImportLocalError::Persistence(_),
+            )) => Some(PqGossipClaimFinish::Retryable),
+            Err(
+                PqImportError::PeerInvalid(_)
+                | PqImportError::ExecutionRejected(_)
+                | PqImportError::TerminalObservation { .. }
+                | PqImportError::StaleHeadAfterVerification { .. }
+                | PqImportError::Local(_),
+            ) => Some(PqGossipClaimFinish::Terminal),
+        };
+        if let Some(finish) = finish {
+            self.chain.observed_pq_blocks.lock().finish(
+                self.binding.key,
+                self.binding.generation,
+                finish,
+            );
+        }
+        self.armed = false;
+        result
+    }
+}
+
+impl<T: BeaconChainTypes> Drop for PqPublishCommitToken<T> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.chain
+                .observed_pq_blocks
+                .lock()
+                .cancel(self.binding.key, self.binding.generation);
+        }
+    }
+}
+
+pub enum PqPublishObservation<T: BeaconChainTypes> {
+    New(PqPublishPropagationToken<T>),
+    Retry(PqPublishCommitToken<T>),
+    Pending,
+    Committed,
+    Terminal,
+    Equivocation { previous: Hash256 },
+    NotPublish,
+    Capacity,
+}
+
+/// An exact-root publication lifecycle that can be answered without repeating the expensive
+/// sealed verification. Retryable records are intentionally omitted: they must regain a fresh
+/// sealed capability before retrying propagation or commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PqKnownPublishObservation {
+    Committed,
+}
+
 pub enum PqGossipObservation<T: BeaconChainTypes> {
     New(PqGossipPropagationToken<T>),
     Retry(PqGossipCommitToken<T>),
@@ -696,6 +919,35 @@ pub(crate) struct PqGossipObservationCache {
 }
 
 impl PqGossipObservationCache {
+    fn promote_or_resolve_publish(
+        &mut self,
+        key: PqGossipObservationKey,
+        root: Hash256,
+        generation: u64,
+    ) -> PqPublishPromotionResolution {
+        let Some(record) = self.entries.get_mut(&key) else {
+            return PqPublishPromotionResolution::Stale;
+        };
+        if record.root != root {
+            return PqPublishPromotionResolution::Equivocation {
+                previous: record.root,
+            };
+        }
+        match record.lifecycle {
+            PqGossipLifecycle::PendingPropagation if record.generation == generation => {
+                record.lifecycle = PqGossipLifecycle::PendingCommit;
+                PqPublishPromotionResolution::Promoted
+            }
+            PqGossipLifecycle::Committed => PqPublishPromotionResolution::Committed,
+            PqGossipLifecycle::Terminal => PqPublishPromotionResolution::Terminal,
+            PqGossipLifecycle::PendingPropagation
+            | PqGossipLifecycle::PendingCommit
+            | PqGossipLifecycle::PendingExternal
+            | PqGossipLifecycle::RetryablePropagation
+            | PqGossipLifecycle::RetryableCommit => PqPublishPromotionResolution::Stale,
+        }
+    }
+
     #[cfg(feature = "pq-startup-testing")]
     fn is_committed(&self, key: PqGossipObservationKey, root: Hash256) -> bool {
         self.entries.get(&key).is_some_and(|record| {
@@ -706,6 +958,13 @@ impl PqGossipObservationCache {
     #[cfg(feature = "pq-startup-testing")]
     fn is_absent(&self, key: PqGossipObservationKey) -> bool {
         !self.entries.contains_key(&key)
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    fn is_pending_commit(&self, key: PqGossipObservationKey, root: Hash256) -> bool {
+        self.entries.get(&key).is_some_and(|record| {
+            record.root == root && record.lifecycle == PqGossipLifecycle::PendingCommit
+        })
     }
 
     pub(crate) fn claim(
@@ -726,9 +985,8 @@ impl PqGossipObservationCache {
                     PqGossipClaim::Pending
                 }
                 PqGossipLifecycle::PendingExternal => PqGossipClaim::Pending,
-                PqGossipLifecycle::Terminal | PqGossipLifecycle::Committed => {
-                    PqGossipClaim::Terminal
-                }
+                PqGossipLifecycle::Terminal => PqGossipClaim::Terminal,
+                PqGossipLifecycle::Committed => PqGossipClaim::Committed,
                 PqGossipLifecycle::RetryablePropagation | PqGossipLifecycle::RetryableCommit => {
                     let Some(generation) = self.allocate_generation() else {
                         return PqGossipClaim::Capacity;
@@ -964,6 +1222,7 @@ pub enum TestingPqGossipClaim {
     Propagate(u64),
     Retry(u64),
     Pending,
+    Committed,
     Terminal,
     Equivocation(Hash256),
     Capacity,
@@ -990,6 +1249,17 @@ pub enum TestingPqExternalReservation {
 
 #[cfg(feature = "pq-startup-testing")]
 #[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TestingPqPublishPromotionResolution {
+    Promoted,
+    Committed,
+    Terminal,
+    Equivocation(Hash256),
+    Stale,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
 #[derive(Default)]
 pub struct TestingPqGossipObservationCache(PqGossipObservationCache);
 
@@ -1012,6 +1282,7 @@ impl TestingPqGossipObservationCache {
             PqGossipClaim::Propagate { generation } => TestingPqGossipClaim::Propagate(generation),
             PqGossipClaim::Retry { generation } => TestingPqGossipClaim::Retry(generation),
             PqGossipClaim::Pending => TestingPqGossipClaim::Pending,
+            PqGossipClaim::Committed => TestingPqGossipClaim::Committed,
             PqGossipClaim::Terminal => TestingPqGossipClaim::Terminal,
             PqGossipClaim::Equivocation { previous } => {
                 TestingPqGossipClaim::Equivocation(previous)
@@ -1105,6 +1376,30 @@ impl TestingPqGossipObservationCache {
             .record_terminal(PqGossipObservationKey::new(slot, proposer), root);
     }
 
+    pub fn promote_or_resolve_publish(
+        &mut self,
+        slot: Slot,
+        proposer: u64,
+        root: Hash256,
+        generation: u64,
+    ) -> TestingPqPublishPromotionResolution {
+        match self.0.promote_or_resolve_publish(
+            PqGossipObservationKey::new(slot, proposer),
+            root,
+            generation,
+        ) {
+            PqPublishPromotionResolution::Promoted => TestingPqPublishPromotionResolution::Promoted,
+            PqPublishPromotionResolution::Committed => {
+                TestingPqPublishPromotionResolution::Committed
+            }
+            PqPublishPromotionResolution::Terminal => TestingPqPublishPromotionResolution::Terminal,
+            PqPublishPromotionResolution::Equivocation { previous } => {
+                TestingPqPublishPromotionResolution::Equivocation(previous)
+            }
+            PqPublishPromotionResolution::Stale => TestingPqPublishPromotionResolution::Stale,
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.0.entries.len()
     }
@@ -1182,6 +1477,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                     })
                 }
                 PqBlockImportSource::Gossip
+                | PqBlockImportSource::Publish
                 | PqBlockImportSource::Rpc
                 | PqBlockImportSource::Lookup => {
                     PqImportError::Local(PqImportLocalError::ParentUnavailable {
@@ -1308,12 +1604,68 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 })
             }
             PqGossipClaim::Pending => PqGossipObservation::Pending,
+            PqGossipClaim::Committed => PqGossipObservation::Terminal,
             PqGossipClaim::Terminal => PqGossipObservation::Terminal,
             PqGossipClaim::Equivocation { previous } => {
                 PqGossipObservation::Equivocation { previous }
             }
             PqGossipClaim::Capacity => PqGossipObservation::Capacity,
         }
+    }
+
+    /// Records a fully verified local publication only after the sealed boundary has succeeded.
+    pub fn observe_verified_pq_publish_block(
+        self: &Arc<Self>,
+        verified: PqVerifiedBlockImport<T::EthSpec>,
+    ) -> PqPublishObservation<T> {
+        if verified.source != PqBlockImportSource::Publish {
+            return PqPublishObservation::NotPublish;
+        }
+        let key = verified.observation_key;
+        let root = verified.block_root;
+        let retained_head_slot = self.head_snapshot().beacon_state.slot();
+        match self
+            .observed_pq_blocks
+            .lock()
+            .claim(key, root, retained_head_slot)
+        {
+            PqGossipClaim::Propagate { generation } => {
+                PqPublishObservation::New(PqPublishPropagationToken {
+                    chain: Arc::clone(self),
+                    verified: Some(verified),
+                    binding: PqGossipClaimBinding { key, generation },
+                    armed: true,
+                })
+            }
+            PqGossipClaim::Retry { generation } => {
+                PqPublishObservation::Retry(PqPublishCommitToken {
+                    chain: Arc::clone(self),
+                    verified: Some(verified),
+                    binding: PqGossipClaimBinding { key, generation },
+                    armed: true,
+                })
+            }
+            PqGossipClaim::Pending => PqPublishObservation::Pending,
+            PqGossipClaim::Committed => PqPublishObservation::Committed,
+            PqGossipClaim::Terminal => PqPublishObservation::Terminal,
+            PqGossipClaim::Equivocation { previous } => {
+                PqPublishObservation::Equivocation { previous }
+            }
+            PqGossipClaim::Capacity => PqPublishObservation::Capacity,
+        }
+    }
+
+    /// Returns committed only for the exact signed current persisted head. The canonical block
+    /// root excludes the proposal signature, so root equality alone is not sufficient. Older
+    /// committed blocks are intentionally not indexed in linear V1 and fall through to the normal
+    /// stale/parent-unavailable import policy.
+    pub fn known_pq_publish_observation(
+        &self,
+        block: &SignedBeaconBlock<T::EthSpec>,
+    ) -> Option<PqKnownPublishObservation> {
+        let head = self.head_snapshot();
+        (head.beacon_block_root == block.canonical_root() && head.beacon_block.as_ref() == block)
+            .then_some(PqKnownPublishObservation::Committed)
     }
 
     #[cfg(feature = "pq-startup-testing")]
@@ -1371,13 +1723,26 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             .is_absent(PqGossipObservationKey::new(slot, proposer))
     }
 
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_pq_observation_is_pending_commit(
+        &self,
+        slot: Slot,
+        proposer: u64,
+        root: Hash256,
+    ) -> bool {
+        self.observed_pq_blocks
+            .lock()
+            .is_pending_commit(PqGossipObservationKey::new(slot, proposer), root)
+    }
+
     /// Calls Engine after full PQ verification (and, for gossip, after caller propagation), then
     /// atomically persists the sealed transition output before publishing the new head.
     async fn commit_verified_pq_block(
         &self,
         verified: PqVerifiedBlockImport<T::EthSpec>,
         gossip_binding: Option<PqGossipClaimBinding>,
-    ) -> Result<PqBlockImportOutcome, PqImportError> {
+    ) -> Result<PqVerifiedCommitOutcome, PqImportError> {
         let observation_key = verified.observation_key;
         let block_root = verified.block_root;
         // This owned permit queues commit attempts without holding a borrowed lock, state or cache
@@ -1408,7 +1773,21 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             {
                 None
             }
-            Some(_) => return Err(PqImportError::TerminalObservation { block_root }),
+            Some(_) => {
+                if verified.source == PqBlockImportSource::Publish
+                    && head.beacon_block_root == block_root
+                    && head.beacon_block.as_ref() == verified.output.block().as_ref()
+                {
+                    return Ok(PqVerifiedCommitOutcome::Committed);
+                }
+                if head.beacon_block_root != verified.expected_parent_root {
+                    return Err(PqImportError::StaleHeadAfterVerification {
+                        expected_parent: verified.expected_parent_root,
+                        actual_head: head.beacon_block_root,
+                    });
+                }
+                return Err(PqImportError::TerminalObservation { block_root });
+            }
             None => {
                 let claim = self.observed_pq_blocks.lock().reserve_external(
                     observation_key,
@@ -1526,7 +1905,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 reservation.disarm();
             }
             drop(_admission);
-            Ok(outcome)
+            Ok(PqVerifiedCommitOutcome::Imported(outcome))
         })
         .await?
     }
@@ -1546,7 +1925,14 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             )));
         }
         let verified = self.verify_pq_block(request).await?;
-        self.commit_verified_pq_block(verified, None).await
+        match self.commit_verified_pq_block(verified, None).await? {
+            PqVerifiedCommitOutcome::Imported(outcome) => Ok(outcome),
+            PqVerifiedCommitOutcome::Committed => {
+                Err(PqImportError::Local(PqImportLocalError::Invariant(
+                    "direct PQ import resolved as an existing committed publication",
+                )))
+            }
+        }
     }
 
     /// Validates and imports a forward range strictly sequentially, stopping at the first error.
@@ -1620,7 +2006,15 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 }
             };
             match self.commit_verified_pq_block(verified, None).await {
-                Ok(outcome) => imported.push(outcome),
+                Ok(PqVerifiedCommitOutcome::Imported(outcome)) => imported.push(outcome),
+                Ok(PqVerifiedCommitOutcome::Committed) => {
+                    return Err(PqForwardRangeError {
+                        imported,
+                        error: PqImportError::Local(PqImportLocalError::Invariant(
+                            "forward PQ import resolved as an existing committed publication",
+                        )),
+                    });
+                }
                 Err(error) => return Err(PqForwardRangeError { imported, error }),
             }
         }

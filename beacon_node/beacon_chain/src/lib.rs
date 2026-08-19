@@ -190,13 +190,15 @@ pub use self::pq_import::{
     PQ_BLOCK_IMPORT_ADMISSION_CAPACITY, PQ_FORWARD_RANGE_BLOCK_CAPACITY, PqBlockImportOutcome,
     PqBlockImportRequest, PqBlockImportSource, PqEnginePayloadDisposition, PqEnginePayloadStatus,
     PqForwardRangeError, PqGossipCommitToken, PqGossipObservation, PqGossipPropagationToken,
-    PqImportError, PqImportLocalError, PqImportPeerInvalid, PqVerifiedBlockImport,
-    classify_pq_engine_payload_status,
+    PqImportError, PqImportLocalError, PqImportPeerInvalid, PqKnownPublishObservation,
+    PqPublishCommitOutcome, PqPublishCommitToken, PqPublishObservation, PqPublishPromotion,
+    PqPublishPropagationToken, PqVerifiedBlockImport, classify_pq_engine_payload_status,
 };
 #[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
 pub use self::pq_import::{
     PqNewPayloadTransport, TestingPqBlockingHook, TestingPqExternalReservation,
     TestingPqGossipClaim, TestingPqGossipFinish, TestingPqGossipObservationCache,
+    TestingPqPublishPromotionResolution,
 };
 #[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
 #[doc(hidden)]

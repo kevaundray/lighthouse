@@ -2056,6 +2056,9 @@ exact immutable signed block inside a publish-specific propagation capability. R
 proposal/RANDAO/attestation proof and owned post-state transition, but distinguish an already
 committed root from an Engine-rejected or otherwise terminal root at the public publication seam.
 Committed duplicate publication is idempotent success; a prior terminal rejection is conflict.
+Because the canonical block root excludes the proposal signature, restart idempotence requires full
+signed-block equality with the exact current persisted head. Linear V1 retains no historical signed
+identity index: an older pruned committed block follows the ordinary stale/parent-unavailable policy.
 
 Add one bounded, process-owned block-broadcast command channel. Each command owns the exact block
 from the sealed capability and a one-shot acknowledgment. A positive acknowledgment means that the
@@ -2064,20 +2067,50 @@ unbounded `NetworkMessage::Publish` is not sufficient. The real network adapter 
 e-e4, while the isolated test actor returns deterministic acknowledgments through the same bounded
 channel. Do not expose a per-request broadcaster strategy.
 
-After full verification, move the admission, propagation capability, broadcaster request, Engine
-notification, and atomic database/head commit into one detached process-owned task. Await broadcast
-acknowledgment before consuming `after_propagation`; only then run the existing chain-owned Engine
-and persistence path. Caller cancellation before acknowledgment drops the unpromoted capability and
-restores propagation retryability. A broadcast failure retries propagation; Engine `SYNCING`,
-transport, or store failure after successful broadcast retries commit without rebroadcast. Once
-Engine returns `VALID`, database/head completion retains the existing cancellation-independent
-guarantee. Add non-waiting HTTP publication admission before body buffering, a bounded broadcaster
-queue, and checked body limits so neither raw requests nor verified post-states accumulate waiters.
+After non-waiting admission, move the raw block, admission, sealed propagation capability,
+broadcaster request, Engine notification, and atomic database/head commit into one detached
+process-owned task. Await broadcast acknowledgment before consuming `after_propagation`; only then
+run the existing chain-owned Engine and persistence path. Caller cancellation never cancels this
+owned operation or releases its admission early. A dropped/negative broadcaster acknowledgment
+drops the unpromoted capability and restores propagation retryability; Engine `SYNCING`, transport,
+or store failure after successful broadcast retries commit without rebroadcast. Once Engine returns
+`VALID`, database/head completion retains the existing cancellation-independent guarantee. Add
+non-waiting HTTP publication admission before body buffering, a bounded broadcaster queue, and
+checked body limits so neither raw requests nor verified post-states accumulate waiters.
+If an RPC/lookup import resolves the same observation while publication awaits its acknowledgment,
+promotion reconciles the current state: exact signed current head is committed, exact-root Engine
+rejection is terminal, and a current different root is equivocation. Configuration-time body-limit
+overflow is a distinct nonretryable startup error, never task unavailability.
 
 Exercise the source/capability and broadcaster lifecycle before adding routes: exact block ownership,
 pending and committed duplicates, terminal rejection, equivocation, queue/admission cap and cap+1,
 failed acknowledgment and rebroadcast retry, post-broadcast Engine/store retry without rebroadcast,
 caller cancellation at broadcaster and Engine barriers, event ordering, and restart-visible commit.
+
+Focused implementation evidence (2026-08-19): warning-denied scalar publication tests passed 8/8
+and the existing import lifecycle tests passed 20/20. The warning-denied AVX2 production target
+compiled, and exact behavior tests passed for acknowledged broadcast-before-Engine plus committed
+duplicate (1/1), `SYNCING` then `VALID` commit retry without rebroadcast (1/1), dropped and rejected
+broadcast retry (1/1), Engine terminal rejection without retry (1/1), caller cancellation with exact
+admission bounds through a pending Engine call and restart-visible commit (1/1), canceled atomic
+persistence failure followed by commit retry without rebroadcast (1/1), and a proposal-signed wrong
+post-state root rejected before broadcast/Engine (1/1). The full AVX2 file and broad workspace gates
+were intentionally not run in this staged e-e2a cycle.
+
+Review remediation evidence (2026-08-19): exact signed persisted-head publication after restart was
+RED as stale and GREEN as committed (1/1, 79.11s), while a mutated proposal signature with the same
+canonical message root was not committed. Same-root RPC commit during the broadcast-ack barrier was
+RED as local invariant and GREEN as committed (1/1, 78.99s); same-root Lookup Engine rejection was
+RED as local invariant and GREEN as terminal (1/1, 79.02s), both with exactly one Engine call. Two
+fully proposal-signed different-root publications from the same slot/proposer produced equivocation
+before a second broadcast or Engine call (1/1, 130.65s); temporarily mapping equivocation to pending
+made that exact test fail (1/1 expected RED, 131.07s) before restoration. Body-limit overflow and
+cross-root promotion reconciliation had focused scalar REDs, then passed in the 8/8 publication
+suite. A final deterministic gate race held RPC inside Engine, acknowledged and promoted Publish
+behind it, then let RPC persist first: the pre-fix Publish result was terminal, while the fixed path
+returned committed with exactly one Engine call (1/1, 79.20s). The three exact same-root
+acknowledgment-race tests passed serially (3/3, 236.32s). Warning-denied AVX2 no-run compilation
+passed after these changes; broad gates remain deferred.
 
 #### Task 5.3e-e2b: Expose the isolated PQ full-V3 HTTP production and publish routes
 
