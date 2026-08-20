@@ -1,8 +1,8 @@
 #[cfg(target_feature = "avx2")]
 use beacon_chain::{
     PQ_BLOCK_PRODUCTION_ADMISSION_CAPACITY, PqBlockProductionError, PqBlockProductionLocalError,
-    PqNewPayloadTransport, PqPayloadBuildRequest, PqProposerDutiesError, TestingPqBlockingHook,
-    TestingPqPayloadBuildObservation, TestingPqPayloadExpectation,
+    PqImportError, PqNewPayloadTransport, PqPayloadBuildRequest, PqProposerDutiesError,
+    TestingPqBlockingHook, TestingPqPayloadBuildObservation, TestingPqPayloadExpectation,
     builder::{BeaconChainBuilder, Witness},
     testing_only_validate_pq_full_payload, testing_only_validate_pq_production_advance,
 };
@@ -14,6 +14,8 @@ use consensus_signature::{
 #[cfg(target_feature = "avx2")]
 use eth2::{BeaconNodeHttpClient, SensitiveUrl, StrictBeaconNodeHttpClient, Timeouts};
 #[cfg(target_feature = "avx2")]
+use futures::StreamExt;
+#[cfg(target_feature = "avx2")]
 use initialized_validators::InitializedValidators;
 #[cfg(target_feature = "avx2")]
 use lighthouse_network::{Context, NetworkConfig, NetworkGlobals, identity::secp256k1};
@@ -22,8 +24,8 @@ use lighthouse_validator_store::{Config as ValidatorStoreConfig, LighthouseValid
 #[cfg(target_feature = "avx2")]
 use network::{
     PQ_BLOCK_PUBLICATION_ADMISSION_CAPACITY, PqBlockPublicationDisposition,
-    PqBlockPublicationService, PqPublicationBodyLimits, PqPublicationCapacity,
-    pq_block_broadcast_channel,
+    PqBlockPublicationService, PqGossipBlockDisposition, PqPublicationBodyLimits,
+    PqPublicationCapacity, pq_block_broadcast_channel,
 };
 #[cfg(target_feature = "avx2")]
 use network::{PqNetworkBlockProcessor, PqNetworkService};
@@ -397,6 +399,10 @@ struct RecordingExecution {
     new_payload_responses: Mutex<VecDeque<execution_layer::PayloadStatus>>,
     stall_new_payload: AtomicBool,
     new_payload_release: tokio::sync::Semaphore,
+    forkchoice_calls: AtomicUsize,
+    forkchoice_responses: Mutex<VecDeque<execution_layer::PayloadStatus>>,
+    stall_forkchoice: AtomicBool,
+    forkchoice_release: tokio::sync::Semaphore,
     payload_calls: AtomicUsize,
     stall_payload: std::sync::atomic::AtomicBool,
     omit_payload_bundle: std::sync::atomic::AtomicBool,
@@ -415,6 +421,16 @@ impl RecordingExecution {
             .new_payload_responses
             .lock()
             .expect("new-payload response lock") = responses.into_iter().collect();
+    }
+
+    fn set_forkchoice_responses(
+        &self,
+        responses: impl IntoIterator<Item = execution_layer::PayloadStatus>,
+    ) {
+        *self
+            .forkchoice_responses
+            .lock()
+            .expect("forkchoice response lock") = responses.into_iter().collect();
     }
 }
 
@@ -443,6 +459,39 @@ impl PqNewPayloadTransport<MinimalEthSpec> for RecordingExecution {
                 let permit = self.new_payload_release.acquire().await.map_err(|_| {
                     execution_layer::Error::Unexpected(
                         "publication new-payload release closed".to_owned(),
+                    )
+                })?;
+                permit.forget();
+            }
+            Ok(response)
+        })
+    }
+
+    fn notify_forkchoice_updated<'a>(
+        &'a self,
+        _head_block_hash: types::ExecutionBlockHash,
+        _current_slot: Slot,
+        _head_block_root: Hash256,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<execution_layer::PayloadStatus, execution_layer::Error>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        self.forkchoice_calls.fetch_add(1, Ordering::SeqCst);
+        let response = self
+            .forkchoice_responses
+            .lock()
+            .expect("forkchoice response lock")
+            .pop_front()
+            .unwrap_or(execution_layer::PayloadStatus::Valid);
+        Box::pin(async move {
+            if self.stall_forkchoice.load(Ordering::SeqCst) {
+                let permit = self.forkchoice_release.acquire().await.map_err(|_| {
+                    execution_layer::Error::Unexpected(
+                        "publication forkchoice release closed".to_owned(),
                     )
                 })?;
                 permit.forget();
@@ -606,6 +655,10 @@ fn independent_pq_receiver_fixture(
         new_payload_responses: Mutex::new(VecDeque::new()),
         stall_new_payload: AtomicBool::new(false),
         new_payload_release: tokio::sync::Semaphore::new(0),
+        forkchoice_calls: AtomicUsize::new(0),
+        forkchoice_responses: Mutex::new(VecDeque::new()),
+        stall_forkchoice: AtomicBool::new(false),
+        forkchoice_release: tokio::sync::Semaphore::new(0),
         payload_calls: AtomicUsize::new(0),
         stall_payload: AtomicBool::new(false),
         omit_payload_bundle: AtomicBool::new(false),
@@ -866,9 +919,31 @@ fn valid_production_fixture_with_hooks_and_spec(
     duties_hook: Option<Arc<TestingPqBlockingHook>>,
     spec: types::ChainSpec,
 ) -> ValidProductionFixture {
+    valid_production_fixture_with_hooks_spec_and_executor(
+        stall_payload,
+        omit_payload_bundle,
+        blocking_hook,
+        persistence_hook,
+        duties_hook,
+        spec,
+        None,
+    )
+}
+
+#[cfg(target_feature = "avx2")]
+fn valid_production_fixture_with_hooks_spec_and_executor(
+    stall_payload: bool,
+    omit_payload_bundle: bool,
+    blocking_hook: Option<Arc<TestingPqBlockingHook>>,
+    persistence_hook: Option<Arc<TestingPqBlockingHook>>,
+    duties_hook: Option<Arc<TestingPqBlockingHook>>,
+    spec: types::ChainSpec,
+    task_executor: Option<task_executor::TaskExecutor>,
+) -> ValidProductionFixture {
     const PASSWORD: &[u8] = b"correct horse battery staple";
 
     let runtime = task_executor::test_utils::TestRuntime::default();
+    let task_executor = task_executor.unwrap_or_else(|| runtime.task_executor.clone());
     let temporary_directory = tempfile::TempDir::new().expect("temporary directory");
     let spec = Arc::new(spec);
     let mut genesis = state_processing::initialize_beacon_state_from_validators::<MinimalEthSpec>(
@@ -919,6 +994,10 @@ fn valid_production_fixture_with_hooks_and_spec(
         new_payload_responses: Mutex::new(VecDeque::new()),
         stall_new_payload: AtomicBool::new(false),
         new_payload_release: tokio::sync::Semaphore::new(0),
+        forkchoice_calls: AtomicUsize::new(0),
+        forkchoice_responses: Mutex::new(VecDeque::new()),
+        stall_forkchoice: AtomicBool::new(false),
+        forkchoice_release: tokio::sync::Semaphore::new(0),
         payload_calls: AtomicUsize::new(0),
         stall_payload: std::sync::atomic::AtomicBool::new(stall_payload),
         omit_payload_bundle: std::sync::atomic::AtomicBool::new(omit_payload_bundle),
@@ -934,7 +1013,7 @@ fn valid_production_fixture_with_hooks_and_spec(
         .genesis_state(genesis.clone())
         .expect("persist genesis")
         .pq_aggregation_service(Arc::clone(&aggregation_service))
-        .task_executor(runtime.task_executor.clone())
+        .task_executor(task_executor)
         .testing_only_pq_execution_notifier(execution.clone());
     if let Some(blocking_hook) = blocking_hook {
         builder = builder.testing_only_pq_blocking_hook(blocking_hook);
@@ -1612,6 +1691,10 @@ async fn invalid_randao_is_rejected_before_any_execution_work() {
         new_payload_responses: Mutex::new(VecDeque::new()),
         stall_new_payload: AtomicBool::new(false),
         new_payload_release: tokio::sync::Semaphore::new(0),
+        forkchoice_calls: AtomicUsize::new(0),
+        forkchoice_responses: Mutex::new(VecDeque::new()),
+        stall_forkchoice: AtomicBool::new(false),
+        forkchoice_release: tokio::sync::Semaphore::new(0),
         payload_calls: AtomicUsize::new(0),
         stall_payload: std::sync::atomic::AtomicBool::new(false),
         omit_payload_bundle: std::sync::atomic::AtomicBool::new(false),
@@ -1732,7 +1815,388 @@ async fn valid_randao_produces_one_full_canonical_empty_block_without_head_mutat
 }
 
 #[cfg(target_feature = "avx2")]
+fn advance_pq_state_to_slot(
+    mut state: BeaconState<MinimalEthSpec>,
+    slot: Slot,
+    spec: &types::ChainSpec,
+) -> BeaconState<MinimalEthSpec> {
+    while state.slot() < slot {
+        state_processing::per_slot_processing_pq(&mut state, spec)
+            .expect("bounded PQ proposal-state advance");
+    }
+    state
+}
+
+#[cfg(target_feature = "avx2")]
+fn sign_pq_randao_for_slot(
+    authority: &PqSigningAuthority,
+    state: &BeaconState<MinimalEthSpec>,
+    slot: Slot,
+    spec: &types::ChainSpec,
+) -> PqRawSignature {
+    let proposer_index = state
+        .get_beacon_proposer_index(slot, spec)
+        .expect("PQ proposer index");
+    let proposer_public_key = state
+        .validators()
+        .get(proposer_index)
+        .expect("PQ proposer validator")
+        .pubkey;
+    let randao_domain = spec.get_domain(
+        state.current_epoch(),
+        Domain::Randao,
+        &state.fork(),
+        state.genesis_validators_root(),
+    );
+    authority
+        .signer(&proposer_public_key)
+        .expect("bound PQ proposer signer")
+        .sign(consensus_signature::pq::PqSigningClaim::new(
+            state.current_epoch().signing_root(randao_domain).0,
+            OneTimeUseId::for_lean_pq_devnet_v1(slot.as_u64(), SigningDuty::RandaoReveal)
+                .expect("slot-bound PQ RANDAO leaf"),
+        ))
+        .expect("PQ RANDAO signature")
+}
+
+#[cfg(target_feature = "avx2")]
+fn sign_pq_block_for_slot(
+    authority: &PqSigningAuthority,
+    state: &BeaconState<MinimalEthSpec>,
+    block: BeaconBlock<MinimalEthSpec>,
+    spec: &types::ChainSpec,
+) -> Arc<SignedBeaconBlock<MinimalEthSpec>> {
+    let proposer_public_key = state
+        .validators()
+        .get(block.proposer_index() as usize)
+        .expect("PQ block proposer validator")
+        .pubkey;
+    let proposal_domain = spec.get_domain(
+        state.current_epoch(),
+        Domain::BeaconProposer,
+        &state.fork(),
+        state.genesis_validators_root(),
+    );
+    let signature = authority
+        .signer(&proposer_public_key)
+        .expect("bound PQ block signer")
+        .sign(consensus_signature::pq::PqSigningClaim::new(
+            block.signing_root(proposal_domain).0,
+            OneTimeUseId::for_lean_pq_devnet_v1(
+                block.slot().as_u64(),
+                SigningDuty::BeaconBlockProposal,
+            )
+            .expect("slot-bound PQ proposal leaf"),
+        ))
+        .expect("PQ proposal signature");
+    Arc::new(SignedBeaconBlock::from_block(block, signature))
+}
+
+#[cfg(target_feature = "avx2")]
 #[tokio::test(flavor = "current_thread")]
+async fn consecutive_imports_reconcile_two_independent_stateful_execution_engines() {
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    const PASSWORD: &[u8] = b"independent execution reconciliation";
+    let runtime = task_executor::test_utils::TestRuntime::default();
+    let temporary_directory = tempfile::TempDir::new().expect("reconciliation fixture directory");
+    let spec = Arc::new(electra_spec());
+    let publisher_execution =
+        execution_layer::test_utils::MockExecutionLayer::<MinimalEthSpec>::new(
+            runtime.task_executor.clone(),
+            Some(0),
+            Some(0),
+            Some(0),
+            None,
+            None,
+            Some(
+                execution_layer::auth::JwtKey::from_slice(
+                    &execution_layer::test_utils::DEFAULT_JWT_SECRET,
+                )
+                .expect("publisher MockEngine JWT"),
+            ),
+            Arc::clone(&spec),
+            None,
+        );
+    let receiver_execution = execution_layer::test_utils::MockExecutionLayer::<MinimalEthSpec>::new(
+        runtime.task_executor.clone(),
+        Some(0),
+        Some(0),
+        Some(0),
+        None,
+        None,
+        Some(
+            execution_layer::auth::JwtKey::from_slice(
+                &execution_layer::test_utils::DEFAULT_JWT_SECRET,
+            )
+            .expect("receiver MockEngine JWT"),
+        ),
+        Arc::clone(&spec),
+        None,
+    );
+    let (genesis_execution_hash, genesis_execution_gas_limit) = {
+        let mut publisher = publisher_execution.server.execution_block_generator();
+        publisher.set_blob_count_range(0, 0);
+        publisher.set_next_execution_requests(Default::default());
+        let publisher_genesis = publisher.latest_block().expect("publisher EL genesis");
+        let mut receiver = receiver_execution.server.execution_block_generator();
+        receiver.set_blob_count_range(0, 0);
+        receiver.set_next_execution_requests(Default::default());
+        let receiver_genesis = receiver.latest_block().expect("receiver EL genesis");
+        assert_eq!(
+            publisher_genesis.block_hash(),
+            receiver_genesis.block_hash()
+        );
+        assert_ne!(publisher_genesis.block_hash(), ExecutionBlockHash::zero());
+        (
+            publisher_genesis.block_hash(),
+            publisher_genesis.gas_limit(),
+        )
+    };
+    let receiver_forkchoice = Arc::new(Mutex::new(Vec::new()));
+    let receiver_forkchoice_hook = Arc::clone(&receiver_forkchoice);
+    receiver_execution
+        .server
+        .ctx
+        .hook
+        .lock()
+        .set_forkchoice_updated_hook(Box::new(move |state, payload_attributes| {
+            receiver_forkchoice_hook
+                .lock()
+                .expect("receiver FCU observation lock")
+                .push((
+                    execution_layer::ForkchoiceState::from(state),
+                    payload_attributes.is_some(),
+                ));
+            None
+        }));
+
+    let mut genesis = state_processing::initialize_beacon_state_from_validators::<MinimalEthSpec>(
+        Hash256::ZERO,
+        0,
+        (1..=16)
+            .map(|byte| state_processing::DirectGenesisValidator {
+                public_key: PqPublicKey::deserialize(&[byte; 32])
+                    .expect("canonical synthetic public key"),
+                withdrawal_credentials: Hash256::ZERO,
+            })
+            .collect(),
+        None,
+        &spec,
+    )
+    .expect("direct PQ reconciliation genesis");
+    genesis
+        .build_all_committee_caches(&spec)
+        .expect("reconciliation genesis committee caches");
+    let mut proposer_indices = [Slot::new(1), Slot::new(2)]
+        .into_iter()
+        .map(|slot| {
+            let state = advance_pq_state_to_slot(genesis.clone(), slot, &spec);
+            state
+                .get_beacon_proposer_index(slot, &spec)
+                .expect("two-slot proposer index")
+        })
+        .collect::<Vec<_>>();
+    proposer_indices.sort_unstable();
+    proposer_indices.dedup();
+    let maximum_leaf = OneTimeUseId::for_lean_pq_devnet_v1(2, SigningDuty::BeaconBlockProposal)
+        .expect("slot-two proposal leaf")
+        .as_u32()
+        .max(
+            OneTimeUseId::for_lean_pq_devnet_v1(2, SigningDuty::RandaoReveal)
+                .expect("slot-two RANDAO leaf")
+                .as_u32(),
+        );
+    let mut keystores = Vec::with_capacity(proposer_indices.len());
+    let mut authenticated = Vec::with_capacity(proposer_indices.len());
+    for (offset, proposer_index) in proposer_indices.iter().copied().enumerate() {
+        let seed_byte = u8::try_from(offset)
+            .ok()
+            .and_then(|offset| 0x80u8.checked_add(offset))
+            .expect("bounded reconciliation seed byte");
+        let keystore = PqKeystore::from_seed([seed_byte; 32], 0..=maximum_leaf, PASSWORD)
+            .expect("two-slot proposer keystore");
+        let metadata = keystore
+            .authenticate(PASSWORD)
+            .expect("two-slot proposer authentication");
+        genesis
+            .validators_mut()
+            .get_mut(proposer_index)
+            .expect("two-slot proposer validator")
+            .pubkey = *metadata.public_key();
+        keystores.push(keystore);
+        authenticated.push(metadata);
+    }
+    let BeaconState::Electra(genesis_inner) = &mut genesis else {
+        panic!("Electra reconciliation genesis")
+    };
+    genesis_inner.latest_execution_payload_header.block_hash = genesis_execution_hash;
+    genesis_inner.latest_execution_payload_header.gas_limit = genesis_execution_gas_limit;
+    let validators_root = genesis.genesis_validators_root().0;
+    let journal_path = temporary_directory.path().join("xmss_usage.sqlite");
+    provision_usage_journal(&journal_path, validators_root, &authenticated)
+        .expect("two-slot usage journal");
+    let authority = PqSigningAuthority::open(
+        &journal_path,
+        validators_root,
+        keystores
+            .into_iter()
+            .map(|keystore| PqKeyUnlock::new(keystore, PASSWORD).expect("two-slot proposer unlock"))
+            .collect(),
+    )
+    .expect("two-slot signing authority");
+    let aggregation_service = Arc::new(AggregationService::new().expect("aggregation service"));
+    let publisher = Arc::new(
+        BeaconChainBuilder::<TestWitness>::pq_new(MinimalEthSpec)
+            .store(exact_snapshot_store(Arc::clone(&spec)))
+            .custom_spec(Arc::clone(&spec))
+            .genesis_state(genesis.clone())
+            .expect("publisher genesis")
+            .pq_aggregation_service(Arc::clone(&aggregation_service))
+            .pq_execution_layer(Arc::new(publisher_execution.el.clone()))
+            .task_executor(runtime.task_executor.clone())
+            .build()
+            .expect("publisher chain"),
+    );
+    let receiver_store = exact_snapshot_store(Arc::clone(&spec));
+    let mut receiver = Arc::new(
+        BeaconChainBuilder::<TestWitness>::pq_new(MinimalEthSpec)
+            .store(Arc::clone(&receiver_store))
+            .custom_spec(Arc::clone(&spec))
+            .genesis_state(genesis)
+            .expect("receiver genesis")
+            .pq_aggregation_service(Arc::clone(&aggregation_service))
+            .pq_execution_layer(Arc::new(receiver_execution.el.clone()))
+            .task_executor(runtime.task_executor.clone())
+            .build()
+            .expect("receiver chain"),
+    );
+    receiver
+        .reconcile_persisted_pq_head()
+        .await
+        .expect("startup reconciles the exact persisted genesis execution head");
+
+    for slot_u64 in 1..=2 {
+        let slot = Slot::new(slot_u64);
+        publisher.slot_clock.set_slot(slot_u64);
+        receiver.slot_clock.set_slot(slot_u64);
+        let proposal_state =
+            advance_pq_state_to_slot(publisher.head_snapshot().beacon_state.clone(), slot, &spec);
+        let randao = sign_pq_randao_for_slot(&authority, &proposal_state, slot, &spec);
+        let produced = publisher
+            .produce_pq_block_v3(slot, randao, Graffiti::default())
+            .await
+            .expect("two-slot full block production");
+        let (block, sidecars) = produced.into_contents().deconstruct();
+        let (proofs, blobs) = sidecars.expect("Electra V3 empty sidecars");
+        assert!(proofs.is_empty());
+        assert!(blobs.is_empty());
+        let signed = sign_pq_block_for_slot(&authority, &proposal_state, block, &spec);
+        receiver_execution
+            .el
+            .insert_proposer(
+                slot + 1,
+                signed.canonical_root(),
+                fork_choice::PayloadStatus::Full,
+                0,
+                execution_layer::PayloadAttributes::new(
+                    1_000 + slot_u64,
+                    Hash256::repeat_byte(0x5a),
+                    Address::repeat_byte(0x6b),
+                    Some(Default::default()),
+                    Some(signed.canonical_root()),
+                    None,
+                    None,
+                ),
+            )
+            .await;
+        PqNetworkBlockProcessor::new(Arc::clone(&publisher))
+            .import_rpc_block(Arc::clone(&signed))
+            .await
+            .expect("publisher imports consecutive block");
+        if slot_u64 == 1 {
+            receiver_execution
+                .server
+                .all_payloads_syncing_on_forkchoice_updated();
+            assert!(matches!(
+                PqNetworkBlockProcessor::new(Arc::clone(&receiver))
+                    .import_rpc_block(Arc::clone(&signed))
+                    .await,
+                Err(beacon_chain::PqImportError::ExecutionReconciliation(
+                    beacon_chain::PqExecutionReconciliationError::Unavailable { attempts: 3 }
+                ))
+            ));
+            assert_eq!(
+                receiver.head_snapshot().beacon_block.as_ref(),
+                signed.as_ref(),
+                "DB/head publication remains authoritative after FCU exhaustion",
+            );
+            let mut tampered = receiver.head_snapshot().as_ref().clone();
+            let BeaconState::Electra(tampered_state) = &mut tampered.beacon_state else {
+                panic!("Electra durable head")
+            };
+            tampered_state.latest_execution_payload_header.block_hash =
+                ExecutionBlockHash::repeat_byte(0x77);
+            assert!(matches!(
+                beacon_chain::testing_only_persisted_pq_execution_head(&tampered, Slot::new(0),),
+                Err(beacon_chain::PqImportError::Local(
+                    beacon_chain::PqImportLocalError::Persistence(
+                        beacon_chain::PqRuntimeError::PersistedHeadBinding(
+                            "block payload hash does not match post-state execution header"
+                        )
+                    )
+                ))
+            ));
+            receiver_execution.server.full_payload_verification();
+            receiver = Arc::new(
+                BeaconChainBuilder::<TestWitness>::pq_new(MinimalEthSpec)
+                    .store(Arc::clone(&receiver_store))
+                    .custom_spec(Arc::clone(&spec))
+                    .resume_from_db()
+                    .expect("resume receiver after failed post-commit FCU")
+                    .pq_aggregation_service(Arc::clone(&aggregation_service))
+                    .pq_execution_layer(Arc::new(receiver_execution.el.clone()))
+                    .task_executor(runtime.task_executor.clone())
+                    .build()
+                    .expect("rebuild receiver after failed post-commit FCU"),
+            );
+            receiver.slot_clock.set_slot(slot_u64);
+            receiver
+                .reconcile_persisted_pq_head()
+                .await
+                .expect("startup reconciles the exact durable slot-one head");
+        } else {
+            PqNetworkBlockProcessor::new(Arc::clone(&receiver))
+                .import_rpc_block(Arc::clone(&signed))
+                .await
+                .expect("independent receiver imports slot two after startup reconciliation");
+        }
+        assert_eq!(
+            publisher.head_snapshot().beacon_block.as_ref(),
+            signed.as_ref()
+        );
+        assert_eq!(
+            receiver.head_snapshot().beacon_block.as_ref(),
+            signed.as_ref()
+        );
+    }
+
+    let receiver_forkchoice = receiver_forkchoice
+        .lock()
+        .expect("receiver FCU observation lock");
+    assert_eq!(receiver_forkchoice.len(), 6);
+    assert!(
+        receiver_forkchoice
+            .iter()
+            .all(|(_, has_attributes)| !has_attributes)
+    );
+    for (forkchoice, _) in receiver_forkchoice.iter() {
+        assert_eq!(forkchoice.safe_block_hash, ExecutionBlockHash::zero());
+        assert_eq!(forkchoice.finalized_block_hash, ExecutionBlockHash::zero());
+    }
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn production_execution_layer_uses_exact_parent_local_payload_and_bypasses_builder() {
     let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
     const PASSWORD: &[u8] = b"production execution layer fixture";
@@ -1795,16 +2259,24 @@ async fn production_execution_layer_uses_exact_parent_local_payload_and_bypasses
 
     let observed_fcu = Arc::new(Mutex::new(None));
     let observed_fcu_for_hook = Arc::clone(&observed_fcu);
+    let forkchoice_calls = Arc::new(AtomicUsize::new(0));
+    let forkchoice_calls_for_hook = Arc::clone(&forkchoice_calls);
+    let payload_forkchoice_hook = TestingPqBlockingHook::blocking();
+    let payload_forkchoice_hook_for_engine = Arc::clone(&payload_forkchoice_hook);
     mock_execution
         .server
         .ctx
         .hook
         .lock()
         .set_forkchoice_updated_hook(Box::new(move |state, payload_attributes| {
-            *observed_fcu_for_hook.lock().expect("FCU observation lock") = Some((
-                execution_layer::ForkchoiceState::from(state),
-                payload_attributes.map(execution_layer::PayloadAttributes::from),
-            ));
+            forkchoice_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+            if payload_attributes.is_some() {
+                *observed_fcu_for_hook.lock().expect("FCU observation lock") = Some((
+                    execution_layer::ForkchoiceState::from(state),
+                    payload_attributes.map(execution_layer::PayloadAttributes::from),
+                ));
+                payload_forkchoice_hook_for_engine.run();
+            }
             None
         }));
 
@@ -1920,10 +2392,49 @@ async fn production_execution_layer_uses_exact_parent_local_payload_and_bypasses
         ))
         .expect("RANDAO signature");
 
-    let produced = chain
-        .produce_pq_block_v3(Slot::new(1), randao, graffiti)
+    let production_chain = Arc::clone(&chain);
+    let production = tokio::spawn(async move {
+        production_chain
+            .produce_pq_block_v3(Slot::new(1), randao, graffiti)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while payload_forkchoice_hook.entered() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("PQ getPayload reaches the real Engine while owning forkchoice");
+    let reconciliation_chain = Arc::clone(&chain);
+    let reconciliation =
+        tokio::spawn(async move { reconciliation_chain.reconcile_persisted_pq_head().await });
+    let heartbeat = tokio::spawn(async { tokio::task::yield_now().await });
+    tokio::time::timeout(Duration::from_secs(5), heartbeat)
         .await
+        .expect("async heartbeat remains live")
+        .expect("heartbeat task");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let request_while_payload_forkchoice_is_blocked = mock_execution
+        .server
+        .take_previous_request()
+        .expect("blocked Engine request");
+    let reconciliation_reached_engine = request_while_payload_forkchoice_is_blocked
+        .pointer("/params/1")
+        .is_some_and(serde_json::Value::is_null);
+    payload_forkchoice_hook.release();
+    assert!(
+        !reconciliation_reached_engine,
+        "startup reconciliation cannot reach the real Engine while PQ getPayload owns the lock"
+    );
+    reconciliation
+        .await
+        .expect("reconciliation task")
+        .expect("reconciliation after getPayload releases forkchoice");
+    let produced = production
+        .await
+        .expect("production task")
         .expect("production ExecutionLayer candidate");
+    assert_eq!(forkchoice_calls.load(Ordering::SeqCst), 2);
 
     let observation = observed_request
         .lock()
@@ -1966,7 +2477,10 @@ async fn production_execution_layer_uses_exact_parent_local_payload_and_bypasses
             .server
             .take_previous_request()
             .and_then(|request| request.get("method").cloned()),
-        Some(serde_json::Value::String("engine_getPayloadV4".to_owned())),
+        Some(serde_json::Value::String(
+            "engine_forkchoiceUpdatedV3".to_owned()
+        )),
+        "the queued no-attributes reconciliation FCU follows the successful V4 payload response",
     );
     assert_eq!(mock_builder.get_header_call_count(), 0);
 
@@ -2074,6 +2588,365 @@ async fn produced_block_publication_broadcasts_exact_verified_block_before_impor
         fixture.execution.new_payload_calls.load(Ordering::SeqCst),
         1
     );
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn exact_cross_source_duplicates_coalesce_while_post_commit_forkchoice_is_pending() {
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    let persistence = TestingPqBlockingHook::counting();
+    let fixture = valid_production_fixture_with_hooks(
+        false,
+        false,
+        None,
+        Some(Arc::clone(&persistence)),
+        None,
+    );
+    fixture
+        .execution
+        .stall_forkchoice
+        .store(true, Ordering::SeqCst);
+    let produced = fixture
+        .chain
+        .produce_pq_block_v3(Slot::new(1), fixture.randao.clone(), Graffiti::default())
+        .await
+        .expect("valid full block production");
+    let signed = sign_produced_block(&fixture, produced);
+    let (broadcast_sender, mut broadcast_receiver) = pq_block_broadcast_channel();
+    let publisher = Arc::new(
+        PqBlockPublicationService::new(
+            Arc::clone(&fixture.chain),
+            fixture._runtime.task_executor.clone(),
+            broadcast_sender,
+        )
+        .expect("publication service"),
+    );
+    let first = publisher.try_admit().expect("first admission");
+    let first_block = Arc::clone(&signed);
+    let first = tokio::spawn(async move { first.publish(first_block).await });
+    broadcast_receiver
+        .recv()
+        .await
+        .expect("first broadcast")
+        .acknowledge(Ok(()));
+
+    tokio::time::timeout(Duration::from_secs(180), async {
+        while fixture.execution.forkchoice_calls.load(Ordering::SeqCst) != 1
+            || fixture.chain.head_snapshot().beacon_block_root != signed.canonical_root()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("durable head reaches blocked post-commit forkchoice");
+    assert!(!first.is_finished());
+    assert_eq!(persistence.entered(), 1);
+
+    let pending_publish = publisher
+        .try_admit()
+        .expect("pending duplicate admission")
+        .publish(Arc::clone(&signed))
+        .await;
+    assert!(matches!(
+        pending_publish,
+        PqBlockPublicationDisposition::Pending
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), broadcast_receiver.recv())
+            .await
+            .is_err(),
+        "pending exact duplicate must not rebroadcast",
+    );
+    assert!(matches!(
+        PqNetworkBlockProcessor::new(Arc::clone(&fixture.chain))
+            .verify_gossip_block(Arc::clone(&signed))
+            .await,
+        PqGossipBlockDisposition::IgnorePending
+    ));
+    let rpc_chain = Arc::clone(&fixture.chain);
+    let rpc_block = Arc::clone(&signed);
+    let rpc = tokio::spawn(async move {
+        PqNetworkBlockProcessor::new(rpc_chain)
+            .import_rpc_block(rpc_block)
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !rpc.is_finished(),
+        "RPC duplicate coalesces on the shared FCU result"
+    );
+    assert_eq!(
+        fixture.chain.testing_only_pq_import_available_permits(),
+        0,
+        "the pending exact RPC waiter retains the second chain import admission"
+    );
+    assert!(matches!(
+        PqNetworkBlockProcessor::new(Arc::clone(&fixture.chain))
+            .import_lookup_block(Arc::clone(&signed))
+            .await,
+        Err(PqImportError::Local(
+            beacon_chain::PqImportLocalError::IngressCapacity
+        ))
+    ));
+    rpc.abort();
+    assert!(rpc.await.is_err(), "the pending RPC caller is canceled");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while fixture.chain.testing_only_pq_import_available_permits() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("canceling a pending waiter releases exactly its admission");
+
+    let lookup_chain = Arc::clone(&fixture.chain);
+    let lookup_block = Arc::clone(&signed);
+    let lookup = tokio::spawn(async move {
+        PqNetworkBlockProcessor::new(lookup_chain)
+            .import_lookup_block(lookup_block)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while fixture.chain.testing_only_pq_import_available_permits() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("replacement pending lookup owns the released admission");
+    let drain = {
+        let chain = Arc::clone(&fixture.chain);
+        tokio::spawn(async move { chain.close_and_drain_pq_imports().await })
+    };
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !drain.is_finished(),
+        "shutdown drain accounts for the admitted pending lookup waiter"
+    );
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(fixture.execution.forkchoice_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(persistence.entered(), 1);
+
+    fixture.execution.forkchoice_release.add_permits(1);
+    assert!(matches!(
+        first.await.expect("first publication"),
+        PqBlockPublicationDisposition::Published(_)
+    ));
+    let lookup = lookup
+        .await
+        .expect("lookup duplicate task")
+        .expect("lookup duplicate outcome");
+    assert_eq!(lookup.source, beacon_chain::PqBlockImportSource::Lookup);
+    assert_eq!(lookup.block_root, signed.canonical_root());
+    drain.await.expect("chain import drain");
+    assert!(matches!(
+        publisher
+            .try_admit()
+            .expect("committed duplicate admission")
+            .publish(Arc::clone(&signed))
+            .await,
+        PqBlockPublicationDisposition::Committed
+    ));
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(fixture.execution.forkchoice_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(persistence.entered(), 1);
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn exact_cross_source_duplicates_share_terminal_post_commit_forkchoice_result() {
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    let persistence = TestingPqBlockingHook::counting();
+    let fixture = valid_production_fixture_with_hooks(
+        false,
+        false,
+        None,
+        Some(Arc::clone(&persistence)),
+        None,
+    );
+    fixture.execution.set_forkchoice_responses([
+        execution_layer::PayloadStatus::InvalidBlockHash {
+            validation_error: Some("terminal reconciliation fixture".to_owned()),
+        },
+    ]);
+    fixture
+        .execution
+        .stall_forkchoice
+        .store(true, Ordering::SeqCst);
+    let produced = fixture
+        .chain
+        .produce_pq_block_v3(Slot::new(1), fixture.randao.clone(), Graffiti::default())
+        .await
+        .expect("valid full block production");
+    let signed = sign_produced_block(&fixture, produced);
+    let (broadcast_sender, mut broadcast_receiver) = pq_block_broadcast_channel();
+    let publisher = Arc::new(
+        PqBlockPublicationService::new(
+            Arc::clone(&fixture.chain),
+            fixture._runtime.task_executor.clone(),
+            broadcast_sender,
+        )
+        .expect("publication service"),
+    );
+    let first = publisher.try_admit().expect("first admission");
+    let first_block = Arc::clone(&signed);
+    let first = tokio::spawn(async move { first.publish(first_block).await });
+    broadcast_receiver
+        .recv()
+        .await
+        .expect("first broadcast")
+        .acknowledge(Ok(()));
+    tokio::time::timeout(Duration::from_secs(180), async {
+        while fixture.execution.forkchoice_calls.load(Ordering::SeqCst) != 1
+            || fixture.chain.head_snapshot().beacon_block_root != signed.canonical_root()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("durable head reaches blocked terminal forkchoice");
+
+    assert!(matches!(
+        publisher
+            .try_admit()
+            .expect("pending duplicate admission")
+            .publish(Arc::clone(&signed))
+            .await,
+        PqBlockPublicationDisposition::Pending
+    ));
+    let rpc_chain = Arc::clone(&fixture.chain);
+    let rpc_block = Arc::clone(&signed);
+    let rpc = tokio::spawn(async move {
+        PqNetworkBlockProcessor::new(rpc_chain)
+            .import_rpc_block(rpc_block)
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(!rpc.is_finished());
+    fixture.execution.forkchoice_release.add_permits(1);
+
+    assert!(matches!(
+        first.await.expect("terminal publication"),
+        PqBlockPublicationDisposition::Terminal(_)
+    ));
+    assert!(matches!(
+        rpc.await.expect("terminal RPC task"),
+        Err(PqImportError::TerminalObservation { block_root })
+            if block_root == signed.canonical_root()
+    ));
+    assert!(matches!(
+        PqNetworkBlockProcessor::new(Arc::clone(&fixture.chain))
+            .verify_gossip_block(Arc::clone(&signed))
+            .await,
+        PqGossipBlockDisposition::IgnoreTerminal
+    ));
+    assert!(matches!(
+        publisher
+            .try_admit()
+            .expect("terminal duplicate admission")
+            .publish(Arc::clone(&signed))
+            .await,
+        PqBlockPublicationDisposition::Terminal(_)
+    ));
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(fixture.execution.forkchoice_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(persistence.entered(), 1);
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn post_persist_join_loss_is_nonretryable_and_restart_recovers_exact_head() {
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    let (executor_exit, executor_exit_receiver) = async_channel::bounded(1);
+    let (shutdown_sender, mut shutdown_receiver) = futures::channel::mpsc::channel(1);
+    let observed_executor = task_executor::TaskExecutor::new(
+        tokio::runtime::Handle::current(),
+        executor_exit_receiver,
+        shutdown_sender,
+    );
+    let fixture = valid_production_fixture_with_hooks_spec_and_executor(
+        false,
+        false,
+        None,
+        None,
+        None,
+        electra_spec(),
+        Some(observed_executor),
+    );
+    let produced = fixture
+        .chain
+        .produce_pq_block_v3(Slot::new(1), fixture.randao.clone(), Graffiti::default())
+        .await
+        .expect("valid full block production");
+    let signed = sign_produced_block(&fixture, produced);
+    let post_persist = TestingPqBlockingHook::panicking();
+    fixture
+        .chain
+        .testing_only_set_pq_post_persist_hook(Arc::clone(&post_persist));
+
+    let error = PqNetworkBlockProcessor::new(Arc::clone(&fixture.chain))
+        .import_rpc_block(Arc::clone(&signed))
+        .await
+        .expect_err("post-persist panic cannot report an imported head");
+    assert_eq!(post_persist.entered(), 1);
+    assert!(matches!(
+        error,
+        PqImportError::DurableStateUnknown {
+            phase: "pq-import-persist-and-publish"
+        }
+    ));
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), shutdown_receiver.next())
+            .await
+            .expect("durable-state-unknown signals process shutdown"),
+        Some(task_executor::ShutdownReason::Failure(
+            "PQ execution reconciliation failed"
+        ))
+    );
+    assert_eq!(
+        fixture.chain.head_snapshot().beacon_block_root,
+        fixture.genesis_root,
+        "panic before the memory swap leaves the live head unchanged"
+    );
+    assert!(matches!(
+        PqNetworkBlockProcessor::new(Arc::clone(&fixture.chain))
+            .import_rpc_block(Arc::clone(&signed))
+            .await,
+        Err(PqImportError::Local(
+            beacon_chain::PqImportLocalError::Transport(execution_layer::Error::ShuttingDown)
+        ))
+    ));
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        1
+    );
+    let restarted = restart_independent_pq_chain(
+        &fixture,
+        Arc::clone(&fixture.store),
+        Arc::clone(&fixture.execution),
+    );
+    assert_eq!(
+        restarted.head_snapshot().beacon_block_root,
+        signed.canonical_root()
+    );
+    assert_eq!(
+        restarted.head_snapshot().beacon_block.as_ref(),
+        signed.as_ref()
+    );
+    restarted
+        .reconcile_persisted_pq_head()
+        .await
+        .expect("restart reconciles the exact durable head");
+    drop(executor_exit);
 }
 
 #[cfg(target_feature = "avx2")]
@@ -3678,6 +4551,10 @@ async fn run_real_pq_proposer_http_composition() {
         new_payload_responses: Mutex::new(VecDeque::new()),
         stall_new_payload: AtomicBool::new(false),
         new_payload_release: tokio::sync::Semaphore::new(0),
+        forkchoice_calls: AtomicUsize::new(0),
+        forkchoice_responses: Mutex::new(VecDeque::new()),
+        stall_forkchoice: AtomicBool::new(false),
+        forkchoice_release: tokio::sync::Semaphore::new(0),
         payload_calls: AtomicUsize::new(0),
         stall_payload: AtomicBool::new(false),
         omit_payload_bundle: AtomicBool::new(false),

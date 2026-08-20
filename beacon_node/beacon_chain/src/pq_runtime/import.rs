@@ -17,7 +17,12 @@ use std::sync::{
     Condvar, Mutex as StdMutex,
     atomic::{AtomicUsize, Ordering},
 };
-use types::{EthSpec, Hash256, SignedBeaconBlock, Slot};
+use std::time::Duration;
+use types::{EthSpec, ExecPayload, ExecutionBlockHash, Hash256, SignedBeaconBlock, Slot};
+
+pub const PQ_EXECUTION_RECONCILIATION_ATTEMPTS: usize = 3;
+const PQ_EXECUTION_RECONCILIATION_BACKOFF: Duration = Duration::from_millis(25);
+const PQ_EXECUTION_RECONCILIATION_FAILURE: &str = "PQ execution reconciliation failed";
 
 /// At most two imported blocks may retain advanced state, proof evidence, or a commit waiter.
 /// A forward range consumes one permit and processes its blocks sequentially under that permit.
@@ -34,6 +39,7 @@ pub struct TestingPqBlockingHook {
     entered: AtomicUsize,
     released: StdMutex<bool>,
     release: Condvar,
+    panic_after_release: bool,
 }
 
 #[cfg(feature = "pq-startup-testing")]
@@ -43,6 +49,7 @@ impl TestingPqBlockingHook {
             entered: AtomicUsize::new(0),
             released: StdMutex::new(false),
             release: Condvar::new(),
+            panic_after_release: false,
         })
     }
 
@@ -51,6 +58,16 @@ impl TestingPqBlockingHook {
             entered: AtomicUsize::new(0),
             released: StdMutex::new(true),
             release: Condvar::new(),
+            panic_after_release: false,
+        })
+    }
+
+    pub fn panicking() -> Arc<Self> {
+        Arc::new(Self {
+            entered: AtomicUsize::new(0),
+            released: StdMutex::new(true),
+            release: Condvar::new(),
+            panic_after_release: true,
         })
     }
 
@@ -67,7 +84,12 @@ impl TestingPqBlockingHook {
         *self.released.lock().expect("PQ blocking test hook lock") = false;
     }
 
-    pub(crate) fn run(&self) {
+    pub fn is_released(&self) -> bool {
+        *self.released.lock().expect("PQ blocking test hook lock")
+    }
+
+    #[doc(hidden)]
+    pub fn run(&self) {
         self.entered.fetch_add(1, Ordering::SeqCst);
         let mut released = self.released.lock().expect("PQ blocking test hook lock");
         while !*released {
@@ -76,6 +98,7 @@ impl TestingPqBlockingHook {
                 .wait(released)
                 .expect("PQ blocking test hook wait");
         }
+        assert!(!self.panic_after_release, "testing post-persist panic");
     }
 }
 
@@ -160,6 +183,19 @@ pub trait PqNewPayloadTransport<E: EthSpec>: Send + Sync {
     ) -> PqFullPayloadFuture<'a, E> {
         Box::pin(async { Err(execution_layer::Error::NoEngine) })
     }
+
+    fn notify_forkchoice_updated<'a>(
+        &'a self,
+        head_block_hash: ExecutionBlockHash,
+        current_slot: Slot,
+        head_block_root: Hash256,
+    ) -> Pin<Box<dyn Future<Output = Result<PayloadStatus, execution_layer::Error>> + Send + 'a>>;
+}
+
+enum PqExecutionForkchoiceGuard {
+    Production(tokio::sync::OwnedMutexGuard<()>),
+    #[cfg(feature = "pq-startup-testing")]
+    Testing,
 }
 
 pub(crate) enum PqExecutionNotifier<E: EthSpec> {
@@ -217,11 +253,69 @@ impl<E: EthSpec> PqExecutionNotifier<E> {
         }
     }
 
+    async fn acquire_forkchoice_guard(
+        &self,
+    ) -> Result<PqExecutionForkchoiceGuard, execution_layer::Error> {
+        match self {
+            Self::Deferred => Err(execution_layer::Error::NoEngine),
+            Self::Production {
+                execution_layer, ..
+            } => Ok(PqExecutionForkchoiceGuard::Production(
+                execution_layer
+                    .execution_engine_forkchoice_lock_owned()
+                    .await,
+            )),
+            #[cfg(feature = "pq-startup-testing")]
+            Self::Testing(_) => Ok(PqExecutionForkchoiceGuard::Testing),
+        }
+    }
+
+    async fn notify_forkchoice_updated(
+        &self,
+        guard: &PqExecutionForkchoiceGuard,
+        head_block_hash: ExecutionBlockHash,
+        _current_slot: Slot,
+        _head_block_root: Hash256,
+    ) -> Result<PayloadStatus, execution_layer::Error> {
+        match (self, guard) {
+            (
+                Self::Production {
+                    execution_layer, ..
+                },
+                PqExecutionForkchoiceGuard::Production(_guard),
+            ) => {
+                execution_layer
+                    .notify_forkchoice_updated_for_pq(execution_layer::ForkchoiceState {
+                        head_block_hash,
+                        safe_block_hash: ExecutionBlockHash::zero(),
+                        finalized_block_hash: ExecutionBlockHash::zero(),
+                    })
+                    .await
+            }
+            #[cfg(feature = "pq-startup-testing")]
+            (Self::Testing(notifier), PqExecutionForkchoiceGuard::Testing) => {
+                notifier
+                    .notify_forkchoice_updated(head_block_hash, _current_slot, _head_block_root)
+                    .await
+            }
+            (Self::Deferred, _) => Err(execution_layer::Error::NoEngine),
+            #[cfg(feature = "pq-startup-testing")]
+            (Self::Production { .. }, PqExecutionForkchoiceGuard::Testing) => {
+                Err(execution_layer::Error::NoEngine)
+            }
+            #[cfg(feature = "pq-startup-testing")]
+            (Self::Testing(_), PqExecutionForkchoiceGuard::Production(_)) => {
+                Err(execution_layer::Error::NoEngine)
+            }
+        }
+    }
+
     pub(crate) async fn get_full_payload(
         &self,
         request: crate::pq_production::PqPayloadBuildRequest<E>,
     ) -> Result<crate::pq_production::PqFullPayloadResponse<E>, execution_layer::Error> {
         let expectation = crate::pq_production::PqPayloadExpectation::from_request(&request);
+        let _forkchoice_guard = self.acquire_forkchoice_guard().await?;
         let contents = match self {
             Self::Deferred => Err(execution_layer::Error::NoEngine),
             Self::Production {
@@ -307,6 +401,176 @@ pub fn classify_pq_engine_payload_status(status: &PayloadStatus) -> PqEnginePayl
     }
 }
 
+fn signal_pq_execution_reconciliation_failure(task_executor: &task_executor::TaskExecutor) {
+    let mut shutdown = task_executor.shutdown_sender();
+    let _ = shutdown.try_send(task_executor::ShutdownReason::Failure(
+        PQ_EXECUTION_RECONCILIATION_FAILURE,
+    ));
+}
+
+async fn reconcile_pq_execution<E: EthSpec>(
+    notifier: &PqExecutionNotifier<E>,
+    guard: &PqExecutionForkchoiceGuard,
+    reconciliation: &Arc<crate::beacon_chain::PqExecutionReconciliation>,
+    task_executor: &task_executor::TaskExecutor,
+    head_block_hash: ExecutionBlockHash,
+    current_slot: Slot,
+    head_block_root: Hash256,
+) -> Result<(), PqImportError> {
+    let mut attempts = 0usize;
+    loop {
+        let Some(next_attempt) = attempts.checked_add(1) else {
+            signal_pq_execution_reconciliation_failure(task_executor);
+            reconciliation.set(
+                crate::beacon_chain::PqExecutionReconciliationState::Failed {
+                    block_root: head_block_root,
+                },
+            );
+            return Err(PqImportError::ExecutionReconciliation(
+                PqExecutionReconciliationError::Unavailable { attempts },
+            ));
+        };
+        attempts = next_attempt;
+        let response = notifier
+            .notify_forkchoice_updated(guard, head_block_hash, current_slot, head_block_root)
+            .await;
+        match response {
+            Ok(status)
+                if classify_pq_engine_payload_status(&status)
+                    == PqEnginePayloadDisposition::CommitValid =>
+            {
+                reconciliation.set(
+                    crate::beacon_chain::PqExecutionReconciliationState::Reconciled {
+                        block_root: head_block_root,
+                    },
+                );
+                return Ok(());
+            }
+            Ok(status)
+                if classify_pq_engine_payload_status(&status)
+                    == PqEnginePayloadDisposition::Reject =>
+            {
+                signal_pq_execution_reconciliation_failure(task_executor);
+                reconciliation.set(
+                    crate::beacon_chain::PqExecutionReconciliationState::Failed {
+                        block_root: head_block_root,
+                    },
+                );
+                return Err(PqImportError::ExecutionReconciliation(
+                    PqExecutionReconciliationError::Rejected(status),
+                ));
+            }
+            Ok(_) if attempts == PQ_EXECUTION_RECONCILIATION_ATTEMPTS => {
+                signal_pq_execution_reconciliation_failure(task_executor);
+                reconciliation.set(
+                    crate::beacon_chain::PqExecutionReconciliationState::Failed {
+                        block_root: head_block_root,
+                    },
+                );
+                return Err(PqImportError::ExecutionReconciliation(
+                    PqExecutionReconciliationError::Unavailable { attempts },
+                ));
+            }
+            Err(error) if attempts == PQ_EXECUTION_RECONCILIATION_ATTEMPTS => {
+                signal_pq_execution_reconciliation_failure(task_executor);
+                reconciliation.set(
+                    crate::beacon_chain::PqExecutionReconciliationState::Failed {
+                        block_root: head_block_root,
+                    },
+                );
+                return Err(PqImportError::ExecutionReconciliation(
+                    PqExecutionReconciliationError::Transport {
+                        attempts,
+                        error: Box::new(error),
+                    },
+                ));
+            }
+            Ok(_) | Err(_) => {
+                tokio::time::sleep(PQ_EXECUTION_RECONCILIATION_BACKOFF).await;
+            }
+        }
+    }
+}
+
+fn persisted_pq_execution_head<E: EthSpec>(
+    snapshot: &crate::BeaconSnapshot<E>,
+    genesis_slot: Slot,
+) -> Result<ExecutionBlockHash, PqImportError> {
+    let state_hash = snapshot
+        .beacon_state
+        .latest_execution_payload_header()
+        .map_err(|_| {
+            PqImportError::Local(PqImportLocalError::Persistence(
+                PqRuntimeError::PersistedHeadBinding("post-state has no execution payload header"),
+            ))
+        })?
+        .block_hash();
+    if snapshot.beacon_state.slot() == genesis_slot {
+        return Ok(state_hash);
+    }
+    let payload_hash = snapshot
+        .beacon_block
+        .message()
+        .body()
+        .execution_payload()
+        .map_err(|_| {
+            PqImportError::Local(PqImportLocalError::Persistence(
+                PqRuntimeError::PersistedHeadBinding(
+                    "non-genesis head has no full execution payload",
+                ),
+            ))
+        })?
+        .block_hash();
+    if payload_hash != state_hash {
+        return Err(PqImportError::Local(PqImportLocalError::Persistence(
+            PqRuntimeError::PersistedHeadBinding(
+                "block payload hash does not match post-state execution header",
+            ),
+        )));
+    }
+    Ok(payload_hash)
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub fn testing_only_persisted_pq_execution_head<E: EthSpec>(
+    snapshot: &crate::BeaconSnapshot<E>,
+    genesis_slot: Slot,
+) -> Result<ExecutionBlockHash, PqImportError> {
+    persisted_pq_execution_head(snapshot, genesis_slot)
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub async fn testing_only_reconcile_pq_execution<E: EthSpec>(
+    transport: Arc<dyn PqNewPayloadTransport<E>>,
+    task_executor: task_executor::TaskExecutor,
+    head_block_hash: ExecutionBlockHash,
+    current_slot: Slot,
+    head_block_root: Hash256,
+) -> Result<(), PqImportError> {
+    let notifier = PqExecutionNotifier::Testing(transport);
+    let guard = notifier
+        .acquire_forkchoice_guard()
+        .await
+        .map_err(|error| PqImportError::Local(PqImportLocalError::Transport(error)))?;
+    let reconciliation = Arc::new(crate::beacon_chain::PqExecutionReconciliation::new(
+        crate::beacon_chain::PqExecutionReconciliationState::Pending {
+            block_root: head_block_root,
+        },
+    ));
+    reconcile_pq_execution(
+        &notifier,
+        &guard,
+        &reconciliation,
+        &task_executor,
+        head_block_hash,
+        current_slot,
+        head_block_root,
+    )
+    .await
+}
+
 /// Errors attributable to hostile or malformed remote block data.
 #[derive(Debug)]
 pub enum PqImportPeerInvalid {
@@ -336,6 +600,21 @@ pub enum PqImportLocalError {
     Persistence(PqRuntimeError),
 }
 
+/// A durable PQ head could not be reconciled with the process-owned execution engine. These
+/// failures are local and never attributable to a peer, but are non-retryable at the import or
+/// network boundary because the continuation already committed the exact block to disk.
+#[derive(Debug)]
+pub enum PqExecutionReconciliationError {
+    Unavailable {
+        attempts: usize,
+    },
+    Transport {
+        attempts: usize,
+        error: Box<execution_layer::Error>,
+    },
+    Rejected(PayloadStatus),
+}
+
 /// Stable peer-scoring boundary for all PQ block ingress routes.
 #[derive(Debug)]
 pub enum PqImportError {
@@ -343,6 +622,12 @@ pub enum PqImportError {
     /// The remote execution engine rejected the payload. An honest peer can have relayed it, so
     /// this is terminal but does not incur a peer penalty.
     ExecutionRejected(PayloadStatus),
+    ExecutionReconciliation(PqExecutionReconciliationError),
+    /// A detached continuation was lost after durable persistence may have begun. The live
+    /// process must stop and recover the authoritative head from disk before accepting retries.
+    DurableStateUnknown {
+        phase: &'static str,
+    },
     /// A prior Engine rejection or canonical commit invalidated this observation generation.
     TerminalObservation {
         block_root: Hash256,
@@ -371,6 +656,15 @@ impl std::fmt::Display for PqImportError {
             Self::PeerInvalid(error) => write!(formatter, "invalid PQ block: {error:?}"),
             Self::ExecutionRejected(status) => {
                 write!(formatter, "PQ execution payload rejected: {status:?}")
+            }
+            Self::ExecutionReconciliation(error) => {
+                write!(
+                    formatter,
+                    "PQ committed-head reconciliation failed: {error:?}"
+                )
+            }
+            Self::DurableStateUnknown { phase } => {
+                write!(formatter, "PQ durable state is unknown after {phase}")
             }
             Self::TerminalObservation { block_root } => {
                 write!(
@@ -436,6 +730,8 @@ impl Error for PqImportError {
                 | PqImportPeerInvalid::ExecutionPayload(_),
             )
             | Self::ExecutionRejected(_)
+            | Self::ExecutionReconciliation(_)
+            | Self::DurableStateUnknown { .. }
             | Self::TerminalObservation { .. }
             | Self::StaleHeadAfterVerification { .. }
             | Self::Local(
@@ -463,6 +759,7 @@ pub struct PqVerifiedBlockImport<E: EthSpec> {
     block_root: Hash256,
     output: state_processing::PqImportedTransitionOutput<E>,
     _admission: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    _activity: Option<Arc<crate::beacon_chain::PqImportActivity>>,
 }
 
 impl<E: EthSpec> PqVerifiedBlockImport<E> {
@@ -514,6 +811,7 @@ enum PqGossipLifecycle {
     PendingExternal,
     RetryablePropagation,
     RetryableCommit,
+    PendingReconciliation,
     Terminal,
     Committed,
 }
@@ -521,6 +819,7 @@ enum PqGossipLifecycle {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PqPublishPromotionResolution {
     Promoted,
+    Pending,
     Committed,
     Terminal,
     Equivocation { previous: Hash256 },
@@ -582,6 +881,13 @@ enum PqExternalReservationClaim {
     Capacity,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PqGossipCommitAuthorization {
+    Authorized,
+    Terminal,
+    Unavailable,
+}
+
 struct PqExternalObservationReservation {
     observations: Arc<parking_lot::Mutex<PqGossipObservationCache>>,
     binding: Option<PqGossipClaimBinding>,
@@ -604,6 +910,25 @@ impl Drop for PqExternalObservationReservation {
                 .cancel_external(binding.key, binding.generation);
         }
     }
+}
+
+struct PqPostPayloadCommit<E: EthSpec> {
+    source: PqBlockImportSource,
+    output: state_processing::PqImportedTransitionOutput<E>,
+    observation_key: PqGossipObservationKey,
+    committed_slot: Slot,
+    execution_block_hash: ExecutionBlockHash,
+    gossip_binding: Option<PqGossipClaimBinding>,
+    external_reservation: Option<PqExternalObservationReservation>,
+    _commit_permit: tokio::sync::OwnedSemaphorePermit,
+    forkchoice_guard: PqExecutionForkchoiceGuard,
+    _admission: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    _activity: Option<Arc<crate::beacon_chain::PqImportActivity>>,
+}
+
+enum PqCommitPreparation<E: EthSpec> {
+    Commit(Box<PqPostPayloadCommit<E>>),
+    Committed,
 }
 
 /// The unique capability allowed to cross the external gossipsub propagation boundary.
@@ -697,6 +1022,8 @@ impl<T: BeaconChainTypes> PqGossipCommitToken<T> {
             Err(
                 PqImportError::PeerInvalid(_)
                 | PqImportError::ExecutionRejected(_)
+                | PqImportError::ExecutionReconciliation(_)
+                | PqImportError::DurableStateUnknown { .. }
                 | PqImportError::TerminalObservation { .. }
                 | PqImportError::StaleHeadAfterVerification { .. }
                 | PqImportError::Local(_),
@@ -759,6 +1086,10 @@ impl<T: BeaconChainTypes> PqPublishPropagationToken<T> {
             );
         match resolution {
             PqPublishPromotionResolution::Promoted => {}
+            PqPublishPromotionResolution::Pending => {
+                self.armed = false;
+                return Ok(PqPublishPromotion::Pending);
+            }
             PqPublishPromotionResolution::Committed => {
                 self.armed = false;
                 // A committed cache record is installed only after the durable write and
@@ -824,6 +1155,7 @@ pub struct PqPublishCommitToken<T: BeaconChainTypes> {
 
 pub enum PqPublishPromotion<T: BeaconChainTypes> {
     Commit(Box<PqPublishCommitToken<T>>),
+    Pending,
     Committed,
     Terminal,
     Equivocation { previous: Hash256 },
@@ -859,6 +1191,8 @@ impl<T: BeaconChainTypes> PqPublishCommitToken<T> {
             Err(
                 PqImportError::PeerInvalid(_)
                 | PqImportError::ExecutionRejected(_)
+                | PqImportError::ExecutionReconciliation(_)
+                | PqImportError::DurableStateUnknown { .. }
                 | PqImportError::TerminalObservation { .. }
                 | PqImportError::StaleHeadAfterVerification { .. }
                 | PqImportError::Local(_),
@@ -903,7 +1237,9 @@ pub enum PqPublishObservation<T: BeaconChainTypes> {
 /// sealed capability before retrying propagation or commit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PqKnownPublishObservation {
+    Pending,
     Committed,
+    Terminal,
 }
 
 pub enum PqGossipObservation<T: BeaconChainTypes> {
@@ -944,6 +1280,7 @@ impl PqGossipObservationCache {
             }
             PqGossipLifecycle::Committed => PqPublishPromotionResolution::Committed,
             PqGossipLifecycle::Terminal => PqPublishPromotionResolution::Terminal,
+            PqGossipLifecycle::PendingReconciliation => PqPublishPromotionResolution::Pending,
             PqGossipLifecycle::PendingPropagation
             | PqGossipLifecycle::PendingCommit
             | PqGossipLifecycle::PendingExternal
@@ -985,9 +1322,9 @@ impl PqGossipObservationCache {
                 };
             }
             return match record.lifecycle {
-                PqGossipLifecycle::PendingPropagation | PqGossipLifecycle::PendingCommit => {
-                    PqGossipClaim::Pending
-                }
+                PqGossipLifecycle::PendingPropagation
+                | PqGossipLifecycle::PendingCommit
+                | PqGossipLifecycle::PendingReconciliation => PqGossipClaim::Pending,
                 PqGossipLifecycle::PendingExternal => PqGossipClaim::Pending,
                 PqGossipLifecycle::Terminal => PqGossipClaim::Terminal,
                 PqGossipLifecycle::Committed => PqGossipClaim::Committed,
@@ -1063,6 +1400,7 @@ impl PqGossipObservationCache {
                 PqGossipLifecycle::RetryablePropagation
                 | PqGossipLifecycle::RetryableCommit
                 | PqGossipLifecycle::PendingExternal
+                | PqGossipLifecycle::PendingReconciliation
                 | PqGossipLifecycle::Terminal
                 | PqGossipLifecycle::Committed,
             )
@@ -1087,17 +1425,30 @@ impl PqGossipObservationCache {
         self.entries.retain(|key, _| key.slot >= committed_slot);
     }
 
-    pub(crate) fn authorize_gossip_commit(
+    fn resolve_gossip_commit(
         &self,
         key: PqGossipObservationKey,
         root: Hash256,
         generation: u64,
-    ) -> bool {
-        self.entries.get(&key).is_some_and(|record| {
-            record.root == root
-                && record.generation == generation
-                && record.lifecycle == PqGossipLifecycle::PendingCommit
-        })
+    ) -> PqGossipCommitAuthorization {
+        let Some(record) = self.entries.get(&key) else {
+            return PqGossipCommitAuthorization::Unavailable;
+        };
+        if record.root != root {
+            return PqGossipCommitAuthorization::Unavailable;
+        }
+        if record.generation == generation && record.lifecycle == PqGossipLifecycle::PendingCommit {
+            return PqGossipCommitAuthorization::Authorized;
+        }
+        if matches!(
+            record.lifecycle,
+            PqGossipLifecycle::PendingReconciliation
+                | PqGossipLifecycle::Terminal
+                | PqGossipLifecycle::Committed
+        ) {
+            return PqGossipCommitAuthorization::Terminal;
+        }
+        PqGossipCommitAuthorization::Unavailable
     }
 
     fn reserve_external(
@@ -1116,7 +1467,9 @@ impl PqGossipObservationCache {
             if record.root == root
                 && matches!(
                     record.lifecycle,
-                    PqGossipLifecycle::Terminal | PqGossipLifecycle::Committed
+                    PqGossipLifecycle::PendingReconciliation
+                        | PqGossipLifecycle::Terminal
+                        | PqGossipLifecycle::Committed
                 )
             {
                 return PqExternalReservationClaim::Terminal;
@@ -1162,6 +1515,16 @@ impl PqGossipObservationCache {
         self.install_terminal_record(key, root, PqGossipLifecycle::Committed);
     }
 
+    pub(crate) fn record_pending_reconciliation(
+        &mut self,
+        key: PqGossipObservationKey,
+        root: Hash256,
+        committed_slot: Slot,
+    ) {
+        self.prune_after_commit(committed_slot);
+        self.install_terminal_record(key, root, PqGossipLifecycle::PendingReconciliation);
+    }
+
     pub(crate) fn record_terminal(&mut self, key: PqGossipObservationKey, root: Hash256) {
         if let Some(record) = self
             .entries
@@ -1170,6 +1533,14 @@ impl PqGossipObservationCache {
         {
             record.lifecycle = PqGossipLifecycle::Terminal;
         }
+    }
+
+    pub(crate) fn record_durable_state_unknown(
+        &mut self,
+        key: PqGossipObservationKey,
+        root: Hash256,
+    ) {
+        self.install_terminal_record(key, root, PqGossipLifecycle::Terminal);
     }
 
     fn install_terminal_record(
@@ -1256,6 +1627,7 @@ pub enum TestingPqExternalReservation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TestingPqPublishPromotionResolution {
     Promoted,
+    Pending,
     Committed,
     Terminal,
     Equivocation(Hash256),
@@ -1342,11 +1714,11 @@ impl TestingPqGossipObservationCache {
         root: Hash256,
         generation: u64,
     ) -> bool {
-        self.0.authorize_gossip_commit(
+        self.0.resolve_gossip_commit(
             PqGossipObservationKey::new(slot, proposer),
             root,
             generation,
-        )
+        ) == PqGossipCommitAuthorization::Authorized
     }
 
     pub fn reserve_external(
@@ -1393,6 +1765,7 @@ impl TestingPqGossipObservationCache {
             generation,
         ) {
             PqPublishPromotionResolution::Promoted => TestingPqPublishPromotionResolution::Promoted,
+            PqPublishPromotionResolution::Pending => TestingPqPublishPromotionResolution::Pending,
             PqPublishPromotionResolution::Committed => {
                 TestingPqPublishPromotionResolution::Committed
             }
@@ -1437,6 +1810,49 @@ impl Error for PqForwardRangeError {
 }
 
 impl<T: BeaconChainTypes> BeaconChain<T> {
+    /// Replays the exact durable PQ head into the process-owned execution engine before any
+    /// external ingress is exposed. Frozen V1 has no fork-choice finality, so safe and finalized
+    /// remain the exact zero hashes used by [`PqExecutionNotifier`].
+    pub async fn reconcile_persisted_pq_head(&self) -> Result<(), PqImportError> {
+        let _commit_permit = Arc::clone(&self.pq_import_gate)
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                PqImportError::Local(PqImportLocalError::Transport(
+                    execution_layer::Error::ShuttingDown,
+                ))
+            })?;
+        let snapshot = self.head_snapshot();
+        let current_slot = snapshot.beacon_state.slot();
+        let head_block_root = snapshot.beacon_block_root;
+        let genesis_slot = self.slot_clock.genesis_slot();
+        let head_block_hash = self
+            .run_pq_blocking("pq-persisted-head-execution-binding", move || {
+                persisted_pq_execution_head(&snapshot, genesis_slot)
+            })
+            .await??;
+        let guard = self
+            .pq_execution_notifier
+            .acquire_forkchoice_guard()
+            .await
+            .map_err(|error| PqImportError::Local(PqImportLocalError::Transport(error)))?;
+        self.pq_execution_reconciliation.set(
+            crate::beacon_chain::PqExecutionReconciliationState::Pending {
+                block_root: head_block_root,
+            },
+        );
+        reconcile_pq_execution(
+            &self.pq_execution_notifier,
+            &guard,
+            &self.pq_execution_reconciliation,
+            &self.task_executor,
+            head_block_hash,
+            current_slot,
+            head_block_root,
+        )
+        .await
+    }
+
     async fn run_pq_blocking<F, R>(&self, phase: &'static str, task: F) -> Result<R, PqImportError>
     where
         F: FnOnce() -> R + Send + 'static,
@@ -1458,10 +1874,16 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         &self,
         request: PqBlockImportRequest<T::EthSpec>,
     ) -> Result<PqVerifiedBlockImport<T::EthSpec>, PqImportError> {
+        let activity = self
+            .pq_import_coordinator
+            .try_start()
+            .ok_or(PqImportError::Local(PqImportLocalError::Transport(
+                execution_layer::Error::ShuttingDown,
+            )))?;
         let admission = Arc::clone(&self.pq_import_admission)
             .try_acquire_owned()
             .map_err(|_| PqImportError::Local(PqImportLocalError::IngressCapacity))?;
-        self.verify_pq_block_admitted(request, Some(Arc::new(admission)))
+        self.verify_pq_block_admitted(request, Some(Arc::new(admission)), Some(activity))
             .await
     }
 
@@ -1469,6 +1891,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         &self,
         request: PqBlockImportRequest<T::EthSpec>,
         admission: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+        activity: Option<Arc<crate::beacon_chain::PqImportActivity>>,
     ) -> Result<PqVerifiedBlockImport<T::EthSpec>, PqImportError> {
         let head = self.head_snapshot();
         let actual_parent = request.block.message().parent_root();
@@ -1516,11 +1939,13 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         let spec = Arc::clone(&self.spec);
         let key_cache = Arc::clone(&self.pq_validator_key_cache);
         let prepare_admission = admission.clone();
+        let prepare_activity = activity.clone();
         #[cfg(feature = "pq-startup-testing")]
         let blocking_test_hook = self.pq_blocking_test_hook.clone();
         let (advanced_parent, prepared) = self
             .run_pq_blocking("pq-import-prepare", move || {
                 let _admission = prepare_admission;
+                let _activity = prepare_activity;
                 #[cfg(feature = "pq-startup-testing")]
                 if let Some(hook) = blocking_test_hook {
                     hook.run();
@@ -1552,9 +1977,11 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             .await
             .map_err(classify_consensus_error)?;
         let transition_admission = admission.clone();
+        let transition_activity = activity.clone();
         let (output, observation_key, block_root) = self
             .run_pq_blocking("pq-import-transition", move || {
                 let _admission = transition_admission;
+                let _activity = transition_activity;
                 let output = transition_pq_imported_block(advanced_parent, verified)
                     .map_err(classify_transition_error)?;
                 let block = output.block();
@@ -1571,6 +1998,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             block_root,
             output,
             _admission: admission,
+            _activity: activity,
         })
     }
 
@@ -1668,8 +2096,49 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         block: &SignedBeaconBlock<T::EthSpec>,
     ) -> Option<PqKnownPublishObservation> {
         let head = self.head_snapshot();
+        if head.beacon_block_root != block.canonical_root() || head.beacon_block.as_ref() != block {
+            return None;
+        }
+        match self.pq_execution_reconciliation.current() {
+            crate::beacon_chain::PqExecutionReconciliationState::Pending { block_root }
+                if block_root == head.beacon_block_root =>
+            {
+                Some(PqKnownPublishObservation::Pending)
+            }
+            crate::beacon_chain::PqExecutionReconciliationState::Reconciled { block_root }
+                if block_root == head.beacon_block_root =>
+            {
+                Some(PqKnownPublishObservation::Committed)
+            }
+            crate::beacon_chain::PqExecutionReconciliationState::Failed { block_root }
+                if block_root == head.beacon_block_root =>
+            {
+                Some(PqKnownPublishObservation::Terminal)
+            }
+            _ => None,
+        }
+    }
+
+    fn exact_current_pq_import_outcome(
+        &self,
+        block: &SignedBeaconBlock<T::EthSpec>,
+        source: PqBlockImportSource,
+    ) -> Option<PqBlockImportOutcome> {
+        let head = self.head_snapshot();
         (head.beacon_block_root == block.canonical_root() && head.beacon_block.as_ref() == block)
-            .then_some(PqKnownPublishObservation::Committed)
+            .then(|| PqBlockImportOutcome {
+                source,
+                block_root: head.beacon_block_root,
+                state_root: head.beacon_block.message().state_root(),
+                payload_status: PqEnginePayloadStatus::Valid,
+            })
+    }
+
+    async fn wait_for_exact_pq_reconciliation(
+        &self,
+        block_root: Hash256,
+    ) -> crate::beacon_chain::PqExecutionReconciliationState {
+        self.pq_execution_reconciliation.wait_for(block_root).await
     }
 
     #[cfg(feature = "pq-startup-testing")]
@@ -1743,10 +2212,60 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
     /// Calls Engine after full PQ verification (and, for gossip, after caller propagation), then
     /// atomically persists the sealed transition output before publishing the new head.
     async fn commit_verified_pq_block(
-        &self,
+        self: &Arc<Self>,
         verified: PqVerifiedBlockImport<T::EthSpec>,
         gossip_binding: Option<PqGossipClaimBinding>,
     ) -> Result<PqVerifiedCommitOutcome, PqImportError> {
+        let prepared = match self
+            .prepare_pq_commit_after_new_payload(verified, gossip_binding)
+            .await?
+        {
+            PqCommitPreparation::Commit(prepared) => prepared,
+            PqCommitPreparation::Committed => return Ok(PqVerifiedCommitOutcome::Committed),
+        };
+        let durable_block_root = prepared.output.block().canonical_root();
+        let durable_observation_key = prepared.observation_key;
+        let chain = Arc::clone(self);
+        let coordinator = Arc::clone(&self.pq_import_coordinator);
+        let task = self.task_executor.spawn_handle_without_exit(
+            async move {
+                let mut panic_guard = crate::beacon_chain::PqImportPanicGuard::new(coordinator);
+                let result = chain.persist_and_reconcile_pq_commit(*prepared).await;
+                panic_guard.disarm();
+                result
+            },
+            "pq-block-import-commit-and-reconcile",
+        );
+        let Some(task) = task else {
+            return Err(PqImportError::Local(PqImportLocalError::BlockingTask(
+                "pq-block-import-commit-and-reconcile",
+            )));
+        };
+        match task.await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) | Err(_) => {
+                self.pq_import_coordinator.close();
+                self.pq_execution_reconciliation.set(
+                    crate::beacon_chain::PqExecutionReconciliationState::Failed {
+                        block_root: durable_block_root,
+                    },
+                );
+                self.observed_pq_blocks
+                    .lock()
+                    .record_durable_state_unknown(durable_observation_key, durable_block_root);
+                signal_pq_execution_reconciliation_failure(&self.task_executor);
+                Err(PqImportError::DurableStateUnknown {
+                    phase: "pq-block-import-commit-and-reconcile",
+                })
+            }
+        }
+    }
+
+    async fn prepare_pq_commit_after_new_payload(
+        &self,
+        verified: PqVerifiedBlockImport<T::EthSpec>,
+        gossip_binding: Option<PqGossipClaimBinding>,
+    ) -> Result<PqCommitPreparation<T::EthSpec>, PqImportError> {
         let observation_key = verified.observation_key;
         let block_root = verified.block_root;
         // This owned permit queues commit attempts without holding a borrowed lock, state or cache
@@ -1760,6 +2279,23 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 ))
             })?;
         let head = self.head_snapshot();
+        if head.beacon_block_root == block_root
+            && head.beacon_block.as_ref() == verified.output.block().as_ref()
+        {
+            return match self.pq_execution_reconciliation.current() {
+                crate::beacon_chain::PqExecutionReconciliationState::Reconciled {
+                    block_root: reconciled,
+                } if reconciled == block_root => Ok(PqCommitPreparation::Committed),
+                crate::beacon_chain::PqExecutionReconciliationState::Pending {
+                    block_root: pending,
+                } if pending == block_root => {
+                    Err(PqImportError::Local(PqImportLocalError::Invariant(
+                        "PQ exact-head duplicate acquired the import gate before reconciliation",
+                    )))
+                }
+                _ => Err(PqImportError::TerminalObservation { block_root }),
+            };
+        }
         if gossip_binding.is_none() && head.beacon_block_root != verified.expected_parent_root {
             return Err(PqImportError::StaleHeadAfterVerification {
                 expected_parent: verified.expected_parent_root,
@@ -1767,30 +2303,37 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             });
         }
         let mut external_reservation = match gossip_binding {
-            Some(binding)
-                if binding.key == observation_key
-                    && self.observed_pq_blocks.lock().authorize_gossip_commit(
+            Some(binding) => {
+                let authorization = if binding.key == observation_key {
+                    self.observed_pq_blocks.lock().resolve_gossip_commit(
                         observation_key,
                         block_root,
                         binding.generation,
-                    ) =>
-            {
-                None
-            }
-            Some(_) => {
-                if verified.source == PqBlockImportSource::Publish
-                    && head.beacon_block_root == block_root
-                    && head.beacon_block.as_ref() == verified.output.block().as_ref()
+                    )
+                } else {
+                    PqGossipCommitAuthorization::Unavailable
+                };
+                if authorization == PqGossipCommitAuthorization::Authorized {
+                    None
+                } else if verified.source != PqBlockImportSource::Publish
+                    && authorization == PqGossipCommitAuthorization::Terminal
                 {
-                    return Ok(PqVerifiedCommitOutcome::Committed);
+                    return Err(PqImportError::TerminalObservation { block_root });
+                } else {
+                    if verified.source == PqBlockImportSource::Publish
+                        && head.beacon_block_root == block_root
+                        && head.beacon_block.as_ref() == verified.output.block().as_ref()
+                    {
+                        return Ok(PqCommitPreparation::Committed);
+                    }
+                    if head.beacon_block_root != verified.expected_parent_root {
+                        return Err(PqImportError::StaleHeadAfterVerification {
+                            expected_parent: verified.expected_parent_root,
+                            actual_head: head.beacon_block_root,
+                        });
+                    }
+                    return Err(PqImportError::TerminalObservation { block_root });
                 }
-                if head.beacon_block_root != verified.expected_parent_root {
-                    return Err(PqImportError::StaleHeadAfterVerification {
-                        expected_parent: verified.expected_parent_root,
-                        actual_head: head.beacon_block_root,
-                    });
-                }
-                return Err(PqImportError::TerminalObservation { block_root });
             }
             None => {
                 let claim = self.observed_pq_blocks.lock().reserve_external(
@@ -1831,6 +2374,11 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 actual_head: head.beacon_block_root,
             });
         }
+        let forkchoice_guard = self
+            .pq_execution_notifier
+            .acquire_forkchoice_guard()
+            .await
+            .map_err(|error| PqImportError::Local(PqImportLocalError::Transport(error)))?;
         let payload_status = {
             let request = NewPayloadRequest::try_from(verified.output.block().message()).map_err(
                 |error| {
@@ -1859,65 +2407,173 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 return Err(PqImportError::ExecutionRejected(payload_status));
             }
         }
+        let execution_block_hash = verified
+            .output
+            .block()
+            .message()
+            .body()
+            .execution_payload()
+            .map_err(|error| {
+                PqImportError::PeerInvalid(PqImportPeerInvalid::ExecutionPayload(error.into()))
+            })?
+            .block_hash();
+        let PqVerifiedBlockImport {
+            source,
+            output,
+            _admission,
+            _activity,
+            ..
+        } = verified;
+        let committed_slot = output.block().slot();
+        Ok(PqCommitPreparation::Commit(Box::new(PqPostPayloadCommit {
+            source,
+            output,
+            observation_key,
+            committed_slot,
+            execution_block_hash,
+            gossip_binding,
+            external_reservation,
+            _commit_permit: commit_permit,
+            forkchoice_guard,
+            _admission,
+            _activity,
+        })))
+    }
 
+    async fn persist_and_reconcile_pq_commit(
+        &self,
+        prepared: PqPostPayloadCommit<T::EthSpec>,
+    ) -> Result<PqVerifiedCommitOutcome, PqImportError> {
+        let PqPostPayloadCommit {
+            source,
+            output,
+            observation_key,
+            committed_slot,
+            execution_block_hash,
+            gossip_binding,
+            mut external_reservation,
+            _commit_permit,
+            forkchoice_guard,
+            _admission,
+            _activity,
+        } = prepared;
         let store = Arc::clone(&self.store);
         let canonical_head = Arc::clone(&self.canonical_head);
         let observations = Arc::clone(&self.observed_pq_blocks);
+        let persistence_observations = Arc::clone(&observations);
+        let reconciliation = Arc::clone(&self.pq_execution_reconciliation);
         #[cfg(feature = "pq-startup-testing")]
         let persistence_test_hook = self.pq_persistence_test_hook.clone();
-        self.run_pq_blocking("pq-import-persist-and-publish", move || {
-            // The closure owns both permits, the sealed output and observation authority. Once
-            // Engine returns VALID, dropping the async caller cannot split durable persistence
-            // from in-memory publication or permit a second commit to pass this one.
-            let _commit_permit = commit_permit;
-            let PqVerifiedBlockImport {
-                source,
-                output,
-                _admission,
-                ..
-            } = verified;
-            #[cfg(feature = "pq-startup-testing")]
-            if let Some(hook) = persistence_test_hook {
-                hook.run();
-            }
-            let snapshot = match crate::builder::persist_pq_imported_transition::<T>(&store, output)
-            {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    if let Some(binding) = gossip_binding {
-                        observations.lock().finish(
-                            binding.key,
-                            binding.generation,
-                            PqGossipClaimFinish::Retryable,
-                        );
-                    }
-                    return Err(PqImportError::Local(PqImportLocalError::Persistence(error)));
+        #[cfg(feature = "pq-startup-testing")]
+        let post_persist_test_hook = self.pq_post_persist_test_hook.lock().clone();
+        let durable_block_root = output.block().canonical_root();
+        let persistence = self.task_executor.spawn_blocking_handle(
+            move || {
+                #[cfg(feature = "pq-startup-testing")]
+                if let Some(hook) = persistence_test_hook {
+                    hook.run();
                 }
-            };
-            let outcome = PqBlockImportOutcome {
-                source,
-                block_root: snapshot.beacon_block_root,
-                state_root: snapshot.beacon_block.message().state_root(),
-                payload_status: PqEnginePayloadStatus::Valid,
-            };
-            let committed_slot = snapshot.beacon_state.slot();
-            *canonical_head.write() = Arc::new(snapshot);
-            observations
-                .lock()
-                .record_commit(observation_key, outcome.block_root, committed_slot);
-            if let Some(reservation) = &mut external_reservation {
-                reservation.disarm();
+                let snapshot =
+                    match crate::builder::persist_pq_imported_transition::<T>(&store, output) {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            if let Some(binding) = gossip_binding {
+                                persistence_observations.lock().finish(
+                                    binding.key,
+                                    binding.generation,
+                                    PqGossipClaimFinish::Retryable,
+                                );
+                            }
+                            return Err(PqImportError::Local(PqImportLocalError::Persistence(
+                                error,
+                            )));
+                        }
+                    };
+                #[cfg(feature = "pq-startup-testing")]
+                if let Some(hook) = post_persist_test_hook {
+                    hook.run();
+                }
+                let outcome = PqBlockImportOutcome {
+                    source,
+                    block_root: snapshot.beacon_block_root,
+                    state_root: snapshot.beacon_block.message().state_root(),
+                    payload_status: PqEnginePayloadStatus::Valid,
+                };
+                *canonical_head.write() = Arc::new(snapshot);
+                reconciliation.set(
+                    crate::beacon_chain::PqExecutionReconciliationState::Pending {
+                        block_root: outcome.block_root,
+                    },
+                );
+                persistence_observations
+                    .lock()
+                    .record_pending_reconciliation(
+                        observation_key,
+                        outcome.block_root,
+                        committed_slot,
+                    );
+                if let Some(reservation) = &mut external_reservation {
+                    reservation.disarm();
+                }
+                Ok(outcome)
+            },
+            "pq-import-persist-and-publish",
+        );
+        let Some(persistence) = persistence else {
+            return Err(PqImportError::Local(PqImportLocalError::BlockingTask(
+                "pq-import-persist-and-publish",
+            )));
+        };
+        let outcome = match persistence.await {
+            Ok(outcome) => outcome?,
+            Err(_) => {
+                self.pq_import_coordinator.close();
+                self.pq_execution_reconciliation.set(
+                    crate::beacon_chain::PqExecutionReconciliationState::Failed {
+                        block_root: durable_block_root,
+                    },
+                );
+                observations
+                    .lock()
+                    .record_durable_state_unknown(observation_key, durable_block_root);
+                signal_pq_execution_reconciliation_failure(&self.task_executor);
+                return Err(PqImportError::DurableStateUnknown {
+                    phase: "pq-import-persist-and-publish",
+                });
             }
-            drop(_admission);
-            Ok(PqVerifiedCommitOutcome::Imported(outcome))
-        })
-        .await?
+        };
+        let result = reconcile_pq_execution(
+            &self.pq_execution_notifier,
+            &forkchoice_guard,
+            &self.pq_execution_reconciliation,
+            &self.task_executor,
+            execution_block_hash,
+            committed_slot,
+            outcome.block_root,
+        )
+        .await
+        .map(|()| PqVerifiedCommitOutcome::Imported(outcome.clone()));
+        match &result {
+            Ok(_) => observations.lock().record_commit(
+                observation_key,
+                outcome.block_root,
+                committed_slot,
+            ),
+            Err(_) => observations
+                .lock()
+                .record_terminal(observation_key, outcome.block_root),
+        }
+        drop(forkchoice_guard);
+        drop(_commit_permit);
+        drop(_admission);
+        drop(_activity);
+        result
     }
 
     /// Imports an RPC or lookup block through the full sealed boundary. Gossip requires the
     /// propagation capability, while forward ranges use their sequential batch entry point.
     pub async fn import_pq_block(
-        &self,
+        self: &Arc<Self>,
         request: PqBlockImportRequest<T::EthSpec>,
     ) -> Result<PqBlockImportOutcome, PqImportError> {
         if !matches!(
@@ -1928,20 +2584,68 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 "PQ direct import accepts only RPC or lookup sources",
             )));
         }
-        let verified = self.verify_pq_block(request).await?;
+        let activity = self
+            .pq_import_coordinator
+            .try_start()
+            .ok_or(PqImportError::Local(PqImportLocalError::Transport(
+                execution_layer::Error::ShuttingDown,
+            )))?;
+        let admission = Arc::new(
+            Arc::clone(&self.pq_import_admission)
+                .try_acquire_owned()
+                .map_err(|_| PqImportError::Local(PqImportLocalError::IngressCapacity))?,
+        );
+        let source = request.source;
+        let block = Arc::clone(&request.block);
+        match self.known_pq_publish_observation(&request.block) {
+            Some(PqKnownPublishObservation::Pending) => {
+                let block_root = request.block.canonical_root();
+                match self.wait_for_exact_pq_reconciliation(block_root).await {
+                    crate::beacon_chain::PqExecutionReconciliationState::Reconciled {
+                        block_root: reconciled,
+                    } if reconciled == block_root => {
+                        return self
+                            .exact_current_pq_import_outcome(&request.block, source)
+                            .ok_or(PqImportError::TerminalObservation { block_root });
+                    }
+                    crate::beacon_chain::PqExecutionReconciliationState::Failed {
+                        block_root: failed,
+                    } if failed == block_root => {
+                        return Err(PqImportError::TerminalObservation { block_root });
+                    }
+                    _ => {}
+                }
+            }
+            Some(PqKnownPublishObservation::Committed) => {
+                return self
+                    .exact_current_pq_import_outcome(&request.block, source)
+                    .ok_or_else(|| PqImportError::TerminalObservation {
+                        block_root: request.block.canonical_root(),
+                    });
+            }
+            Some(PqKnownPublishObservation::Terminal) => {
+                return Err(PqImportError::TerminalObservation {
+                    block_root: request.block.canonical_root(),
+                });
+            }
+            None => {}
+        }
+        let verified = self
+            .verify_pq_block_admitted(request, Some(admission), Some(activity))
+            .await?;
         match self.commit_verified_pq_block(verified, None).await? {
             PqVerifiedCommitOutcome::Imported(outcome) => Ok(outcome),
-            PqVerifiedCommitOutcome::Committed => {
-                Err(PqImportError::Local(PqImportLocalError::Invariant(
-                    "direct PQ import resolved as an existing committed publication",
-                )))
-            }
+            PqVerifiedCommitOutcome::Committed => self
+                .exact_current_pq_import_outcome(&block, source)
+                .ok_or(PqImportError::Local(PqImportLocalError::Invariant(
+                    "direct PQ import resolved without the exact committed head",
+                ))),
         }
     }
 
     /// Validates and imports a forward range strictly sequentially, stopping at the first error.
     pub async fn import_pq_forward_range(
-        &self,
+        self: &Arc<Self>,
         requests: Vec<PqBlockImportRequest<T::EthSpec>>,
     ) -> Result<Vec<PqBlockImportOutcome>, PqForwardRangeError> {
         if requests.len() > PQ_FORWARD_RANGE_BLOCK_CAPACITY {
@@ -1953,6 +2657,15 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 }),
             });
         }
+        let activity =
+            self.pq_import_coordinator
+                .try_start()
+                .ok_or_else(|| PqForwardRangeError {
+                    imported: vec![],
+                    error: PqImportError::Local(PqImportLocalError::Transport(
+                        execution_layer::Error::ShuttingDown,
+                    )),
+                })?;
         let admission = Arc::new(
             Arc::clone(&self.pq_import_admission)
                 .try_acquire_owned()
@@ -1964,9 +2677,11 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         let mut imported = Vec::with_capacity(requests.len());
         let head = self.head_snapshot();
         let preflight_admission = Arc::clone(&admission);
+        let preflight_activity = Arc::clone(&activity);
         let requests = match self
             .run_pq_blocking("pq-range-preflight", move || {
                 let _admission = preflight_admission;
+                let _activity = preflight_activity;
                 let mut expected_parent = head.beacon_block_root;
                 let mut previous_slot = head.beacon_state.slot();
                 for request in &requests {
@@ -2001,7 +2716,11 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         };
         for request in requests {
             let verified = match self
-                .verify_pq_block_admitted(request, Some(Arc::clone(&admission)))
+                .verify_pq_block_admitted(
+                    request,
+                    Some(Arc::clone(&admission)),
+                    Some(Arc::clone(&activity)),
+                )
                 .await
             {
                 Ok(verified) => verified,

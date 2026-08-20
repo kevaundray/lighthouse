@@ -373,6 +373,8 @@ fn commit_error_resolution(error: Option<&PqImportError>) -> AdmittedMessageComm
         | Some(
             PqImportError::PeerInvalid(_)
             | PqImportError::ExecutionRejected(_)
+            | PqImportError::ExecutionReconciliation(_)
+            | PqImportError::DurableStateUnknown { .. }
             | PqImportError::TerminalObservation { .. }
             | PqImportError::StaleHeadAfterVerification { .. }
             | PqImportError::Local(_),
@@ -387,7 +389,9 @@ pub enum PqCommitResolutionTestCase {
     Success,
     BlockingTask,
     ParentUnavailable,
+    ReconciliationFailure,
     TerminalObservation,
+    DurableStateUnknown,
 }
 
 #[cfg(feature = "pq-startup-testing")]
@@ -403,9 +407,19 @@ pub fn testing_only_pq_commit_resolution(case: PqCommitResolutionTestCase) -> bo
                 parent_root: Hash256::ZERO,
             },
         )),
+        PqCommitResolutionTestCase::ReconciliationFailure => {
+            Some(PqImportError::ExecutionReconciliation(
+                beacon_chain::PqExecutionReconciliationError::Unavailable { attempts: 3 },
+            ))
+        }
         PqCommitResolutionTestCase::TerminalObservation => {
             Some(PqImportError::TerminalObservation {
                 block_root: Hash256::ZERO,
+            })
+        }
+        PqCommitResolutionTestCase::DurableStateUnknown => {
+            Some(PqImportError::DurableStateUnknown {
+                phase: "testing-post-persist",
             })
         }
     };

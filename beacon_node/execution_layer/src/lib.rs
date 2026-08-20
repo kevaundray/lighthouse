@@ -36,6 +36,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use strum::AsRefStr;
 use task_executor::TaskExecutor;
+#[cfg(feature = "pq-devnet")]
+use tokio::sync::OwnedMutexGuard;
 use tokio::{
     sync::{Mutex, MutexGuard, RwLock},
     time::sleep,
@@ -455,7 +457,7 @@ type PayloadContentsRefTuple<'a, E> = (ExecutionPayloadRef<'a, E>, Option<&'a Bl
 struct Inner<E: EthSpec> {
     engine: Arc<Engine>,
     builder: ArcSwapOption<BuilderHttpClient>,
-    execution_engine_forkchoice_lock: Mutex<()>,
+    execution_engine_forkchoice_lock: Arc<Mutex<()>>,
     suggested_fee_recipient: Option<Address>,
     proposer_preparation_data: Mutex<HashMap<u64, ProposerPreparationDataEntry>>,
     proposers: RwLock<HashMap<ProposerKey, Proposer>>,
@@ -572,7 +574,7 @@ impl<E: EthSpec> ExecutionLayer<E> {
         let inner = Inner {
             engine: Arc::new(engine),
             builder: ArcSwapOption::empty(),
-            execution_engine_forkchoice_lock: <_>::default(),
+            execution_engine_forkchoice_lock: Arc::new(Mutex::default()),
             suggested_fee_recipient,
             proposer_preparation_data: Mutex::new(HashMap::new()),
             proposers: RwLock::new(HashMap::new()),
@@ -688,6 +690,14 @@ impl<E: EthSpec> ExecutionLayer<E> {
 
     pub async fn execution_engine_forkchoice_lock(&self) -> MutexGuard<'_, ()> {
         self.inner.execution_engine_forkchoice_lock.lock().await
+    }
+
+    /// Owns the execution forkchoice lock across the detached PQ DB-to-FCU continuation.
+    #[cfg(feature = "pq-devnet")]
+    pub async fn execution_engine_forkchoice_lock_owned(&self) -> OwnedMutexGuard<()> {
+        Arc::clone(&self.inner.execution_engine_forkchoice_lock)
+            .lock_owned()
+            .await
     }
 
     /// Convenience function to allow spawning a task without waiting for the result.
@@ -1621,6 +1631,46 @@ impl<E: EthSpec> ExecutionLayer<E> {
 
         process_payload_status(
             head_block_hash,
+            result.map(|response| response.payload_status),
+        )
+        .map_err(Box::new)
+        .map_err(Error::EngineError)
+    }
+
+    /// Issues the exact no-payload-attributes forkchoice update used by the sealed PQ runtime.
+    ///
+    /// The PQ import owner holds `execution_engine_forkchoice_lock` across durable head
+    /// publication and this call. Unlike the ordinary fork-choice path, this method deliberately
+    /// does not consult the proposer cache: reconciling an already committed PQ head must never
+    /// start an execution payload build.
+    #[cfg(feature = "pq-devnet")]
+    pub async fn notify_forkchoice_updated_for_pq(
+        &self,
+        forkchoice_state: ForkchoiceState,
+    ) -> Result<PayloadStatus, Error> {
+        let _timer = metrics::start_timer_vec(
+            &metrics::EXECUTION_LAYER_REQUEST_TIMES,
+            &[metrics::FORKCHOICE_UPDATED],
+        );
+        self.engine()
+            .set_latest_forkchoice_state(forkchoice_state)
+            .await;
+        let result = self
+            .engine()
+            .request(|engine| async move {
+                engine
+                    .notify_forkchoice_updated(forkchoice_state, None)
+                    .await
+            })
+            .await;
+        if let Ok(status) = &result {
+            metrics::inc_counter_vec(
+                &metrics::EXECUTION_LAYER_PAYLOAD_STATUS,
+                &["forkchoice_updated", status.payload_status.status.into()],
+            );
+        }
+        process_payload_status(
+            forkchoice_state.head_block_hash,
             result.map(|response| response.payload_status),
         )
         .map_err(Box::new)

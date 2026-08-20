@@ -18,6 +18,45 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use store::{DBColumn, KeyValueStore};
 use types::{EthSpec, ForkName, MinimalEthSpec};
 
+struct AlwaysValidStartupExecution;
+
+impl beacon_chain::PqNewPayloadTransport<MinimalEthSpec> for AlwaysValidStartupExecution {
+    fn notify_new_payload<'a>(
+        &'a self,
+        _request: execution_layer::NewPayloadRequest<'a, MinimalEthSpec>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<execution_layer::PayloadStatus, execution_layer::Error>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async { Ok(execution_layer::PayloadStatus::Valid) })
+    }
+
+    fn notify_forkchoice_updated<'a>(
+        &'a self,
+        _head_block_hash: types::ExecutionBlockHash,
+        _current_slot: types::Slot,
+        _head_block_root: types::Hash256,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<execution_layer::PayloadStatus, execution_layer::Error>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async { Ok(execution_layer::PayloadStatus::Valid) })
+    }
+}
+
+fn testing_runtime_config(client: ClientConfig, testnet: std::path::PathBuf) -> PqRuntimeConfig {
+    PqRuntimeConfig::new(client, testnet)
+        .testing_only_execution_notifier(Arc::new(AlwaysValidStartupExecution))
+}
+
 fn valid_client_config(absent_data_dir: std::path::PathBuf) -> ClientConfig {
     let mut config = ClientConfig::default();
     config.set_data_dir(absent_data_dir);
@@ -50,7 +89,7 @@ fn pure_plan_rejects_non_300_second_profile_before_io() {
         std::process::id()
     ));
     assert!(!absent_data_dir.exists());
-    let config = PqRuntimeConfig::new(
+    let config = testing_runtime_config(
         valid_client_config(absent_data_dir.clone()),
         std::path::PathBuf::from("testnet"),
     );
@@ -85,7 +124,7 @@ fn pure_plan_requires_a_real_execution_endpoint_and_explicit_jwt() {
     let mut missing_layer = valid_client_config(data_dir.clone());
     missing_layer.execution_layer = None;
     assert_eq!(
-        PqRuntimeConfig::new(missing_layer, "testnet".into())
+        testing_runtime_config(missing_layer, "testnet".into())
             .testing_only_validate(&spec)
             .expect_err("execution layer is mandatory"),
         PqRuntimeConfigError::MissingExecutionLayer,
@@ -98,7 +137,7 @@ fn pure_plan_requires_a_real_execution_endpoint_and_explicit_jwt() {
         .expect("execution config")
         .execution_endpoint = None;
     assert_eq!(
-        PqRuntimeConfig::new(missing_endpoint, "testnet".into())
+        testing_runtime_config(missing_endpoint, "testnet".into())
             .testing_only_validate(&spec)
             .expect_err("execution endpoint is mandatory"),
         PqRuntimeConfigError::MissingExecutionEndpoint,
@@ -111,7 +150,7 @@ fn pure_plan_requires_a_real_execution_endpoint_and_explicit_jwt() {
         .expect("execution config")
         .secret_file = None;
     assert_eq!(
-        PqRuntimeConfig::new(missing_jwt, "testnet".into())
+        testing_runtime_config(missing_jwt, "testnet".into())
             .testing_only_validate(&spec)
             .expect_err("explicit JWT path is mandatory"),
         PqRuntimeConfigError::MissingJwtSecret,
@@ -128,7 +167,7 @@ fn pure_plan_rejects_validator_bundle_without_proposer_feature() {
         .set_slot_duration_ms::<MinimalEthSpec>(300_000);
 
     assert_eq!(
-        PqRuntimeConfig::new(valid_client_config(data_dir), "testnet".into())
+        testing_runtime_config(valid_client_config(data_dir), "testnet".into())
             .with_validator_bundle("bundle".into())
             .testing_only_validate(&spec)
             .expect_err("validator bundle requires the additive feature"),
@@ -158,7 +197,7 @@ fn pure_plan_seals_optional_proposer_paths_without_opening_them() {
 
     let disabled_http = valid_client_config(data_dir.clone());
     assert_eq!(
-        PqRuntimeConfig::new(disabled_http, root.join("testnet"))
+        testing_runtime_config(disabled_http, root.join("testnet"))
             .with_validator_bundle(bundle_dir.clone())
             .testing_only_validate(&spec)
             .expect_err("proposer requires the narrow HTTP surface"),
@@ -167,7 +206,7 @@ fn pure_plan_seals_optional_proposer_paths_without_opening_them() {
 
     let mut enabled_http = valid_client_config(data_dir);
     enabled_http.http_api.enabled = true;
-    let plan = PqRuntimeConfig::new(enabled_http, root.join("testnet"))
+    let plan = testing_runtime_config(enabled_http, root.join("testnet"))
         .with_validator_bundle(bundle_dir.clone())
         .testing_only_validate(&spec)
         .expect("sealed proposer plan");
@@ -190,7 +229,7 @@ fn pure_plan_rejects_unsupported_http_metrics_and_monitoring() {
         key: "key.pem".into(),
     });
     assert_eq!(
-        PqRuntimeConfig::new(tls, "testnet".into())
+        testing_runtime_config(tls, "testnet".into())
             .testing_only_validate(&spec)
             .expect_err("HTTP TLS is outside the PQ facade"),
         PqRuntimeConfigError::UnsupportedOption("HTTP TLS"),
@@ -199,7 +238,7 @@ fn pure_plan_rejects_unsupported_http_metrics_and_monitoring() {
     let mut cors = valid_client_config(root.join("cors"));
     cors.http_api.allow_origin = Some("*".into());
     assert_eq!(
-        PqRuntimeConfig::new(cors, "testnet".into())
+        testing_runtime_config(cors, "testnet".into())
             .testing_only_validate(&spec)
             .expect_err("CORS is outside the PQ facade"),
         PqRuntimeConfigError::UnsupportedOption("HTTP CORS"),
@@ -208,7 +247,7 @@ fn pure_plan_rejects_unsupported_http_metrics_and_monitoring() {
     let mut metrics = valid_client_config(root.join("metrics"));
     metrics.http_metrics.enabled = true;
     assert_eq!(
-        PqRuntimeConfig::new(metrics, "testnet".into())
+        testing_runtime_config(metrics, "testnet".into())
             .testing_only_validate(&spec)
             .expect_err("metrics are outside the PQ runtime"),
         PqRuntimeConfigError::UnsupportedOption("metrics"),
@@ -217,7 +256,7 @@ fn pure_plan_rejects_unsupported_http_metrics_and_monitoring() {
     let mut monitoring = valid_client_config(root.join("monitoring"));
     monitoring.monitoring_api = Some(monitoring_api::Config::default());
     assert_eq!(
-        PqRuntimeConfig::new(monitoring, "testnet".into())
+        testing_runtime_config(monitoring, "testnet".into())
             .testing_only_validate(&spec)
             .expect_err("monitoring is outside the PQ runtime"),
         PqRuntimeConfigError::UnsupportedOption("monitoring"),
@@ -250,7 +289,7 @@ fn pure_plan_seals_exact_disk_network_genesis_and_jwt_paths_without_io() {
         .make_genesis_spec(MinimalEthSpec::default_spec())
         .set_slot_duration_ms::<MinimalEthSpec>(300_000);
 
-    let plan = PqRuntimeConfig::new(config, testnet_dir.clone())
+    let plan = testing_runtime_config(config, testnet_dir.clone())
         .testing_only_validate(&spec)
         .expect("valid pure plan");
     assert_eq!(plan.hot_db_path(), data_dir.join("chain_db"));
@@ -286,7 +325,7 @@ fn pure_plan_uses_configured_data_dir_lexically_even_if_a_legacy_directory_exist
         .make_genesis_spec(MinimalEthSpec::default_spec())
         .set_slot_duration_ms::<MinimalEthSpec>(300_000);
 
-    let plan = PqRuntimeConfig::new(client, relative_data_dir.join("testnet"))
+    let plan = testing_runtime_config(client, relative_data_dir.join("testnet"))
         .testing_only_validate(&spec)
         .expect("pure lexical plan");
     assert_eq!(plan.hot_db_path(), relative_data_dir.join("chain_db"),);
@@ -310,7 +349,7 @@ fn pure_plan_rejects_invalid_store_compression_and_pruning_before_io() {
     let mut invalid_compression = valid_client_config(root.join("compression"));
     invalid_compression.store.compression_level = i32::MAX;
     assert_eq!(
-        PqRuntimeConfig::new(invalid_compression, root.join("testnet"))
+        testing_runtime_config(invalid_compression, root.join("testnet"))
             .testing_only_validate(&spec)
             .expect_err("invalid store compression"),
         PqRuntimeConfigError::InvalidStoreConfiguration,
@@ -320,7 +359,7 @@ fn pure_plan_rejects_invalid_store_compression_and_pruning_before_io() {
     let mut invalid_pruning = valid_client_config(root.join("pruning"));
     invalid_pruning.store.epochs_per_blob_prune = 0;
     assert_eq!(
-        PqRuntimeConfig::new(invalid_pruning, root.join("testnet"))
+        testing_runtime_config(invalid_pruning, root.join("testnet"))
             .testing_only_validate(&spec)
             .expect_err("invalid blob prune period"),
         PqRuntimeConfigError::InvalidStoreConfiguration,
@@ -755,7 +794,7 @@ async fn invalid_genesis_is_rejected_on_owned_blocking_worker_before_runtime_wri
     };
 
     assert!(matches!(
-        PqClient::start_pq_runtime(context, PqRuntimeConfig::new(client, testnet)).await,
+        PqClient::start_pq_runtime(context, testing_runtime_config(client, testnet)).await,
         Err(PqRuntimeError::PublicTestnet(
             PqPublicTestnetError::GenesisDecode(_)
         )),
@@ -808,12 +847,154 @@ async fn jwt_is_parsed_with_the_exact_execution_layer_format_before_genesis() {
     };
 
     assert!(matches!(
-        PqClient::start_pq_runtime(context, PqRuntimeConfig::new(client, testnet)).await,
+        PqClient::start_pq_runtime(context, testing_runtime_config(client, testnet)).await,
         Err(PqRuntimeError::JwtInvalid(_)),
     ));
     assert!(!data_dir.exists());
     assert!(!network_dir.exists());
     std::fs::remove_dir_all(root).expect("remove fixture");
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_reconciliation_precedes_all_network_resources_and_cleans_failure() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time after epoch")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "lighthouse-pq-runtime-reconciliation-order-{}-{unique}",
+        std::process::id()
+    ));
+    let testnet = root.join("testnet");
+    let data_dir = root.join("node");
+    let network_dir = root.join("network");
+    let jwt = root.join("jwt.hex");
+    let spec = Arc::new(
+        ForkName::Electra
+            .make_genesis_spec(MinimalEthSpec::default_spec())
+            .set_slot_duration_ms::<MinimalEthSpec>(300_000),
+    );
+    write_exact_public_testnet(&testnet, &spec);
+    std::fs::write(
+        &jwt,
+        hex::encode(execution_layer::test_utils::DEFAULT_JWT_SECRET),
+    )
+    .expect("JWT fixture");
+    let reserved = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .expect("reserve network port");
+    let network_port = reserved.local_addr().expect("reserved address").port();
+    drop(reserved);
+
+    let engine_runtime = task_executor::test_utils::TestRuntime::default();
+    let engine = execution_layer::test_utils::MockExecutionLayer::<MinimalEthSpec>::new(
+        engine_runtime.task_executor.clone(),
+        Some(0),
+        Some(0),
+        Some(0),
+        None,
+        None,
+        Some(
+            execution_layer::auth::JwtKey::from_slice(
+                &execution_layer::test_utils::DEFAULT_JWT_SECRET,
+            )
+            .expect("MockEngine JWT"),
+        ),
+        Arc::clone(&spec),
+        None,
+    );
+    engine.server.all_payloads_syncing_on_forkchoice_updated();
+    let (entered_sender, entered_receiver) = std::sync::mpsc::sync_channel(1);
+    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let release_hook = Arc::clone(&release);
+    let blocked_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let blocked_once_hook = Arc::clone(&blocked_once);
+    engine
+        .server
+        .ctx
+        .hook
+        .lock()
+        .set_forkchoice_updated_hook(Box::new(move |_, attributes| {
+            assert!(attributes.is_none(), "startup FCU must have no attributes");
+            if !blocked_once_hook.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                entered_sender.send(()).expect("startup observer alive");
+                let (lock, condition) = &*release_hook;
+                let mut released = lock.lock().expect("startup release lock");
+                while !*released {
+                    released = condition.wait(released).expect("startup release wait");
+                }
+            }
+            None
+        }));
+
+    let mut client = valid_client_config(data_dir.clone());
+    client.network.network_dir.clone_from(&network_dir);
+    client
+        .network
+        .set_ipv4_listening_address(std::net::Ipv4Addr::LOCALHOST, network_port, 0, 0);
+    let execution = client.execution_layer.as_mut().expect("execution config");
+    execution.execution_endpoint =
+        Some(SensitiveUrl::parse(&engine.server.url()).expect("MockEngine execution endpoint"));
+    execution.secret_file = Some(jwt);
+    let context = |executor| environment::RuntimeContext {
+        executor,
+        eth_spec_instance: MinimalEthSpec,
+        eth2_config: eth2_config::Eth2Config {
+            eth_spec_id: types::EthSpecId::Minimal,
+            spec: Arc::clone(&spec),
+        },
+        eth2_network_config: None,
+        sse_logging_components: None,
+    };
+    let failed_runtime = task_executor::test_utils::TestRuntime::default();
+    let start = tokio::spawn(PqClient::start_pq_runtime(
+        context(failed_runtime.task_executor.clone()),
+        PqRuntimeConfig::new(client.clone(), testnet.clone()),
+    ));
+    tokio::task::spawn_blocking(move || {
+        entered_receiver
+            .recv_timeout(Duration::from_secs(60))
+            .expect("startup reaches persisted-head FCU")
+    })
+    .await
+    .expect("startup observer task");
+    assert!(!network_dir.exists());
+    let held_port = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, network_port))
+        .expect("network listener must not exist before reconciliation");
+    drop(held_port);
+    let (lock, condition) = &*release;
+    *lock.lock().expect("startup release lock") = true;
+    condition.notify_all();
+    assert!(matches!(
+        start.await.expect("startup task"),
+        Err(PqRuntimeError::ExecutionReconciliation(
+            beacon_chain::PqImportError::ExecutionReconciliation(
+                beacon_chain::PqExecutionReconciliationError::Unavailable { attempts: 3 }
+            )
+        ))
+    ));
+    assert!(!network_dir.exists());
+    let rebound = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, network_port))
+        .expect("failed startup leaves network port restartable");
+    drop(rebound);
+
+    engine.server.all_payloads_valid_on_forkchoice_updated();
+    let recovery_runtime = task_executor::test_utils::TestRuntime::default();
+    let recovered = PqClient::start_pq_runtime(
+        context(recovery_runtime.task_executor.clone()),
+        PqRuntimeConfig::new(client, testnet),
+    )
+    .await
+    .expect("valid startup reconciliation exposes the runtime");
+    assert!(network_dir.exists());
+    recovered
+        .shutdown()
+        .await
+        .expect("recovered runtime shutdown");
+    let rebound = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, network_port))
+        .expect("clean shutdown releases the network port");
+    drop(rebound);
+    std::fs::remove_dir_all(root).expect("remove reconciliation fixture");
 }
 
 #[cfg(target_feature = "avx2")]
@@ -857,7 +1038,7 @@ async fn valid_genesis_disk_configuration_constructs_an_owned_runtime() {
         sse_logging_components: None,
     };
 
-    let handle = PqClient::start_pq_runtime(context, PqRuntimeConfig::new(client, testnet))
+    let handle = PqClient::start_pq_runtime(context, testing_runtime_config(client, testnet))
         .await
         .expect("valid PQ disk runtime");
     handle.shutdown().await.expect("clean PQ runtime shutdown");
@@ -908,7 +1089,7 @@ async fn verifier_http_binds_after_network_and_normalizes_wildcard_port_zero() {
         sse_logging_components: None,
     };
 
-    let handle = PqClient::start_pq_runtime(context, PqRuntimeConfig::new(client, testnet))
+    let handle = PqClient::start_pq_runtime(context, testing_runtime_config(client, testnet))
         .await
         .expect("verifier HTTP runtime");
     let listen = handle
@@ -990,7 +1171,7 @@ async fn http_bind_failure_drains_network_and_allows_immediate_runtime_restart()
 
     let error = match PqClient::start_pq_runtime(
         context(),
-        PqRuntimeConfig::new(client.clone(), testnet.clone()),
+        testing_runtime_config(client.clone(), testnet.clone()),
     )
     .await
     {
@@ -1006,7 +1187,7 @@ async fn http_bind_failure_drains_network_and_allows_immediate_runtime_restart()
     assert!(matches!(error, PqRuntimeError::HttpBind(_)), "{error:?}");
 
     drop(occupied);
-    let restarted = PqClient::start_pq_runtime(context(), PqRuntimeConfig::new(client, testnet))
+    let restarted = PqClient::start_pq_runtime(context(), testing_runtime_config(client, testnet))
         .await
         .expect("bind failure released network, aggregation, and store owners");
     assert_eq!(
@@ -1062,7 +1243,7 @@ async fn http_connection_admission_bounds_idle_partial_headers_and_shutdown() {
         eth2_network_config: None,
         sse_logging_components: None,
     };
-    let handle = PqClient::start_pq_runtime(context, PqRuntimeConfig::new(client, testnet))
+    let handle = PqClient::start_pq_runtime(context, testing_runtime_config(client, testnet))
         .await
         .expect("bounded HTTP runtime");
     let port = handle.http_api_listen_addr().expect("HTTP listener").port();
@@ -1165,7 +1346,7 @@ async fn unexpected_http_exit_signals_process_and_shutdown_still_drains_network(
     };
     let handle = PqClient::start_pq_runtime(
         context(),
-        PqRuntimeConfig::new(client.clone(), testnet.clone()),
+        testing_runtime_config(client.clone(), testnet.clone()),
     )
     .await
     .expect("HTTP runtime");
@@ -1187,7 +1368,7 @@ async fn unexpected_http_exit_signals_process_and_shutdown_still_drains_network(
         Err(PqRuntimeError::HttpUnexpectedExit),
     ));
 
-    let restarted = PqClient::start_pq_runtime(context(), PqRuntimeConfig::new(client, testnet))
+    let restarted = PqClient::start_pq_runtime(context(), testing_runtime_config(client, testnet))
         .await
         .expect("HTTP failure shutdown still drained network and store owners");
     restarted.shutdown().await.expect("restarted shutdown");
@@ -1240,7 +1421,7 @@ async fn from_store_requires_one_exact_public_testnet_load() {
     assert!(matches!(
         PqClient::start_pq_runtime(
             absent_context,
-            PqRuntimeConfig::new(client.clone(), testnet.clone()),
+            testing_runtime_config(client.clone(), testnet.clone()),
         )
         .await,
         Err(PqRuntimeError::PublicTestnet(
@@ -1262,7 +1443,7 @@ async fn from_store_requires_one_exact_public_testnet_load() {
         sse_logging_components: None,
     };
     assert!(matches!(
-        PqClient::start_pq_runtime(corrupt_context, PqRuntimeConfig::new(client, testnet),).await,
+        PqClient::start_pq_runtime(corrupt_context, testing_runtime_config(client, testnet),).await,
         Err(PqRuntimeError::PublicTestnet(
             PqPublicTestnetError::GenesisDecode(_)
         )),
@@ -1338,7 +1519,7 @@ async fn verifier_resume_checks_the_selected_public_identity_before_runtime_owne
 
     let error = match PqClient::start_pq_runtime(
         context,
-        PqRuntimeConfig::new(client, testnet).testing_only_genesis_read_hook(read_hook),
+        testing_runtime_config(client, testnet).testing_only_genesis_read_hook(read_hook),
     )
     .await
     {
@@ -1401,7 +1582,7 @@ async fn from_store_rejects_an_empty_disk_without_starting_runtime_workers() {
     };
 
     assert!(matches!(
-        PqClient::start_pq_runtime(context, PqRuntimeConfig::new(client, testnet)).await,
+        PqClient::start_pq_runtime(context, testing_runtime_config(client, testnet)).await,
         Err(PqRuntimeError::EmptyStoreRequiresGenesis),
     ));
     std::fs::remove_dir_all(root).expect("remove fixture");
@@ -1462,7 +1643,7 @@ async fn caller_cancellation_retains_the_owned_blocking_runtime_until_completion
             released = condition.wait(released).expect("release wait");
         }
     });
-    let config = PqRuntimeConfig::new(client, testnet).testing_only_blocking_hook(hook);
+    let config = testing_runtime_config(client, testnet).testing_only_blocking_hook(hook);
 
     let start = tokio::spawn(PqClient::start_pq_runtime(context, config));
     tokio::time::timeout(std::time::Duration::from_secs(60), entered_receiver)
@@ -1547,7 +1728,7 @@ async fn genesis_state_mode_resumes_from_one_sealed_public_network_load() {
     };
     let first = PqClient::start_pq_runtime(
         first_context,
-        PqRuntimeConfig::new(client.clone(), testnet.clone()),
+        testing_runtime_config(client.clone(), testnet.clone()),
     )
     .await
     .expect("initial disk runtime");
@@ -1585,7 +1766,7 @@ async fn genesis_state_mode_resumes_from_one_sealed_public_network_load() {
     };
     let second = PqClient::start_pq_runtime(
         second_context,
-        PqRuntimeConfig::new(client.clone(), testnet.clone())
+        testing_runtime_config(client.clone(), testnet.clone())
             .testing_only_genesis_read_hook(Arc::clone(&genesis_read_hook)),
     )
     .await
@@ -1616,7 +1797,7 @@ async fn genesis_state_mode_resumes_from_one_sealed_public_network_load() {
     };
     let third_error = match PqClient::start_pq_runtime(
         third_context,
-        PqRuntimeConfig::new(client, testnet).testing_only_genesis_read_hook(genesis_read_hook),
+        testing_runtime_config(client, testnet).testing_only_genesis_read_hook(genesis_read_hook),
     )
     .await
     {
@@ -1684,7 +1865,7 @@ async fn late_network_construction_failure_releases_all_provisional_runtime_owne
     };
 
     assert!(matches!(
-        PqClient::start_pq_runtime(context, PqRuntimeConfig::new(client, testnet)).await,
+        PqClient::start_pq_runtime(context, testing_runtime_config(client, testnet)).await,
         Err(PqRuntimeError::Network(
             network::PqNetworkServiceError::Construction(_)
         )),
@@ -1780,7 +1961,8 @@ async fn proposer_manifest_identity_mismatch_releases_the_prepared_store_without
 
     let error = match PqClient::start_pq_runtime(
         context,
-        PqRuntimeConfig::new(client.clone(), testnet.clone()).with_validator_bundle(bundle.clone()),
+        testing_runtime_config(client.clone(), testnet.clone())
+            .with_validator_bundle(bundle.clone()),
     )
     .await
     {
@@ -1825,7 +2007,8 @@ async fn proposer_manifest_identity_mismatch_releases_the_prepared_store_without
     };
     let error = match PqClient::start_pq_runtime(
         root_context,
-        PqRuntimeConfig::new(client.clone(), testnet.clone()).with_validator_bundle(bundle.clone()),
+        testing_runtime_config(client.clone(), testnet.clone())
+            .with_validator_bundle(bundle.clone()),
     )
     .await
     {
@@ -1868,7 +2051,7 @@ async fn proposer_manifest_identity_mismatch_releases_the_prepared_store_without
         sse_logging_components: None,
     };
     let recovered =
-        PqClient::start_pq_runtime(recovery_context, PqRuntimeConfig::new(client, testnet))
+        PqClient::start_pq_runtime(recovery_context, testing_runtime_config(client, testnet))
             .await
             .expect("invalid bundle authentication must release the prepared store");
     recovered
@@ -1917,7 +2100,7 @@ async fn assert_post_bind_proposer_failure_cleans_all_owners(
     };
     let failure = match PqClient::start_pq_runtime(
         context(),
-        PqRuntimeConfig::new(failure_client.clone(), testnet.clone())
+        testing_runtime_config(failure_client.clone(), testnet.clone())
             .with_validator_bundle(bundle_dir)
             .testing_only_fail_proposer_construction(),
     )
@@ -1946,7 +2129,7 @@ async fn assert_post_bind_proposer_failure_cleans_all_owners(
     );
     drop(failure_slashing);
     let recovered =
-        PqClient::start_pq_runtime(context(), PqRuntimeConfig::new(failure_client, testnet))
+        PqClient::start_pq_runtime(context(), testing_runtime_config(failure_client, testnet))
             .await
             .expect("constructor cleanup releases network, DB, and aggregation owners");
     assert_eq!(
@@ -2083,7 +2266,7 @@ async fn proposer_configuration_constructs_a_sealed_validator_store_owner() {
         eth2_network_config: None,
         sse_logging_components: None,
     };
-    let config = PqRuntimeConfig::new(client.clone(), testnet.clone())
+    let config = testing_runtime_config(client.clone(), testnet.clone())
         .with_validator_bundle(bundle_dir.clone());
 
     let handle = PqClient::start_pq_runtime(context, config)
@@ -2140,7 +2323,7 @@ async fn proposer_configuration_constructs_a_sealed_validator_store_owner() {
     };
     let restarted = PqClient::start_pq_runtime(
         restart_context,
-        PqRuntimeConfig::new(client.clone(), testnet.clone())
+        testing_runtime_config(client.clone(), testnet.clone())
             .with_validator_bundle(bundle_dir.clone()),
     )
     .await
@@ -2199,7 +2382,7 @@ async fn proposer_configuration_constructs_a_sealed_validator_store_owner() {
     };
     let cancelled_start = tokio::spawn(PqClient::start_pq_runtime(
         cancelled_context,
-        PqRuntimeConfig::new(cancelled_client.clone(), testnet.clone())
+        testing_runtime_config(cancelled_client.clone(), testnet.clone())
             .with_validator_bundle(bundle_dir.clone())
             .testing_only_bundle_auth_barriers(
                 Arc::clone(&auth_entered),
@@ -2224,7 +2407,7 @@ async fn proposer_configuration_constructs_a_sealed_validator_store_owner() {
     };
     match PqClient::start_pq_runtime(
         contender_context,
-        PqRuntimeConfig::new(cancelled_client.clone(), testnet.clone()),
+        testing_runtime_config(cancelled_client.clone(), testnet.clone()),
     )
     .await
     {
@@ -2277,7 +2460,7 @@ async fn proposer_configuration_constructs_a_sealed_validator_store_owner() {
         std::time::Duration::from_secs(10),
         PqClient::start_pq_runtime(
             recovered_context,
-            PqRuntimeConfig::new(cancelled_client, testnet.clone()),
+            testing_runtime_config(cancelled_client, testnet.clone()),
         ),
     )
     .await
@@ -2346,7 +2529,7 @@ async fn proposer_configuration_constructs_a_sealed_validator_store_owner() {
     };
     let mismatch_error = match PqClient::start_pq_runtime(
         mismatch_context,
-        PqRuntimeConfig::new(mismatched_client, testnet)
+        testing_runtime_config(mismatched_client, testnet)
             .with_validator_bundle(bundle_dir.clone())
             .testing_only_genesis_read_hook(genesis_read_hook),
     )

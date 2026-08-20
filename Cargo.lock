@@ -7271,6 +7271,7 @@ dependencies = [
  "eth2",
  "ethereum_ssz",
  "execution_layer",
+ "fork_choice",
  "futures",
  "hex",
  "initialized_validators",

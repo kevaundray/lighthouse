@@ -1,7 +1,8 @@
 use beacon_chain::{
     BeaconChain, BeaconChainTypes, PqAggregateGossipPropagationToken, PqAttestationGossipError,
     PqBlockImportOutcome, PqBlockImportRequest, PqForwardRangeError, PqGossipCommitToken,
-    PqGossipObservation, PqGossipPropagationToken, PqImportError, PqSingleGossipPropagationToken,
+    PqGossipObservation, PqGossipPropagationToken, PqImportError, PqKnownPublishObservation,
+    PqSingleGossipPropagationToken,
 };
 use std::sync::Arc;
 use types::{SignedAggregateAndProof, SignedBeaconBlock, SingleAttestation, SubnetId};
@@ -120,6 +121,16 @@ impl<T: BeaconChainTypes> PqNetworkBlockProcessor<T> {
         &self,
         block: Arc<SignedBeaconBlock<T::EthSpec>>,
     ) -> PqGossipBlockDisposition<T> {
+        match self.chain.known_pq_publish_observation(&block) {
+            Some(PqKnownPublishObservation::Pending) => {
+                return PqGossipBlockDisposition::IgnorePending;
+            }
+            Some(PqKnownPublishObservation::Committed)
+            | Some(PqKnownPublishObservation::Terminal) => {
+                return PqGossipBlockDisposition::IgnoreTerminal;
+            }
+            None => {}
+        }
         match self
             .chain
             .verify_pq_block(PqBlockImportRequest::gossip(block))

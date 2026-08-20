@@ -54,7 +54,13 @@ fn detached_commit_resolution_releases_only_exact_retryable_commit_failures() {
         PqCommitResolutionTestCase::ParentUnavailable,
     ));
     assert!(!testing_only_pq_commit_resolution(
+        PqCommitResolutionTestCase::ReconciliationFailure,
+    ));
+    assert!(!testing_only_pq_commit_resolution(
         PqCommitResolutionTestCase::TerminalObservation,
+    ));
+    assert!(!testing_only_pq_commit_resolution(
+        PqCommitResolutionTestCase::DurableStateUnknown,
     ));
 }
 
@@ -291,6 +297,22 @@ impl PqNewPayloadTransport<MinimalEthSpec> for UnusedValidTransport {
     fn notify_new_payload<'a>(
         &'a self,
         _request: execution_layer::NewPayloadRequest<'a, MinimalEthSpec>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<execution_layer::PayloadStatus, execution_layer::Error>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async { Ok(execution_layer::PayloadStatus::Valid) })
+    }
+
+    fn notify_forkchoice_updated<'a>(
+        &'a self,
+        _head_block_hash: types::ExecutionBlockHash,
+        _current_slot: types::Slot,
+        _head_block_root: Hash256,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<

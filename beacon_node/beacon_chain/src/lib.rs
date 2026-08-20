@@ -160,6 +160,9 @@ pub mod validator_monitor;
 #[cfg(not(feature = "pq-devnet"))]
 pub mod validator_pubkey_cache;
 
+#[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
+#[doc(hidden)]
+pub use self::beacon_chain::testing_only_pq_import_drain_race;
 #[cfg(not(feature = "pq-devnet"))]
 pub use self::beacon_chain::{
     AttestationProcessingOutcome, AvailabilityProcessingStatus, BeaconBlockResponse,
@@ -195,18 +198,21 @@ pub use self::pq_attestation_gossip::{
 };
 #[cfg(feature = "pq-devnet")]
 pub use self::pq_import::{
-    PQ_BLOCK_IMPORT_ADMISSION_CAPACITY, PQ_FORWARD_RANGE_BLOCK_CAPACITY, PqBlockImportOutcome,
-    PqBlockImportRequest, PqBlockImportSource, PqEnginePayloadDisposition, PqEnginePayloadStatus,
-    PqForwardRangeError, PqGossipCommitToken, PqGossipObservation, PqGossipPropagationToken,
-    PqImportError, PqImportLocalError, PqImportPeerInvalid, PqKnownPublishObservation,
-    PqPublishCommitOutcome, PqPublishCommitToken, PqPublishObservation, PqPublishPromotion,
-    PqPublishPropagationToken, PqVerifiedBlockImport, classify_pq_engine_payload_status,
+    PQ_BLOCK_IMPORT_ADMISSION_CAPACITY, PQ_EXECUTION_RECONCILIATION_ATTEMPTS,
+    PQ_FORWARD_RANGE_BLOCK_CAPACITY, PqBlockImportOutcome, PqBlockImportRequest,
+    PqBlockImportSource, PqEnginePayloadDisposition, PqEnginePayloadStatus,
+    PqExecutionReconciliationError, PqForwardRangeError, PqGossipCommitToken, PqGossipObservation,
+    PqGossipPropagationToken, PqImportError, PqImportLocalError, PqImportPeerInvalid,
+    PqKnownPublishObservation, PqPublishCommitOutcome, PqPublishCommitToken, PqPublishObservation,
+    PqPublishPromotion, PqPublishPropagationToken, PqVerifiedBlockImport,
+    classify_pq_engine_payload_status,
 };
 #[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
 pub use self::pq_import::{
     PqNewPayloadTransport, TestingPqBlockingHook, TestingPqExternalReservation,
     TestingPqGossipClaim, TestingPqGossipFinish, TestingPqGossipObservationCache,
-    TestingPqPublishPromotionResolution,
+    TestingPqPublishPromotionResolution, testing_only_persisted_pq_execution_head,
+    testing_only_reconcile_pq_execution,
 };
 #[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
 #[doc(hidden)]

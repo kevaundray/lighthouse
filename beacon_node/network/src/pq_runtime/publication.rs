@@ -204,8 +204,16 @@ impl<T: BeaconChainTypes> PqBlockPublicationService<T> {
         block: Arc<SignedBeaconBlock<T::EthSpec>>,
     ) -> PqBlockPublicationDisposition {
         match self.chain.known_pq_publish_observation(&block) {
+            Some(PqKnownPublishObservation::Pending) => {
+                return PqBlockPublicationDisposition::Pending;
+            }
             Some(PqKnownPublishObservation::Committed) => {
                 return PqBlockPublicationDisposition::Committed;
+            }
+            Some(PqKnownPublishObservation::Terminal) => {
+                return PqBlockPublicationDisposition::Terminal(
+                    PqBlockPublicationTerminal::Rejected,
+                );
             }
             None => {}
         }
@@ -245,6 +253,7 @@ impl<T: BeaconChainTypes> PqBlockPublicationService<T> {
                         Err(error) => classify_import_error(error),
                     },
                     PqPublishPromotion::Committed => PqBlockPublicationDisposition::Committed,
+                    PqPublishPromotion::Pending => PqBlockPublicationDisposition::Pending,
                     PqPublishPromotion::Terminal => PqBlockPublicationDisposition::Terminal(
                         PqBlockPublicationTerminal::Rejected,
                     ),
@@ -334,7 +343,10 @@ fn classify_broadcast_error(error: PqBlockBroadcastError) -> PqBlockPublicationD
 fn classify_import_error(error: PqImportError) -> PqBlockPublicationDisposition {
     match error {
         PqImportError::PeerInvalid(_) => PqBlockPublicationDisposition::Invalid(error),
-        PqImportError::ExecutionRejected(_) | PqImportError::TerminalObservation { .. } => {
+        PqImportError::ExecutionRejected(_)
+        | PqImportError::ExecutionReconciliation(_)
+        | PqImportError::DurableStateUnknown { .. }
+        | PqImportError::TerminalObservation { .. } => {
             PqBlockPublicationDisposition::Terminal(PqBlockPublicationTerminal::Rejected)
         }
         PqImportError::StaleHeadAfterVerification { .. } => {

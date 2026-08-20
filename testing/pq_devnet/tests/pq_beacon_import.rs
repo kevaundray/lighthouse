@@ -10,7 +10,7 @@ use beacon_chain::{
     TestingPqAttestationObservationCache, TestingPqExternalReservation, TestingPqGossipClaim,
     TestingPqGossipFinish, TestingPqGossipObservationCache, classify_pq_engine_payload_status,
     testing_only_pq_attestation_advance_distance, testing_only_pq_attestation_late_window,
-    testing_only_pq_attestation_target_root,
+    testing_only_pq_attestation_target_root, testing_only_pq_import_drain_race,
 };
 #[cfg(target_feature = "avx2")]
 use consensus_signature::{
@@ -48,6 +48,14 @@ use types::{
     SignedAggregateAndProof, SignedRoot, SingleAttestation, SubnetId,
 };
 use types::{Hash256, Slot};
+
+#[tokio::test]
+async fn pq_import_drain_cannot_lose_final_activity() {
+    assert!(
+        testing_only_pq_import_drain_race().await,
+        "dropping the final activity before the drain await must still complete"
+    );
+}
 
 #[test]
 fn pq_attestation_errors_expose_nested_local_causes() {
@@ -450,6 +458,200 @@ fn real_engine_responses_have_typed_commit_retry_and_reject_mapping() {
     assert!(transport.is_retryable());
 }
 
+#[cfg(target_feature = "avx2")]
+async fn run_reconciliation_outcome_case(
+    responses: impl IntoIterator<Item = Result<execution_layer::PayloadStatus, execution_layer::Error>>,
+) -> (
+    Result<(), PqImportError>,
+    Arc<ReconciliationOutcomeTransport>,
+    futures::channel::mpsc::Receiver<task_executor::ShutdownReason>,
+    async_channel::Sender<()>,
+) {
+    let transport = Arc::new(ReconciliationOutcomeTransport::new(responses));
+    let (exit_sender, exit_receiver) = async_channel::bounded(1);
+    let (shutdown_sender, shutdown_receiver) = futures::channel::mpsc::channel(1);
+    let executor = task_executor::TaskExecutor::new(
+        tokio::runtime::Handle::current(),
+        exit_receiver,
+        shutdown_sender,
+    );
+    let result = beacon_chain::testing_only_reconcile_pq_execution(
+        transport.clone(),
+        executor,
+        types::ExecutionBlockHash::repeat_byte(0x81),
+        Slot::new(1),
+        Hash256::repeat_byte(0x82),
+    )
+    .await;
+    (result, transport, shutdown_receiver, exit_sender)
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn committed_execution_reconciliation_has_bounded_terminal_outcomes() {
+    use execution_layer::PayloadStatus;
+    use futures::StreamExt;
+
+    let (valid, valid_transport, _, _valid_exit) =
+        run_reconciliation_outcome_case([Ok(PayloadStatus::Valid)]).await;
+    assert!(valid.is_ok());
+    assert_eq!(valid_transport.forkchoice_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(valid_transport.new_payload_calls.load(Ordering::SeqCst), 0);
+
+    let (transient, transient_transport, _, _transient_exit) = run_reconciliation_outcome_case([
+        Ok(PayloadStatus::Syncing),
+        Ok(PayloadStatus::Accepted),
+        Ok(PayloadStatus::Valid),
+    ])
+    .await;
+    assert!(transient.is_ok());
+    assert_eq!(
+        transient_transport.forkchoice_calls.load(Ordering::SeqCst),
+        3
+    );
+    assert_eq!(
+        transient_transport.new_payload_calls.load(Ordering::SeqCst),
+        0
+    );
+
+    let (transport_retry, transport_retry_transport, _, _transport_exit) =
+        run_reconciliation_outcome_case([
+            Err(execution_layer::Error::NoEngine),
+            Ok(PayloadStatus::Valid),
+        ])
+        .await;
+    assert!(transport_retry.is_ok());
+    assert_eq!(
+        transport_retry_transport
+            .forkchoice_calls
+            .load(Ordering::SeqCst),
+        2
+    );
+    assert_eq!(
+        transport_retry_transport
+            .new_payload_calls
+            .load(Ordering::SeqCst),
+        0
+    );
+
+    let (exhausted, exhausted_transport, mut exhausted_shutdown, _exhausted_exit) =
+        run_reconciliation_outcome_case([
+            Ok(PayloadStatus::Syncing),
+            Ok(PayloadStatus::Accepted),
+            Ok(PayloadStatus::Syncing),
+        ])
+        .await;
+    assert!(matches!(
+        exhausted,
+        Err(PqImportError::ExecutionReconciliation(
+            beacon_chain::PqExecutionReconciliationError::Unavailable { attempts: 3 }
+        ))
+    ));
+    assert!(
+        !exhausted
+            .as_ref()
+            .expect_err("bounded exhaustion")
+            .is_retryable()
+    );
+    assert!(
+        !exhausted
+            .as_ref()
+            .expect_err("bounded exhaustion")
+            .should_penalize_peer()
+    );
+    assert_eq!(
+        exhausted_transport.forkchoice_calls.load(Ordering::SeqCst),
+        beacon_chain::PQ_EXECUTION_RECONCILIATION_ATTEMPTS
+    );
+    assert_eq!(
+        exhausted_transport.new_payload_calls.load(Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        exhausted_shutdown.next().await,
+        Some(task_executor::ShutdownReason::Failure(
+            "PQ execution reconciliation failed"
+        ))
+    );
+
+    let (transport_exhausted, transport_exhausted_trace, mut transport_shutdown, _exit) =
+        run_reconciliation_outcome_case([
+            Err(execution_layer::Error::NoEngine),
+            Err(execution_layer::Error::NoEngine),
+            Err(execution_layer::Error::NoEngine),
+        ])
+        .await;
+    assert!(matches!(
+        &transport_exhausted,
+        Err(PqImportError::ExecutionReconciliation(
+            beacon_chain::PqExecutionReconciliationError::Transport { attempts: 3, .. }
+        ))
+    ));
+    assert!(
+        !transport_exhausted
+            .as_ref()
+            .expect_err("bounded transport exhaustion")
+            .is_retryable()
+    );
+    assert_eq!(
+        transport_exhausted_trace
+            .forkchoice_calls
+            .load(Ordering::SeqCst),
+        beacon_chain::PQ_EXECUTION_RECONCILIATION_ATTEMPTS
+    );
+    assert_eq!(
+        transport_exhausted_trace
+            .new_payload_calls
+            .load(Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        transport_shutdown.next().await,
+        Some(task_executor::ShutdownReason::Failure(
+            "PQ execution reconciliation failed"
+        ))
+    );
+
+    for rejected in [
+        PayloadStatus::Invalid {
+            latest_valid_hash: None,
+            validation_error: Some("invalid reconciliation head".to_owned()),
+        },
+        PayloadStatus::InvalidBlockHash {
+            validation_error: Some("invalid reconciliation hash".to_owned()),
+        },
+    ] {
+        let (result, transport, mut shutdown, _exit) =
+            run_reconciliation_outcome_case([Ok(rejected)]).await;
+        assert!(matches!(
+            result,
+            Err(PqImportError::ExecutionReconciliation(
+                beacon_chain::PqExecutionReconciliationError::Rejected(_)
+            ))
+        ));
+        assert!(
+            !result
+                .as_ref()
+                .expect_err("Engine rejection")
+                .is_retryable()
+        );
+        assert!(
+            !result
+                .as_ref()
+                .expect_err("Engine rejection")
+                .should_penalize_peer()
+        );
+        assert_eq!(transport.forkchoice_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.new_payload_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            shutdown.next().await,
+            Some(task_executor::ShutdownReason::Failure(
+                "PQ execution reconciliation failed"
+            ))
+        );
+    }
+}
+
 #[test]
 fn slot_ordering_is_a_peer_invalid_error() {
     let error = PqImportError::PeerInvalid(PqImportPeerInvalid::NonAdvancingSlot {
@@ -676,6 +878,9 @@ type TestWitness = Witness<slot_clock::TestingSlotClock, MinimalEthSpec, MemoryS
 struct RecordingTransport {
     calls: Mutex<Vec<Hash256>>,
     responses: Mutex<VecDeque<Result<execution_layer::PayloadStatus, execution_layer::Error>>>,
+    forkchoice_calls: Mutex<Vec<types::ExecutionBlockHash>>,
+    forkchoice_responses:
+        Mutex<VecDeque<Result<execution_layer::PayloadStatus, execution_layer::Error>>>,
 }
 
 #[cfg(target_feature = "avx2")]
@@ -684,6 +889,10 @@ impl RecordingTransport {
         Self {
             calls: Mutex::new(Vec::new()),
             responses: Mutex::new(VecDeque::from([Ok(execution_layer::PayloadStatus::Valid)])),
+            forkchoice_calls: Mutex::new(Vec::new()),
+            forkchoice_responses: Mutex::new(VecDeque::from([Ok(
+                execution_layer::PayloadStatus::Valid,
+            )])),
         }
     }
 
@@ -695,6 +904,10 @@ impl RecordingTransport {
                 Ok(execution_layer::PayloadStatus::Valid),
                 Ok(execution_layer::PayloadStatus::Valid),
             ])),
+            forkchoice_calls: Mutex::new(Vec::new()),
+            forkchoice_responses: Mutex::new(VecDeque::from([Ok(
+                execution_layer::PayloadStatus::Valid,
+            )])),
         }
     }
 
@@ -706,6 +919,8 @@ impl RecordingTransport {
                     validation_error: Some("fixture rejection".to_owned()),
                 },
             )])),
+            forkchoice_calls: Mutex::new(Vec::new()),
+            forkchoice_responses: Mutex::new(VecDeque::new()),
         }
     }
 }
@@ -737,12 +952,191 @@ impl PqNewPayloadTransport<MinimalEthSpec> for RecordingTransport {
             )));
         Box::pin(async move { response })
     }
+
+    fn notify_forkchoice_updated<'a>(
+        &'a self,
+        head_block_hash: types::ExecutionBlockHash,
+        _current_slot: Slot,
+        _head_block_root: Hash256,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<execution_layer::PayloadStatus, execution_layer::Error>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        self.forkchoice_calls
+            .lock()
+            .expect("recording forkchoice calls lock")
+            .push(head_block_hash);
+        let response = self
+            .forkchoice_responses
+            .lock()
+            .expect("recording forkchoice responses lock")
+            .pop_front()
+            .unwrap_or(Err(execution_layer::Error::Unexpected(
+                "missing explicit fixture forkchoice response".to_owned(),
+            )));
+        Box::pin(async move { response })
+    }
 }
 
 #[cfg(target_feature = "avx2")]
 struct StallingTransport {
     calls: AtomicUsize,
     release: tokio::sync::Semaphore,
+}
+
+#[cfg(target_feature = "avx2")]
+struct BlockingForkchoiceTransport {
+    new_payload_calls: AtomicUsize,
+    forkchoice_calls: AtomicUsize,
+    forkchoice_dropped: AtomicBool,
+    forkchoice_release: tokio::sync::Semaphore,
+}
+
+#[cfg(target_feature = "avx2")]
+struct ReconciliationOutcomeTransport {
+    new_payload_calls: AtomicUsize,
+    forkchoice_calls: AtomicUsize,
+    forkchoice_responses:
+        Mutex<VecDeque<Result<execution_layer::PayloadStatus, execution_layer::Error>>>,
+}
+
+#[cfg(target_feature = "avx2")]
+impl ReconciliationOutcomeTransport {
+    fn new(
+        responses: impl IntoIterator<
+            Item = Result<execution_layer::PayloadStatus, execution_layer::Error>,
+        >,
+    ) -> Self {
+        Self {
+            new_payload_calls: AtomicUsize::new(0),
+            forkchoice_calls: AtomicUsize::new(0),
+            forkchoice_responses: Mutex::new(responses.into_iter().collect()),
+        }
+    }
+}
+
+#[cfg(target_feature = "avx2")]
+impl PqNewPayloadTransport<MinimalEthSpec> for ReconciliationOutcomeTransport {
+    fn notify_new_payload<'a>(
+        &'a self,
+        _request: execution_layer::NewPayloadRequest<'a, MinimalEthSpec>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<execution_layer::PayloadStatus, execution_layer::Error>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        self.new_payload_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Err(execution_layer::Error::Unexpected(
+                "reconciliation helper called newPayload".to_owned(),
+            ))
+        })
+    }
+
+    fn notify_forkchoice_updated<'a>(
+        &'a self,
+        _head_block_hash: types::ExecutionBlockHash,
+        _current_slot: Slot,
+        _head_block_root: Hash256,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<execution_layer::PayloadStatus, execution_layer::Error>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        self.forkchoice_calls.fetch_add(1, Ordering::SeqCst);
+        let response = self
+            .forkchoice_responses
+            .lock()
+            .expect("reconciliation response lock")
+            .pop_front()
+            .unwrap_or(Err(execution_layer::Error::Unexpected(
+                "reconciliation exceeded explicit response table".to_owned(),
+            )));
+        Box::pin(async move { response })
+    }
+}
+
+#[cfg(target_feature = "avx2")]
+impl BlockingForkchoiceTransport {
+    fn new() -> Self {
+        Self {
+            new_payload_calls: AtomicUsize::new(0),
+            forkchoice_calls: AtomicUsize::new(0),
+            forkchoice_dropped: AtomicBool::new(false),
+            forkchoice_release: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+#[cfg(target_feature = "avx2")]
+impl PqNewPayloadTransport<MinimalEthSpec> for BlockingForkchoiceTransport {
+    fn notify_new_payload<'a>(
+        &'a self,
+        _request: execution_layer::NewPayloadRequest<'a, MinimalEthSpec>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<execution_layer::PayloadStatus, execution_layer::Error>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        self.new_payload_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(execution_layer::PayloadStatus::Valid) })
+    }
+
+    fn notify_forkchoice_updated<'a>(
+        &'a self,
+        _head_block_hash: types::ExecutionBlockHash,
+        _current_slot: Slot,
+        _head_block_root: Hash256,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<execution_layer::PayloadStatus, execution_layer::Error>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        struct DropTrace<'a> {
+            dropped: &'a AtomicBool,
+            armed: bool,
+        }
+
+        impl Drop for DropTrace<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.dropped.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+
+        self.forkchoice_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            let mut trace = DropTrace {
+                dropped: &self.forkchoice_dropped,
+                armed: true,
+            };
+            let permit = self.forkchoice_release.acquire().await.map_err(|_| {
+                execution_layer::Error::Unexpected(
+                    "blocking forkchoice transport closed".to_owned(),
+                )
+            })?;
+            permit.forget();
+            trace.armed = false;
+            Ok(execution_layer::PayloadStatus::Valid)
+        })
+    }
 }
 
 #[cfg(target_feature = "avx2")]
@@ -776,6 +1170,22 @@ impl PqNewPayloadTransport<MinimalEthSpec> for StallingTransport {
             permit.forget();
             Ok(execution_layer::PayloadStatus::Valid)
         })
+    }
+
+    fn notify_forkchoice_updated<'a>(
+        &'a self,
+        _head_block_hash: types::ExecutionBlockHash,
+        _current_slot: Slot,
+        _head_block_root: Hash256,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<execution_layer::PayloadStatus, execution_layer::Error>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async { Ok(execution_layer::PayloadStatus::Valid) })
     }
 }
 
@@ -1281,6 +1691,132 @@ async fn full_gossip_verification_precedes_observation_engine_commit_and_restart
     );
     let signed = Arc::new(SignedBeaconBlock::from_block(block, proposal_signature));
 
+    let cancellation_transport = Arc::new(BlockingForkchoiceTransport::new());
+    let (executor_exit_sender, executor_exit_receiver) = async_channel::bounded(1);
+    let (executor_shutdown_sender, _executor_shutdown_receiver) =
+        futures::channel::mpsc::channel(1);
+    let cancellation_executor = task_executor::TaskExecutor::new(
+        tokio::runtime::Handle::current(),
+        executor_exit_receiver,
+        executor_shutdown_sender,
+    );
+    let cancellation_chain = Arc::new(
+        BeaconChainBuilder::<TestWitness>::pq_new(MinimalEthSpec)
+            .store(exact_snapshot_store(Arc::clone(&spec)))
+            .custom_spec(Arc::clone(&spec))
+            .genesis_state(genesis.clone())
+            .expect("persist reconciliation-cancellation genesis")
+            .pq_aggregation_service(Arc::clone(&service))
+            .task_executor(cancellation_executor)
+            .testing_only_pq_execution_notifier(cancellation_transport.clone())
+            .build()
+            .expect("reconciliation-cancellation PQ chain"),
+    );
+    cancellation_chain.slot_clock.set_slot(2);
+    let cancellation_processor = Arc::new(PqNetworkBlockProcessor::new(Arc::clone(
+        &cancellation_chain,
+    )));
+    let canceled_reconciliation = {
+        let processor = Arc::clone(&cancellation_processor);
+        let block = Arc::clone(&signed);
+        tokio::spawn(async move { processor.import_rpc_block(block).await })
+    };
+    wait_for_test_condition(
+        || {
+            cancellation_transport
+                .forkchoice_calls
+                .load(Ordering::SeqCst)
+                == 1
+        },
+        "post-commit forkchoice reconciliation barrier",
+    )
+    .await;
+    assert_eq!(
+        cancellation_transport
+            .new_payload_calls
+            .load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        cancellation_chain.head_snapshot().beacon_block_root,
+        signed.canonical_root(),
+        "the durable head is published before reconciliation"
+    );
+    assert_eq!(
+        cancellation_chain.testing_only_pq_import_available_permits(),
+        PQ_BLOCK_IMPORT_ADMISSION_CAPACITY - 1,
+        "the detached reconciliation retains admission after DB publication"
+    );
+    canceled_reconciliation.abort();
+    assert!(canceled_reconciliation.await.is_err());
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !cancellation_transport
+            .forkchoice_dropped
+            .load(Ordering::SeqCst),
+        "caller cancellation must not cancel the chain-owned reconciliation"
+    );
+    assert_eq!(
+        cancellation_chain.testing_only_pq_import_available_permits(),
+        PQ_BLOCK_IMPORT_ADMISSION_CAPACITY - 1
+    );
+
+    drop(executor_exit_sender);
+    for _ in 0..256 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !cancellation_transport
+            .forkchoice_dropped
+            .load(Ordering::SeqCst),
+        "executor exit must not cancel a durable-but-unreconciled head"
+    );
+    assert_eq!(
+        cancellation_chain.testing_only_pq_import_available_permits(),
+        PQ_BLOCK_IMPORT_ADMISSION_CAPACITY - 1,
+        "executor exit must not release commit authority before reconciliation"
+    );
+    let reconciliation_drain = {
+        let chain = Arc::clone(&cancellation_chain);
+        tokio::spawn(async move { chain.close_and_drain_pq_imports().await })
+    };
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !reconciliation_drain.is_finished(),
+        "chain shutdown must await the retained reconciliation"
+    );
+    cancellation_transport.forkchoice_release.add_permits(1);
+    reconciliation_drain
+        .await
+        .expect("reconciliation drain task");
+    assert_eq!(
+        cancellation_chain.testing_only_pq_import_available_permits(),
+        PQ_BLOCK_IMPORT_ADMISSION_CAPACITY
+    );
+    assert!(
+        !cancellation_transport
+            .forkchoice_dropped
+            .load(Ordering::SeqCst),
+        "successful reconciliation disarms cancellation tracing"
+    );
+    assert_eq!(
+        cancellation_chain.known_pq_publish_observation(signed.as_ref()),
+        Some(beacon_chain::PqKnownPublishObservation::Committed),
+        "only the reconciled exact head becomes a committed fast path"
+    );
+    assert!(matches!(
+        cancellation_processor
+            .import_lookup_block(Arc::clone(&signed))
+            .await,
+        Err(PqImportError::Local(PqImportLocalError::Transport(
+            execution_layer::Error::ShuttingDown
+        )))
+    ));
+
     let wrong_root_journal_path = temporary_directory.path().join("xmss_wrong_root.sqlite");
     let wrong_root_keystore = PqKeystore::from_seed([0xa5; 32], 0..=maximum_leaf, PASSWORD)
         .expect("wrong-root fixture keystore");
@@ -1464,11 +2000,15 @@ async fn full_gossip_verification_precedes_observation_engine_commit_and_restart
             .expect("late non-canonical-lineage check")
     );
     assert_eq!(transport.calls.lock().expect("calls lock").len(), 3);
-    assert!(matches!(
-        processor.commit_gossip_block(queued_before_range).await,
-        Err(PqImportError::TerminalObservation { block_root })
-            if block_root == outcome.block_root
-    ));
+    let queued_after_range = processor.commit_gossip_block(queued_before_range).await;
+    assert!(
+        matches!(
+            queued_after_range,
+            Err(PqImportError::TerminalObservation { block_root })
+                if block_root == outcome.block_root
+        ),
+        "queued gossip after range resolved as {queued_after_range:?}"
+    );
     assert_eq!(transport.calls.lock().expect("calls lock").len(), 3);
 
     let restarted = BeaconChainBuilder::<TestWitness>::pq_new(MinimalEthSpec)

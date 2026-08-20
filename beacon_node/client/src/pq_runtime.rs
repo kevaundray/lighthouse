@@ -8,7 +8,7 @@ use consensus_signature::AggregationService;
 use consensus_signature::PqValidatorRegistryEntry;
 use environment::RuntimeContext;
 use futures::FutureExt;
-use lighthouse_network::{Context, NetworkGlobals, identity::Keypair, load_private_key};
+use lighthouse_network::{Context, NetworkGlobals, load_private_key};
 #[cfg(feature = "pq-proposer")]
 use lighthouse_validator_store::{Config as ValidatorStoreConfig, LighthouseValidatorStore};
 use network::{
@@ -398,7 +398,6 @@ struct PqBlockingRuntime {
     validator_store: Option<Arc<PqValidatorStore>>,
     network_config: Arc<network::NetworkConfig>,
     http_api_config: crate::config::PqHttpApiConfig,
-    local_keypair: Keypair,
     #[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
     fail_proposer_construction: bool,
 }
@@ -457,12 +456,14 @@ async fn cleanup_pq_post_bind_owners(
     http_shutdown: Option<PqHttpServerShutdown>,
     broadcaster: PqBlockBroadcastSender<MinimalEthSpec>,
     network_shutdown: PqNetworkServiceShutdown,
+    chain: Arc<PqDiskChain>,
 ) {
     if let Some(http_shutdown) = http_shutdown {
         let _ = http_shutdown.wait().await;
     }
     drop(broadcaster);
     let _ = network_shutdown.wait().await;
+    chain.close_and_drain_pq_imports().await;
 }
 
 struct PqHttpConnection {
@@ -982,6 +983,8 @@ pub struct PqRuntimeConfig {
     blocking_test_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(feature = "pq-startup-testing")]
     genesis_read_test_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(feature = "pq-startup-testing")]
+    execution_notifier: Option<Arc<dyn beacon_chain::PqNewPayloadTransport<MinimalEthSpec>>>,
     #[cfg(all(feature = "pq-startup-testing", feature = "pq-proposer"))]
     bundle_auth_test_barriers: Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>,
     #[cfg(all(feature = "pq-startup-testing", feature = "pq-proposer"))]
@@ -1009,6 +1012,8 @@ impl PqRuntimeConfig {
             blocking_test_hook: None,
             #[cfg(feature = "pq-startup-testing")]
             genesis_read_test_hook: None,
+            #[cfg(feature = "pq-startup-testing")]
+            execution_notifier: None,
             #[cfg(all(feature = "pq-startup-testing", feature = "pq-proposer"))]
             bundle_auth_test_barriers: None,
             #[cfg(all(feature = "pq-startup-testing", feature = "pq-proposer"))]
@@ -1032,6 +1037,16 @@ impl PqRuntimeConfig {
     #[doc(hidden)]
     pub fn testing_only_genesis_read_hook(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
         self.genesis_read_test_hook = Some(hook);
+        self
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_execution_notifier(
+        mut self,
+        notifier: Arc<dyn beacon_chain::PqNewPayloadTransport<MinimalEthSpec>>,
+    ) -> Self {
+        self.execution_notifier = Some(notifier);
         self
     }
 
@@ -1127,6 +1142,8 @@ impl PqRuntimeConfig {
             blocking_test_hook: self.blocking_test_hook,
             #[cfg(feature = "pq-startup-testing")]
             genesis_read_test_hook: self.genesis_read_test_hook,
+            #[cfg(feature = "pq-startup-testing")]
+            execution_notifier: self.execution_notifier,
             #[cfg(all(feature = "pq-startup-testing", feature = "pq-proposer"))]
             bundle_auth_test_barriers: self.bundle_auth_test_barriers,
             #[cfg(all(feature = "pq-startup-testing", feature = "pq-proposer"))]
@@ -1189,6 +1206,8 @@ pub struct PqRuntimePlan {
     blocking_test_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(feature = "pq-startup-testing")]
     genesis_read_test_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(feature = "pq-startup-testing")]
+    execution_notifier: Option<Arc<dyn beacon_chain::PqNewPayloadTransport<MinimalEthSpec>>>,
     #[cfg(all(feature = "pq-startup-testing", feature = "pq-proposer"))]
     bundle_auth_test_barriers: Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>,
     #[cfg(all(feature = "pq-startup-testing", feature = "pq-proposer"))]
@@ -1535,12 +1554,18 @@ impl PqRuntimeOwner {
                         )
                         .map_err(PqRuntimeError::Execution)?,
                     );
-                    let chain = builder
+                    let chain_builder = builder
                         .pq_aggregation_service(aggregation)
                         .pq_execution_layer(execution)
-                        .task_executor(blocking_executor.clone())
-                        .build()
-                        .map_err(PqRuntimeError::Chain)?;
+                        .task_executor(blocking_executor.clone());
+                    #[cfg(feature = "pq-startup-testing")]
+                    let chain_builder = match plan.execution_notifier.as_ref() {
+                        Some(notifier) => {
+                            chain_builder.testing_only_pq_execution_notifier(notifier.clone())
+                        }
+                        None => chain_builder,
+                    };
+                    let chain = chain_builder.build().map_err(PqRuntimeError::Chain)?;
                     let chain = Arc::new(chain);
                     #[cfg(feature = "pq-proposer")]
                     let validator_store = match (initialized_validators, plan.proposer.as_ref()) {
@@ -1596,22 +1621,14 @@ impl PqRuntimeOwner {
                     if let Some(hook) = plan.blocking_test_hook.as_ref() {
                         hook();
                     }
-                    std::fs::create_dir_all(&plan.network_dir).map_err(|error| {
-                        PqRuntimeError::Directory {
-                            path: plan.network_dir.clone(),
-                            error,
-                        }
-                    })?;
                     let network_config = Arc::new(plan.client.network.clone());
                     let http_api_config = plan.client.http_api.clone();
-                    let local_keypair = load_private_key(&network_config);
                     Ok::<_, PqRuntimeError>(PqBlockingRuntime {
                         chain,
                         #[cfg(feature = "pq-proposer")]
                         validator_store,
                         network_config,
                         http_api_config,
-                        local_keypair,
                         #[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
                         fail_proposer_construction: plan.fail_proposer_construction,
                     })
@@ -1627,10 +1644,32 @@ impl PqRuntimeOwner {
             validator_store,
             network_config,
             http_api_config,
-            local_keypair,
             #[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
             fail_proposer_construction,
         } = blocking_runtime;
+        chain
+            .reconcile_persisted_pq_head()
+            .await
+            .map_err(PqRuntimeError::ExecutionReconciliation)?;
+        let network_dir = network_config.network_dir.clone();
+        let key_network_config = Arc::clone(&network_config);
+        let local_keypair = context
+            .executor
+            .spawn_blocking_handle(
+                move || {
+                    std::fs::create_dir_all(&network_dir).map_err(|error| {
+                        PqRuntimeError::Directory {
+                            path: network_dir,
+                            error,
+                        }
+                    })?;
+                    Ok::<_, PqRuntimeError>(load_private_key(&key_network_config))
+                },
+                "pq-runtime-create-network-owner",
+            )
+            .ok_or(PqRuntimeError::TaskUnavailable)?
+            .await
+            .map_err(|error| PqRuntimeError::TaskJoin(error.to_string()))??;
         let head = chain.head_snapshot();
         let genesis_validators_root = head.beacon_state.genesis_validators_root();
         let fork_context = Arc::new(ForkContext::new::<MinimalEthSpec>(
@@ -1679,6 +1718,7 @@ impl PqRuntimeOwner {
                 Err(error) => {
                     drop(broadcaster);
                     let _ = network_shutdown.wait().await;
+                    chain.close_and_drain_pq_imports().await;
                     return Err(error);
                 }
             }
@@ -1729,6 +1769,7 @@ impl PqRuntimeOwner {
                     http_shutdown.take(),
                     broadcaster,
                     network_shutdown,
+                    Arc::clone(&chain),
                 ))
                 .await;
                 return Err(error);
@@ -1749,6 +1790,7 @@ impl PqRuntimeOwner {
                         http_shutdown.take(),
                         broadcaster,
                         network_shutdown,
+                        Arc::clone(&chain),
                     ))
                     .await;
                     return Err(error);
@@ -1783,7 +1825,7 @@ impl PqRuntimeOwner {
 
     async fn shutdown(self) -> Result<(), PqRuntimeError> {
         let Self {
-            chain: _,
+            chain,
             network_globals: _,
             broadcaster,
             http_api_listen_addr: _,
@@ -1811,6 +1853,7 @@ impl PqRuntimeOwner {
             .wait()
             .await
             .map_err(PqRuntimeError::Network);
+        chain.close_and_drain_pq_imports().await;
         #[cfg(feature = "pq-proposer")]
         drop(proposer_service);
         #[cfg(feature = "pq-proposer")]
@@ -1944,6 +1987,7 @@ pub enum PqRuntimeError {
     Aggregation(consensus_signature::AggregationError),
     Execution(execution_layer::Error),
     Chain(beacon_chain::PqRuntimeError),
+    ExecutionReconciliation(beacon_chain::PqImportError),
     Network(PqNetworkServiceError),
     HttpConfiguration(network::PqBlockPublicationConfigurationError),
     HttpBind(std::io::Error),
@@ -2002,6 +2046,7 @@ impl std::fmt::Display for PqRuntimeError {
                 )
             }
             Self::Chain(error) => error.fmt(formatter),
+            Self::ExecutionReconciliation(error) => error.fmt(formatter),
             Self::Network(error) => error.fmt(formatter),
             Self::HttpConfiguration(error) => error.fmt(formatter),
             Self::HttpBind(error) => write!(formatter, "could not bind PQ HTTP API: {error}"),
@@ -2032,6 +2077,7 @@ impl std::error::Error for PqRuntimeError {
             Self::StoreStartup(error) => Some(error),
             Self::Aggregation(error) => Some(error),
             Self::Chain(error) => Some(error),
+            Self::ExecutionReconciliation(error) => Some(error),
             Self::Network(error) => Some(error),
             Self::HttpConfiguration(error) => Some(error),
             Self::HttpBind(error) => Some(error),
