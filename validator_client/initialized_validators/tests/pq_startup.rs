@@ -1,6 +1,6 @@
 #![cfg(all(feature = "pq-devnet", target_os = "linux"))]
 
-use consensus_signature::PqPublicKey;
+use consensus_signature::{PqPublicKey, PqValidatorRegistryEntry};
 use initialized_validators::{Error, InitializedValidators};
 use pq_signing::{PqKeystore, PqSigningError, PqUsageJournalError, provision_usage_journal};
 use std::fs;
@@ -52,10 +52,13 @@ async fn opens_one_authority_after_network_root_and_binds_all_signers() {
     fs::write(&manifest_path, serde_json::to_vec(&manifest).expect("JSON")).expect("manifest");
     fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600)).expect("manifest mode");
     let runtime = TestRuntime::default();
+    let registry = vec![PqValidatorRegistryEntry::new(0, public_key, [0x22; 32])];
 
     let initialized = InitializedValidators::from_pq_bundle(
         bundle_root.clone(),
         network_root,
+        342,
+        registry.clone(),
         runtime.task_executor.clone(),
     )
     .await
@@ -79,6 +82,8 @@ async fn opens_one_authority_after_network_root_and_binds_all_signers() {
     let second = InitializedValidators::from_pq_bundle(
         bundle_root.clone(),
         network_root,
+        342,
+        registry.clone(),
         runtime.task_executor.clone(),
     )
     .await;
@@ -91,7 +96,9 @@ async fn opens_one_authority_after_network_root_and_binds_all_signers() {
     fs::write(&password_path, PASSWORD).expect("restore password");
 
     drop(initialized);
-    let bundle = PqDevnetBundle::load(&bundle_root, network_root).expect("anchored bundle");
+    let bundle =
+        PqDevnetBundle::load_for_network_registry(&bundle_root, network_root, 342, &registry)
+            .expect("anchored bundle");
     let moved_root = root.path().join("moved-bundle");
     fs::rename(&bundle_root, &moved_root).expect("move original bundle");
     fs::create_dir(&bundle_root).expect("replacement root");

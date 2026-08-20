@@ -24,6 +24,7 @@ pq-devnet = [
     "lighthouse_network/pq-devnet",
     "types/pq-devnet",
 ]
+pq-proposer = ["pq-devnet", "client/pq-proposer"]
 
 [dependencies]
 account_utils = { workspace = true }

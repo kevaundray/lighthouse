@@ -26,6 +26,8 @@ pub use beacon_chain::BeaconChainTypes;
 pub use builder::ClientBuilder;
 pub use config::{ClientGenesis, Config as ClientConfig};
 pub use eth2_config::Eth2Config;
+#[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
+pub use pq_runtime::PqPublicTestnetError;
 #[cfg(feature = "pq-devnet")]
 pub use pq_runtime::{
     PqClient, PqProposerRuntimePaths, PqRuntimeConfig, PqRuntimeConfigError, PqRuntimeError,

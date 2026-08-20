@@ -19,6 +19,8 @@ pub use client::config::PqDevnetConfigError as PqClientConfigError;
 pub use client::{Client, ClientConfig, ClientGenesis};
 #[cfg(feature = "pq-devnet")]
 pub use config::PqDevnetConfigError as PqCliConfigError;
+#[cfg(feature = "pq-devnet")]
+pub use config::PqDevnetConfigError as PqLaunchCliError;
 pub use config::{get_config, get_data_dir, set_network_config};
 use environment::RuntimeContext;
 pub use eth2_config::Eth2Config;
@@ -29,6 +31,8 @@ use network_utils::enr_ext::peer_id_to_node_id;
 #[cfg(feature = "slasher")]
 use slasher::{DatabaseBackendOverride, Slasher};
 use std::ops::{Deref, DerefMut};
+#[cfg(feature = "pq-devnet")]
+use std::path::PathBuf;
 #[cfg(not(feature = "pq-devnet"))]
 use std::sync::Arc;
 use store::database::interface::BeaconNodeBackend;
@@ -41,6 +45,55 @@ use types::{ChainSpec, Epoch, ForkName};
 /// A type-alias to the tighten the definition of a production-intended `Client`.
 pub type ProductionClient<E> =
     Client<Witness<SystemTimeSlotClock, E, BeaconNodeBackend, BeaconNodeBackend>>;
+
+/// Side-effect-free launch paths selected by the narrow PQ CLI.
+#[cfg(feature = "pq-devnet")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PqLaunchCliPlan {
+    testnet_dir: PathBuf,
+    validator_bundle: Option<PathBuf>,
+}
+
+#[cfg(feature = "pq-devnet")]
+impl PqLaunchCliPlan {
+    pub fn testnet_dir(&self) -> &std::path::Path {
+        &self.testnet_dir
+    }
+
+    pub fn validator_bundle(&self) -> Option<&std::path::Path> {
+        self.validator_bundle.as_deref()
+    }
+}
+
+/// Parses only path values. It never resolves, probes, creates, or removes them.
+#[cfg(feature = "pq-devnet")]
+pub fn parse_pq_launch_cli(matches: &ArgMatches) -> Result<PqLaunchCliPlan, PqLaunchCliError> {
+    config::validate_pq_devnet_cli_profile(matches)?;
+    let testnet_dir = matches
+        .try_get_raw("testnet-dir")
+        .ok()
+        .flatten()
+        .and_then(|mut values| values.next_back())
+        .map(PathBuf::from)
+        .ok_or(PqLaunchCliError::MissingTestnetDir)?;
+    let validator_bundle = matches
+        .try_get_raw("pq-validator-bundle")
+        .ok()
+        .flatten()
+        .and_then(|mut values| values.next_back())
+        .map(PathBuf::from);
+    #[cfg(not(feature = "pq-proposer"))]
+    if validator_bundle.is_some() {
+        return Err(PqLaunchCliError::ProposerFeatureDisabled);
+    }
+    if validator_bundle.is_some() && !matches.get_flag("http") {
+        return Err(PqLaunchCliError::ProposerRequiresHttp);
+    }
+    Ok(PqLaunchCliPlan {
+        testnet_dir,
+        validator_bundle,
+    })
+}
 
 /// A typed, side-effect-free rejection from the frozen PQ production boundary.
 #[cfg(feature = "pq-devnet")]
@@ -243,7 +296,7 @@ impl<E: EthSpec> ProductionBeaconNode<E> {
 
 #[cfg(feature = "pq-devnet")]
 fn validate_pq_cli_arguments(matches: &ArgMatches) -> Result<(), PqCliConfigError> {
-    config::validate_pq_devnet_cli_profile(matches)
+    parse_pq_launch_cli(matches).map(|_| ())
 }
 
 #[cfg(not(feature = "pq-devnet"))]
@@ -330,6 +383,9 @@ mod pq_test {
                 "http://127.0.0.1:8551",
             ])
             .expect("plain beacon-node arguments");
-        assert_eq!(validate_pq_cli_arguments(&matches), Ok(()));
+        assert_eq!(
+            validate_pq_cli_arguments(&matches),
+            Err(PqCliConfigError::MissingTestnetDir),
+        );
     }
 }

@@ -34,6 +34,40 @@ pub use pq_wire::{
 pub type ValidatorPublicKeyBytes = PqPublicKey;
 #[cfg(feature = "pq-wire")]
 pub type VerificationKey = PqPublicKey;
+#[cfg(feature = "pq-devnet")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PqValidatorRegistryEntry {
+    validator_index: u64,
+    public_key: PqPublicKey,
+    withdrawal_credentials: [u8; 32],
+}
+
+#[cfg(feature = "pq-devnet")]
+impl PqValidatorRegistryEntry {
+    pub const fn new(
+        validator_index: u64,
+        public_key: PqPublicKey,
+        withdrawal_credentials: [u8; 32],
+    ) -> Self {
+        Self {
+            validator_index,
+            public_key,
+            withdrawal_credentials,
+        }
+    }
+
+    pub const fn validator_index(&self) -> u64 {
+        self.validator_index
+    }
+
+    pub const fn public_key(&self) -> PqPublicKey {
+        self.public_key
+    }
+
+    pub const fn withdrawal_credentials(&self) -> [u8; 32] {
+        self.withdrawal_credentials
+    }
+}
 #[cfg(feature = "pq-wire")]
 pub type IndividualSignature = PqRawSignature;
 #[cfg(feature = "pq-wire")]

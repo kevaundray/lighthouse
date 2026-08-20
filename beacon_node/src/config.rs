@@ -929,6 +929,9 @@ pub fn get_config<E: EthSpec>(
 #[cfg(feature = "pq-devnet")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PqDevnetConfigError {
+    MissingTestnetDir,
+    ProposerFeatureDisabled,
+    ProposerRequiresHttp,
     UnsupportedOption(&'static str),
 }
 
@@ -936,6 +939,15 @@ pub enum PqDevnetConfigError {
 impl std::fmt::Display for PqDevnetConfigError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::MissingTestnetDir => {
+                formatter.write_str("lean PQ devnet V1 requires --testnet-dir")
+            }
+            Self::ProposerFeatureDisabled => {
+                formatter.write_str("--pq-validator-bundle requires the pq-proposer feature")
+            }
+            Self::ProposerRequiresHttp => {
+                formatter.write_str("--pq-validator-bundle requires --http")
+            }
             Self::UnsupportedOption(option) => {
                 write!(formatter, "lean PQ devnet V1 does not support {option}")
             }
@@ -949,48 +961,84 @@ impl std::error::Error for PqDevnetConfigError {}
 /// Rejects unsupported PQ modes before stores, networking, or workers are initialized.
 #[cfg(feature = "pq-devnet")]
 pub fn validate_pq_devnet_cli_profile(cli_args: &ArgMatches) -> Result<(), PqDevnetConfigError> {
-    let unsupported_flag = [
-        ("slasher", "--slasher"),
-        ("genesis-backfill", "--genesis-backfill"),
-        ("complete-blob-backfill", "--complete-blob-backfill"),
-        ("archive", "--archive"),
-        ("validator-monitor-auto", "--validator-monitor-auto"),
-        ("gui", "--gui"),
-    ]
-    .into_iter()
-    .find_map(|(id, option)| cli_args.get_flag(id).then_some(option));
-    if let Some(option) = unsupported_flag {
-        return Err(PqDevnetConfigError::UnsupportedOption(option));
-    }
+    const ALLOWED_COMMAND_LINE_IDS: &[&str] = &[
+        "datadir",
+        "testnet-dir",
+        "dump-config",
+        "dump-chain-config",
+        "immediate-shutdown",
+        "network-dir",
+        "zero-ports",
+        "listen-address",
+        "port",
+        "port6",
+        "discovery-port",
+        "quic-port",
+        "discovery-port6",
+        "quic-port6",
+        "target-peers",
+        "boot-nodes",
+        "disable-upnp",
+        "private",
+        "enr-udp-port",
+        "enr-quic-port",
+        "enr-udp6-port",
+        "enr-quic6-port",
+        "enr-tcp-port",
+        "enr-tcp6-port",
+        "enr-address",
+        "enr-match",
+        "disable-enr-auto-update",
+        "libp2p-addresses",
+        "disable-discovery",
+        "disable-quic",
+        "trusted-peers",
+        "execution-endpoint",
+        "execution-jwt",
+        "execution-jwt-secret-key",
+        "execution-jwt-id",
+        "execution-jwt-version",
+        "http",
+        "enable_http",
+        "http-address",
+        "http-port",
+        "pq-validator-bundle",
+    ];
 
-    for (id, option) in [
-        ("builder", "--builder"),
-        ("checkpoint-sync-url", "--checkpoint-sync-url"),
-        ("checkpoint-state", "--checkpoint-state"),
-        ("checkpoint-block", "--checkpoint-block"),
-        ("checkpoint-blobs", "--checkpoint-blobs"),
-        ("wss-checkpoint", "--wss-checkpoint"),
-        ("validator-monitor-pubkeys", "--validator-monitor-pubkeys"),
-        ("validator-monitor-file", "--validator-monitor-file"),
-    ] {
-        if cli_args.get_raw(id).is_some() {
-            return Err(PqDevnetConfigError::UnsupportedOption(option));
-        }
-    }
-    if cli_args
-        .get_one::<String>("hierarchy-exponents")
-        .is_some_and(|value| value != "0")
-    {
-        return Err(PqDevnetConfigError::UnsupportedOption(
-            "--hierarchy-exponents other than 0",
-        ));
-    }
-    if cli_args.value_source("validator-monitor-individual-tracking-threshold")
-        == Some(ValueSource::CommandLine)
-    {
-        return Err(PqDevnetConfigError::UnsupportedOption(
-            "--validator-monitor-individual-tracking-threshold",
-        ));
+    let unsupported = cli_args.ids().find(|id| {
+        cli_args.value_source(id.as_str()) == Some(ValueSource::CommandLine)
+            && !ALLOWED_COMMAND_LINE_IDS.contains(&id.as_str())
+    });
+    if let Some(id) = unsupported {
+        let option = match id.as_str() {
+            "slasher" => "--slasher",
+            "builder" => "--builder",
+            "checkpoint-sync-url" => "--checkpoint-sync-url",
+            "checkpoint-state" => "--checkpoint-state",
+            "checkpoint-block" => "--checkpoint-block",
+            "checkpoint-blobs" => "--checkpoint-blobs",
+            "wss-checkpoint" => "--wss-checkpoint",
+            "genesis-backfill" => "--genesis-backfill",
+            "complete-blob-backfill" => "--complete-blob-backfill",
+            "archive" => "--archive",
+            "validator-monitor-auto" => "--validator-monitor-auto",
+            "validator-monitor-pubkeys" => "--validator-monitor-pubkeys",
+            "validator-monitor-file" => "--validator-monitor-file",
+            "validator-monitor-individual-tracking-threshold" => {
+                "--validator-monitor-individual-tracking-threshold"
+            }
+            "gui" => "--gui",
+            "http-allow-origin" => "--http-allow-origin",
+            "http-enable-tls" | "http-tls-cert" | "http-tls-key" => "--http-enable-tls",
+            "metrics" | "metrics-address" | "metrics-port" | "metrics-allow-origin" => "--metrics",
+            "monitoring-endpoint" | "monitoring-endpoint-period" => "--monitoring-endpoint",
+            "subscribe-all-subnets" => "--subscribe-all-subnets",
+            "suggested-fee-recipient" => "--suggested-fee-recipient",
+            "purge-db" | "purge-db-force" => "--purge-db",
+            "hierarchy-exponents" => "--hierarchy-exponents",
+            _ => "command-line option outside the PQ allowlist",
+        };
+        return Err(PqDevnetConfigError::UnsupportedOption(option));
     }
     Ok(())
 }

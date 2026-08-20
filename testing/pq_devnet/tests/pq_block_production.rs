@@ -3640,8 +3640,10 @@ async fn run_real_pq_proposer_http_composition() {
         .expect("genesis committee caches");
     let runtime = task_executor::test_utils::TestRuntime::default();
     let initialized = InitializedValidators::from_pq_bundle(
-        bundle_path,
+        provisioned.bundle_dir().to_path_buf(),
         provisioned.genesis_validators_root(),
+        provisioned.genesis_time(),
+        provisioned.validator_registry().to_vec(),
         runtime.task_executor.clone(),
     )
     .await

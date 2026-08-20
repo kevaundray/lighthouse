@@ -44,8 +44,10 @@ async fn real_pq_block_signing_offloads_the_locked_sqlite_transaction() {
     let public_key = provisioned.public_keys()[0];
     let runtime = TestRuntime::default();
     let initialized = InitializedValidators::from_pq_bundle(
-        destination.clone(),
+        provisioned.bundle_dir().to_path_buf(),
         provisioned.genesis_validators_root(),
+        provisioned.genesis_time(),
+        provisioned.validator_registry().to_vec(),
         runtime.task_executor.clone(),
     )
     .await
@@ -469,8 +471,10 @@ async fn slashing_commit_precedes_pq_reservation_and_same_data_is_recoverable() 
     let public_key = provisioned.public_keys()[0];
     let runtime = TestRuntime::default();
     let initialized = InitializedValidators::from_pq_bundle(
-        destination.clone(),
+        provisioned.bundle_dir().to_path_buf(),
         provisioned.genesis_validators_root(),
+        provisioned.genesis_time(),
+        provisioned.validator_registry().to_vec(),
         runtime.task_executor.clone(),
     )
     .await

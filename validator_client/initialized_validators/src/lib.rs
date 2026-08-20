@@ -22,7 +22,7 @@ use bls::PublicKey;
 #[cfg(not(feature = "pq-devnet"))]
 use bls::PublicKeyBytes;
 #[cfg(feature = "pq-devnet")]
-use consensus_signature::PqPublicKey as PublicKeyBytes;
+use consensus_signature::{PqPublicKey as PublicKeyBytes, PqValidatorRegistryEntry};
 use eth2_keystore::Keystore;
 use lockfile::{Lockfile, LockfileError};
 #[cfg(not(feature = "pq-devnet"))]
@@ -622,18 +622,30 @@ impl InitializedValidators {
     pub async fn from_pq_bundle(
         bundle_root: PathBuf,
         network_genesis_validators_root: [u8; 32],
+        network_genesis_time: u64,
+        registry: Vec<PqValidatorRegistryEntry>,
         executor: TaskExecutor,
     ) -> Result<Self, Error> {
         let (authority, validators) = executor
             .spawn_blocking_with_rayon_async(RayonPoolType::HighPriority, move || {
-                let bundle = PqDevnetBundle::load(&bundle_root, network_genesis_validators_root)?;
-                let expected_public_keys = bundle.public_keys().to_vec();
+                let bundle = PqDevnetBundle::load_for_network_registry(
+                    &bundle_root,
+                    network_genesis_validators_root,
+                    network_genesis_time,
+                    &registry,
+                )?;
+                let expected_registry = bundle.registry().to_vec();
+                let expected_public_keys = expected_registry
+                    .iter()
+                    .map(PqValidatorRegistryEntry::public_key)
+                    .collect::<Vec<_>>();
                 let authority = bundle.open_authority(network_genesis_validators_root)?;
                 if authority.public_keys() != expected_public_keys {
                     return Err(Error::DuplicatePublicKey);
                 }
                 let mut validators = HashMap::with_capacity(expected_public_keys.len());
-                for (index, public_key) in (0_u64..).zip(expected_public_keys) {
+                for registry_entry in expected_registry {
+                    let public_key = registry_entry.public_key();
                     let signer = authority.signer(&public_key)?;
                     let initialized = InitializedValidator {
                         signing_method: Arc::new(SigningMethod::pq_local(signer)),
@@ -643,7 +655,7 @@ impl InitializedValidators {
                         builder_proposals: Some(false),
                         builder_boost_factor: None,
                         prefer_builder_proposals: Some(false),
-                        index: Some(index),
+                        index: Some(registry_entry.validator_index()),
                     };
                     if validators.insert(public_key, initialized).is_some() {
                         return Err(Error::DuplicatePublicKey);

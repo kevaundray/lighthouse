@@ -402,6 +402,22 @@ where
         Ok(self)
     }
 
+    /// Returns the exact genesis identity of the snapshot selected for startup.
+    ///
+    /// This is available before runtime services are installed so the disk owner can bind a
+    /// sealed public testnet to either a fresh or resumed snapshot without constructing proof,
+    /// execution, or network capabilities first.
+    pub fn pq_snapshot_network_identity(&self) -> Result<(Hash256, u64), PqRuntimeError> {
+        let snapshot = self
+            .snapshot
+            .as_ref()
+            .ok_or(PqRuntimeError::MissingHeadState)?;
+        Ok((
+            snapshot.beacon_state.genesis_validators_root(),
+            snapshot.beacon_state.genesis_time(),
+        ))
+    }
+
     pub fn pq_aggregation_service(mut self, service: Arc<AggregationService>) -> Self {
         self.aggregation_service = Some(service);
         self

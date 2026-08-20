@@ -2441,23 +2441,43 @@ proposer-service, or slashing crate. HTTP binding, proposer resource constructio
 
 ##### Task 5.3e-e4d: Make provisioning and configuration launchable and unambiguous
 
-Extend the PQ provisioner with a public, key-free testnet directory containing the frozen minimal
-Electra `config.yaml`, `deposit_contract_block.txt`, empty bootstrap list, and the already generated
-`genesis.ssz`; keep the authenticated validator bundle, passwords, and journal in the private
-bundle root. Make the Lighthouse `pq-devnet` feature select the minimal preset and require the
-generated testnet directory. Add one PQ-only optional beacon-node flag for the authenticated
-validator-bundle root. Absence means verifier-only. Presence enables exactly one local proposer
-authority and defaults its SQLite slashing database to a dedicated path under that node's data
-directory. Never discover or load validator keys from the public network directory.
+Extend the PQ provisioner with one atomically published container. Its distributable, key-free
+`testnet/` directory contains the frozen Minimal Electra `config.yaml`,
+`deposit_contract_block.txt`, empty bootstrap list, and exact `genesis.ssz`; its private `bundle/`
+directory contains the authenticated validator bundle, passwords, and journal. Stage the whole
+container privately, publish it with one rename, then expose only the final public directory and
+files as 0755/0644 while retaining every private directory/file as 0700/0600. Bounded loaders reject
+missing, unexpected, symlink, non-regular, over-count, over-size, or permission-incompatible entries
+before authentication. The public loader seals exact genesis bytes, validators root, genesis time,
+and the canonical validator-index/public-key/withdrawal-credential registry. Bundle identity
+validation checks both the validators root and the checked frozen relation
+`eth1_timestamp + 300 == genesis_time`, then binds every authenticated manifest entry to that exact
+registry position; a bundle may own a canonical prefix without inventing its own indices.
+
+Add an additive `pq-proposer` feature over `pq-devnet`, so the verifier-only normal/build graph has
+no validator-store, signer, or slashing dependency. Make the PQ launch parser require the generated
+testnet directory and accept one optional authenticated validator-bundle root only with that
+feature. Absence means verifier-only. Presence enables exactly one local proposer authority and
+derives its SQLite slashing database lexically as
+`<node-datadir>/pq-proposer/slashing_protection.sqlite`. Parsing is allowlisted and pure: it neither
+probes nor creates any supplied path. Never discover or load validator keys from the public network
+directory.
 
 Reject, before filesystem or network side effects, TLS/CORS/metrics/UI, checkpoint/history modes,
 builders, monitoring, ordinary validator options, an execution layer without a real endpoint, a
-bundle whose manifest root differs from the network genesis, and an HTTP-disabled proposer. A
-verifier-only node must not construct `InitializedValidators`, `LighthouseValidatorStore`, a
-slashing database, strict HTTP client, or proposer service. A proposer node loads the authenticated
-bundle on the process executor, opens/registers the exact sealed identities in slashing protection
-on the blocking executor, constructs the validator store with builder/doppelganger/remote signing
-disabled, and passes only that store snapshot to `PqProposerService`.
+bundle whose manifest identity or validator registry differs from the selected public network, and
+an HTTP-disabled proposer. Every fresh or resumed launch bounded-loads and seals the selected public
+network exactly once. Disk chains compare their exact root/time identity with that sealed input
+before AggregationService, Engine, network, or proposer resources; the inner store/resume path never
+rereads `genesis.ssz`. A verifier-only node must not construct `InitializedValidators`,
+`LighthouseValidatorStore`, a slashing database, strict HTTP client, or proposer service. A proposer
+node loads the authenticated bundle on a detached process-executor task which retains the already
+opened and identity-bound store across caller cancellation. It opens or resumes and atomically
+registers the exact sealed canonical identity sequence in slashing protection on the blocking
+executor, and constructs a sealed non-clone validator-store owner with builder, doppelganger, and
+remote signing disabled.
+Task e4d stops at that resource. Task e4e constructs `PqProposerService` only after Warp is bound and
+the actual strict loopback beacon-node URL is known.
 
 ##### Task 5.3e-e4e: Bind the narrow HTTP server and drive the proposer
 

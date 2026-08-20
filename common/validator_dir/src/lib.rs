@@ -23,6 +23,8 @@ pub use builder::{
     WITHDRAWAL_KEYSTORE_FILE, keystore_password_path,
 };
 #[cfg(feature = "pq-devnet")]
+pub use consensus_signature::PqValidatorRegistryEntry;
+#[cfg(feature = "pq-devnet")]
 pub use pq_devnet_bundle::{
     MAX_PQ_DEVNET_MANIFEST_BYTES, MAX_PQ_DEVNET_VALIDATORS, PQ_DEVNET_GENESIS_FILE,
     PQ_DEVNET_JOURNAL_FILE, PQ_DEVNET_MANIFEST_FILE, PqDevnetBundle, PqDevnetBundleError,

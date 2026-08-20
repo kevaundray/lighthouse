@@ -41,6 +41,7 @@ pq-beacon-startup-testing = [
     "beacon_chain/pq-startup-testing",
     "store/pq-devnet",
 ]
+pq-proposer = ["pq-beacon-startup-testing", "beacon_node/pq-proposer"]
 pq-beacon-import-testing = [
     "pq-beacon-startup-testing",
     "pq-transition-testing",
@@ -106,6 +107,7 @@ task_executor = { workspace = true, optional = true }
 types = { workspace = true, optional = true, features = ["pq-devnet"] }
 validator_dir = { workspace = true, optional = true, features = ["pq-devnet"] }
 warp = { workspace = true, optional = true }
+yaml_serde = { workspace = true }
 zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -122,6 +124,11 @@ required-features = ["pq-devnet"]
 name = "provision"
 path = "tests/provision.rs"
 required-features = ["pq-devnet"]
+
+[[test]]
+name = "pq_launch_cli"
+path = "tests/pq_launch_cli.rs"
+required-features = ["pq-beacon-startup-testing"]
 
 [[test]]
 name = "pq_attestation"

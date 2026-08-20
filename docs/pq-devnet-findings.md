@@ -1607,3 +1607,42 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
 - The top-level binary, narrow HTTP binding, proposer construction/scheduler, CLI provisioning, and
   attestation topics remain deliberately deferred to e4d/e/f. Hash-chain/hash-onion RANDAO remains
   a future versioned proposal; V1 retains the signature-derived duty.
+
+### 2026-08-20: Atomic PQ launch provisioning and sealed proposer resource implemented (Task 5.3e-e4d)
+
+- The provisioner now publishes one container with an exact distributable `testnet/` and private
+  authenticated `bundle/`. Staging remains 0700 until one atomic rename; final public directories
+  and files are 0755/0644, while the bundle and all descendants remain 0700/0600. The public side is
+  key-free and contains only frozen Minimal Electra configuration, deposit block zero, an empty
+  bootstrap list, and the exact genesis state.
+- PQ-specific loaders bound the public genesis at 128 MiB, tightly cap every other public file, and
+  cap bundle, validator, and secret enumeration at the frozen 16-validator maximum plus one before
+  collection. Exact layouts reject missing, extra, symlink, non-regular, or permission-incompatible
+  entries. The startup loader directly opens only its bounded validator set and rechecks the exact
+  set, without a second unbounded discovery scan. The sealed public identity retains exact genesis
+  bytes/root/time plus canonical validator indices, voting keys, and withdrawal credentials. Bundle
+  authentication checks the validators root, the checked V1 time relation
+  `manifest.eth1_timestamp + 300 == public.genesis_time`, and each authenticated manifest entry at
+  its exact public-registry position; overflow, substitution, reordering, absence, and withdrawal
+  mismatch fail closed.
+- The positive-allowlist launch parser requires an explicit public testnet path and accepts an
+  optional bundle only behind the additive `pq-proposer` feature and with the narrow HTTP surface
+  enabled. Every command-line option outside the sealed path/EL/HTTP/P2P launch set is rejected, and
+  parsing performs no filesystem I/O. The proposer database path is derived lexically as
+  `<node-datadir>/pq-proposer/slashing_protection.sqlite`. The verifier-only normal/build graph has
+  no validator-store, signer, or slashing capability; the proposer graph deliberately adds the
+  sealed local store without ordinary beacon-node fallback polling.
+- Every launch bounded-loads the selected public network once. Fresh and resumed runtime preflight
+  compares its sealed root/time with the exact disk-chain identity before AggregationService,
+  Engine, network, slashing, or signer side effects; inner store construction does not reread the
+  public path. Proposer authentication runs in one detached process-owned task that retains the
+  prepared DB lock and boxed builder across caller cancellation. It registers the sealed canonical
+  indices atomically in resumable SQLite, so a late conflict leaves no partial registration and a
+  clean shutdown/restart retains exact signing history. E4d retains a sealed non-clone
+  validator-store/SQLite owner and deliberately does not construct `PqProposerService`; e4e will do
+  so after the actual strict loopback HTTP URL is known.
+- Focused warning-denied evidence passed verifier/proposer pure-parser tests (4/4 and 5/5), binary
+  pre-runtime tests (2/2 and 3/3), the atomic multi-identity SQLite regression, production checks for
+  client/beacon-node/lighthouse in both PQ profiles, and the ordinary CLI regression. Dependency
+  inspection confirmed an empty verifier signer/slashing graph and no `beacon_node_fallback` in the
+  proposer graph. No broad workspace gate was run before independent review.

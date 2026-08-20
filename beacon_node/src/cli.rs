@@ -6,7 +6,7 @@ use strum::VariantNames;
 
 #[allow(clippy::large_stack_frames)]
 pub fn cli_app() -> Command {
-    Command::new("beacon_node")
+    pq_cli_args(Command::new("beacon_node")
         .display_order(0)
         .visible_aliases(["b", "bn", "beacon"])
         .version(crate_version!())
@@ -1658,7 +1658,25 @@ pub fn cli_app() -> Command {
                 .action(ArgAction::Set)
                 .hide(true)
         )
-        .group(ArgGroup::new("enable_http").args(["http", "gui", "staking"]).multiple(true))
+        .group(ArgGroup::new("enable_http").args(["http", "gui", "staking"]).multiple(true)))
+}
+
+fn pq_cli_args(command: Command) -> Command {
+    #[cfg(feature = "pq-devnet")]
+    {
+        command.arg(
+            Arg::new("pq-validator-bundle")
+                .long("pq-validator-bundle")
+                .value_name("DIR")
+                .help("Authenticated private validator bundle for the lean PQ proposer profile.")
+                .action(ArgAction::Set)
+                .display_order(0),
+        )
+    }
+    #[cfg(not(feature = "pq-devnet"))]
+    {
+        command
+    }
 }
 
 fn slasher_backend_variants() -> Vec<&'static str> {
@@ -1669,5 +1687,18 @@ fn slasher_backend_variants() -> Vec<&'static str> {
     #[cfg(not(feature = "slasher"))]
     {
         vec!["lmdb", "mdbx", "redb"]
+    }
+}
+
+#[cfg(all(test, not(feature = "pq-devnet")))]
+mod tests {
+    use super::cli_app;
+
+    #[test]
+    fn ordinary_cli_does_not_expose_the_pq_validator_bundle() {
+        let error = cli_app()
+            .try_get_matches_from(["beacon_node", "--pq-validator-bundle", "private-bundle"])
+            .expect_err("ordinary CLI must not expose the PQ bundle option");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument,);
     }
 }

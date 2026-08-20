@@ -1,4 +1,4 @@
-use consensus_signature::PqPublicKey;
+use consensus_signature::{PqPublicKey, PqValidatorRegistryEntry};
 use pq_signing::{
     MAX_PQ_PASSWORD_BYTES, PqKeystore, PqKeystoreError, PqSigningError, validate_pq_password,
 };
@@ -18,7 +18,9 @@ use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use types::{BeaconState, ChainSpec, EthSpec, ForkName, Hash256, MinimalEthSpec};
+use types::{
+    BeaconState, ChainSpec, Config as Eth2Config, EthSpec, ForkName, Hash256, MinimalEthSpec,
+};
 use validator_dir::{
     MAX_PQ_DEVNET_MANIFEST_BYTES, PQ_DEVNET_GENESIS_FILE, PQ_DEVNET_MANIFEST_FILE,
     PqDevnetManifest, PqManifestValidator, PqValidatorDir, PqValidatorDirBuilder,
@@ -28,6 +30,11 @@ use zeroize::Zeroizing;
 
 const VALIDATORS_DIR: &str = "validators";
 const PASSWORDS_DIR: &str = "secrets";
+const PUBLIC_TESTNET_DIR: &str = "testnet";
+const PRIVATE_BUNDLE_DIR: &str = "bundle";
+const TESTNET_CONFIG_FILE: &str = "config.yaml";
+const TESTNET_DEPOSIT_BLOCK_FILE: &str = "deposit_contract_block.txt";
+const TESTNET_BOOTSTRAP_FILE: &str = "bootstrap_nodes.yaml";
 const PRODUCTION_VALIDATOR_COUNT: usize = 16;
 const MAX_VALIDATOR_COUNT: usize = PRODUCTION_VALIDATOR_COUNT;
 const PRODUCTION_RANGE_START: u32 = 0;
@@ -129,9 +136,13 @@ impl From<PqSigningError> for ProvisionError {
 #[derive(Clone, Debug)]
 pub struct ProvisionedDevnet {
     output_dir: PathBuf,
+    testnet_dir: PathBuf,
+    bundle_dir: PathBuf,
     public_keys: Vec<PqPublicKey>,
+    validator_registry: Vec<PqValidatorRegistryEntry>,
     genesis_state_bytes: Vec<u8>,
     genesis_validators_root: [u8; 32],
+    genesis_time: u64,
 }
 
 impl ProvisionedDevnet {
@@ -139,8 +150,20 @@ impl ProvisionedDevnet {
         &self.output_dir
     }
 
+    pub fn testnet_dir(&self) -> &Path {
+        &self.testnet_dir
+    }
+
+    pub fn bundle_dir(&self) -> &Path {
+        &self.bundle_dir
+    }
+
     pub fn public_keys(&self) -> Vec<PqPublicKey> {
         self.public_keys.clone()
+    }
+
+    pub fn validator_registry(&self) -> &[PqValidatorRegistryEntry] {
+        &self.validator_registry
     }
 
     pub fn genesis_state_bytes(&self) -> &[u8] {
@@ -149,6 +172,10 @@ impl ProvisionedDevnet {
 
     pub const fn genesis_validators_root(&self) -> [u8; 32] {
         self.genesis_validators_root
+    }
+
+    pub const fn genesis_time(&self) -> u64 {
+        self.genesis_time
     }
 }
 
@@ -232,7 +259,7 @@ impl AnchoredDestination {
         rustix::fs::fsync(&self.parent)
             .map_err(|error| ProvisionError::Io(self.parent_path.clone(), error.into()))?;
         let staging =
-            open_private_directory_at(&self.parent, &self.staging_component, &self.staging)?;
+            open_directory_at(&self.parent, &self.staging_component, &self.staging, 0o700)?;
         verify_entry_identity(
             &self.parent,
             &self.staging_component,
@@ -273,10 +300,11 @@ impl AnchoredDestination {
         .map_err(|error| ProvisionError::Publish(self.destination.clone(), error.into()))?;
         sync_parent(&self.parent)
             .map_err(|error| ProvisionError::Io(self.parent_path.clone(), error))?;
-        let published = open_private_directory_at(
+        let published = open_directory_at(
             &self.parent,
             &self.destination_component,
             &self.destination,
+            0o700,
         )?;
         let staging_stat = rustix::fs::fstat(&staging.file)
             .map_err(|error| ProvisionError::Io(self.destination.clone(), error.into()))?;
@@ -287,6 +315,12 @@ impl AnchoredDestination {
                 "published directory identity mismatch".to_owned(),
             ));
         }
+        rustix::fs::fchmod(&published.file, Mode::from_bits_retain(0o755))
+            .map_err(|error| ProvisionError::Io(self.destination.clone(), error.into()))?;
+        rustix::fs::fsync(&published.file)
+            .map_err(|error| ProvisionError::Io(self.destination.clone(), error.into()))?;
+        rustix::fs::fsync(&self.parent)
+            .map_err(|error| ProvisionError::Io(self.parent_path.clone(), error.into()))?;
         Ok(published)
     }
 
@@ -323,10 +357,11 @@ fn proc_fd_path(file: &File) -> PathBuf {
 }
 
 #[cfg(target_os = "linux")]
-fn open_private_directory_at(
+fn open_directory_at(
     parent: &File,
     component: &OsStr,
     display_path: &Path,
+    required_mode: u32,
 ) -> Result<AnchoredDirectory, ProvisionError> {
     let fd = rustix::fs::openat(
         parent,
@@ -335,13 +370,13 @@ fn open_private_directory_at(
         Mode::empty(),
     )
     .map_err(|error| ProvisionError::Io(display_path.to_path_buf(), error.into()))?;
-    rustix::fs::fchmod(&fd, Mode::RWXU)
+    rustix::fs::fchmod(&fd, Mode::from_bits_retain(required_mode))
         .map_err(|error| ProvisionError::Io(display_path.to_path_buf(), error.into()))?;
     let file = File::from(fd);
     let metadata = file
         .metadata()
         .map_err(|error| ProvisionError::Io(display_path.to_path_buf(), error))?;
-    if !metadata.is_dir() || metadata.permissions().mode() & 0o777 != 0o700 {
+    if !metadata.is_dir() || metadata.permissions().mode() & 0o777 != required_mode {
         return Err(ProvisionError::InvalidDestination(
             display_path.to_path_buf(),
         ));
@@ -448,7 +483,9 @@ fn validate_config(config: &ProvisionConfig) -> Result<(), ProvisionError> {
 }
 
 fn electra_genesis_spec() -> ChainSpec {
-    ForkName::Electra.make_genesis_spec(MinimalEthSpec::default_spec())
+    ForkName::Electra
+        .make_genesis_spec(MinimalEthSpec::default_spec())
+        .set_slot_duration_ms::<MinimalEthSpec>(300_000)
 }
 
 #[cfg(unix)]
@@ -511,8 +548,10 @@ fn build_staging(
     master_seed: &[u8; 32],
     password: &[u8],
 ) -> Result<ProvisionedDevnet, ProvisionError> {
-    let validators_dir = create_child_directory(staging, VALIDATORS_DIR)?;
-    let passwords_dir = create_child_directory(staging, PASSWORDS_DIR)?;
+    let bundle_dir = create_child_directory(staging, PRIVATE_BUNDLE_DIR)?;
+    let testnet_dir = create_child_directory_with_mode(staging, PUBLIC_TESTNET_DIR, 0o755)?;
+    let validators_dir = create_child_directory(&bundle_dir, VALIDATORS_DIR)?;
+    let passwords_dir = create_child_directory(&bundle_dir, PASSWORDS_DIR)?;
     let mut metadata = Vec::with_capacity(config.validator_count);
     let mut direct_validators = Vec::with_capacity(config.validator_count);
     let mut manifest_validators = Vec::with_capacity(config.validator_count);
@@ -554,12 +593,27 @@ fn build_staging(
     .map_err(|error| ProvisionError::State(format!("{error:?}")))?;
     let genesis_state_bytes = state.as_ssz_bytes();
     let genesis_validators_root = hash256_bytes(&state.genesis_validators_root())?;
+    let genesis_time = state.genesis_time();
     let public_keys = metadata
         .iter()
         .map(|entry| *entry.public_key())
         .collect::<Vec<_>>();
+    let validator_registry = state
+        .validators()
+        .iter()
+        .enumerate()
+        .map(|(position, validator)| {
+            let validator_index =
+                u64::try_from(position).map_err(|_| ProvisionError::InvalidConfig)?;
+            Ok(PqValidatorRegistryEntry::new(
+                validator_index,
+                validator.pubkey,
+                validator.withdrawal_credentials.0,
+            ))
+        })
+        .collect::<Result<Vec<_>, ProvisionError>>()?;
 
-    provision_usage_journal_anchored(&staging.file, genesis_validators_root, &metadata)?;
+    provision_usage_journal_anchored(&bundle_dir.file, genesis_validators_root, &metadata)?;
 
     let manifest = PqDevnetManifest::new(
         config.validator_count,
@@ -571,17 +625,45 @@ fn build_staging(
     );
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)
         .map_err(|error| ProvisionError::Json(error.to_string()))?;
-    write_private_file_at(staging, PQ_DEVNET_GENESIS_FILE, &genesis_state_bytes)?;
-    write_private_file_at(staging, PQ_DEVNET_MANIFEST_FILE, &manifest_bytes)?;
+    let config_bytes = yaml_bytes(&Eth2Config::from_chain_spec::<MinimalEthSpec>(&spec))?;
+    let deposit_block_bytes = yaml_bytes(&0_u64)?;
+    let bootstrap_bytes = yaml_bytes(&Vec::<String>::new())?;
+    write_public_file_at(&testnet_dir, PQ_DEVNET_GENESIS_FILE, &genesis_state_bytes)?;
+    write_public_file_at(&testnet_dir, TESTNET_CONFIG_FILE, &config_bytes)?;
+    write_public_file_at(
+        &testnet_dir,
+        TESTNET_DEPOSIT_BLOCK_FILE,
+        &deposit_block_bytes,
+    )?;
+    write_public_file_at(&testnet_dir, TESTNET_BOOTSTRAP_FILE, &bootstrap_bytes)?;
+    write_private_file_at(&bundle_dir, PQ_DEVNET_MANIFEST_FILE, &manifest_bytes)?;
+    rustix::fs::fsync(&bundle_dir.file)
+        .map_err(|error| ProvisionError::Io(bundle_dir.path.clone(), error.into()))?;
+    rustix::fs::fsync(&testnet_dir.file)
+        .map_err(|error| ProvisionError::Io(testnet_dir.path.clone(), error.into()))?;
     rustix::fs::fsync(&staging.file)
         .map_err(|error| ProvisionError::Io(staging.path.clone(), error.into()))?;
 
     Ok(ProvisionedDevnet {
         output_dir: config.destination.clone(),
+        testnet_dir: config.destination.join(PUBLIC_TESTNET_DIR),
+        bundle_dir: config.destination.join(PRIVATE_BUNDLE_DIR),
         public_keys,
+        validator_registry,
         genesis_state_bytes,
         genesis_validators_root,
+        genesis_time,
     })
+}
+
+fn yaml_bytes(value: &impl serde::Serialize) -> Result<Vec<u8>, ProvisionError> {
+    let yaml =
+        yaml_serde::to_string(value).map_err(|error| ProvisionError::Json(error.to_string()))?;
+    Ok(yaml
+        .strip_prefix("---\n")
+        .unwrap_or(&yaml)
+        .as_bytes()
+        .to_vec())
 }
 
 fn derive32(domain: &[u8], master_seed: &[u8; 32], index: u64) -> Zeroizing<[u8; 32]> {
@@ -620,12 +702,21 @@ fn create_child_directory(
     parent: &AnchoredDirectory,
     component: &str,
 ) -> Result<AnchoredDirectory, ProvisionError> {
+    create_child_directory_with_mode(parent, component, 0o700)
+}
+
+#[cfg(target_os = "linux")]
+fn create_child_directory_with_mode(
+    parent: &AnchoredDirectory,
+    component: &str,
+    mode: u32,
+) -> Result<AnchoredDirectory, ProvisionError> {
     let display_path = parent.path.join(component);
-    rustix::fs::mkdirat(&parent.file, component, Mode::RWXU)
+    rustix::fs::mkdirat(&parent.file, component, Mode::from_bits_retain(mode))
         .map_err(|error| ProvisionError::Io(display_path.clone(), error.into()))?;
     rustix::fs::fsync(&parent.file)
         .map_err(|error| ProvisionError::Io(parent.path.clone(), error.into()))?;
-    let child = open_private_directory_at(&parent.file, OsStr::new(component), &display_path)?;
+    let child = open_directory_at(&parent.file, OsStr::new(component), &display_path, mode)?;
     verify_entry_identity(
         &parent.file,
         OsStr::new(component),
@@ -641,12 +732,31 @@ fn write_private_file_at(
     component: &str,
     bytes: &[u8],
 ) -> Result<(), ProvisionError> {
+    write_file_at(parent, component, bytes, 0o600)
+}
+
+#[cfg(target_os = "linux")]
+fn write_public_file_at(
+    parent: &AnchoredDirectory,
+    component: &str,
+    bytes: &[u8],
+) -> Result<(), ProvisionError> {
+    write_file_at(parent, component, bytes, 0o644)
+}
+
+#[cfg(target_os = "linux")]
+fn write_file_at(
+    parent: &AnchoredDirectory,
+    component: &str,
+    bytes: &[u8],
+    mode: u32,
+) -> Result<(), ProvisionError> {
     let path = parent.path.join(component);
     let fd = rustix::fs::openat(
         &parent.file,
         component,
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR,
+        Mode::from_bits_retain(mode),
     )
     .map_err(|error| ProvisionError::Io(path.to_path_buf(), error.into()))?;
     let mut file = File::from(fd);
@@ -665,8 +775,24 @@ fn validate_output(
     expected: &ProvisionedDevnet,
     password: &[u8],
 ) -> Result<(), ProvisionError> {
+    let bundle = open_directory_at(
+        &root.file,
+        OsStr::new(PRIVATE_BUNDLE_DIR),
+        &root.path.join(PRIVATE_BUNDLE_DIR),
+        0o700,
+    )?;
+    let testnet = open_directory_at(
+        &root.file,
+        OsStr::new(PUBLIC_TESTNET_DIR),
+        &root.path.join(PUBLIC_TESTNET_DIR),
+        0o755,
+    )?;
     let spec = electra_genesis_spec();
-    let state_bytes = read_public_file(&root.path.join(PQ_DEVNET_GENESIS_FILE), MAX_GENESIS_BYTES)?;
+    let state_bytes = read_bounded_regular_file(
+        &testnet.path.join(PQ_DEVNET_GENESIS_FILE),
+        MAX_GENESIS_BYTES,
+        0o644,
+    )?;
     if state_bytes != expected.genesis_state_bytes {
         return Err(ProvisionError::Integrity(
             "genesis state changed after durable write".to_owned(),
@@ -706,7 +832,7 @@ fn validate_output(
         ));
     }
 
-    let discovered = PqValidatorDir::discover(root.path.join(VALIDATORS_DIR))?;
+    let discovered = PqValidatorDir::discover(bundle.path.join(VALIDATORS_DIR))?;
     if discovered.len() != config.validator_count {
         return Err(ProvisionError::Integrity(
             "validator directory count mismatch".to_owned(),
@@ -715,7 +841,7 @@ fn validate_output(
     let mut by_public_key = BTreeMap::new();
     let mut authenticated = Vec::with_capacity(discovered.len());
     for validator_dir in discovered {
-        validator_dir.validate_keystore_password(root.path.join(PASSWORDS_DIR))?;
+        validator_dir.validate_keystore_password(bundle.path.join(PASSWORDS_DIR))?;
         let keystore = validator_dir.keystore()?;
         let entry = keystore.authenticate(password)?;
         if entry.one_time_use_range() != config.one_time_use_range {
@@ -738,16 +864,25 @@ fn validate_output(
             ));
         }
     }
-    validate_usage_journal_anchored(&root.file, expected.genesis_validators_root, &authenticated)?;
+    validate_usage_journal_anchored(
+        &bundle.file,
+        expected.genesis_validators_root,
+        &authenticated,
+    )?;
 
-    let manifest_bytes = read_public_file(
-        &root.path.join(PQ_DEVNET_MANIFEST_FILE),
+    let manifest_bytes = read_bounded_regular_file(
+        &bundle.path.join(PQ_DEVNET_MANIFEST_FILE),
         MAX_PQ_DEVNET_MANIFEST_BYTES,
+        0o600,
     )?;
     let manifest = PqDevnetManifest::from_json_slice(&manifest_bytes)
         .map_err(|error| ProvisionError::Json(error.to_string()))?;
     let validated = manifest
-        .validate_for_network(expected.genesis_validators_root)
+        .validate_for_network_registry(
+            expected.genesis_validators_root,
+            expected.genesis_time,
+            &expected.validator_registry,
+        )
         .map_err(|error| ProvisionError::Integrity(error.to_string()))?;
     let expected_withdrawal_credentials = registry_withdrawal_credentials
         .iter()
@@ -765,7 +900,11 @@ fn validate_output(
 }
 
 #[cfg(unix)]
-fn read_public_file(path: &Path, maximum: usize) -> Result<Vec<u8>, ProvisionError> {
+fn read_bounded_regular_file(
+    path: &Path,
+    maximum: usize,
+    required_mode: u32,
+) -> Result<Vec<u8>, ProvisionError> {
     let fd = rustix::fs::open(
         path,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -778,7 +917,10 @@ fn read_public_file(path: &Path, maximum: usize) -> Result<Vec<u8>, ProvisionErr
         .map_err(|error| ProvisionError::Io(path.to_path_buf(), error))?;
     let file_len = usize::try_from(metadata.len())
         .map_err(|_| ProvisionError::Integrity("public file is too large".to_owned()))?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o777 != 0o600 || file_len > maximum {
+    if !metadata.is_file()
+        || metadata.permissions().mode() & 0o777 != required_mode
+        || file_len > maximum
+    {
         return Err(ProvisionError::Integrity(format!(
             "unsafe or oversized public file {}",
             path.display()

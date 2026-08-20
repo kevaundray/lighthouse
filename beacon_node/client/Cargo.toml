@@ -20,6 +20,15 @@ pq-devnet = [
     "store/pq-devnet",
     "types/pq-devnet",
 ]
+pq-proposer = [
+    "pq-devnet",
+    "dep:initialized_validators",
+    "dep:lighthouse_validator_store",
+    "dep:slashing_protection",
+    "initialized_validators/pq-devnet",
+    "lighthouse_validator_store/pq-devnet",
+    "slashing_protection/pq-devnet",
+]
 pq-startup-testing = [
     "pq-devnet",
     "beacon_chain/pq-startup-testing",
@@ -42,18 +51,22 @@ genesis = { workspace = true }
 http_api = { workspace = true, optional = true }
 http_metrics = { path = "../http_metrics", optional = true }
 hyper = { workspace = true }
+initialized_validators = { path = "../../validator_client/initialized_validators", optional = true, default-features = false }
 kzg = { workspace = true }
 lighthouse_network = { workspace = true }
+lighthouse_validator_store = { path = "../../validator_client/lighthouse_validator_store", optional = true, default-features = false }
 logging = { workspace = true }
 metrics = { workspace = true }
 monitoring_api = { workspace = true }
 network = { path = "../network", default-features = false }
 rand = { workspace = true }
+rustix = { workspace = true }
 sensitive_url = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 slasher = { workspace = true, optional = true }
 slasher_service = { path = "../../slasher/service", optional = true }
+slashing_protection = { path = "../../validator_client/slashing_protection", optional = true, default-features = false }
 slot_clock = { workspace = true }
 state_processing = { workspace = true }
 store = { workspace = true }
@@ -64,11 +77,17 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 types = { workspace = true }
+yaml_serde = { workspace = true }
 
 [dev-dependencies]
+hex = { workspace = true }
 operation_pool = { workspace = true }
+pq_devnet = { path = "../../testing/pq_devnet", default-features = false, features = ["pq-devnet"] }
+pq_signing = { workspace = true, features = ["pq-devnet"] }
+rusqlite = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true }
-yaml_serde = { workspace = true }
+validator_dir = { workspace = true, features = ["pq-devnet"] }
 
 [[test]]
 name = "pq_runtime"

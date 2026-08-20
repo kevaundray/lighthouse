@@ -22,6 +22,129 @@ fn write_inputs(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathB
     (seed_path, password_path)
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn provisioned_container_separates_public_testnet_from_private_bundle() {
+    let root = tempdir().expect("root");
+    let (seed_path, password_path) = write_inputs(root.path());
+    let container = root.path().join("devnet");
+    let provisioned = provision_devnet(
+        ProvisionConfig::for_test(container.clone(), 1, 0..=3, 42),
+        &seed_path,
+        &password_path,
+    )
+    .expect("provisioned container");
+
+    assert_eq!(provisioned.output_dir(), container);
+    assert_eq!(provisioned.testnet_dir(), container.join("testnet"));
+    assert_eq!(provisioned.bundle_dir(), container.join("bundle"));
+    assert_eq!(
+        fs::metadata(&container)
+            .expect("container metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755,
+    );
+    assert_eq!(
+        fs::metadata(provisioned.testnet_dir())
+            .expect("testnet metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755,
+    );
+    assert_eq!(
+        fs::metadata(provisioned.bundle_dir())
+            .expect("bundle metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700,
+    );
+
+    let entry_names = |directory: &std::path::Path| {
+        let mut names = fs::read_dir(directory)
+            .expect("read directory")
+            .map(|entry| {
+                entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    assert_eq!(
+        entry_names(provisioned.testnet_dir()),
+        vec![
+            "bootstrap_nodes.yaml",
+            "config.yaml",
+            "deposit_contract_block.txt",
+            "genesis.ssz",
+        ],
+    );
+    let mut expected_bundle_entries = vec![
+        PQ_DEVNET_JOURNAL_FILE.to_owned(),
+        format!("{PQ_DEVNET_JOURNAL_FILE}.lock"),
+        PQ_DEVNET_MANIFEST_FILE.to_owned(),
+        "secrets".to_owned(),
+        "validators".to_owned(),
+    ];
+    expected_bundle_entries.sort();
+    assert_eq!(
+        entry_names(provisioned.bundle_dir()),
+        expected_bundle_entries,
+    );
+    for public_file in entry_names(provisioned.testnet_dir()) {
+        assert_eq!(
+            fs::metadata(provisioned.testnet_dir().join(public_file))
+                .expect("public file metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644,
+        );
+    }
+    let public_config: types::Config = yaml_serde::from_reader(
+        fs::File::open(provisioned.testnet_dir().join("config.yaml")).expect("public config file"),
+    )
+    .expect("public config YAML");
+    let expected_spec = ForkName::Electra
+        .make_genesis_spec(MinimalEthSpec::default_spec())
+        .set_slot_duration_ms::<MinimalEthSpec>(300_000);
+    assert_eq!(
+        public_config,
+        types::Config::from_chain_spec::<MinimalEthSpec>(&expected_spec),
+    );
+    for private_dir in ["validators", "secrets"] {
+        assert_eq!(
+            fs::metadata(provisioned.bundle_dir().join(private_dir))
+                .expect("private directory metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+        );
+    }
+    for private_file in [
+        PQ_DEVNET_JOURNAL_FILE.to_owned(),
+        format!("{PQ_DEVNET_JOURNAL_FILE}.lock"),
+        PQ_DEVNET_MANIFEST_FILE.to_owned(),
+    ] {
+        assert_eq!(
+            fs::metadata(provisioned.bundle_dir().join(private_file))
+                .expect("private file metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+        );
+    }
+}
+
 #[test]
 fn one_validator_provisioning_is_reopenable_and_publicly_deterministic() {
     let root = tempdir().expect("root");
@@ -44,13 +167,13 @@ fn one_validator_provisioning_is_reopenable_and_publicly_deterministic() {
         second.genesis_validators_root()
     );
     assert_eq!(
-        fs::read(first_path.join(PQ_DEVNET_MANIFEST_FILE)).expect("manifest"),
-        fs::read(second_path.join(PQ_DEVNET_MANIFEST_FILE)).expect("manifest")
+        fs::read(first.bundle_dir().join(PQ_DEVNET_MANIFEST_FILE)).expect("manifest"),
+        fs::read(second.bundle_dir().join(PQ_DEVNET_MANIFEST_FILE)).expect("manifest")
     );
 
     let spec = ForkName::Electra.make_genesis_spec(MinimalEthSpec::default_spec());
     let state = BeaconState::<MinimalEthSpec>::from_ssz_bytes(
-        &fs::read(first_path.join(PQ_DEVNET_GENESIS_FILE)).expect("genesis"),
+        &fs::read(first.testnet_dir().join(PQ_DEVNET_GENESIS_FILE)).expect("genesis"),
         &spec,
     )
     .expect("decode genesis");
@@ -63,14 +186,15 @@ fn one_validator_provisioning_is_reopenable_and_publicly_deterministic() {
         first.public_keys()
     );
 
-    let first_dirs = PqValidatorDir::discover(first_path.join("validators")).expect("discover");
+    let first_dirs =
+        PqValidatorDir::discover(first.bundle_dir().join("validators")).expect("discover");
     assert_eq!(first_dirs.len(), 1);
     assert!(first_dirs[0].dir().join(PQ_VOTING_KEYSTORE_FILE).is_file());
     first_dirs[0]
-        .validate_keystore_password(first_path.join("secrets"))
+        .validate_keystore_password(first.bundle_dir().join("secrets"))
         .expect("password and keystore");
     let first_keystore_json = fs::read(first_dirs[0].pq_voting_keystore_path()).expect("keystore");
-    let second_dir = PqValidatorDir::discover(second_path.join("validators"))
+    let second_dir = PqValidatorDir::discover(second.bundle_dir().join("validators"))
         .expect("discover")
         .remove(0);
     let second_keystore_json = fs::read(second_dir.pq_voting_keystore_path()).expect("keystore");
@@ -87,7 +211,7 @@ fn one_validator_provisioning_is_reopenable_and_publicly_deterministic() {
         })
         .collect::<Vec<AuthenticatedPqKeyMetadata>>();
     validate_usage_journal(
-        &first_path.join(PQ_DEVNET_JOURNAL_FILE),
+        &first.bundle_dir().join(PQ_DEVNET_JOURNAL_FILE),
         first.genesis_validators_root(),
         &metadata,
     )
