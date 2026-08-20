@@ -576,12 +576,87 @@ struct ValidProductionFixture {
     execution: Arc<RecordingExecution>,
     randao: PqRawSignature,
     genesis_root: Hash256,
+    genesis_checkpoint: types::Checkpoint,
     authority: PqSigningAuthority,
     spec: Arc<types::ChainSpec>,
     proposal_state: types::BeaconState<MinimalEthSpec>,
     proposer_index: usize,
     _runtime: task_executor::test_utils::TestRuntime,
     _temporary_directory: tempfile::TempDir,
+}
+
+#[cfg(target_feature = "avx2")]
+struct IndependentPqReceiverFixture {
+    chain: Arc<beacon_chain::BeaconChain<TestWitness>>,
+    store: Arc<HotColdDB<MinimalEthSpec, MemoryStore, MemoryStore>>,
+    aggregation_service: Arc<AggregationService>,
+    execution: Arc<RecordingExecution>,
+    genesis_root: Hash256,
+    genesis_checkpoint: types::Checkpoint,
+}
+
+#[cfg(target_feature = "avx2")]
+fn independent_pq_receiver_fixture(
+    publisher: &ValidProductionFixture,
+) -> IndependentPqReceiverFixture {
+    let genesis = publisher.chain.head_snapshot().beacon_state.clone();
+    let store = exact_snapshot_store(Arc::clone(&publisher.spec));
+    let execution = Arc::new(RecordingExecution {
+        new_payload_calls: AtomicUsize::new(0),
+        new_payload_responses: Mutex::new(VecDeque::new()),
+        stall_new_payload: AtomicBool::new(false),
+        new_payload_release: tokio::sync::Semaphore::new(0),
+        payload_calls: AtomicUsize::new(0),
+        stall_payload: AtomicBool::new(false),
+        omit_payload_bundle: AtomicBool::new(false),
+        invalid_payload_block_hash: AtomicBool::new(false),
+        nonzero_blob_gas: AtomicBool::new(false),
+        payload_release: tokio::sync::Semaphore::new(0),
+    });
+    let chain = Arc::new(
+        BeaconChainBuilder::<TestWitness>::pq_new(MinimalEthSpec)
+            .store(Arc::clone(&store))
+            .custom_spec(Arc::clone(&publisher.spec))
+            .genesis_state(genesis)
+            .expect("persist independent receiver genesis")
+            .pq_aggregation_service(Arc::clone(&publisher.aggregation_service))
+            .task_executor(publisher._runtime.task_executor.clone())
+            .testing_only_pq_execution_notifier(execution.clone())
+            .build()
+            .expect("independent receiver chain"),
+    );
+    chain.slot_clock.set_slot(1);
+    let head = chain.head_snapshot();
+    let genesis_root = head.beacon_block_root;
+    let genesis_checkpoint = head.beacon_state.finalized_checkpoint();
+    IndependentPqReceiverFixture {
+        chain,
+        store,
+        aggregation_service: Arc::clone(&publisher.aggregation_service),
+        execution,
+        genesis_root,
+        genesis_checkpoint,
+    }
+}
+
+#[cfg(target_feature = "avx2")]
+fn restart_independent_pq_chain(
+    fixture: &ValidProductionFixture,
+    store: Arc<HotColdDB<MinimalEthSpec, MemoryStore, MemoryStore>>,
+    execution: Arc<RecordingExecution>,
+) -> Arc<beacon_chain::BeaconChain<TestWitness>> {
+    Arc::new(
+        BeaconChainBuilder::<TestWitness>::pq_new(MinimalEthSpec)
+            .store(store)
+            .custom_spec(Arc::clone(&fixture.spec))
+            .resume_from_db()
+            .expect("resume independent PQ head")
+            .pq_aggregation_service(Arc::clone(&fixture.aggregation_service))
+            .task_executor(fixture._runtime.task_executor.clone())
+            .testing_only_pq_execution_notifier(execution)
+            .build()
+            .expect("rebuild independent PQ head"),
+    )
 }
 
 #[cfg(target_feature = "avx2")]
@@ -872,7 +947,9 @@ fn valid_production_fixture_with_hooks_and_spec(
     }
     let chain = Arc::new(builder.build().expect("PQ chain"));
     chain.slot_clock.set_slot(1);
-    let genesis_root = chain.head_snapshot().beacon_block_root;
+    let head = chain.head_snapshot();
+    let genesis_root = head.beacon_block_root;
+    let genesis_checkpoint = head.beacon_state.finalized_checkpoint();
     let mut proposal_state = genesis;
     state_processing::per_slot_processing_pq(&mut proposal_state, &spec)
         .expect("advance proposal state");
@@ -903,6 +980,7 @@ fn valid_production_fixture_with_hooks_and_spec(
         execution,
         randao,
         genesis_root,
+        genesis_checkpoint,
         authority,
         spec,
         proposal_state,
@@ -934,7 +1012,31 @@ async fn start_pq_network_worker(
     tokio::sync::mpsc::Sender<lighthouse_network::Multiaddr>,
     Arc<lighthouse_network::PqGossipValidationAdmission>,
 ) {
-    let head = fixture.chain.head_snapshot();
+    let (broadcast_sender, globals, dial_sender, admission, _shutdown) =
+        start_pq_network_worker_for_chain(
+            fixture,
+            Arc::clone(&fixture.chain),
+            disable_discovery,
+            None,
+        )
+        .await;
+    (broadcast_sender, globals, dial_sender, admission)
+}
+
+#[cfg(target_feature = "avx2")]
+async fn start_pq_network_worker_for_chain(
+    fixture: &ValidProductionFixture,
+    chain: Arc<beacon_chain::BeaconChain<TestWitness>>,
+    disable_discovery: bool,
+    encoding_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> (
+    network::PqBlockBroadcastSender<MinimalEthSpec>,
+    Arc<NetworkGlobals<MinimalEthSpec>>,
+    tokio::sync::mpsc::Sender<lighthouse_network::Multiaddr>,
+    Arc<lighthouse_network::PqGossipValidationAdmission>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
+    let head = chain.head_snapshot();
     let genesis_validators_root = head.beacon_state.genesis_validators_root();
     let mut network_config = NetworkConfig::default();
     network_config.set_ipv4_listening_address(std::net::Ipv4Addr::LOCALHOST, 0, 0, 0);
@@ -955,21 +1057,27 @@ async fn start_pq_network_worker(
         libp2p_registry: None,
     };
     let (broadcast_sender, broadcast_receiver) = pq_block_broadcast_channel();
-    let service = PqNetworkService::new(
+    let mut service = PqNetworkService::new(
         fixture._runtime.task_executor.clone(),
         context,
         fixture.spec.custody_requirement,
         secp256k1::Keypair::generate().into(),
-        Arc::clone(&fixture.chain),
+        chain,
         broadcast_receiver,
     )
     .await
     .expect("PQ network service");
+    if let Some(hook) = encoding_hook {
+        service.testing_only_set_block_encoding_hook(hook);
+    }
     let globals = service.network_globals();
     let dial_sender = service.testing_only_dial_sender();
     let admission = service.testing_only_gossip_admission();
+    let shutdown = service
+        .testing_only_shutdown_receipt()
+        .expect("one shutdown receipt per PQ network owner");
     service.start().expect("start PQ network service");
-    (broadcast_sender, globals, dial_sender, admission)
+    (broadcast_sender, globals, dial_sender, admission, shutdown)
 }
 
 #[cfg(target_feature = "avx2")]
@@ -1134,6 +1242,258 @@ async fn real_delayed_network_proof_survives_old_history_and_commits_engine_db_h
     assert_eq!(
         restarted.head_snapshot().beacon_block_root,
         signed.canonical_root(),
+    );
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn real_publication_service_converges_two_independent_network_chains() {
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    let test_started = std::time::Instant::now();
+    let spec = ForkName::Electra
+        .make_genesis_spec(MinimalEthSpec::default_spec())
+        .set_slot_duration_ms::<MinimalEthSpec>(300_000);
+    let publisher =
+        valid_production_fixture_with_hooks_and_spec(false, false, None, None, None, spec);
+    let receiver = independent_pq_receiver_fixture(&publisher);
+    assert!(!Arc::ptr_eq(&publisher.store, &receiver.store));
+    assert!(!Arc::ptr_eq(&publisher.chain, &receiver.chain));
+    assert!(!Arc::ptr_eq(&publisher.execution, &receiver.execution));
+    assert!(Arc::ptr_eq(
+        &publisher.aggregation_service,
+        &receiver.aggregation_service,
+    ));
+    assert_eq!(publisher.genesis_root, receiver.genesis_root);
+    assert_eq!(
+        publisher.genesis_checkpoint,
+        publisher
+            .chain
+            .head_snapshot()
+            .beacon_state
+            .finalized_checkpoint(),
+    );
+    assert_eq!(
+        receiver.genesis_checkpoint,
+        receiver
+            .chain
+            .head_snapshot()
+            .beacon_state
+            .finalized_checkpoint(),
+    );
+
+    let produced = publisher
+        .chain
+        .produce_pq_block_v3(Slot::new(1), publisher.randao.clone(), Graffiti::default())
+        .await
+        .expect("valid publisher candidate");
+    let signed = sign_produced_block(&publisher, produced);
+    let signed_root = signed.canonical_root();
+    eprintln!("PQ e4b: produced at {:?}", test_started.elapsed());
+
+    let (receiver_sender, receiver_globals, _receiver_dial, _, receiver_shutdown) =
+        start_pq_network_worker_for_chain(&publisher, Arc::clone(&receiver.chain), false, None)
+            .await;
+    let receiver_address = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let enr = receiver_globals.local_enr();
+            if let Some(address) = enr.multiaddr_p2p_tcp().into_iter().next() {
+                break address;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("receiver listening ENR");
+
+    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let (entered_sender, mut entered_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let encoding_hook = {
+        let release = Arc::clone(&release);
+        Arc::new(move || {
+            entered_sender.send(()).expect("encoding observer alive");
+            let (lock, condition) = &*release;
+            let mut released = lock.lock().expect("encoding release lock");
+            while !*released {
+                released = condition.wait(released).expect("encoding release wait");
+            }
+        }) as Arc<dyn Fn() + Send + Sync>
+    };
+    let (
+        publisher_sender,
+        publisher_globals,
+        publisher_dial,
+        publisher_admission,
+        publisher_shutdown,
+    ) = start_pq_network_worker_for_chain(
+        &publisher,
+        Arc::clone(&publisher.chain),
+        true,
+        Some(encoding_hook),
+    )
+    .await;
+    publisher_dial
+        .try_send(receiver_address)
+        .expect("bounded testing dial command");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while publisher_globals.connected_peers() == 0
+            || receiver_globals.connected_peers() == 0
+            || !publisher_admission.has_compatible_peers()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("compatible PQ Status handshake");
+    eprintln!(
+        "PQ e4b: compatible handshake at {:?}",
+        test_started.elapsed()
+    );
+
+    let publication_service = Arc::new(
+        PqBlockPublicationService::new(
+            Arc::clone(&publisher.chain),
+            publisher._runtime.task_executor.clone(),
+            publisher_sender,
+        )
+        .expect("publisher publication service"),
+    );
+    let admission = publication_service
+        .try_admit()
+        .expect("publication admission");
+    let signed_for_publish = Arc::clone(&signed);
+    let publication = tokio::spawn(async move { admission.publish(signed_for_publish).await });
+
+    let entered = tokio::time::timeout(Duration::from_secs(300), entered_receiver.recv()).await;
+    let publication_finished_before_ack = publication.is_finished();
+    let publisher_engine_before_ack = publisher.execution.new_payload_calls.load(Ordering::SeqCst);
+    let receiver_engine_before_ack = receiver.execution.new_payload_calls.load(Ordering::SeqCst);
+    let publisher_head_before_ack = publisher.chain.head_snapshot().beacon_block_root;
+    let receiver_head_before_ack = receiver.chain.head_snapshot().beacon_block_root;
+    let (lock, condition) = &*release;
+    *lock.lock().expect("encoding release lock") = true;
+    condition.notify_all();
+    entered
+        .expect("real publication reaches network encoding")
+        .expect("encoding observer");
+    eprintln!("PQ e4b: pre-ack barrier at {:?}", test_started.elapsed());
+    assert!(!publication_finished_before_ack);
+    assert_eq!(publisher_engine_before_ack, 0);
+    assert_eq!(receiver_engine_before_ack, 0);
+    assert_eq!(publisher_head_before_ack, publisher.genesis_root);
+    assert_eq!(receiver_head_before_ack, receiver.genesis_root);
+
+    let disposition = tokio::time::timeout(Duration::from_secs(300), publication)
+        .await
+        .expect("publisher publication completes")
+        .expect("publisher publication task");
+    let PqBlockPublicationDisposition::Published(outcome) = disposition else {
+        panic!("real publication must commit the publisher")
+    };
+    assert_eq!(outcome.source, beacon_chain::PqBlockImportSource::Publish);
+    assert_eq!(outcome.block_root, signed_root);
+    eprintln!(
+        "PQ e4b: publisher committed at {:?}",
+        test_started.elapsed()
+    );
+
+    tokio::time::timeout(Duration::from_secs(300), async {
+        while receiver.chain.head_snapshot().beacon_block_root != signed_root {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("receiver full proof and import");
+    eprintln!("PQ e4b: receiver committed at {:?}", test_started.elapsed());
+    assert_eq!(
+        publisher.execution.new_payload_calls.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        receiver.execution.new_payload_calls.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        publisher
+            .store
+            .get_full_block(&signed_root)
+            .expect("publisher block lookup")
+            .expect("publisher persisted exact block"),
+        *signed,
+    );
+    assert_eq!(
+        receiver
+            .store
+            .get_full_block(&signed_root)
+            .expect("receiver block lookup")
+            .expect("receiver persisted exact block"),
+        *signed,
+    );
+    assert_eq!(
+        publisher
+            .chain
+            .head_snapshot()
+            .beacon_state
+            .finalized_checkpoint(),
+        publisher.genesis_checkpoint,
+    );
+    assert_eq!(
+        receiver
+            .chain
+            .head_snapshot()
+            .beacon_state
+            .finalized_checkpoint(),
+        receiver.genesis_checkpoint,
+    );
+
+    drop(publication_service);
+    drop(receiver_sender);
+    tokio::time::timeout(Duration::from_secs(10), publisher_shutdown)
+        .await
+        .expect("publisher network owner shuts down")
+        .expect("publisher shutdown receipt");
+    tokio::time::timeout(Duration::from_secs(10), receiver_shutdown)
+        .await
+        .expect("receiver network owner shuts down")
+        .expect("receiver shutdown receipt");
+    let restarted_publisher = restart_independent_pq_chain(
+        &publisher,
+        Arc::clone(&publisher.store),
+        Arc::clone(&publisher.execution),
+    );
+    let restarted_receiver = restart_independent_pq_chain(
+        &publisher,
+        Arc::clone(&receiver.store),
+        Arc::clone(&receiver.execution),
+    );
+    assert_eq!(
+        restarted_publisher.head_snapshot().beacon_block_root,
+        signed_root
+    );
+    assert_eq!(
+        restarted_receiver.head_snapshot().beacon_block_root,
+        signed_root
+    );
+    assert_eq!(
+        restarted_publisher.head_snapshot().beacon_block.as_ref(),
+        signed.as_ref(),
+    );
+    assert_eq!(
+        restarted_receiver.head_snapshot().beacon_block.as_ref(),
+        signed.as_ref(),
+    );
+    assert_eq!(
+        restarted_publisher
+            .head_snapshot()
+            .beacon_state
+            .finalized_checkpoint(),
+        publisher.genesis_checkpoint,
+    );
+    assert_eq!(
+        restarted_receiver
+            .head_snapshot()
+            .beacon_state
+            .finalized_checkpoint(),
+        receiver.genesis_checkpoint,
     );
 }
 

@@ -40,6 +40,18 @@ pub const PQ_NETWORK_BLOCK_COMMIT_CAPACITY: usize = 2;
 #[cfg(feature = "pq-startup-testing")]
 type PqBlockEncodingHook = Arc<dyn Fn() + Send + Sync>;
 
+#[cfg(feature = "pq-startup-testing")]
+struct PqNetworkShutdownTestGuard(Option<tokio::sync::oneshot::Sender<()>>);
+
+#[cfg(feature = "pq-startup-testing")]
+impl Drop for PqNetworkShutdownTestGuard {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PqNetworkServiceError {
     Construction(String),
@@ -454,6 +466,8 @@ pub struct PqNetworkService<T: BeaconChainTypes> {
     testing_dial_receiver: mpsc::Receiver<lighthouse_network::Multiaddr>,
     #[cfg(feature = "pq-startup-testing")]
     testing_block_encoding_hook: Option<PqBlockEncodingHook>,
+    #[cfg(feature = "pq-startup-testing")]
+    testing_shutdown_sender: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl<T: BeaconChainTypes> PqNetworkService<T> {
@@ -506,6 +520,8 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
             testing_dial_receiver,
             #[cfg(feature = "pq-startup-testing")]
             testing_block_encoding_hook: None,
+            #[cfg(feature = "pq-startup-testing")]
+            testing_shutdown_sender: None,
         })
     }
 
@@ -531,6 +547,17 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
         self.testing_block_encoding_hook = Some(hook);
     }
 
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_shutdown_receipt(&mut self) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        if self.testing_shutdown_sender.is_some() {
+            return None;
+        }
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        self.testing_shutdown_sender = Some(sender);
+        Some(receiver)
+    }
+
     pub fn start(self) -> Result<(), PqNetworkServiceError> {
         if self.task_executor.handle().is_none() {
             return Err(PqNetworkServiceError::TaskUnavailable);
@@ -541,6 +568,8 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
     }
 
     async fn run(mut self) {
+        #[cfg(feature = "pq-startup-testing")]
+        let _shutdown_guard = PqNetworkShutdownTestGuard(self.testing_shutdown_sender.take());
         loop {
             let event = tokio::select! {
                 command = self.broadcast_receiver.recv() => {

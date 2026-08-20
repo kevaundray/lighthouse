@@ -317,7 +317,11 @@ fn exact_snapshot_store(
 fn build_chain(
     runtime: &task_executor::test_utils::TestRuntime,
 ) -> (Arc<beacon_chain::BeaconChain<TestWitness>>, Arc<ChainSpec>) {
-    let spec = Arc::new(ForkName::Electra.make_genesis_spec(MinimalEthSpec::default_spec()));
+    let spec = Arc::new(
+        ForkName::Electra
+            .make_genesis_spec(MinimalEthSpec::default_spec())
+            .set_slot_duration_ms::<MinimalEthSpec>(300_000),
+    );
     let mut genesis = state_processing::initialize_beacon_state_from_validators::<MinimalEthSpec>(
         Hash256::ZERO,
         0,
@@ -413,8 +417,16 @@ async fn start_network_service(
 async fn live_worker_negatively_acknowledges_exact_block_without_peers() {
     let runtime = task_executor::test_utils::TestRuntime::default();
     let (chain, spec) = build_chain(&runtime);
-    let (sender, _globals, _dial_sender, _gossip_admission) =
-        start_network_service(&runtime, chain, Arc::clone(&spec), vec![], true, None).await;
+    let genesis_root = chain.head_snapshot().beacon_block_root;
+    let (sender, _globals, _dial_sender, gossip_admission) = start_network_service(
+        &runtime,
+        Arc::clone(&chain),
+        Arc::clone(&spec),
+        vec![],
+        true,
+        None,
+    )
+    .await;
     let block = Arc::new(SignedBeaconBlock::from_block(
         BeaconBlock::empty(&spec),
         IndividualSignature::empty(),
@@ -426,6 +438,8 @@ async fn live_worker_negatively_acknowledges_exact_block_without_peers() {
             .expect("worker acknowledgement"),
         Err(PqBlockBroadcastError::Rejected),
     );
+    assert_eq!(chain.head_snapshot().beacon_block_root, genesis_root);
+    assert_eq!(gossip_admission.testing_only_active_total(), 0);
 }
 
 #[cfg(target_feature = "avx2")]

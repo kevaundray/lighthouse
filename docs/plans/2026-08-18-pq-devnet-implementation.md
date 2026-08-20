@@ -2347,8 +2347,9 @@ seconds. During that pending proof, submitting the exact block through the recei
 returns prompt negative `PendingValidation`, proving the mutable receiver loop remains live rather
 than observing an unrelated publisher loop. Releasing the barrier completes the full sealed proof,
 Engine VALID notification, atomic DB/head publication, exact stored block lookup, and restart at the
-same signed root (1/1 in 93.86 seconds). Independent-store two-node convergence and publisher-side
-HTTP publication ordering remain deliberately deferred to e4b.
+same signed root (1/1 in 93.86 seconds). Independent-store two-node convergence and direct
+publisher `PqBlockPublicationService` ordering are covered by e4b rather than this receiver-only
+gate; this is not an HTTP-route test.
 
 ##### Task 5.3e-e4b: Prove the bounded two-node live-block boundary
 
@@ -2366,6 +2367,24 @@ This slice is deliberately a live-gossip/non-finality proof. V1 has no fork choi
 checkpoint advancement, and a node that starts behind is not synchronized. Do not advertise range
 sync, lookup, finality, or late-join support. Complete this evidence before adding the attestation
 topics or top-level proposer assembly so failures remain attributable.
+
+Implemented evidence uses two independent `HotColdDB` instances, chain heads, and deterministic
+Engine adapters, with the one process-owned `AggregationService` shared by both nodes. The publisher
+uses the real bounded publication service and the live network worker as its sole broadcaster. A
+blocking encoding barrier proves that neither Engine is notified and neither head changes before the
+real gossipsub acknowledgment. Releasing it yields a `Publish`-source publisher commit followed by
+the receiver's independent admitted proof, validation report, Engine VALID notification, and atomic
+DB/head commit. Both stores contain the exact signed block and both chains rebuild from their own DB
+at that signed root only after their network-owner shutdown receipts resolve; each finalized
+checkpoint remains exactly its captured genesis checkpoint, including epoch and root. The
+warning-denied AVX gate passed 1/1 in 80.03 seconds.
+
+The live zero-peer gate returns a negative acknowledgment while leaving the publisher head at
+genesis with no retained gossip admission. Existing bounded lifecycle tests pin owner shutdown while
+an acknowledgment is pending, and the publication cancellation gate pins detached completion and
+restart after the caller is dropped. Exact duplicate, invalid evidence, local retry, and bounded
+overload behavior remain covered by the e4a/e-e2a lifecycle gates rather than repeating their full
+proof work here. Late join, range synchronization, and finality remain deliberately unsupported.
 
 ##### Task 5.3e-e4c: Add a PQ-only disk-chain and process owner
 
