@@ -414,6 +414,231 @@ async fn start_network_service(
 
 #[cfg(target_feature = "avx2")]
 #[tokio::test(flavor = "current_thread")]
+async fn result_bearing_network_start_confirms_owner_shutdown() {
+    use std::sync::{Condvar, Mutex};
+
+    struct ReleaseOnDrop(Arc<(Mutex<bool>, Condvar)>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let (lock, condition) = &*self.0;
+            *lock.lock().expect("release lock") = true;
+            condition.notify_all();
+        }
+    }
+
+    let runtime = task_executor::test_utils::TestRuntime::default();
+    let (chain, spec) = build_chain(&runtime);
+    let head = chain.head_snapshot();
+    let block = Arc::clone(&head.beacon_block);
+    let genesis_validators_root = head.beacon_state.genesis_validators_root();
+    let mut network_config = NetworkConfig::default();
+    network_config.set_ipv4_listening_address(std::net::Ipv4Addr::LOCALHOST, 0, 0, 0);
+    network_config.enr_address = (Some(std::net::Ipv4Addr::LOCALHOST), None);
+    network_config.disable_discovery = true;
+    network_config.network_dir = tempfile::TempDir::new().expect("network directory").keep();
+    let context = Context {
+        config: Arc::new(network_config),
+        enr_fork_id: spec
+            .enr_fork_id::<MinimalEthSpec>(head.beacon_block.slot(), genesis_validators_root),
+        fork_context: Arc::new(ForkContext::new::<MinimalEthSpec>(
+            head.beacon_block.slot(),
+            genesis_validators_root,
+            &spec,
+        )),
+        chain_spec: spec,
+        libp2p_registry: None,
+    };
+    let (broadcast_sender, broadcast_receiver) = pq_block_broadcast_channel();
+    let (network_runtime_owner, network_exit) = async_channel::bounded(1);
+    let (network_shutdown_sender, _) = futures::channel::mpsc::channel(1);
+    let network_executor = task_executor::TaskExecutor::new(
+        tokio::runtime::Handle::current(),
+        network_exit,
+        network_shutdown_sender,
+    );
+    let mut service = PqNetworkService::new(
+        network_executor,
+        context,
+        MinimalEthSpec::default_spec().custody_requirement,
+        secp256k1::Keypair::generate().into(),
+        chain,
+        broadcast_receiver,
+    )
+    .await
+    .expect("PQ network service");
+    assert!(
+        service
+            .testing_only_gossip_admission()
+            .try_add_compatible(lighthouse_network::PeerId::random())
+    );
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let _release_on_drop = ReleaseOnDrop(Arc::clone(&release));
+    let (entered_sender, mut entered_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let hook = {
+        let release = Arc::clone(&release);
+        Arc::new(move || {
+            entered_sender.send(()).expect("shutdown test alive");
+            let (lock, condition) = &*release;
+            let mut released = lock.lock().expect("release lock");
+            while !*released {
+                released = condition.wait(released).expect("release wait");
+            }
+        }) as Arc<dyn Fn() + Send + Sync>
+    };
+    service.testing_only_set_block_encoding_hook(hook);
+
+    let shutdown = service
+        .start_with_shutdown_receipt()
+        .await
+        .expect("result-bearing network start");
+    let retained_sender = broadcast_sender.clone();
+    let pending = broadcast_sender
+        .try_send(Arc::clone(&block))
+        .expect("bounded pending broadcast");
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered_receiver.recv())
+        .await
+        .expect("encoding hook entered")
+        .expect("encoding hook signal");
+    let mut shutdown_task = tokio::spawn(shutdown.testing_only_wait_for_exit());
+    drop(network_runtime_owner);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut shutdown_task)
+            .await
+            .is_err(),
+        "shutdown must retain the in-flight encoder owner",
+    );
+    assert!(matches!(
+        AggregationService::new(),
+        Err(consensus_signature::AggregationError::AlreadyActive),
+    ));
+    {
+        let (lock, condition) = &*release;
+        *lock.lock().expect("release lock") = true;
+        condition.notify_all();
+    }
+    assert_eq!(
+        pending.wait().await,
+        Err(PqBlockBroadcastError::WorkerUnavailable),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), shutdown_task)
+        .await
+        .expect("network owner shutdown")
+        .expect("shutdown task")
+        .expect("network worker result");
+    assert!(matches!(
+        retained_sender.try_send(block),
+        Err(PqBlockBroadcastError::WorkerUnavailable),
+    ));
+    drop(AggregationService::new().expect("aggregation owner released after drain"));
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn result_bearing_network_start_rejects_executor_shutdown_before_first_poll() {
+    let runtime = task_executor::test_utils::TestRuntime::default();
+    let (chain, spec) = build_chain(&runtime);
+    let head = chain.head_snapshot();
+    let genesis_validators_root = head.beacon_state.genesis_validators_root();
+    let mut network_config = NetworkConfig::default();
+    network_config.set_ipv4_listening_address(std::net::Ipv4Addr::LOCALHOST, 0, 0, 0);
+    network_config.enr_address = (Some(std::net::Ipv4Addr::LOCALHOST), None);
+    network_config.disable_discovery = true;
+    network_config.network_dir = tempfile::TempDir::new().expect("network directory").keep();
+    let context = Context {
+        config: Arc::new(network_config),
+        enr_fork_id: spec
+            .enr_fork_id::<MinimalEthSpec>(head.beacon_block.slot(), genesis_validators_root),
+        fork_context: Arc::new(ForkContext::new::<MinimalEthSpec>(
+            head.beacon_block.slot(),
+            genesis_validators_root,
+            &spec,
+        )),
+        chain_spec: Arc::clone(&spec),
+        libp2p_registry: None,
+    };
+    let (runtime_owner, exit) = async_channel::bounded(1);
+    let (shutdown_sender, _) = futures::channel::mpsc::channel(1);
+    let shutting_down_executor =
+        task_executor::TaskExecutor::new(tokio::runtime::Handle::current(), exit, shutdown_sender);
+    let (_broadcast_sender, broadcast_receiver) = pq_block_broadcast_channel();
+    let service = PqNetworkService::new(
+        shutting_down_executor,
+        context,
+        spec.custody_requirement,
+        secp256k1::Keypair::generate().into(),
+        chain,
+        broadcast_receiver,
+    )
+    .await
+    .expect("PQ network service");
+    drop(runtime_owner);
+
+    assert!(matches!(
+        service.start_with_shutdown_receipt().await,
+        Err(PqNetworkServiceError::TaskUnavailable),
+    ));
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn result_bearing_network_start_reports_worker_panic_through_task_executor() {
+    use futures::StreamExt;
+
+    let runtime = task_executor::test_utils::TestRuntime::default();
+    let (chain, spec) = build_chain(&runtime);
+    let head = chain.head_snapshot();
+    let genesis_validators_root = head.beacon_state.genesis_validators_root();
+    let mut network_config = NetworkConfig::default();
+    network_config.set_ipv4_listening_address(std::net::Ipv4Addr::LOCALHOST, 0, 0, 0);
+    network_config.enr_address = (Some(std::net::Ipv4Addr::LOCALHOST), None);
+    network_config.disable_discovery = true;
+    network_config.network_dir = tempfile::TempDir::new().expect("network directory").keep();
+    let context = Context {
+        config: Arc::new(network_config),
+        enr_fork_id: spec
+            .enr_fork_id::<MinimalEthSpec>(head.beacon_block.slot(), genesis_validators_root),
+        fork_context: Arc::new(ForkContext::new::<MinimalEthSpec>(
+            head.beacon_block.slot(),
+            genesis_validators_root,
+            &spec,
+        )),
+        chain_spec: Arc::clone(&spec),
+        libp2p_registry: None,
+    };
+    let (_runtime_owner, exit) = async_channel::bounded(1);
+    let (shutdown_sender, mut shutdown_receiver) = futures::channel::mpsc::channel(1);
+    let monitored_executor =
+        task_executor::TaskExecutor::new(tokio::runtime::Handle::current(), exit, shutdown_sender);
+    let (_broadcast_sender, broadcast_receiver) = pq_block_broadcast_channel();
+    let mut service = PqNetworkService::new(
+        monitored_executor,
+        context,
+        spec.custody_requirement,
+        secp256k1::Keypair::generate().into(),
+        chain,
+        broadcast_receiver,
+    )
+    .await
+    .expect("PQ network service");
+    service.testing_only_set_run_hook(Arc::new(|| panic!("PQ network worker panic")));
+
+    assert!(matches!(
+        service.start_with_shutdown_receipt().await,
+        Err(PqNetworkServiceError::TaskUnavailable),
+    ));
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), shutdown_receiver.next())
+            .await
+            .expect("panic monitor notification"),
+        Some(task_executor::ShutdownReason::Failure(
+            "Panic (fatal error)"
+        )),
+    );
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
 async fn live_worker_negatively_acknowledges_exact_block_without_peers() {
     let runtime = task_executor::test_utils::TestRuntime::default();
     let (chain, spec) = build_chain(&runtime);

@@ -26,6 +26,7 @@ pub use publication::{
 pub use service::{
     PQ_NETWORK_BLOCK_COMMIT_CAPACITY, PQ_NETWORK_BLOCK_ENCODING_CAPACITY,
     PQ_NETWORK_BLOCK_PROOF_CAPACITY, PqNetworkService, PqNetworkServiceError,
+    PqNetworkServiceShutdown,
 };
 #[cfg(feature = "pq-startup-testing")]
 pub use service::{

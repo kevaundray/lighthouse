@@ -10,8 +10,8 @@ use state_processing::{
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
-use store::metadata::ANCHOR_UNINITIALIZED;
-use store::{DBColumn, HotColdDB, ItemStore, StoreItem, StoreOp};
+use store::metadata::{ANCHOR_UNINITIALIZED, STATE_UPPER_LIMIT_NO_RETAIN};
+use store::{AnchorInfo, DBColumn, HotColdDB, ItemStore, StoreItem, StoreOp};
 use task_executor::TaskExecutor;
 use types::{BeaconState, ChainSpec, EthSpec, Hash256, SignedBeaconBlock, Slot};
 
@@ -22,6 +22,100 @@ pub(crate) struct PersistedPqHead {
     block_root: Hash256,
     state_root: Hash256,
     slot: Slot,
+}
+
+/// Startup disposition derived from the PQ head marker and the store anchor as one coherent pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PqStoreStartup {
+    Empty,
+    Resume,
+}
+
+#[derive(Debug)]
+pub enum PqStoreStartupError {
+    OrdinaryBeaconChain,
+    MissingPqHeadForInitializedAnchor,
+    MissingAnchorForPqHead,
+    IncompatibleAnchor,
+    Store(store::Error),
+}
+
+impl std::fmt::Display for PqStoreStartupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OrdinaryBeaconChain => {
+                formatter.write_str("ordinary beacon-chain sentinel is present")
+            }
+            Self::MissingPqHeadForInitializedAnchor => {
+                formatter.write_str("initialized anchor is missing PQ head metadata")
+            }
+            Self::MissingAnchorForPqHead => {
+                formatter.write_str("PQ head metadata is missing an initialized anchor")
+            }
+            Self::IncompatibleAnchor => {
+                formatter.write_str("PQ store anchor does not match the frozen genesis anchor")
+            }
+            Self::Store(error) => write!(formatter, "PQ store marker read failed: {error:?}"),
+        }
+    }
+}
+
+impl std::error::Error for PqStoreStartupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Store(_)
+            | Self::OrdinaryBeaconChain
+            | Self::MissingPqHeadForInitializedAnchor
+            | Self::MissingAnchorForPqHead
+            | Self::IncompatibleAnchor => None,
+        }
+    }
+}
+
+impl From<store::Error> for PqStoreStartupError {
+    fn from(error: store::Error) -> Self {
+        Self::Store(error)
+    }
+}
+
+/// Classify a store without constructing a chain or mutating any persisted data.
+pub fn classify_pq_store_startup<E, Hot, Cold>(
+    store: &Arc<HotColdDB<E, Hot, Cold>>,
+) -> Result<PqStoreStartup, PqStoreStartupError>
+where
+    E: EthSpec,
+    Hot: ItemStore,
+    Cold: ItemStore,
+{
+    if store
+        .hot_db
+        .key_exists(DBColumn::BeaconChain, Hash256::ZERO.as_slice())?
+    {
+        return Err(PqStoreStartupError::OrdinaryBeaconChain);
+    }
+    let has_pq_head = store
+        .get_item::<PersistedPqHead>(&PQ_HEAD_DB_KEY)?
+        .is_some();
+    let anchor = store.get_anchor_info();
+    let has_anchor = anchor != ANCHOR_UNINITIALIZED;
+    match (has_pq_head, has_anchor) {
+        (false, false) => Ok(PqStoreStartup::Empty),
+        (true, true)
+            if anchor
+                == (AnchorInfo {
+                    anchor_slot: Slot::new(0),
+                    oldest_block_slot: Slot::new(0),
+                    oldest_block_parent: Hash256::ZERO,
+                    state_upper_limit: STATE_UPPER_LIMIT_NO_RETAIN,
+                    state_lower_limit: Slot::new(0),
+                }) =>
+        {
+            Ok(PqStoreStartup::Resume)
+        }
+        (true, true) => Err(PqStoreStartupError::IncompatibleAnchor),
+        (false, true) => Err(PqStoreStartupError::MissingPqHeadForInitializedAnchor),
+        (true, false) => Err(PqStoreStartupError::MissingAnchorForPqHead),
+    }
 }
 
 pub(crate) fn persist_pq_imported_transition<T: BeaconChainTypes>(

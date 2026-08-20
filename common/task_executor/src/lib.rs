@@ -204,6 +204,43 @@ impl TaskExecutor {
         }
     }
 
+    /// Spawn a result-bearing task that owns its own graceful-exit handling.
+    ///
+    /// Unlike [`Self::spawn_handle`], this does not cancel `task` when the executor exit signal
+    /// fires. The task must observe [`Self::exit`] itself and finish its cleanup before returning.
+    /// A TaskExecutor-owned monitor reports panics through the process shutdown channel and sends
+    /// the exact join result to the returned receiver.
+    pub fn spawn_handle_without_exit<R: Send + 'static>(
+        &self,
+        task: impl Future<Output = R> + Send + 'static,
+        name: &'static str,
+    ) -> Option<tokio::sync::oneshot::Receiver<Result<R, tokio::task::JoinError>>> {
+        let handle = self.handle()?;
+        let int_gauge = metrics::get_int_gauge(&metrics::ASYNC_TASKS_COUNT, &[name])?;
+        int_gauge.inc();
+        let task_handle = handle.spawn(task);
+        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+        let mut shutdown_sender = self.shutdown_sender();
+        let monitor = async move {
+            let timer = metrics::start_timer_vec(&metrics::TASKS_HISTOGRAM, &[name]);
+            let result = task_handle.await;
+            if result.as_ref().is_err_and(tokio::task::JoinError::is_panic) {
+                let _ = shutdown_sender.try_send(ShutdownReason::Failure("Panic (fatal error)"));
+            }
+            let _ = result_sender.send(result);
+            drop(timer);
+            int_gauge.dec();
+        };
+        #[cfg(tokio_unstable)]
+        tokio::task::Builder::new()
+            .name(&format!("{name}-monitor"))
+            .spawn_on(monitor, &handle)
+            .expect("Failed to spawn monitor task");
+        #[cfg(not(tokio_unstable))]
+        handle.spawn(monitor);
+        Some(result_receiver)
+    }
+
     /// Spawn a blocking task on a dedicated tokio thread pool wrapped in an exit future.
     /// This function generates prometheus metrics on number of tasks and task duration.
     pub fn spawn_blocking<F>(&self, task: F, name: &'static str)

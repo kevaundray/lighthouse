@@ -22,9 +22,12 @@ use lighthouse_network::{
     PqBeaconBlockPublishError, PqBeaconBlockPublishOutcome, PqEncodedBeaconBlock,
     PqGossipValidationAdmission, PubsubMessage, ReportSource, identity::Keypair,
 };
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use task_executor::TaskExecutor;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing::{debug, warn};
 use types::{EthSpec, Hash256};
 
@@ -37,8 +40,47 @@ pub const PQ_NETWORK_BLOCK_ENCODING_CAPACITY: usize = 2;
 /// Maximum number of detached Engine/DB commits whose exact gossipsub reservations are retained.
 pub const PQ_NETWORK_BLOCK_COMMIT_CAPACITY: usize = 2;
 
+#[derive(Default)]
+struct PqNetworkInFlight {
+    count: AtomicUsize,
+    drained: Notify,
+}
+
+impl PqNetworkInFlight {
+    fn start(self: &Arc<Self>) -> PqNetworkInFlightGuard {
+        self.count.fetch_add(1, Ordering::AcqRel);
+        PqNetworkInFlightGuard {
+            tracker: Arc::clone(self),
+        }
+    }
+
+    async fn wait_until_drained(&self) {
+        loop {
+            let drained = self.drained.notified();
+            if self.count.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            drained.await;
+        }
+    }
+}
+
+struct PqNetworkInFlightGuard {
+    tracker: Arc<PqNetworkInFlight>,
+}
+
+impl Drop for PqNetworkInFlightGuard {
+    fn drop(&mut self) {
+        if self.tracker.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.tracker.drained.notify_waiters();
+        }
+    }
+}
+
 #[cfg(feature = "pq-startup-testing")]
 type PqBlockEncodingHook = Arc<dyn Fn() + Send + Sync>;
+#[cfg(feature = "pq-startup-testing")]
+type PqNetworkRunHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(feature = "pq-startup-testing")]
 struct PqNetworkShutdownTestGuard(Option<tokio::sync::oneshot::Sender<()>>);
@@ -49,6 +91,37 @@ impl Drop for PqNetworkShutdownTestGuard {
         if let Some(sender) = self.0.take() {
             let _ = sender.send(());
         }
+    }
+}
+
+/// Result-bearing ownership receipt for the sole PQ network worker.
+pub struct PqNetworkServiceShutdown {
+    shutdown_sender: Option<tokio::sync::oneshot::Sender<()>>,
+    task: tokio::sync::oneshot::Receiver<Result<(), tokio::task::JoinError>>,
+}
+
+impl PqNetworkServiceShutdown {
+    pub async fn wait(mut self) -> Result<(), PqNetworkServiceError> {
+        if let Some(sender) = self.shutdown_sender.take() {
+            let _ = sender.send(());
+        }
+        self.wait_for_completion().await
+    }
+
+    async fn wait_for_completion(self) -> Result<(), PqNetworkServiceError> {
+        match self.task.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) | Err(_) => Err(PqNetworkServiceError::TaskUnavailable),
+        }
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub async fn testing_only_wait_for_exit(mut self) -> Result<(), PqNetworkServiceError> {
+        let shutdown_sender = self.shutdown_sender.take();
+        let result = self.wait_for_completion().await;
+        drop(shutdown_sender);
+        result
     }
 }
 
@@ -184,6 +257,7 @@ struct PqNetworkCompletionLifecycle<'a, T: BeaconChainTypes> {
     commit_sender: mpsc::Sender<PqBlockCommitCompletion>,
     message_id: MessageId,
     source: PeerId,
+    in_flight: Arc<PqNetworkInFlight>,
 }
 
 impl<T: BeaconChainTypes>
@@ -216,8 +290,10 @@ impl<T: BeaconChainTypes>
     fn commit(&mut self, admission: Self::Reservation, commit: PqGossipCommitToken<T>) {
         let processor = Arc::clone(&self.processor);
         let commit_sender = self.commit_sender.clone();
+        let _in_flight = self.in_flight.start();
         self.task_executor.spawn(
             async move {
+                let _in_flight_guard = _in_flight;
                 let result = processor.commit_gossip_block(commit).await;
                 try_send_completion(
                     &commit_sender,
@@ -467,7 +543,12 @@ pub struct PqNetworkService<T: BeaconChainTypes> {
     #[cfg(feature = "pq-startup-testing")]
     testing_block_encoding_hook: Option<PqBlockEncodingHook>,
     #[cfg(feature = "pq-startup-testing")]
+    testing_run_hook: Option<PqNetworkRunHook>,
+    #[cfg(feature = "pq-startup-testing")]
     testing_shutdown_sender: Option<tokio::sync::oneshot::Sender<()>>,
+    live_sender: Option<tokio::sync::oneshot::Sender<()>>,
+    shutdown_receiver: Option<tokio::sync::oneshot::Receiver<()>>,
+    in_flight: Arc<PqNetworkInFlight>,
 }
 
 impl<T: BeaconChainTypes> PqNetworkService<T> {
@@ -521,7 +602,12 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
             #[cfg(feature = "pq-startup-testing")]
             testing_block_encoding_hook: None,
             #[cfg(feature = "pq-startup-testing")]
+            testing_run_hook: None,
+            #[cfg(feature = "pq-startup-testing")]
             testing_shutdown_sender: None,
+            live_sender: None,
+            shutdown_receiver: None,
+            in_flight: Arc::new(PqNetworkInFlight::default()),
         })
     }
 
@@ -549,6 +635,12 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
 
     #[cfg(feature = "pq-startup-testing")]
     #[doc(hidden)]
+    pub fn testing_only_set_run_hook(&mut self, hook: Arc<dyn Fn() + Send + Sync>) {
+        self.testing_run_hook = Some(hook);
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
     pub fn testing_only_shutdown_receipt(&mut self) -> Option<tokio::sync::oneshot::Receiver<()>> {
         if self.testing_shutdown_sender.is_some() {
             return None;
@@ -559,19 +651,75 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
     }
 
     pub fn start(self) -> Result<(), PqNetworkServiceError> {
-        if self.task_executor.handle().is_none() {
-            return Err(PqNetworkServiceError::TaskUnavailable);
-        }
+        self.spawn()
+    }
+
+    /// Start the sole PQ network worker and return a receipt that resolves only after it exits.
+    pub async fn start_with_shutdown_receipt(
+        mut self,
+    ) -> Result<PqNetworkServiceShutdown, PqNetworkServiceError> {
+        let (live_sender, live_receiver) = tokio::sync::oneshot::channel();
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        self.live_sender = Some(live_sender);
+        self.shutdown_receiver = Some(shutdown_receiver);
         let executor = self.task_executor.clone();
-        executor.spawn(self.run(), "pq_network_service");
+        let mut task = executor
+            .spawn_handle_without_exit(self.run(), "pq_network_service")
+            .ok_or(PqNetworkServiceError::TaskUnavailable)?;
+        tokio::select! {
+            biased;
+            _ = &mut task => Err(PqNetworkServiceError::TaskUnavailable),
+            live = live_receiver => {
+                live.map_err(|_| PqNetworkServiceError::TaskUnavailable)?;
+                Ok(PqNetworkServiceShutdown {
+                    shutdown_sender: Some(shutdown_sender),
+                    task,
+                })
+            }
+        }
+    }
+
+    fn spawn(self) -> Result<(), PqNetworkServiceError> {
+        let executor = self.task_executor.clone();
+        let _task = executor
+            .spawn_handle_without_exit(self.run(), "pq_network_service")
+            .ok_or(PqNetworkServiceError::TaskUnavailable)?;
         Ok(())
     }
 
     async fn run(mut self) {
+        let mut executor_exit = Box::pin(self.task_executor.exit());
+        tokio::select! {
+            biased;
+            _ = &mut executor_exit => {
+                self.shutdown_and_drain().await;
+                return;
+            }
+            _ = tokio::task::yield_now() => {}
+        }
         #[cfg(feature = "pq-startup-testing")]
-        let _shutdown_guard = PqNetworkShutdownTestGuard(self.testing_shutdown_sender.take());
+        if let Some(hook) = self.testing_run_hook.take() {
+            hook();
+        }
+        if let Some(sender) = self.live_sender.take() {
+            let _ = sender.send(());
+        }
+        #[cfg(feature = "pq-startup-testing")]
+        let _testing_shutdown_guard =
+            PqNetworkShutdownTestGuard(self.testing_shutdown_sender.take());
+        let mut shutdown_receiver = self.shutdown_receiver.take();
         loop {
             let event = tokio::select! {
+                biased;
+                _ = &mut executor_exit => break,
+                _ = async {
+                    match shutdown_receiver.as_mut() {
+                        Some(receiver) => {
+                            let _ = receiver.await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => break,
                 command = self.broadcast_receiver.recv() => {
                     PqNetworkServiceEvent::Broadcast(command)
                 }
@@ -616,23 +764,29 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
                     command.acknowledge(result);
                     drop(_permit);
                 }
-                PqNetworkServiceEvent::Encoding(None) => return,
-                PqNetworkServiceEvent::Broadcast(None) => return,
+                PqNetworkServiceEvent::Encoding(None) => break,
+                PqNetworkServiceEvent::Broadcast(None) => break,
                 PqNetworkServiceEvent::Verification(Some(completion)) => {
                     self.handle_verification_completion(*completion);
                 }
-                PqNetworkServiceEvent::Verification(None) => return,
+                PqNetworkServiceEvent::Verification(None) => break,
                 PqNetworkServiceEvent::Commit(Some(completion)) => {
                     self.handle_commit_completion(*completion);
                 }
-                PqNetworkServiceEvent::Commit(None) => return,
+                PqNetworkServiceEvent::Commit(None) => break,
                 PqNetworkServiceEvent::Network(event) => self.handle_network_event(*event),
                 PqNetworkServiceEvent::TestingDial(Some(address)) => {
                     let _ = self.network.testing_dial(address);
                 }
-                PqNetworkServiceEvent::TestingDial(None) => return,
+                PqNetworkServiceEvent::TestingDial(None) => break,
             }
         }
+        self.shutdown_and_drain().await;
+    }
+
+    async fn shutdown_and_drain(&mut self) {
+        self.broadcast_receiver.close_and_reject_pending();
+        self.in_flight.wait_until_drained().await;
     }
 
     fn start_block_encoding(&mut self, command: super::PqBlockBroadcastCommand<T::EthSpec>) {
@@ -651,10 +805,12 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
         let block = Arc::clone(command.block());
         let fork_digest = self.fork_digest;
         let sender = self.encoding_sender.clone();
+        let _in_flight = self.in_flight.start();
         #[cfg(feature = "pq-startup-testing")]
         let hook = self.testing_block_encoding_hook.clone();
         self.task_executor.spawn_blocking(
             move || {
+                let _in_flight_guard = _in_flight;
                 #[cfg(feature = "pq-startup-testing")]
                 if let Some(hook) = hook {
                     hook();
@@ -774,8 +930,10 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
         }
         let processor = Arc::clone(&self.processor);
         let completion_sender = self.completion_sender.clone();
+        let _in_flight = self.in_flight.start();
         self.task_executor.spawn(
             async move {
+                let _in_flight_guard = _in_flight;
                 let disposition = processor.verify_gossip_block(block).await;
                 try_send_completion(
                     &completion_sender,
@@ -805,6 +963,7 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
             commit_sender: self.commit_sender.clone(),
             message_id,
             source,
+            in_flight: Arc::clone(&self.in_flight),
         };
         handle_completion_lifecycle(completion_disposition(disposition), &mut lifecycle);
         drop(_permit);

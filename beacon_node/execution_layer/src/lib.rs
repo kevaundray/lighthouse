@@ -31,7 +31,7 @@ use std::collections::{HashMap, hash_map::Entry};
 use std::fmt;
 use std::future::Future;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use strum::AsRefStr;
@@ -495,6 +495,23 @@ pub struct Config {
     pub execution_timeout_multiplier: Option<u32>,
 }
 
+fn read_jwt_key(secret_file: &Path) -> Result<JwtKey, Error> {
+    std::fs::read_to_string(secret_file)
+        .map_err(|error| format!("Failed to read JWT secret file. Error: {error:?}"))
+        .and_then(|secret| {
+            JwtKey::from_slice(
+                &hex::decode(strip_prefix(secret.trim_end()))
+                    .map_err(|error| format!("Invalid hex string: {error:?}"))?,
+            )
+        })
+        .map_err(Error::InvalidJWTSecret)
+}
+
+/// Validate an existing JWT secret with the same parser used for Engine API construction.
+pub fn validate_jwt_secret_file(secret_file: &Path) -> Result<(), Error> {
+    read_jwt_key(secret_file).map(drop)
+}
+
 /// Provides access to one execution engine and provides a neat interface for consumption by the
 /// `BeaconChain`.
 #[derive(Clone)]
@@ -525,17 +542,8 @@ impl<E: EthSpec> ExecutionLayer<E> {
         let secret_file = secret_file.unwrap_or_else(|| default_datadir.join(DEFAULT_JWT_FILE));
 
         let jwt_key = if secret_file.exists() {
-            // Read secret from file if it already exists
-            std::fs::read_to_string(&secret_file)
-                .map_err(|e| format!("Failed to read JWT secret file. Error: {:?}", e))
-                .and_then(|ref s| {
-                    let secret = JwtKey::from_slice(
-                        &hex::decode(strip_prefix(s.trim_end()))
-                            .map_err(|e| format!("Invalid hex string: {:?}", e))?,
-                    )?;
-                    Ok(secret)
-                })
-                .map_err(Error::InvalidJWTSecret)
+            // Read secret from file if it already exists.
+            read_jwt_key(&secret_file)
         } else {
             // Create a new file and write a randomly generated secret to it if file does not exist
             warn!(path = %secret_file.display(),"No JWT found on disk. Generating");

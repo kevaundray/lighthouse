@@ -36,7 +36,8 @@ pub use pq_runtime::{
     PqBlockPublicationDisposition, PqBlockPublicationLocalError, PqBlockPublicationService,
     PqBlockPublicationTerminal, PqGossipAggregateDisposition, PqGossipAttestationDisposition,
     PqGossipBlockDisposition, PqNetworkBlockProcessor, PqNetworkService, PqNetworkServiceError,
-    PqPublicationBodyLimits, PqPublicationCapacity, pq_block_broadcast_channel,
+    PqNetworkServiceShutdown, PqPublicationBodyLimits, PqPublicationCapacity,
+    pq_block_broadcast_channel,
 };
 #[cfg(feature = "pq-startup-testing")]
 #[doc(hidden)]

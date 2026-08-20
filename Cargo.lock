@@ -1956,6 +1956,7 @@ version = "0.2.0"
 dependencies = [
  "beacon_chain",
  "beacon_processor",
+ "consensus_signature",
  "directory",
  "dirs",
  "environment",
@@ -7242,6 +7243,7 @@ dependencies = [
 name = "pq_devnet"
 version = "0.1.0"
 dependencies = [
+ "async-channel 1.9.0",
  "attestation_aggregation",
  "beacon_chain",
  "beacon_node",

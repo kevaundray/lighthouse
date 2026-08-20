@@ -62,6 +62,13 @@ impl<E: EthSpec> PqBlockBroadcastReceiver<E> {
     pub async fn recv(&mut self) -> Option<PqBlockBroadcastCommand<E>> {
         self.receiver.recv().await
     }
+
+    pub(super) fn close_and_reject_pending(&mut self) {
+        self.receiver.close();
+        while let Ok(command) = self.receiver.try_recv() {
+            command.acknowledge(Err(PqBlockBroadcastError::WorkerUnavailable));
+        }
+    }
 }
 
 /// One exact fully verified block awaiting a network-worker acknowledgment.

@@ -10,6 +10,8 @@ pub mod config;
 mod metrics;
 #[cfg(feature = "full-runtime")]
 mod notifier;
+#[cfg(feature = "pq-devnet")]
+mod pq_runtime;
 
 #[cfg(feature = "full-runtime")]
 pub mod builder;
@@ -24,6 +26,10 @@ pub use beacon_chain::BeaconChainTypes;
 pub use builder::ClientBuilder;
 pub use config::{ClientGenesis, Config as ClientConfig};
 pub use eth2_config::Eth2Config;
+#[cfg(feature = "pq-devnet")]
+pub use pq_runtime::{
+    PqClient, PqProposerRuntimePaths, PqRuntimeConfig, PqRuntimeConfigError, PqRuntimeError,
+};
 
 /// The core "beacon node" client.
 ///
@@ -35,6 +41,8 @@ pub struct Client<T: BeaconChainTypes> {
     http_api_listen_addr: Option<SocketAddr>,
     /// Listen address for the HTTP server which serves Prometheus metrics.
     http_metrics_listen_addr: Option<SocketAddr>,
+    #[cfg(feature = "pq-devnet")]
+    pq_runtime_owner: Option<pq_runtime::PqRuntimeOwner>,
 }
 
 impl<T: BeaconChainTypes> Client<T> {

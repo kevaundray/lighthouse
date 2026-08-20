@@ -1572,3 +1572,38 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   atomic database/head commit, persisted restart identity, and idempotent restart duplicate without
   another broadcast or Engine call. Warning-denied PQ production, default validator-store, and
   default `eth2` checks passed. No broad workspace gate was run before independent review.
+
+### 2026-08-20: PQ disk/process runtime owner implemented (Task 5.3e-e4c)
+
+- A private, feature-isolated `client::pq_runtime` validates and seals the exact Minimal/300-second runtime
+  profile before I/O. It supports only explicit GenesisState and exact PQ FromStore resume, a real
+  Engine endpoint/JWT, the narrow future HTTP settings, and optional sealed proposer paths. It
+  rejects ordinary history/checkpoint/builder/light-client/monitoring profiles before touching the
+  datadir.
+- Startup uses a PQ-only current-schema dispatcher and an exact PQ-head/frozen-anchor classifier.
+  The ordinary beacon-chain sentinel, partial 2x2 head/anchor bindings, incompatible anchor fields,
+  corrupt reads, and migration from an older schema fail closed. GenesisState is decoded and
+  profile-checked before writes. Existing stores are classified before consulting GenesisState, so
+  exact Resume neither reads nor replays an absent/corrupt candidate; Empty alone consumes it.
+  Store paths are derived lexically from configured data_dir, and invalid compression/prune
+  settings fail before filesystem effects regardless of legacy-directory presence.
+- One blocking task owns JWT/genesis reads, disk opening, the sole process AggregationService,
+  production ExecutionLayer, and BeaconChain construction. Caller cancellation cannot release
+  those provisional resources before the task completes. The live PQ network is the last fallible
+  step and returns a first-poll-acknowledged shutdown receipt with a non-clone process stop trigger.
+  The worker is a TaskExecutor-owned, panic-monitored result task: executor exit initiates the same
+  ingress close and admitted-task drain as explicit stop, while panic or abnormal task loss maps to
+  `TaskUnavailable` and a panic requests process shutdown.
+  The existing `Client` privately owns this runtime and its sender; no raw runtime/broadcaster API
+  exists in production. Awaited shutdown closes the sole receiver even while internal sender clones
+  remain, waits for every admitted encoding/proof/commit owner, resolves queued requests as
+  `WorkerUnavailable`, drains the worker, and releases its exact TCP port for same-process restart.
+- Focused warning-denied evidence passed 14/14 scalar runtime tests, the complete AVX2 test graph
+  compile, exact valid/from-store/cancellation/failure/proposer/restart AVX2 cases, PQ and default
+  client checks, and focused Client/Network Clippy. The fixed-port restart restored the exact signed
+  head with no genesis file. A forced real network bind failure released the process aggregation
+  owner immediately. The PQ normal/build dependency graph contains no validator/proposer/signing or
+  slashing resources, and proposer-configured e4c startup left bundle/slashing paths absent.
+- The top-level binary, narrow HTTP binding, proposer construction/scheduler, CLI provisioning, and
+  attestation topics remain deliberately deferred to e4d/e/f. Hash-chain/hash-onion RANDAO remains
+  a future versioned proposal; V1 retains the signature-derived duty.

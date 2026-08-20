@@ -2398,12 +2398,46 @@ head/initialized anchor rather than blindly replaying `GenesisState`; missing or
 PQ metadata fails closed. Do not call or cfg-enable the ordinary `ClientBuilder`.
 
 The PQ runtime owner retains the chain, network globals, bound addresses, and closed service
-capabilities. Long-lived network and scheduler loops use `TaskExecutor::spawn` so the environment
-exit signal cancels them. HTTP uses its own graceful-shutdown future and
+capabilities. The long-lived network loop uses a TaskExecutor-owned, panic-monitored result task
+which observes the environment exit signal itself, closes ingress, and drains its admitted
+encoding/proof/commit owners before returning. HTTP uses its own graceful-shutdown future and
 `spawn_without_exit`, matching Warp ownership. Dropping/ending the network worker drops the sole
 broadcast receiver so every pending acknowledgment resolves `WorkerUnavailable`; no caller may
 retain a receiver or mutable libp2p handle. Startup failure after a component is launched must fire
 shutdown and must not leave a detached listener or proof worker accepting new work.
+
+Implemented e4c adds the isolated `client::pq_runtime` disk/process owner without changing the
+top-level binary boundary. Pure planning seals Minimal's exact 300-second profile, GenesisState or
+FromStore mode, disk/network/JWT paths, the real Engine endpoint, narrow HTTP settings, and optional
+proposer paths before any filesystem query or write. The disk classifier accepts only the exact
+PQ-head/frozen-anchor empty-or-resume pairs, rejects the ordinary beacon-chain sentinel and partial
+or corrupt metadata, and dispatches only the current PQ schema without ordinary fork-choice
+migration.
+
+JWT validation uses the ExecutionLayer's production parser. GenesisState reads, context-decodes,
+and profile-validates `genesis.ssz` before directory creation; FromStore never requires or reads the
+genesis file. One owned blocking closure retains every provisional disk, aggregation, Engine, and
+chain owner across caller cancellation. After it completes, the real PQ network is the last
+fallible startup step. Its result-bearing start awaits a first-poll live acknowledgment; an executor
+exit that wins before that acknowledgment returns `TaskUnavailable`, never a client. The existing
+`Client` privately owns the PQ disk/network owner and sender. The PQ runtime module, raw owner,
+broadcaster, receiver, and mutable lower network are not production API. Shutdown uses a
+process-owned, non-clone stop trigger: it closes the sole receiver, waits for all admitted encoding,
+proof, and commit tasks to release their exact owners, then resolves queued and future requests from
+retained sender clones as `WorkerUnavailable` before its receipt completes. Worker panic is reported
+through the TaskExecutor shutdown channel, and both panic and abnormal task loss map to the typed
+`TaskUnavailable` startup/receipt outcome rather than detaching an unmonitored Tokio owner.
+
+Pure planning derives store paths lexically from the configured data directory and validates the
+PQ store configuration without consulting legacy-directory existence. Fresh GenesisState input is
+validated before directory creation. An existing store is classified first; exact Resume never
+reads an absent or corrupt genesis candidate, while Empty consults that candidate. Focused evidence
+also covers empty/partial/ordinary/corrupt store rejection, blocking-construction cancellation
+ownership, real network construction failure cleanup, fixed-port shutdown/rebind, and exact
+signed-head disk restart. A proposer-configured e4c start leaves the sealed bundle and slashing
+paths unopened, and the PQ client dependency graph contains no validator-store, signer,
+proposer-service, or slashing crate. HTTP binding, proposer resource construction, top-level
+`DeferredRuntimeIntegration` replacement, CLI provisioning, and slot scheduling remain e4d/e work.
 
 ##### Task 5.3e-e4d: Make provisioning and configuration launchable and unambiguous
 

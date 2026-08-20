@@ -278,6 +278,21 @@ impl Config {
         &self.data_dir
     }
 
+    /// Derive the PQ runtime's store paths without consulting legacy-directory existence.
+    #[cfg(feature = "pq-devnet")]
+    pub(crate) fn pq_lexical_store_paths(&self) -> (PathBuf, PathBuf, PathBuf) {
+        let hot = self.data_dir.join(&self.db_name);
+        let cold = self
+            .freezer_db_path
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join(DEFAULT_FREEZER_DB_DIR));
+        let blobs = self
+            .blobs_db_path
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join(DEFAULT_BLOBS_DB_DIR));
+        (hot, cold, blobs)
+    }
+
     /// Get the database path without initialising it.
     pub fn get_db_path(&self) -> PathBuf {
         self.get_data_dir().join(&self.db_name)

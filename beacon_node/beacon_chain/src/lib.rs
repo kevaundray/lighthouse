@@ -135,6 +135,9 @@ pub mod proposer_preferences_verification;
 pub mod proposer_prep_service;
 #[cfg(not(feature = "pq-devnet"))]
 pub mod schema_change;
+#[cfg(feature = "pq-devnet")]
+#[path = "pq_runtime/schema_change.rs"]
+pub mod schema_change;
 #[cfg(not(feature = "pq-devnet"))]
 pub mod shuffling_cache;
 #[cfg(not(feature = "pq-devnet"))]
@@ -171,6 +174,8 @@ pub use self::beacon_chain::{
 };
 #[cfg(not(feature = "pq-devnet"))]
 pub use self::beacon_snapshot::BeaconSnapshot;
+#[cfg(feature = "pq-devnet")]
+pub use self::builder::{PqStoreStartup, PqStoreStartupError, classify_pq_store_startup};
 pub use self::chain_config::ChainConfig;
 #[cfg(not(feature = "pq-devnet"))]
 pub use self::errors::{BeaconChainError, BlockProductionError};
@@ -221,6 +226,8 @@ pub use self::pq_production::{
 pub use self::pq_proposer_duties::{
     PQ_PROPOSER_DUTY_ADMISSION_CAPACITY, PqProposerDuties, PqProposerDutiesError, PqProposerDuty,
 };
+#[cfg(feature = "pq-devnet")]
+pub use self::schema_change::migrate_pq_schema;
 #[cfg(not(feature = "pq-devnet"))]
 pub use attestation_verification::Error as AttestationError;
 #[cfg(not(feature = "pq-devnet"))]
