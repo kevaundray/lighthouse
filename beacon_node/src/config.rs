@@ -25,7 +25,9 @@ use std::fmt::Debug;
 use std::fs;
 use std::io::{IsTerminal, Read};
 use std::net::Ipv6Addr;
-use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+#[cfg(not(feature = "pq-devnet"))]
+use std::net::ToSocketAddrs;
+use std::net::{IpAddr, Ipv4Addr};
 use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -995,7 +997,6 @@ pub fn validate_pq_devnet_cli_profile(cli_args: &ArgMatches) -> Result<(), PqDev
         "trusted-peers",
         "execution-endpoint",
         "execution-jwt",
-        "execution-jwt-secret-key",
         "execution-jwt-id",
         "execution-jwt-version",
         "http",
@@ -1034,6 +1035,7 @@ pub fn validate_pq_devnet_cli_profile(cli_args: &ArgMatches) -> Result<(), PqDev
             "monitoring-endpoint" | "monitoring-endpoint-period" => "--monitoring-endpoint",
             "subscribe-all-subnets" => "--subscribe-all-subnets",
             "suggested-fee-recipient" => "--suggested-fee-recipient",
+            "execution-jwt-secret-key" => "--execution-jwt-secret-key",
             "purge-db" | "purge-db-force" => "--purge-db",
             "hierarchy-exponents" => "--hierarchy-exponents",
             _ => "command-line option outside the PQ allowlist",
@@ -1044,6 +1046,31 @@ pub fn validate_pq_devnet_cli_profile(cli_args: &ArgMatches) -> Result<(), PqDev
 }
 
 /// Gets the listening_addresses for lighthouse based on the cli options.
+fn select_listen_port(
+    use_zero_ports: bool,
+    configured: Option<u16>,
+    fallback: u16,
+    probe_unused_port: fn() -> Result<u16, String>,
+) -> Result<u16, String> {
+    #[cfg(feature = "pq-devnet")]
+    {
+        let _ = probe_unused_port;
+        Ok(if use_zero_ports {
+            0
+        } else {
+            configured.unwrap_or(fallback)
+        })
+    }
+    #[cfg(not(feature = "pq-devnet"))]
+    {
+        if use_zero_ports {
+            probe_unused_port()
+        } else {
+            Ok(configured.unwrap_or(fallback))
+        }
+    }
+}
+
 pub fn parse_listening_addresses(cli_args: &ArgMatches) -> Result<ListenAddress, String> {
     let listen_addresses_str = cli_args
         .get_many::<String>("listen-address")
@@ -1134,6 +1161,7 @@ pub fn parse_listening_addresses(cli_args: &ArgMatches) -> Result<ListenAddress,
     if matches!((maybe_ipv4, maybe_ipv6), (None, None)) {
         maybe_ipv4 = Some(Ipv4Addr::UNSPECIFIED);
 
+        #[cfg(not(feature = "pq-devnet"))]
         if NetworkConfig::is_ipv6_supported() {
             maybe_ipv6 = Some(Ipv6Addr::UNSPECIFIED);
         }
@@ -1157,10 +1185,12 @@ pub fn parse_listening_addresses(cli_args: &ArgMatches) -> Result<ListenAddress,
             let port = maybe_port6.unwrap_or(port);
 
             // use zero ports if required. If not, use the given port.
-            let tcp_port = use_zero_ports
-                .then(network_utils::unused_port::unused_tcp6_port)
-                .transpose()?
-                .unwrap_or(port);
+            let tcp_port = select_listen_port(
+                use_zero_ports,
+                None,
+                port,
+                network_utils::unused_port::unused_tcp6_port,
+            )?;
 
             if maybe_disc6_port.is_some() {
                 warn!(
@@ -1176,17 +1206,19 @@ pub fn parse_listening_addresses(cli_args: &ArgMatches) -> Result<ListenAddress,
 
             // use zero ports if required. If not, use the specific udp port. If none given, use
             // the tcp port.
-            let disc_port = use_zero_ports
-                .then(network_utils::unused_port::unused_udp6_port)
-                .transpose()?
-                .or(maybe_disc_port)
-                .unwrap_or(tcp_port);
+            let disc_port = select_listen_port(
+                use_zero_ports,
+                maybe_disc_port,
+                tcp_port,
+                network_utils::unused_port::unused_udp6_port,
+            )?;
 
-            let quic_port = use_zero_ports
-                .then(network_utils::unused_port::unused_udp6_port)
-                .transpose()?
-                .or(maybe_quic_port)
-                .unwrap_or(if tcp_port == 0 { 0 } else { tcp_port + 1 });
+            let quic_port = select_listen_port(
+                use_zero_ports,
+                maybe_quic_port,
+                if tcp_port == 0 { 0 } else { tcp_port + 1 },
+                network_utils::unused_port::unused_udp6_port,
+            )?;
 
             ListenAddress::V6(network_utils::listen_addr::ListenAddr {
                 addr: ipv6,
@@ -1199,24 +1231,28 @@ pub fn parse_listening_addresses(cli_args: &ArgMatches) -> Result<ListenAddress,
             // A single ipv4 address was provided. Set the ports
 
             // use zero ports if required. If not, use the given port.
-            let tcp_port = use_zero_ports
-                .then(network_utils::unused_port::unused_tcp4_port)
-                .transpose()?
-                .unwrap_or(port);
+            let tcp_port = select_listen_port(
+                use_zero_ports,
+                None,
+                port,
+                network_utils::unused_port::unused_tcp4_port,
+            )?;
             // use zero ports if required. If not, use the specific discovery port. If none given, use
             // the tcp port.
-            let disc_port = use_zero_ports
-                .then(network_utils::unused_port::unused_udp4_port)
-                .transpose()?
-                .or(maybe_disc_port)
-                .unwrap_or(tcp_port);
+            let disc_port = select_listen_port(
+                use_zero_ports,
+                maybe_disc_port,
+                tcp_port,
+                network_utils::unused_port::unused_udp4_port,
+            )?;
             // use zero ports if required. If not, use the specific quic port. If none given, use
             // the tcp port + 1.
-            let quic_port = use_zero_ports
-                .then(network_utils::unused_port::unused_udp4_port)
-                .transpose()?
-                .or(maybe_quic_port)
-                .unwrap_or(if tcp_port == 0 { 0 } else { tcp_port + 1 });
+            let quic_port = select_listen_port(
+                use_zero_ports,
+                maybe_quic_port,
+                if tcp_port == 0 { 0 } else { tcp_port + 1 },
+                network_utils::unused_port::unused_udp4_port,
+            )?;
 
             ListenAddress::V4(network_utils::listen_addr::ListenAddr {
                 addr: ipv4,
@@ -1229,44 +1265,52 @@ pub fn parse_listening_addresses(cli_args: &ArgMatches) -> Result<ListenAddress,
             // If --port6 is not set, we use --port
             let port6 = maybe_port6.unwrap_or(port);
 
-            let ipv4_tcp_port = use_zero_ports
-                .then(network_utils::unused_port::unused_tcp4_port)
-                .transpose()?
-                .unwrap_or(port);
-            let ipv4_disc_port = use_zero_ports
-                .then(network_utils::unused_port::unused_udp4_port)
-                .transpose()?
-                .or(maybe_disc_port)
-                .unwrap_or(ipv4_tcp_port);
-            let ipv4_quic_port = use_zero_ports
-                .then(network_utils::unused_port::unused_udp4_port)
-                .transpose()?
-                .or(maybe_quic_port)
-                .unwrap_or(if ipv4_tcp_port == 0 {
+            let ipv4_tcp_port = select_listen_port(
+                use_zero_ports,
+                None,
+                port,
+                network_utils::unused_port::unused_tcp4_port,
+            )?;
+            let ipv4_disc_port = select_listen_port(
+                use_zero_ports,
+                maybe_disc_port,
+                ipv4_tcp_port,
+                network_utils::unused_port::unused_udp4_port,
+            )?;
+            let ipv4_quic_port = select_listen_port(
+                use_zero_ports,
+                maybe_quic_port,
+                if ipv4_tcp_port == 0 {
                     0
                 } else {
                     ipv4_tcp_port + 1
-                });
+                },
+                network_utils::unused_port::unused_udp4_port,
+            )?;
 
             // Defaults to 9000 when required
-            let ipv6_tcp_port = use_zero_ports
-                .then(network_utils::unused_port::unused_tcp6_port)
-                .transpose()?
-                .unwrap_or(port6);
-            let ipv6_disc_port = use_zero_ports
-                .then(network_utils::unused_port::unused_udp6_port)
-                .transpose()?
-                .or(maybe_disc6_port)
-                .unwrap_or(ipv6_tcp_port);
-            let ipv6_quic_port = use_zero_ports
-                .then(network_utils::unused_port::unused_udp6_port)
-                .transpose()?
-                .or(maybe_quic6_port)
-                .unwrap_or(if ipv6_tcp_port == 0 {
+            let ipv6_tcp_port = select_listen_port(
+                use_zero_ports,
+                None,
+                port6,
+                network_utils::unused_port::unused_tcp6_port,
+            )?;
+            let ipv6_disc_port = select_listen_port(
+                use_zero_ports,
+                maybe_disc6_port,
+                ipv6_tcp_port,
+                network_utils::unused_port::unused_udp6_port,
+            )?;
+            let ipv6_quic_port = select_listen_port(
+                use_zero_ports,
+                maybe_quic6_port,
+                if ipv6_tcp_port == 0 {
                     0
                 } else {
                     ipv6_tcp_port + 1
-                });
+                },
+                network_utils::unused_port::unused_udp6_port,
+            )?;
 
             ListenAddress::DualStack(
                 network_utils::listen_addr::ListenAddr {
@@ -1479,7 +1523,9 @@ pub fn set_network_config(
     if let Some(enr_addresses) = cli_args.get_many::<String>("enr-address") {
         let mut enr_ip4 = None;
         let mut enr_ip6 = None;
+        #[cfg(not(feature = "pq-devnet"))]
         let mut resolved_enr_ip4 = None;
+        #[cfg(not(feature = "pq-devnet"))]
         let mut resolved_enr_ip6 = None;
 
         for addr in enr_addresses {
@@ -1499,41 +1545,48 @@ pub fn set_network_config(
                     }
                 }
                 Err(_) => {
-                    // Try to resolve the address
+                    #[cfg(feature = "pq-devnet")]
+                    return Err(format!(
+                        "PQ --enr-address requires a literal IP address, got {addr}"
+                    ));
+                    #[cfg(not(feature = "pq-devnet"))]
+                    {
+                        // Try to resolve the address
 
-                    // NOTE: From checking the `to_socket_addrs` code I don't think the port
-                    // actually matters. Just use the udp port.
+                        // NOTE: From checking the `to_socket_addrs` code I don't think the port
+                        // actually matters. Just use the udp port.
 
-                    let port = match config.listen_addrs() {
-                        ListenAddress::V4(v4_addr) => v4_addr.disc_port,
-                        ListenAddress::V6(v6_addr) => v6_addr.disc_port,
-                        ListenAddress::DualStack(v4_addr, _v6_addr) => {
-                            // NOTE: slight preference for ipv4 that I don't think is of importance.
-                            v4_addr.disc_port
-                        }
-                    };
+                        let port = match config.listen_addrs() {
+                            ListenAddress::V4(v4_addr) => v4_addr.disc_port,
+                            ListenAddress::V6(v6_addr) => v6_addr.disc_port,
+                            ListenAddress::DualStack(v4_addr, _v6_addr) => {
+                                // NOTE: slight preference for ipv4 that I don't think is of importance.
+                                v4_addr.disc_port
+                            }
+                        };
 
-                    let addr_str = format!("{addr}:{port}");
-                    match addr_str.to_socket_addrs() {
-                        Err(_e) => {
-                            return Err(format!("Failed to parse or resolve address {addr}."));
-                        }
-                        Ok(resolved_addresses) => {
-                            for socket_addr in resolved_addresses {
-                                // Use the first ipv4 and first ipv6 addresses present.
+                        let addr_str = format!("{addr}:{port}");
+                        match addr_str.to_socket_addrs() {
+                            Err(_e) => {
+                                return Err(format!("Failed to parse or resolve address {addr}."));
+                            }
+                            Ok(resolved_addresses) => {
+                                for socket_addr in resolved_addresses {
+                                    // Use the first ipv4 and first ipv6 addresses present.
 
-                                // NOTE: this means that if two dns addresses are provided, we
-                                // might end up using the ipv4 and ipv6 resolved addresses of just
-                                // the first.
-                                match socket_addr.ip() {
-                                    IpAddr::V4(v4_addr) => {
-                                        if resolved_enr_ip4.is_none() {
-                                            resolved_enr_ip4 = Some(v4_addr)
+                                    // NOTE: this means that if two dns addresses are provided, we
+                                    // might end up using the ipv4 and ipv6 resolved addresses of just
+                                    // the first.
+                                    match socket_addr.ip() {
+                                        IpAddr::V4(v4_addr) => {
+                                            if resolved_enr_ip4.is_none() {
+                                                resolved_enr_ip4 = Some(v4_addr)
+                                            }
                                         }
-                                    }
-                                    IpAddr::V6(v6_addr) => {
-                                        if resolved_enr_ip6.is_none() {
-                                            resolved_enr_ip6 = Some(v6_addr)
+                                        IpAddr::V6(v6_addr) => {
+                                            if resolved_enr_ip6.is_none() {
+                                                resolved_enr_ip6 = Some(v6_addr)
+                                            }
                                         }
                                     }
                                 }
@@ -1545,12 +1598,19 @@ pub fn set_network_config(
         }
 
         // The ENR addresses given as ips should take preference over any resolved address
-        let used_host_resolution = resolved_enr_ip4.is_some() || resolved_enr_ip6.is_some();
-        let ip4 = enr_ip4.or(resolved_enr_ip4);
-        let ip6 = enr_ip6.or(resolved_enr_ip6);
-        config.enr_address = (ip4, ip6);
-        if used_host_resolution {
-            config.discv5_config.enr_update = false;
+        #[cfg(not(feature = "pq-devnet"))]
+        {
+            let used_host_resolution = resolved_enr_ip4.is_some() || resolved_enr_ip6.is_some();
+            let ip4 = enr_ip4.or(resolved_enr_ip4);
+            let ip6 = enr_ip6.or(resolved_enr_ip6);
+            config.enr_address = (ip4, ip6);
+            if used_host_resolution {
+                config.discv5_config.enr_update = false;
+            }
+        }
+        #[cfg(feature = "pq-devnet")]
+        {
+            config.enr_address = (enr_ip4, enr_ip6);
         }
     }
 

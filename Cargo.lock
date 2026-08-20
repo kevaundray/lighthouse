@@ -1954,6 +1954,7 @@ dependencies = [
 name = "client"
 version = "0.2.0"
 dependencies = [
+ "async-channel 1.9.0",
  "beacon_chain",
  "beacon_processor",
  "consensus_signature",
@@ -1980,8 +1981,11 @@ dependencies = [
  "network",
  "operation_pool",
  "pq_devnet",
+ "pq_http_api",
+ "pq_proposer_service",
  "pq_signing",
  "rand 0.9.2",
+ "reqwest",
  "rusqlite",
  "rustix",
  "sensitive_url",
@@ -1998,10 +2002,12 @@ dependencies = [
  "time",
  "timer",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "types",
  "validator_dir",
+ "warp",
  "yaml_serde",
 ]
 
@@ -5741,6 +5747,7 @@ version = "8.2.2"
 dependencies = [
  "account_manager",
  "account_utils",
+ "async-channel 1.9.0",
  "beacon_node",
  "beacon_node_fallback",
  "beacon_processor",
@@ -5774,6 +5781,7 @@ dependencies = [
  "store",
  "task_executor",
  "tempfile",
+ "tokio",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",

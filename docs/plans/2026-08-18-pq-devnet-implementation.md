@@ -2484,17 +2484,34 @@ the actual strict loopback beacon-node URL is known.
 Bind only `PqHttpApi::new(chain, executor, broadcast_sender).routes()` with Warp graceful shutdown.
 Start it after the network receiver is live and before the proposer. If the configured listener is
 wildcard, derive the strict local client URL from loopback plus the actual bound port; never send
-the proposer through an advertised wildcard address. The proposer scheduler is a process-owned,
-exit-aware slot loop which calls only `try_propose_current_slot`; it does not accept caller duties,
-keys, indices, or slots, and it never starts more than the service's cap-one detached operation.
-Monitor the cloneable receipt for typed logging/shutdown policy without exposing signed blocks or
-intermediate authority. Shutdown stops new slots first, closes HTTP/network ingress, resolves
-pending broadcast acknowledgments, and lets the environment own final task draining.
+the proposer through an advertised wildcard address. Bound accepted HTTP connections with separate
+nonwaiting loopback and remote admissions retained for each connection lifetime, so idle and
+partial-header clients cannot make shutdown or memory retention unbounded. Construct the strict
+local client from the actual URL with redirects and proxies disabled, HTTP/1 only, and the frozen
+285-second transport ceiling.
+
+The proposer scheduler is a process-owned, exit-aware slot loop which calls only
+`try_propose_current_slot`; it does not accept caller duties, keys, indices, or slots, and it never
+retains more than the service's cap-one detached receipt. It attempts the current non-genesis slot
+immediately, recomputes each slot boundary, coalesces a completed same-slot result, and boundedly
+retries every closed-policy nonfatal synchronous outcome (including capacity, unavailable clock,
+and a stale-slot admission race) after a one-second backoff. Immediately before every admission it
+uses a biased stop/executor-exit gate, so an already-ready or same-poll stop cannot start new
+non-cancellable work. Executor/task loss and configuration/signing invariants terminate the
+process. Malformed local response headers/JSON/SSZ, protocol violations, and impossible
+bounded-body/resource outcomes are fatal, while allowlisted transport/status and block/publication
+conflict outcomes remain slot-local. Shutdown stops new slots and
+non-cancellably awaits any retained receipt before closing HTTP/network ingress and releasing the
+sealed store; a fatal retained completion is still propagated after the resource drain.
 
 Replace both synchronous PQ `new_from_cli`/`DeferredRuntimeIntegration` branches with the ordinary
 environment sequence: parse and programmatically validate config, honor dump/immediate-shutdown,
 then spawn asynchronous `ProductionBeaconNode::new(context, config)`. Remove the pre-runtime
-hard-exit path. Keep non-beacon-node commands compile-omitted.
+hard-exit path. Keep non-beacon-node commands compile-omitted. The top-level supervisor must own
+startup immediately: a signal received during construction queues stop without canceling the
+startup future, then drains the constructed `Client` before firing the environment executor exit.
+Every failure after HTTP bind must similarly stop and await HTTP, drop the sole broadcaster, await
+network shutdown, and return the original construction error rather than a cleanup artifact.
 
 ##### Task 5.3e-e4f: Wire the remaining PQ gossip topics and run the launch harness
 

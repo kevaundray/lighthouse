@@ -21,7 +21,7 @@ use task_executor::{ShutdownReason, TaskExecutor};
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 use tracing::{error, info, warn};
 use tracing_subscriber::filter::LevelFilter;
-use types::{EthSpec, GnosisEthSpec, MainnetEthSpec, MinimalEthSpec};
+use types::{EthSpec, ForkName, GnosisEthSpec, MainnetEthSpec, MinimalEthSpec};
 
 #[cfg(target_family = "unix")]
 use {
@@ -132,6 +132,24 @@ impl EnvironmentBuilder<MinimalEthSpec> {
             sse_logging_components: None,
             eth_spec_instance: MinimalEthSpec,
             eth2_config: Eth2Config::minimal(),
+            eth2_network_config: None,
+        }
+    }
+
+    /// Creates the exact, network-file-independent runtime specification for the frozen PQ V1
+    /// profile. Public testnet bytes are bounded and validated later by the PQ client owner.
+    pub fn minimal_pq() -> Self {
+        let spec = ForkName::Electra
+            .make_genesis_spec(types::ChainSpec::minimal())
+            .set_slot_duration_ms::<MinimalEthSpec>(300_000);
+        Self {
+            runtime: None,
+            sse_logging_components: None,
+            eth_spec_instance: MinimalEthSpec,
+            eth2_config: Eth2Config {
+                eth_spec_id: types::EthSpecId::Minimal,
+                spec: Arc::new(spec),
+            },
             eth2_network_config: None,
         }
     }
@@ -500,5 +518,24 @@ impl Future for SignalFuture {
             Poll::Ready(Some(_)) => Poll::Ready(Some(ShutdownReason::Success(self.message))),
             Poll::Ready(None) => Poll::Ready(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use types::{Epoch, ForkName};
+
+    #[test]
+    fn pq_builder_seals_minimal_electra_and_exact_slot_duration() {
+        let builder = EnvironmentBuilder::minimal_pq();
+        let spec = builder.eth2_config.spec.as_ref();
+        assert_eq!(builder.eth2_config.eth_spec_id, types::EthSpecId::Minimal);
+        assert_eq!(spec.get_slot_duration(), Duration::from_secs(300));
+        assert_eq!(spec.fork_name_at_epoch(Epoch::new(0)), ForkName::Electra);
+        assert_eq!(spec.fulu_fork_epoch, None);
+        assert_eq!(spec.gloas_fork_epoch, None);
+        assert!(builder.eth2_network_config.is_none());
     }
 }

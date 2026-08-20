@@ -7,6 +7,7 @@ use consensus_signature::AggregationService;
 #[cfg(any(feature = "pq-proposer", feature = "pq-startup-testing"))]
 use consensus_signature::PqValidatorRegistryEntry;
 use environment::RuntimeContext;
+use futures::FutureExt;
 use lighthouse_network::{Context, NetworkGlobals, identity::Keypair, load_private_key};
 #[cfg(feature = "pq-proposer")]
 use lighthouse_validator_store::{Config as ValidatorStoreConfig, LighthouseValidatorStore};
@@ -14,8 +15,15 @@ use network::{
     PqBlockBroadcastSender, PqNetworkService, PqNetworkServiceError, PqNetworkServiceShutdown,
     pq_block_broadcast_channel,
 };
+use pq_http_api::PqHttpApi;
+#[cfg(feature = "pq-proposer")]
+use pq_proposer_service::{
+    PqBeaconFailure, PqProposalCompletion, PqProposerService, PqProposerServiceError,
+};
 #[cfg(target_os = "linux")]
 use rustix::fs::{Mode, OFlags};
+#[cfg(feature = "pq-proposer")]
+use slot_clock::SlotClock;
 #[cfg(target_os = "linux")]
 use std::fs::File;
 use std::io::Read;
@@ -25,6 +33,8 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 use store::HotColdDB;
 use store::database::interface::BeaconNodeBackend;
@@ -32,6 +42,11 @@ use types::{
     BeaconState, ChainSpec, Config as Eth2Config, EthSpec, ForkContext, ForkName, Hash256,
     MinimalEthSpec,
 };
+
+const PQ_HTTP_LOOPBACK_CONNECTION_CAPACITY: usize = 2;
+const PQ_HTTP_REMOTE_CONNECTION_CAPACITY: usize = 16;
+#[cfg(feature = "pq-proposer")]
+const PQ_PROPOSER_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 const PQ_TESTNET_CONFIG_FILE: &str = "config.yaml";
 const PQ_TESTNET_DEPOSIT_BLOCK_FILE: &str = "deposit_contract_block.txt";
@@ -382,7 +397,570 @@ struct PqBlockingRuntime {
     #[cfg(feature = "pq-proposer")]
     validator_store: Option<Arc<PqValidatorStore>>,
     network_config: Arc<network::NetworkConfig>,
+    http_api_config: crate::config::PqHttpApiConfig,
     local_keypair: Keypair,
+    #[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+    fail_proposer_construction: bool,
+}
+
+struct PqHttpServerShutdown {
+    shutdown_sender: Option<tokio::sync::oneshot::Sender<()>>,
+    connection_shutdown: tokio_util::sync::CancellationToken,
+    stopping: Arc<AtomicBool>,
+    #[cfg(feature = "pq-startup-testing")]
+    outcome: tokio::sync::watch::Receiver<Option<PqHttpTaskOutcome>>,
+    task: tokio::sync::oneshot::Receiver<Result<PqHttpTaskOutcome, tokio::task::JoinError>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PqHttpTaskOutcome {
+    Graceful,
+    Unexpected,
+}
+
+impl PqHttpServerShutdown {
+    async fn wait(mut self) -> Result<(), PqRuntimeError> {
+        self.stopping.store(true, Ordering::SeqCst);
+        self.connection_shutdown.cancel();
+        if let Some(sender) = self.shutdown_sender.take() {
+            let _ = sender.send(());
+        }
+        match self.task.await {
+            Ok(Ok(PqHttpTaskOutcome::Graceful)) => Ok(()),
+            Ok(Ok(PqHttpTaskOutcome::Unexpected)) => Err(PqRuntimeError::HttpUnexpectedExit),
+            Ok(Err(error)) => Err(PqRuntimeError::TaskJoin(error.to_string())),
+            Err(_) => Err(PqRuntimeError::TaskUnavailable),
+        }
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    async fn testing_only_stop_unexpectedly(&self) -> Result<(), PqRuntimeError> {
+        let mut outcome = self.outcome.clone();
+        self.connection_shutdown.cancel();
+        loop {
+            if let Some(outcome) = *outcome.borrow() {
+                return match outcome {
+                    PqHttpTaskOutcome::Unexpected => Ok(()),
+                    PqHttpTaskOutcome::Graceful => Err(PqRuntimeError::TaskUnavailable),
+                };
+            }
+            outcome
+                .changed()
+                .await
+                .map_err(|_| PqRuntimeError::TaskUnavailable)?;
+        }
+    }
+}
+
+#[cfg(feature = "pq-proposer")]
+async fn cleanup_pq_post_bind_owners(
+    http_shutdown: Option<PqHttpServerShutdown>,
+    broadcaster: PqBlockBroadcastSender<MinimalEthSpec>,
+    network_shutdown: PqNetworkServiceShutdown,
+) {
+    if let Some(http_shutdown) = http_shutdown {
+        let _ = http_shutdown.wait().await;
+    }
+    drop(broadcaster);
+    let _ = network_shutdown.wait().await;
+}
+
+struct PqHttpConnection {
+    stream: tokio::net::TcpStream,
+    shutdown: futures::future::Fuse<futures::future::BoxFuture<'static, ()>>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl tokio::io::AsyncRead for PqHttpConnection {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.shutdown.poll_unpin(context).is_ready() {
+            return Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut self.stream).poll_read(context, buffer)
+    }
+}
+
+impl tokio::io::AsyncWrite for PqHttpConnection {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        if self.shutdown.poll_unpin(context).is_ready() {
+            return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+        }
+        std::pin::Pin::new(&mut self.stream).poll_write(context, buffer)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        if self.shutdown.poll_unpin(context).is_ready() {
+            return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+        }
+        std::pin::Pin::new(&mut self.stream).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        std::pin::Pin::new(&mut self.stream).poll_shutdown(context)
+    }
+}
+
+#[cfg(feature = "pq-proposer")]
+struct PqProposerLoopShutdown {
+    shutdown_sender: Option<tokio::sync::oneshot::Sender<()>>,
+    task: tokio::sync::oneshot::Receiver<
+        Result<Result<(), PqProposerServiceError>, tokio::task::JoinError>,
+    >,
+    #[cfg(feature = "pq-startup-testing")]
+    observer: Arc<PqProposerLoopObserver>,
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+struct PqProposerLoopObserver {
+    attempts: std::sync::atomic::AtomicUsize,
+    max_retained_receipts: std::sync::atomic::AtomicUsize,
+    attempt: tokio::sync::Notify,
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+impl PqProposerLoopObserver {
+    fn new() -> Self {
+        Self {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+            max_retained_receipts: std::sync::atomic::AtomicUsize::new(0),
+            attempt: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+#[cfg(feature = "pq-proposer")]
+impl PqProposerLoopShutdown {
+    async fn wait(mut self) -> Result<(), PqRuntimeError> {
+        if let Some(sender) = self.shutdown_sender.take() {
+            let _ = sender.send(());
+        }
+        match self.task.await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(error))) => Err(PqRuntimeError::Proposer(error)),
+            Ok(Err(error)) => Err(PqRuntimeError::TaskJoin(error.to_string())),
+            Err(_) => Err(PqRuntimeError::TaskUnavailable),
+        }
+    }
+}
+
+#[cfg(feature = "pq-proposer")]
+fn pq_beacon_failure_is_fatal(error: &PqBeaconFailure, conflict_is_slot_local: bool) -> bool {
+    match error {
+        PqBeaconFailure::Connect
+        | PqBeaconFailure::Timeout
+        | PqBeaconFailure::Status(408 | 429 | 503) => false,
+        PqBeaconFailure::Status(409) if conflict_is_slot_local => false,
+        PqBeaconFailure::Status(_)
+        | PqBeaconFailure::ResponseTooLarge
+        | PqBeaconFailure::FragmentLimit
+        | PqBeaconFailure::Stream
+        | PqBeaconFailure::Resource
+        | PqBeaconFailure::InvalidHeaders
+        | PqBeaconFailure::InvalidJson
+        | PqBeaconFailure::InvalidSsz
+        | PqBeaconFailure::Protocol => true,
+    }
+}
+
+#[cfg(feature = "pq-proposer")]
+fn pq_proposer_error_is_fatal(error: &PqProposerServiceError) -> bool {
+    match error {
+        PqProposerServiceError::DutyRequest(error) => pq_beacon_failure_is_fatal(error, false),
+        PqProposerServiceError::BlockProduction(error)
+        | PqProposerServiceError::Publication(error) => pq_beacon_failure_is_fatal(error, true),
+        PqProposerServiceError::PublicationRejected { status } => *status != 409,
+        PqProposerServiceError::ClockUnavailable
+        | PqProposerServiceError::OptimisticDuties
+        | PqProposerServiceError::DoppelgangerNotReady { .. }
+        | PqProposerServiceError::BlockSigningExpired { .. }
+        | PqProposerServiceError::PublicationExpired { .. }
+        | PqProposerServiceError::PreparationExpired { .. }
+        | PqProposerServiceError::StaleAfterDuty { .. }
+        | PqProposerServiceError::StaleSlot { .. }
+        | PqProposerServiceError::Capacity => false,
+        PqProposerServiceError::Randao(error) | PqProposerServiceError::BlockSigning(error) => {
+            !error.is_transient()
+        }
+        PqProposerServiceError::InvalidIdentitySet
+        | PqProposerServiceError::WrongSlotDuration { .. }
+        | PqProposerServiceError::Configuration(_)
+        | PqProposerServiceError::MissingValidatorIndex { .. }
+        | PqProposerServiceError::DutyIdentityMismatch { .. }
+        | PqProposerServiceError::InvalidCurrentSlotDutyCount { .. }
+        | PqProposerServiceError::InvalidProducedBlock(_)
+        | PqProposerServiceError::PublicationEncoding(_)
+        | PqProposerServiceError::PublicationProtocol { .. }
+        | PqProposerServiceError::TimingOverflow
+        | PqProposerServiceError::TaskUnavailable => true,
+    }
+}
+
+#[cfg(feature = "pq-proposer")]
+trait PqProposerLoopReceipt: Send {
+    fn slot(&self) -> types::Slot;
+
+    fn completion(
+        &self,
+    ) -> futures::future::BoxFuture<'_, Result<PqProposalCompletion, PqProposerServiceError>>;
+}
+
+#[cfg(feature = "pq-proposer")]
+impl PqProposerLoopReceipt for pq_proposer_service::PqProposalReceipt {
+    fn slot(&self) -> types::Slot {
+        self.slot()
+    }
+
+    fn completion(
+        &self,
+    ) -> futures::future::BoxFuture<'_, Result<PqProposalCompletion, PqProposerServiceError>> {
+        self.completion().boxed()
+    }
+}
+
+#[cfg(feature = "pq-proposer")]
+trait PqProposerLoopSource: Send + Sync + 'static {
+    type Receipt: PqProposerLoopReceipt;
+
+    fn now(&self) -> Option<types::Slot>;
+    fn genesis_slot(&self) -> types::Slot;
+    fn duration_to_next_slot(&self) -> Option<Duration>;
+    fn try_propose_current_slot(&self) -> Result<Self::Receipt, PqProposerServiceError>;
+}
+
+#[cfg(feature = "pq-proposer")]
+struct ProductionPqProposerLoopSource {
+    service: Arc<PqProposerService<SystemTimeSlotClock>>,
+    clock: SystemTimeSlotClock,
+}
+
+#[cfg(feature = "pq-proposer")]
+impl PqProposerLoopSource for ProductionPqProposerLoopSource {
+    type Receipt = pq_proposer_service::PqProposalReceipt;
+
+    fn now(&self) -> Option<types::Slot> {
+        self.clock.now()
+    }
+
+    fn genesis_slot(&self) -> types::Slot {
+        self.clock.genesis_slot()
+    }
+
+    fn duration_to_next_slot(&self) -> Option<Duration> {
+        self.clock.duration_to_next_slot()
+    }
+
+    fn try_propose_current_slot(&self) -> Result<Self::Receipt, PqProposerServiceError> {
+        self.service.try_propose_current_slot()
+    }
+}
+
+#[cfg(feature = "pq-proposer")]
+async fn run_pq_proposer_loop<S: PqProposerLoopSource>(
+    source: S,
+    shutdown_receiver: tokio::sync::oneshot::Receiver<()>,
+    exit: impl std::future::Future<Output = ()> + Send + 'static,
+    #[cfg(feature = "pq-startup-testing")] observer: Arc<PqProposerLoopObserver>,
+) -> Result<(), PqProposerServiceError> {
+    let mut shutdown: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+        Box::pin(async move {
+            tokio::select! {
+                _ = exit => {}
+                _ = shutdown_receiver => {}
+            }
+        });
+    let mut completed_slot = None;
+
+    loop {
+        let Some(now) = source.now() else {
+            tokio::select! {
+                _ = shutdown.as_mut() => return Ok(()),
+                _ = tokio::time::sleep(PQ_PROPOSER_RETRY_DELAY) => continue,
+            }
+        };
+        if now == source.genesis_slot() || completed_slot.is_some_and(|slot| now <= slot) {
+            let delay = source
+                .duration_to_next_slot()
+                .unwrap_or(PQ_PROPOSER_RETRY_DELAY);
+            tokio::select! {
+                _ = shutdown.as_mut() => return Ok(()),
+                _ = tokio::time::sleep(delay) => continue,
+            }
+        }
+
+        // Give an already-ready (or concurrently-ready) process stop priority immediately before
+        // admission.  The ready branch makes this a non-waiting gate while `biased` ensures that a
+        // stop observed in the same poll cannot start another non-cancellable proposal.
+        tokio::select! {
+            biased;
+            _ = shutdown.as_mut() => return Ok(()),
+            _ = std::future::ready(()) => {}
+        }
+
+        let receipt = match source.try_propose_current_slot() {
+            Ok(receipt) => receipt,
+            Err(error) if pq_proposer_error_is_fatal(&error) => return Err(error),
+            Err(_) => {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.as_mut() => return Ok(()),
+                    _ = tokio::time::sleep(PQ_PROPOSER_RETRY_DELAY) => continue,
+                }
+            }
+        };
+        #[cfg(feature = "pq-startup-testing")]
+        {
+            observer.attempts.fetch_add(1, Ordering::SeqCst);
+            observer
+                .max_retained_receipts
+                .fetch_max(1, Ordering::SeqCst);
+            observer.attempt.notify_waiters();
+        }
+        let slot = receipt.slot();
+        let completion = tokio::select! {
+            _ = shutdown.as_mut() => {
+                return match receipt.completion().await {
+                    Err(error) if pq_proposer_error_is_fatal(&error) => Err(error),
+                    _ => Ok(()),
+                };
+            }
+            completion = receipt.completion() => completion,
+        };
+        completed_slot = Some(slot);
+        match completion {
+            Ok(PqProposalCompletion::NoLocalDuty { .. })
+            | Ok(PqProposalCompletion::Published { .. }) => {}
+            Err(error) if pq_proposer_error_is_fatal(&error) => return Err(error),
+            Err(_) => {}
+        }
+    }
+}
+
+#[cfg(feature = "pq-proposer")]
+async fn start_pq_proposer_loop(
+    service: Arc<PqProposerService<SystemTimeSlotClock>>,
+    clock: SystemTimeSlotClock,
+    task_executor: task_executor::TaskExecutor,
+) -> Result<PqProposerLoopShutdown, PqRuntimeError> {
+    start_pq_proposer_loop_source(
+        ProductionPqProposerLoopSource { service, clock },
+        task_executor,
+    )
+    .await
+}
+
+#[cfg(feature = "pq-proposer")]
+async fn start_pq_proposer_loop_source<S: PqProposerLoopSource>(
+    source: S,
+    task_executor: task_executor::TaskExecutor,
+) -> Result<PqProposerLoopShutdown, PqRuntimeError> {
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+    let (live_sender, live_receiver) = tokio::sync::oneshot::channel();
+    #[cfg(feature = "pq-startup-testing")]
+    let observer = Arc::new(PqProposerLoopObserver::new());
+    #[cfg(feature = "pq-startup-testing")]
+    let task_observer = Arc::clone(&observer);
+    let exit = task_executor.exit();
+    let mut process_shutdown = task_executor.shutdown_sender();
+    let mut task = task_executor
+        .spawn_handle_without_exit(
+            async move {
+                let _ = live_sender.send(());
+                let result = run_pq_proposer_loop(
+                    source,
+                    shutdown_receiver,
+                    exit,
+                    #[cfg(feature = "pq-startup-testing")]
+                    task_observer,
+                )
+                .await;
+                if result.as_ref().is_err_and(pq_proposer_error_is_fatal) {
+                    let _ = process_shutdown.try_send(task_executor::ShutdownReason::Failure(
+                        "PQ proposer loop failed",
+                    ));
+                }
+                result
+            },
+            "pq_proposer_loop",
+        )
+        .ok_or(PqRuntimeError::TaskUnavailable)?;
+    tokio::select! {
+        biased;
+        result = &mut task => match result {
+            Ok(Ok(Err(error))) => Err(PqRuntimeError::Proposer(error)),
+            Ok(Ok(Ok(()))) | Ok(Err(_)) | Err(_) => Err(PqRuntimeError::TaskUnavailable),
+        },
+        live = live_receiver => {
+            live.map_err(|_| PqRuntimeError::TaskUnavailable)?;
+            Ok(PqProposerLoopShutdown {
+                shutdown_sender: Some(shutdown_sender),
+                task,
+                #[cfg(feature = "pq-startup-testing")]
+                observer,
+            })
+        }
+    }
+}
+
+fn pq_local_http_address(bound: std::net::SocketAddr) -> std::net::SocketAddr {
+    let ip = match bound.ip() {
+        std::net::IpAddr::V4(ip) if ip.is_unspecified() => {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        }
+        std::net::IpAddr::V6(ip) if ip.is_unspecified() => {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        }
+        ip => ip,
+    };
+    std::net::SocketAddr::new(ip, bound.port())
+}
+
+async fn start_pq_http_server(
+    chain: Arc<PqDiskChain>,
+    task_executor: task_executor::TaskExecutor,
+    broadcaster: PqBlockBroadcastSender<MinimalEthSpec>,
+    config: &crate::config::PqHttpApiConfig,
+) -> Result<
+    (
+        std::net::SocketAddr,
+        sensitive_url::SensitiveUrl,
+        PqHttpServerShutdown,
+    ),
+    PqRuntimeError,
+> {
+    let routes = PqHttpApi::new(chain, task_executor.clone(), broadcaster)
+        .map_err(PqRuntimeError::HttpConfiguration)?
+        .routes();
+    let configured = std::net::SocketAddr::new(config.listen_addr, config.listen_port);
+    let listener = std::net::TcpListener::bind(configured).map_err(PqRuntimeError::HttpBind)?;
+    listener
+        .set_nonblocking(true)
+        .map_err(PqRuntimeError::HttpBind)?;
+    let bound = listener.local_addr().map_err(PqRuntimeError::HttpBind)?;
+    let listener = tokio::net::TcpListener::from_std(listener).map_err(PqRuntimeError::HttpBind)?;
+    let listener = Arc::new(listener);
+    let loopback_admission = Arc::new(tokio::sync::Semaphore::new(
+        PQ_HTTP_LOOPBACK_CONNECTION_CAPACITY,
+    ));
+    let remote_admission = Arc::new(tokio::sync::Semaphore::new(
+        PQ_HTTP_REMOTE_CONNECTION_CAPACITY,
+    ));
+    let connection_shutdown = tokio_util::sync::CancellationToken::new();
+    let incoming_shutdown = connection_shutdown.clone();
+    let incoming = futures::stream::unfold(
+        (
+            listener,
+            loopback_admission,
+            remote_admission,
+            incoming_shutdown,
+        ),
+        |(listener, loopback_admission, remote_admission, shutdown)| async move {
+            loop {
+                let accepted = tokio::select! {
+                    _ = shutdown.cancelled() => return None,
+                    accepted = listener.accept() => accepted,
+                };
+                match accepted {
+                    Ok((stream, peer)) => {
+                        let admission = if peer.ip().is_loopback() {
+                            Arc::clone(&loopback_admission).try_acquire_owned()
+                        } else {
+                            Arc::clone(&remote_admission).try_acquire_owned()
+                        };
+                        match admission {
+                            Ok(permit) => {
+                                let connection = PqHttpConnection {
+                                    stream,
+                                    shutdown: shutdown.clone().cancelled_owned().boxed().fuse(),
+                                    _permit: permit,
+                                };
+                                return Some((
+                                    Ok::<_, std::io::Error>(connection),
+                                    (listener, loopback_admission, remote_admission, shutdown),
+                                ));
+                            }
+                            Err(_) => {
+                                drop(stream);
+                                tokio::task::yield_now().await;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        return Some((
+                            Err(error),
+                            (listener, loopback_admission, remote_admission, shutdown),
+                        ));
+                    }
+                }
+            }
+        },
+    );
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+    let server = warp::serve(routes).serve_incoming_with_graceful_shutdown(incoming, async move {
+        let _ = shutdown_receiver.await;
+    });
+    let local = pq_local_http_address(bound);
+    let local_url = sensitive_url::SensitiveUrl::parse(&format!("http://{local}/"))
+        .map_err(|error| PqRuntimeError::HttpUrl(error.to_string()))?;
+    let (live_sender, live_receiver) = tokio::sync::oneshot::channel();
+    #[cfg(feature = "pq-startup-testing")]
+    let (outcome_sender, outcome_receiver) = tokio::sync::watch::channel(None);
+    let stopping = Arc::new(AtomicBool::new(false));
+    let task_stopping = Arc::clone(&stopping);
+    let mut process_shutdown = task_executor.shutdown_sender();
+    let mut task = task_executor
+        .spawn_handle_without_exit(
+            async move {
+                let _ = live_sender.send(());
+                server.await;
+                let outcome = if task_stopping.load(Ordering::SeqCst) {
+                    PqHttpTaskOutcome::Graceful
+                } else {
+                    let _ = process_shutdown.try_send(task_executor::ShutdownReason::Failure(
+                        "PQ HTTP API exited unexpectedly",
+                    ));
+                    PqHttpTaskOutcome::Unexpected
+                };
+                #[cfg(feature = "pq-startup-testing")]
+                outcome_sender.send_replace(Some(outcome));
+                outcome
+            },
+            "pq_http_api",
+        )
+        .ok_or(PqRuntimeError::TaskUnavailable)?;
+    tokio::select! {
+        biased;
+        result = &mut task => match result {
+            Ok(Ok(PqHttpTaskOutcome::Unexpected)) => Err(PqRuntimeError::HttpUnexpectedExit),
+            Ok(Ok(PqHttpTaskOutcome::Graceful)) => Err(PqRuntimeError::TaskUnavailable),
+            Ok(Err(error)) => Err(PqRuntimeError::TaskJoin(error.to_string())),
+            Err(_) => Err(PqRuntimeError::TaskUnavailable),
+        },
+        live = live_receiver => {
+            live.map_err(|_| PqRuntimeError::TaskUnavailable)?;
+            Ok((bound, local_url, PqHttpServerShutdown {
+                shutdown_sender: Some(shutdown_sender),
+                connection_shutdown,
+                stopping,
+                #[cfg(feature = "pq-startup-testing")]
+                outcome: outcome_receiver,
+                task,
+            }))
+        }
+    }
 }
 
 struct PqPreparedDiskRuntime {
@@ -406,6 +984,8 @@ pub struct PqRuntimeConfig {
     genesis_read_test_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(all(feature = "pq-startup-testing", feature = "pq-proposer"))]
     bundle_auth_test_barriers: Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>,
+    #[cfg(all(feature = "pq-startup-testing", feature = "pq-proposer"))]
+    fail_proposer_construction: bool,
 }
 
 impl std::fmt::Debug for PqRuntimeConfig {
@@ -431,6 +1011,8 @@ impl PqRuntimeConfig {
             genesis_read_test_hook: None,
             #[cfg(all(feature = "pq-startup-testing", feature = "pq-proposer"))]
             bundle_auth_test_barriers: None,
+            #[cfg(all(feature = "pq-startup-testing", feature = "pq-proposer"))]
+            fail_proposer_construction: false,
         }
     }
 
@@ -461,6 +1043,13 @@ impl PqRuntimeConfig {
         completed: Arc<tokio::sync::Barrier>,
     ) -> Self {
         self.bundle_auth_test_barriers = Some((entered, completed));
+        self
+    }
+
+    #[cfg(all(feature = "pq-startup-testing", feature = "pq-proposer"))]
+    #[doc(hidden)]
+    pub fn testing_only_fail_proposer_construction(mut self) -> Self {
+        self.fail_proposer_construction = true;
         self
     }
 
@@ -540,6 +1129,8 @@ impl PqRuntimeConfig {
             genesis_read_test_hook: self.genesis_read_test_hook,
             #[cfg(all(feature = "pq-startup-testing", feature = "pq-proposer"))]
             bundle_auth_test_barriers: self.bundle_auth_test_barriers,
+            #[cfg(all(feature = "pq-startup-testing", feature = "pq-proposer"))]
+            fail_proposer_construction: self.fail_proposer_construction,
         })
     }
 
@@ -600,6 +1191,8 @@ pub struct PqRuntimePlan {
     genesis_read_test_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(all(feature = "pq-startup-testing", feature = "pq-proposer"))]
     bundle_auth_test_barriers: Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>,
+    #[cfg(all(feature = "pq-startup-testing", feature = "pq-proposer"))]
+    fail_proposer_construction: bool,
 }
 
 impl std::fmt::Debug for PqRuntimePlan {
@@ -718,8 +1311,15 @@ pub(crate) struct PqRuntimeOwner {
     chain: Arc<PqDiskChain>,
     network_globals: Arc<NetworkGlobals<MinimalEthSpec>>,
     broadcaster: PqBlockBroadcastSender<MinimalEthSpec>,
+    http_api_listen_addr: Option<std::net::SocketAddr>,
+    _local_http_url: Option<sensitive_url::SensitiveUrl>,
+    http_shutdown: Option<PqHttpServerShutdown>,
     #[cfg(feature = "pq-proposer")]
-    _validator_store: Option<Arc<PqValidatorStore>>,
+    _proposer_service: Option<Arc<PqProposerService<SystemTimeSlotClock>>>,
+    #[cfg(feature = "pq-proposer")]
+    proposer_loop: Option<PqProposerLoopShutdown>,
+    #[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+    validator_identities: Option<Vec<(consensus_signature::ValidatorPublicKeyBytes, u64)>>,
     network_shutdown: PqNetworkServiceShutdown,
 }
 
@@ -1003,13 +1603,17 @@ impl PqRuntimeOwner {
                         }
                     })?;
                     let network_config = Arc::new(plan.client.network.clone());
+                    let http_api_config = plan.client.http_api.clone();
                     let local_keypair = load_private_key(&network_config);
                     Ok::<_, PqRuntimeError>(PqBlockingRuntime {
                         chain,
                         #[cfg(feature = "pq-proposer")]
                         validator_store,
                         network_config,
+                        http_api_config,
                         local_keypair,
+                        #[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+                        fail_proposer_construction: plan.fail_proposer_construction,
                     })
                 },
                 "pq-runtime-build-disk-owner",
@@ -1022,7 +1626,10 @@ impl PqRuntimeOwner {
             #[cfg(feature = "pq-proposer")]
             validator_store,
             network_config,
+            http_api_config,
             local_keypair,
+            #[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+            fail_proposer_construction,
         } = blocking_runtime;
         let head = chain.head_snapshot();
         let genesis_validators_root = head.beacon_state.genesis_validators_root();
@@ -1043,7 +1650,7 @@ impl PqRuntimeOwner {
         };
         let (broadcaster, broadcast_receiver) = pq_block_broadcast_channel();
         let service = PqNetworkService::new(
-            executor,
+            executor.clone(),
             network_context,
             spec.custody_requirement,
             local_keypair,
@@ -1057,12 +1664,111 @@ impl PqRuntimeOwner {
             .start_with_shutdown_receipt()
             .await
             .map_err(PqRuntimeError::Network)?;
+        let (http_api_listen_addr, local_http_url, http_shutdown) = if http_api_config.enabled {
+            match start_pq_http_server(
+                Arc::clone(&chain),
+                executor.clone(),
+                broadcaster.clone(),
+                &http_api_config,
+            )
+            .await
+            {
+                Ok((address, local_url, shutdown)) => {
+                    (Some(address), Some(local_url), Some(shutdown))
+                }
+                Err(error) => {
+                    drop(broadcaster);
+                    let _ = network_shutdown.wait().await;
+                    return Err(error);
+                }
+            }
+        } else {
+            (None, None, None)
+        };
+        #[cfg(feature = "pq-proposer")]
+        let mut http_shutdown = http_shutdown;
+        #[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+        let validator_identities = validator_store
+            .as_ref()
+            .and_then(|store| store.pq_validator_identity_snapshot());
+        #[cfg(feature = "pq-proposer")]
+        let proposer_service_result = (|| {
+            Ok(match validator_store {
+                Some(validator_store) => {
+                    #[cfg(feature = "pq-startup-testing")]
+                    if fail_proposer_construction {
+                        return Err(PqRuntimeError::ProposerPreflightInvariant);
+                    }
+                    let local_url = local_http_url
+                        .clone()
+                        .ok_or(PqRuntimeError::ProposerPreflightInvariant)?;
+                    let beacon_node = eth2::StrictBeaconNodeHttpClient::from_builder(
+                        local_url,
+                        eth2::Timeouts::set_all(Duration::from_secs(285)),
+                        reqwest::Client::builder().no_proxy().http1_only(),
+                    )
+                    .map_err(PqRuntimeError::HttpClient)?;
+                    Some(Arc::new(
+                        PqProposerService::new(
+                            chain.slot_clock.clone(),
+                            executor.clone(),
+                            validator_store,
+                            beacon_node,
+                        )
+                        .map_err(PqRuntimeError::Proposer)?,
+                    ))
+                }
+                None => None,
+            })
+        })();
+        #[cfg(feature = "pq-proposer")]
+        let proposer_service = match proposer_service_result {
+            Ok(service) => service,
+            Err(error) => {
+                Box::pin(cleanup_pq_post_bind_owners(
+                    http_shutdown.take(),
+                    broadcaster,
+                    network_shutdown,
+                ))
+                .await;
+                return Err(error);
+            }
+        };
+        #[cfg(feature = "pq-proposer")]
+        let proposer_loop = match proposer_service.as_ref() {
+            Some(service) => match start_pq_proposer_loop(
+                Arc::clone(service),
+                chain.slot_clock.clone(),
+                executor,
+            )
+            .await
+            {
+                Ok(proposer_loop) => Some(proposer_loop),
+                Err(error) => {
+                    Box::pin(cleanup_pq_post_bind_owners(
+                        http_shutdown.take(),
+                        broadcaster,
+                        network_shutdown,
+                    ))
+                    .await;
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
         Ok(Self {
             chain,
             network_globals,
             broadcaster,
+            http_api_listen_addr,
+            _local_http_url: local_http_url,
+            http_shutdown,
             #[cfg(feature = "pq-proposer")]
-            _validator_store: validator_store,
+            _proposer_service: proposer_service,
+            #[cfg(feature = "pq-proposer")]
+            proposer_loop,
+            #[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+            validator_identities,
             network_shutdown,
         })
     }
@@ -1080,15 +1786,42 @@ impl PqRuntimeOwner {
             chain: _,
             network_globals: _,
             broadcaster,
+            http_api_listen_addr: _,
+            _local_http_url: _,
+            http_shutdown,
             #[cfg(feature = "pq-proposer")]
-                _validator_store: _,
+                _proposer_service: proposer_service,
+            #[cfg(feature = "pq-proposer")]
+            proposer_loop,
+            #[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+                validator_identities: _,
             network_shutdown,
         } = self;
+        #[cfg(feature = "pq-proposer")]
+        let proposer_result = match proposer_loop {
+            Some(proposer_loop) => proposer_loop.wait().await,
+            None => Ok(()),
+        };
+        let http_result = match http_shutdown {
+            Some(http_shutdown) => http_shutdown.wait().await,
+            None => Ok(()),
+        };
         drop(broadcaster);
-        network_shutdown
+        let network_result = network_shutdown
             .wait()
             .await
-            .map_err(PqRuntimeError::Network)
+            .map_err(PqRuntimeError::Network);
+        #[cfg(feature = "pq-proposer")]
+        drop(proposer_service);
+        #[cfg(feature = "pq-proposer")]
+        if let Err(error) = proposer_result {
+            return Err(error);
+        }
+        match (http_result, network_result) {
+            (Err(http_error), _) => Err(http_error),
+            (Ok(()), Err(network_error)) => Err(network_error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
     }
 }
 
@@ -1097,11 +1830,11 @@ impl Client<PqDiskWitness> {
         context: RuntimeContext<MinimalEthSpec>,
         config: PqRuntimeConfig,
     ) -> Result<Self, PqRuntimeError> {
-        let owner = PqRuntimeOwner::start(context, config).await?;
+        let owner = Box::pin(PqRuntimeOwner::start(context, config)).await?;
         Ok(Self {
             beacon_chain: Some(owner.beacon_chain()),
             network_globals: Some(owner.network_globals()),
-            http_api_listen_addr: None,
+            http_api_listen_addr: owner.http_api_listen_addr,
             http_metrics_listen_addr: None,
             pq_runtime_owner: Some(owner),
         })
@@ -1115,16 +1848,66 @@ impl Client<PqDiskWitness> {
             .map(|owner| owner.broadcaster.clone())
     }
 
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_pq_local_http_url(&self) -> Option<sensitive_url::SensitiveUrl> {
+        self.pq_runtime_owner.as_ref()?._local_http_url.clone()
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub async fn testing_only_stop_pq_http_unexpectedly(&self) -> Result<(), PqRuntimeError> {
+        self.pq_runtime_owner
+            .as_ref()
+            .and_then(|owner| owner.http_shutdown.as_ref())
+            .ok_or(PqRuntimeError::TaskUnavailable)?
+            .testing_only_stop_unexpectedly()
+            .await
+    }
+
     #[cfg(all(feature = "pq-startup-testing", feature = "pq-proposer"))]
     #[doc(hidden)]
     pub fn testing_only_pq_validator_identities(
         &self,
     ) -> Option<Vec<(consensus_signature::ValidatorPublicKeyBytes, u64)>> {
+        self.pq_runtime_owner.as_ref()?.validator_identities.clone()
+    }
+
+    #[cfg(all(feature = "pq-startup-testing", feature = "pq-proposer"))]
+    #[doc(hidden)]
+    pub fn testing_only_pq_proposer_is_running(&self) -> bool {
         self.pq_runtime_owner
+            .as_ref()
+            .is_some_and(|owner| owner._proposer_service.is_some())
+    }
+
+    #[cfg(all(feature = "pq-startup-testing", feature = "pq-proposer"))]
+    #[doc(hidden)]
+    pub async fn testing_only_wait_for_pq_proposer_attempt(&self) -> Result<(), PqRuntimeError> {
+        let observer = &self
+            .pq_runtime_owner
+            .as_ref()
+            .and_then(|owner| owner.proposer_loop.as_ref())
+            .ok_or(PqRuntimeError::TaskUnavailable)?
+            .observer;
+        loop {
+            if observer.attempts.load(Ordering::SeqCst) > 0 {
+                return Ok(());
+            }
+            observer.attempt.notified().await;
+        }
+    }
+
+    #[cfg(all(feature = "pq-startup-testing", feature = "pq-proposer"))]
+    #[doc(hidden)]
+    pub fn testing_only_pq_proposer_max_retained_receipts(&self) -> Option<usize> {
+        let observer = &self
+            .pq_runtime_owner
             .as_ref()?
-            ._validator_store
+            .proposer_loop
             .as_ref()?
-            .pq_validator_identity_snapshot()
+            .observer;
+        Some(observer.max_retained_receipts.load(Ordering::SeqCst))
     }
 
     pub async fn shutdown(mut self) -> Result<(), PqRuntimeError> {
@@ -1162,6 +1945,14 @@ pub enum PqRuntimeError {
     Execution(execution_layer::Error),
     Chain(beacon_chain::PqRuntimeError),
     Network(PqNetworkServiceError),
+    HttpConfiguration(network::PqBlockPublicationConfigurationError),
+    HttpBind(std::io::Error),
+    HttpUrl(String),
+    HttpUnexpectedExit,
+    #[cfg(feature = "pq-proposer")]
+    HttpClient(eth2::Error),
+    #[cfg(feature = "pq-proposer")]
+    Proposer(pq_proposer_service::PqProposerServiceError),
     TaskUnavailable,
     TaskJoin(String),
 }
@@ -1212,6 +2003,17 @@ impl std::fmt::Display for PqRuntimeError {
             }
             Self::Chain(error) => error.fmt(formatter),
             Self::Network(error) => error.fmt(formatter),
+            Self::HttpConfiguration(error) => error.fmt(formatter),
+            Self::HttpBind(error) => write!(formatter, "could not bind PQ HTTP API: {error}"),
+            Self::HttpUrl(error) => write!(formatter, "invalid PQ local HTTP URL: {error}"),
+            Self::HttpUnexpectedExit => formatter.write_str("PQ HTTP API exited unexpectedly"),
+            #[cfg(feature = "pq-proposer")]
+            Self::HttpClient(error) => write!(
+                formatter,
+                "could not construct strict PQ HTTP client: {error}"
+            ),
+            #[cfg(feature = "pq-proposer")]
+            Self::Proposer(error) => error.fmt(formatter),
             Self::TaskUnavailable => formatter.write_str("PQ runtime executor is unavailable"),
             Self::TaskJoin(error) => write!(formatter, "PQ runtime blocking task failed: {error}"),
         }
@@ -1231,8 +2033,14 @@ impl std::error::Error for PqRuntimeError {
             Self::Aggregation(error) => Some(error),
             Self::Chain(error) => Some(error),
             Self::Network(error) => Some(error),
+            Self::HttpConfiguration(error) => Some(error),
+            Self::HttpBind(error) => Some(error),
+            #[cfg(feature = "pq-proposer")]
+            Self::Proposer(error) => Some(error),
             #[cfg(feature = "pq-proposer")]
             Self::Slashing(_) => None,
+            #[cfg(feature = "pq-proposer")]
+            Self::HttpClient(_) => None,
             Self::JwtInvalid(_)
             | Self::GenesisRead(_)
             | Self::GenesisDecode(_)
@@ -1243,6 +2051,8 @@ impl std::error::Error for PqRuntimeError {
             | Self::Store(_)
             | Self::MissingExecutionLayer
             | Self::Execution(_)
+            | Self::HttpUrl(_)
+            | Self::HttpUnexpectedExit
             | Self::TaskUnavailable
             | Self::TaskJoin(_) => None,
         }
@@ -1312,5 +2122,481 @@ mod tests {
                 i64::try_from(canonical_index).expect("small canonical index") + 1,
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "pq-proposer", feature = "pq-startup-testing"))]
+mod proposer_loop_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    struct TestingReceipt {
+        slot: types::Slot,
+        completion: tokio::sync::watch::Receiver<
+            Option<Result<PqProposalCompletion, PqProposerServiceError>>,
+        >,
+    }
+
+    impl PqProposerLoopReceipt for TestingReceipt {
+        fn slot(&self) -> types::Slot {
+            self.slot
+        }
+
+        fn completion(
+            &self,
+        ) -> futures::future::BoxFuture<'_, Result<PqProposalCompletion, PqProposerServiceError>>
+        {
+            async move {
+                let mut completion = self.completion.clone();
+                loop {
+                    if let Some(result) = completion.borrow().clone() {
+                        return result;
+                    }
+                    completion
+                        .changed()
+                        .await
+                        .map_err(|_| PqProposerServiceError::TaskUnavailable)?;
+                }
+            }
+            .boxed()
+        }
+    }
+
+    struct TestingSource {
+        now: std::sync::atomic::AtomicU64,
+        now_calls: std::sync::atomic::AtomicUsize,
+        genesis: types::Slot,
+        starts: std::sync::atomic::AtomicUsize,
+        boundary_checks: std::sync::atomic::AtomicUsize,
+        script: Mutex<VecDeque<Result<TestingReceipt, PqProposerServiceError>>>,
+        stop_on_now_call: Mutex<Option<(usize, tokio::sync::oneshot::Sender<()>)>>,
+    }
+
+    impl TestingSource {
+        fn new(
+            now: Option<types::Slot>,
+            genesis: types::Slot,
+            script: Vec<Result<TestingReceipt, PqProposerServiceError>>,
+        ) -> Self {
+            Self {
+                now: std::sync::atomic::AtomicU64::new(now.map_or(u64::MAX, |slot| slot.as_u64())),
+                now_calls: std::sync::atomic::AtomicUsize::new(0),
+                genesis,
+                starts: std::sync::atomic::AtomicUsize::new(0),
+                boundary_checks: std::sync::atomic::AtomicUsize::new(0),
+                script: Mutex::new(script.into()),
+                stop_on_now_call: Mutex::new(None),
+            }
+        }
+
+        fn set_now(&self, now: Option<types::Slot>) {
+            self.now
+                .store(now.map_or(u64::MAX, |slot| slot.as_u64()), Ordering::SeqCst);
+        }
+
+        fn stop_on_now_call(&self, call: usize, sender: tokio::sync::oneshot::Sender<()>) {
+            *self.stop_on_now_call.lock().expect("stop-on-now lock") = Some((call, sender));
+        }
+    }
+
+    impl PqProposerLoopSource for Arc<TestingSource> {
+        type Receipt = TestingReceipt;
+
+        fn now(&self) -> Option<types::Slot> {
+            let call = self.now_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut stop = self.stop_on_now_call.lock().expect("stop-on-now lock");
+            if stop.as_ref().is_some_and(|(expected, _)| *expected == call)
+                && let Some((_, sender)) = stop.take()
+            {
+                let _ = sender.send(());
+            }
+            let now = self.now.load(Ordering::SeqCst);
+            (now != u64::MAX).then(|| types::Slot::new(now))
+        }
+
+        fn genesis_slot(&self) -> types::Slot {
+            self.genesis
+        }
+
+        fn duration_to_next_slot(&self) -> Option<Duration> {
+            self.boundary_checks.fetch_add(1, Ordering::SeqCst);
+            Some(Duration::from_secs(1))
+        }
+
+        fn try_propose_current_slot(&self) -> Result<Self::Receipt, PqProposerServiceError> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            self.script
+                .lock()
+                .expect("testing script lock")
+                .pop_front()
+                .unwrap_or(Err(PqProposerServiceError::TaskUnavailable))
+        }
+    }
+
+    fn receipt(
+        slot: u64,
+    ) -> (
+        TestingReceipt,
+        tokio::sync::watch::Sender<Option<Result<PqProposalCompletion, PqProposerServiceError>>>,
+    ) {
+        let (sender, completion) = tokio::sync::watch::channel(None);
+        (
+            TestingReceipt {
+                slot: types::Slot::new(slot),
+                completion,
+            },
+            sender,
+        )
+    }
+
+    fn observer() -> Arc<PqProposerLoopObserver> {
+        Arc::new(PqProposerLoopObserver::new())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capacity_and_clock_retries_are_bounded_but_executor_loss_is_fatal() {
+        let source = Arc::new(TestingSource::new(
+            Some(types::Slot::new(1)),
+            types::Slot::new(0),
+            vec![
+                Err(PqProposerServiceError::Capacity),
+                Err(PqProposerServiceError::ClockUnavailable),
+                Err(PqProposerServiceError::TaskUnavailable),
+            ],
+        ));
+        let (_shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        let (_exit_sender, exit_receiver) = tokio::sync::oneshot::channel::<()>();
+        let task_source = Arc::clone(&source);
+        let task = tokio::spawn(run_pq_proposer_loop(
+            task_source,
+            shutdown_receiver,
+            async move {
+                let _ = exit_receiver.await;
+            },
+            observer(),
+        ));
+
+        tokio::task::yield_now().await;
+        assert_eq!(source.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(tokio::spawn(async { 17 }).await.expect("heartbeat"), 17);
+        tokio::time::advance(Duration::from_millis(999)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(source.starts.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(source.starts.load(Ordering::SeqCst), 2);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(matches!(
+            task.await.expect("loop task"),
+            Err(PqProposerServiceError::TaskUnavailable),
+        ));
+        assert_eq!(source.starts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synchronous_stale_slot_waits_and_next_slot_can_succeed() {
+        let (next, completion) = receipt(2);
+        completion.send_replace(Some(Ok(PqProposalCompletion::NoLocalDuty {
+            slot: types::Slot::new(2),
+        })));
+        let source = Arc::new(TestingSource::new(
+            Some(types::Slot::new(1)),
+            types::Slot::new(0),
+            vec![
+                Err(PqProposerServiceError::StaleSlot {
+                    slot: types::Slot::new(1),
+                    highest_started: Some(types::Slot::new(1)),
+                }),
+                Ok(next),
+            ],
+        ));
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        let (_exit_sender, exit_receiver) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(run_pq_proposer_loop(
+            Arc::clone(&source),
+            shutdown_receiver,
+            async move {
+                let _ = exit_receiver.await;
+            },
+            observer(),
+        ));
+
+        tokio::task::yield_now().await;
+        assert_eq!(source.starts.load(Ordering::SeqCst), 1);
+        assert!(
+            !task.is_finished(),
+            "StaleSlot is slot-local, not loop-fatal"
+        );
+        source.set_now(Some(types::Slot::new(2)));
+        tokio::time::advance(PQ_PROPOSER_RETRY_DELAY).await;
+        tokio::task::yield_now().await;
+        assert_eq!(source.starts.load(Ordering::SeqCst), 2);
+        shutdown_sender.send(()).expect("stop live loop");
+        assert!(task.await.expect("loop task").is_ok());
+    }
+
+    #[tokio::test]
+    async fn already_ready_stop_prevents_non_genesis_admission() {
+        let source = Arc::new(TestingSource::new(
+            Some(types::Slot::new(1)),
+            types::Slot::new(0),
+            vec![Err(PqProposerServiceError::TaskUnavailable)],
+        ));
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        shutdown_sender.send(()).expect("arm stop before loop");
+        let (_exit_sender, exit_receiver) = tokio::sync::oneshot::channel::<()>();
+        assert!(
+            run_pq_proposer_loop(
+                Arc::clone(&source),
+                shutdown_receiver,
+                async move {
+                    let _ = exit_receiver.await;
+                },
+                observer(),
+            )
+            .await
+            .is_ok(),
+        );
+        assert_eq!(source.starts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn stop_racing_completed_receipt_at_advanced_slot_prevents_next_admission() {
+        let (first, completion) = receipt(1);
+        let source = Arc::new(TestingSource::new(
+            Some(types::Slot::new(1)),
+            types::Slot::new(0),
+            vec![Ok(first), Err(PqProposerServiceError::TaskUnavailable)],
+        ));
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        source.stop_on_now_call(2, shutdown_sender);
+        let (_exit_sender, exit_receiver) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(run_pq_proposer_loop(
+            Arc::clone(&source),
+            shutdown_receiver,
+            async move {
+                let _ = exit_receiver.await;
+            },
+            observer(),
+        ));
+        while source.starts.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        source.set_now(Some(types::Slot::new(2)));
+        completion.send_replace(Some(Ok(PqProposalCompletion::NoLocalDuty {
+            slot: types::Slot::new(1),
+        })));
+
+        assert!(task.await.expect("loop task").is_ok());
+        assert_eq!(
+            source.starts.load(Ordering::SeqCst),
+            1,
+            "the stop made ready by the advanced-slot observation must win before admission",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn genesis_and_completed_same_slot_wait_for_recomputed_next_boundary() {
+        let (first, first_completion) = receipt(1);
+        first_completion.send_replace(Some(Ok(PqProposalCompletion::NoLocalDuty {
+            slot: types::Slot::new(1),
+        })));
+        let source = Arc::new(TestingSource::new(
+            Some(types::Slot::new(0)),
+            types::Slot::new(0),
+            vec![Ok(first), Err(PqProposerServiceError::TaskUnavailable)],
+        ));
+        let (_shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        let (_exit_sender, exit_receiver) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(run_pq_proposer_loop(
+            Arc::clone(&source),
+            shutdown_receiver,
+            async move {
+                let _ = exit_receiver.await;
+            },
+            observer(),
+        ));
+
+        tokio::task::yield_now().await;
+        assert_eq!(source.starts.load(Ordering::SeqCst), 0);
+        source.set_now(Some(types::Slot::new(1)));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(source.starts.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(source.starts.load(Ordering::SeqCst), 1);
+        source.set_now(Some(types::Slot::new(2)));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(matches!(
+            task.await.expect("loop task"),
+            Err(PqProposerServiceError::TaskUnavailable),
+        ));
+        assert_eq!(source.starts.load(Ordering::SeqCst), 2);
+        assert!(source.boundary_checks.load(Ordering::SeqCst) >= 3);
+    }
+
+    #[tokio::test]
+    async fn stop_retains_one_receipt_until_noncancellable_completion() {
+        let (held, completion) = receipt(1);
+        let source = Arc::new(TestingSource::new(
+            Some(types::Slot::new(1)),
+            types::Slot::new(0),
+            vec![Ok(held)],
+        ));
+        let (exit_sender, exit_receiver) = async_channel::bounded(1);
+        let (process_shutdown, _process_shutdown_receiver) = futures::channel::mpsc::channel(1);
+        let executor = task_executor::TaskExecutor::new(
+            tokio::runtime::Handle::current(),
+            exit_receiver,
+            process_shutdown,
+        );
+        let loop_shutdown = start_pq_proposer_loop_source(source, executor)
+            .await
+            .expect("result-bearing loop owner");
+        let observer = Arc::clone(&loop_shutdown.observer);
+        while observer.attempts.load(Ordering::SeqCst) == 0 {
+            observer.attempt.notified().await;
+        }
+        let task = tokio::spawn(loop_shutdown.wait());
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished(), "stop must retain the admitted receipt");
+        assert_eq!(observer.max_retained_receipts.load(Ordering::SeqCst), 1,);
+        assert_eq!(tokio::spawn(async { 23 }).await.expect("heartbeat"), 23);
+        completion.send_replace(Some(Ok(PqProposalCompletion::NoLocalDuty {
+            slot: types::Slot::new(1),
+        })));
+        assert!(task.await.expect("loop task").is_ok());
+        drop(exit_sender);
+    }
+
+    #[tokio::test]
+    async fn stop_retains_fatal_receipt_and_propagates_failure_after_completion() {
+        use futures::StreamExt;
+
+        let (held, completion) = receipt(1);
+        let source = Arc::new(TestingSource::new(
+            Some(types::Slot::new(1)),
+            types::Slot::new(0),
+            vec![Ok(held)],
+        ));
+        let (exit_sender, exit_receiver) = async_channel::bounded(1);
+        let (process_shutdown, mut process_shutdown_receiver) = futures::channel::mpsc::channel(1);
+        let executor = task_executor::TaskExecutor::new(
+            tokio::runtime::Handle::current(),
+            exit_receiver,
+            process_shutdown,
+        );
+        let loop_shutdown = start_pq_proposer_loop_source(source, executor)
+            .await
+            .expect("result-bearing loop owner");
+        let observer = Arc::clone(&loop_shutdown.observer);
+        while observer.attempts.load(Ordering::SeqCst) == 0 {
+            observer.attempt.notified().await;
+        }
+        let task = tokio::spawn(loop_shutdown.wait());
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished(), "stop must retain the fatal receipt");
+
+        completion.send_replace(Some(Err(PqProposerServiceError::TaskUnavailable)));
+        assert!(matches!(
+            task.await.expect("loop task"),
+            Err(PqRuntimeError::Proposer(
+                PqProposerServiceError::TaskUnavailable
+            )),
+        ));
+        assert!(matches!(
+            process_shutdown_receiver.next().await,
+            Some(task_executor::ShutdownReason::Failure(
+                "PQ proposer loop failed"
+            )),
+        ));
+        drop(exit_sender);
+    }
+
+    #[tokio::test]
+    async fn fatal_executor_loss_signals_process_shutdown() {
+        use futures::StreamExt;
+
+        let source = Arc::new(TestingSource::new(
+            Some(types::Slot::new(1)),
+            types::Slot::new(0),
+            vec![Err(PqProposerServiceError::TaskUnavailable)],
+        ));
+        let (exit_sender, exit_receiver) = async_channel::bounded(1);
+        let (process_shutdown, mut process_shutdown_receiver) = futures::channel::mpsc::channel(1);
+        let executor = task_executor::TaskExecutor::new(
+            tokio::runtime::Handle::current(),
+            exit_receiver,
+            process_shutdown,
+        );
+        let error = match start_pq_proposer_loop_source(source, executor).await {
+            Err(error) => error,
+            Ok(shutdown) => shutdown
+                .wait()
+                .await
+                .expect_err("executor loss must terminate the loop"),
+        };
+        assert!(matches!(
+            error,
+            PqRuntimeError::Proposer(PqProposerServiceError::TaskUnavailable),
+        ));
+        assert!(matches!(
+            process_shutdown_receiver.next().await,
+            Some(task_executor::ShutdownReason::Failure(
+                "PQ proposer loop failed"
+            )),
+        ));
+        drop(exit_sender);
+    }
+
+    #[test]
+    fn nested_beacon_failures_have_an_exhaustive_operation_sensitive_fatal_policy() {
+        let cases = [
+            (PqBeaconFailure::Connect, false, false, false),
+            (PqBeaconFailure::Timeout, false, false, false),
+            (PqBeaconFailure::Status(408), false, false, false),
+            (PqBeaconFailure::Status(429), false, false, false),
+            (PqBeaconFailure::Status(503), false, false, false),
+            (PqBeaconFailure::Status(409), true, false, false),
+            (PqBeaconFailure::Status(400), true, true, true),
+            (PqBeaconFailure::ResponseTooLarge, true, true, true),
+            (PqBeaconFailure::FragmentLimit, true, true, true),
+            (PqBeaconFailure::Stream, true, true, true),
+            (PqBeaconFailure::Resource, true, true, true),
+            (PqBeaconFailure::InvalidHeaders, true, true, true),
+            (PqBeaconFailure::InvalidJson, true, true, true),
+            (PqBeaconFailure::InvalidSsz, true, true, true),
+            (PqBeaconFailure::Protocol, true, true, true),
+        ];
+        for (failure, duty_fatal, production_fatal, publication_fatal) in cases {
+            assert_eq!(
+                pq_proposer_error_is_fatal(&PqProposerServiceError::DutyRequest(failure)),
+                duty_fatal,
+                "duty policy for {failure:?}",
+            );
+            assert_eq!(
+                pq_proposer_error_is_fatal(&PqProposerServiceError::BlockProduction(failure)),
+                production_fatal,
+                "block-production policy for {failure:?}",
+            );
+            assert_eq!(
+                pq_proposer_error_is_fatal(&PqProposerServiceError::Publication(failure)),
+                publication_fatal,
+                "publication policy for {failure:?}",
+            );
+        }
+        assert!(!pq_proposer_error_is_fatal(
+            &PqProposerServiceError::PublicationRejected { status: 409 }
+        ));
+        for status in [400, 413, 415] {
+            assert!(pq_proposer_error_is_fatal(
+                &PqProposerServiceError::PublicationRejected { status }
+            ));
+        }
+        assert!(pq_proposer_error_is_fatal(
+            &PqProposerServiceError::PublicationProtocol { status: 204 }
+        ));
     }
 }

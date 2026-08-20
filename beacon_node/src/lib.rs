@@ -9,11 +9,14 @@ compile_error!(
 compile_error!("beacon_node runtime profiles full-runtime and pq-devnet are mutually exclusive");
 
 pub use beacon_chain;
+#[cfg(not(feature = "pq-devnet"))]
 use beacon_chain::{builder::Witness, slot_clock::SystemTimeSlotClock};
 use clap::ArgMatches;
 pub use cli::cli_app;
 #[cfg(not(feature = "pq-devnet"))]
 pub use client::ClientBuilder;
+#[cfg(feature = "pq-devnet")]
+pub use client::PqRuntimeConfig;
 #[cfg(feature = "pq-devnet")]
 pub use client::config::PqDevnetConfigError as PqClientConfigError;
 pub use client::{Client, ClientConfig, ClientGenesis};
@@ -28,21 +31,27 @@ pub use eth2_config::Eth2Config;
 use lighthouse_network::load_private_key;
 #[cfg(not(feature = "pq-devnet"))]
 use network_utils::enr_ext::peer_id_to_node_id;
+#[cfg(feature = "pq-devnet")]
+use sensitive_url::SensitiveUrl;
 #[cfg(feature = "slasher")]
 use slasher::{DatabaseBackendOverride, Slasher};
+#[cfg(not(feature = "pq-devnet"))]
 use std::ops::{Deref, DerefMut};
 #[cfg(feature = "pq-devnet")]
 use std::path::PathBuf;
 #[cfg(not(feature = "pq-devnet"))]
 use std::sync::Arc;
+#[cfg(not(feature = "pq-devnet"))]
 use store::database::interface::BeaconNodeBackend;
 #[cfg(not(feature = "pq-devnet"))]
 use tracing::{info, warn};
+#[cfg(not(feature = "pq-devnet"))]
 use types::EthSpec;
 #[cfg(not(feature = "pq-devnet"))]
 use types::{ChainSpec, Epoch, ForkName};
 
 /// A type-alias to the tighten the definition of a production-intended `Client`.
+#[cfg(not(feature = "pq-devnet"))]
 pub type ProductionClient<E> =
     Client<Witness<SystemTimeSlotClock, E, BeaconNodeBackend, BeaconNodeBackend>>;
 
@@ -95,13 +104,118 @@ pub fn parse_pq_launch_cli(matches: &ArgMatches) -> Result<PqLaunchCliPlan, PqLa
     })
 }
 
+/// Builds the opaque PQ runtime configuration from the positive CLI profile without filesystem,
+/// DNS, socket, or worker side effects.
+#[cfg(feature = "pq-devnet")]
+pub fn build_pq_runtime_config(
+    matches: &ArgMatches,
+) -> Result<client::PqRuntimeConfig, PqLaunchConfigError> {
+    let launch = parse_pq_launch_cli(matches).map_err(PqLaunchConfigError::Cli)?;
+    let mut client_config = ClientConfig::default();
+    client_config.set_data_dir(get_data_dir(matches));
+    client_config.genesis = ClientGenesis::GenesisState;
+    client_config.store.hierarchy_config.exponents = vec![0];
+    client_config.chain.enable_light_client_server = false;
+    client_config.network.enable_light_client_server = false;
+    client_config.chain.optimistic_finalized_sync = false;
+
+    let data_dir = client_config.data_dir().clone();
+    set_network_config(&mut client_config.network, matches, &data_dir)
+        .map_err(PqLaunchConfigError::Network)?;
+    client_config.network.enable_light_client_server = false;
+
+    client_config.http_api.enabled = matches.get_flag("http");
+    if let Some(address) = matches.get_one::<String>("http-address") {
+        client_config.http_api.listen_addr = address
+            .parse()
+            .map_err(|_| PqLaunchConfigError::InvalidHttpAddress)?;
+    }
+    if let Some(port) = matches.get_one::<String>("http-port") {
+        client_config.http_api.listen_port = port
+            .parse()
+            .map_err(|_| PqLaunchConfigError::InvalidHttpPort)?;
+    }
+    if matches.get_flag("zero-ports") {
+        client_config.http_api.listen_port = 0;
+    }
+
+    let endpoint = matches
+        .get_one::<String>("execution-endpoint")
+        .ok_or(PqLaunchConfigError::MissingExecutionEndpoint)?;
+    let jwt = matches
+        .get_one::<String>("execution-jwt")
+        .ok_or(PqLaunchConfigError::MissingJwt)?;
+    let mut execution = execution_layer::Config::default();
+    execution.execution_endpoint = Some(
+        SensitiveUrl::parse(endpoint).map_err(|_| PqLaunchConfigError::InvalidExecutionEndpoint)?,
+    );
+    execution.secret_file = Some(PathBuf::from(jwt));
+    execution.jwt_id = matches.get_one::<String>("execution-jwt-id").cloned();
+    execution.jwt_version = matches.get_one::<String>("execution-jwt-version").cloned();
+    execution.default_datadir = client_config.data_dir().clone();
+    client_config.execution_layer = Some(execution);
+
+    let mut runtime = client::PqRuntimeConfig::new(client_config, launch.testnet_dir);
+    if let Some(bundle) = launch.validator_bundle {
+        runtime = runtime.with_validator_bundle(bundle);
+    }
+    Ok(runtime)
+}
+
+#[cfg(feature = "pq-devnet")]
+#[derive(Debug)]
+pub enum PqLaunchConfigError {
+    Cli(PqLaunchCliError),
+    MissingExecutionEndpoint,
+    MissingJwt,
+    InvalidExecutionEndpoint,
+    InvalidHttpAddress,
+    InvalidHttpPort,
+    Network(String),
+}
+
+#[cfg(feature = "pq-devnet")]
+impl std::fmt::Display for PqLaunchConfigError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cli(error) => error.fmt(formatter),
+            Self::MissingExecutionEndpoint => {
+                formatter.write_str("lean PQ runtime requires --execution-endpoint")
+            }
+            Self::MissingJwt => formatter.write_str("lean PQ runtime requires --execution-jwt"),
+            Self::InvalidExecutionEndpoint => {
+                formatter.write_str("--execution-endpoint is not a valid URL")
+            }
+            Self::InvalidHttpAddress => formatter.write_str("--http-address is not a valid IP"),
+            Self::InvalidHttpPort => formatter.write_str("--http-port is not a valid u16"),
+            Self::Network(error) => write!(formatter, "invalid PQ network configuration: {error}"),
+        }
+    }
+}
+
+#[cfg(feature = "pq-devnet")]
+impl std::error::Error for PqLaunchConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Cli(error) => Some(error),
+            Self::MissingExecutionEndpoint
+            | Self::MissingJwt
+            | Self::InvalidExecutionEndpoint
+            | Self::InvalidHttpAddress
+            | Self::InvalidHttpPort
+            | Self::Network(_) => None,
+        }
+    }
+}
+
 /// A typed, side-effect-free rejection from the frozen PQ production boundary.
 #[cfg(feature = "pq-devnet")]
 #[derive(Debug)]
 pub enum PqStartupError {
     CliConfig(PqCliConfigError),
+    LaunchConfig(PqLaunchConfigError),
     ClientConfig(PqClientConfigError),
-    Runtime(beacon_chain::PqRuntimeError),
+    Runtime(client::PqRuntimeError),
 }
 
 #[cfg(feature = "pq-devnet")]
@@ -109,6 +223,7 @@ impl std::fmt::Display for PqStartupError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::CliConfig(error) => error.fmt(formatter),
+            Self::LaunchConfig(error) => error.fmt(formatter),
             Self::ClientConfig(error) => error.fmt(formatter),
             Self::Runtime(error) => error.fmt(formatter),
         }
@@ -120,6 +235,7 @@ impl std::error::Error for PqStartupError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::CliConfig(error) => Some(error),
+            Self::LaunchConfig(error) => Some(error),
             Self::ClientConfig(error) => Some(error),
             Self::Runtime(error) => Some(error),
         }
@@ -141,8 +257,15 @@ impl From<PqClientConfigError> for PqStartupError {
 }
 
 #[cfg(feature = "pq-devnet")]
-impl From<beacon_chain::PqRuntimeError> for PqStartupError {
-    fn from(error: beacon_chain::PqRuntimeError) -> Self {
+impl From<PqLaunchConfigError> for PqStartupError {
+    fn from(error: PqLaunchConfigError) -> Self {
+        Self::LaunchConfig(error)
+    }
+}
+
+#[cfg(feature = "pq-devnet")]
+impl From<client::PqRuntimeError> for PqStartupError {
+    fn from(error: client::PqRuntimeError) -> Self {
         Self::Runtime(error)
     }
 }
@@ -150,21 +273,19 @@ impl From<beacon_chain::PqRuntimeError> for PqStartupError {
 /// The beacon node `Client` that is used in production.
 ///
 /// Generic over some `EthSpec`.
+#[cfg(not(feature = "pq-devnet"))]
 pub struct ProductionBeaconNode<E: EthSpec>(ProductionClient<E>);
 
+#[cfg(feature = "pq-devnet")]
+pub struct ProductionBeaconNode(client::PqClient);
+
+#[cfg(not(feature = "pq-devnet"))]
 impl<E: EthSpec> ProductionBeaconNode<E> {
     /// Starts a new beacon node `Client` in the given `environment`.
     ///
     /// Identical to `start_from_client_config`, however the `client_config` is generated from the
     /// given `matches` and potentially configuration files on the local filesystem or other
     /// configurations hosted remotely.
-    #[cfg(feature = "pq-devnet")]
-    pub fn new_from_cli(matches: ArgMatches) -> Result<Self, PqStartupError> {
-        validate_pq_cli_arguments(&matches)?;
-        Err(beacon_chain::PqRuntimeError::DeferredRuntimeIntegration.into())
-    }
-
-    #[cfg(not(feature = "pq-devnet"))]
     pub async fn new_from_cli(
         context: RuntimeContext<E>,
         matches: ArgMatches,
@@ -176,17 +297,6 @@ impl<E: EthSpec> ProductionBeaconNode<E> {
     /// Starts a new beacon node `Client` in the given `environment`.
     ///
     /// Client behaviour is defined by the given `client_config`.
-    #[cfg(feature = "pq-devnet")]
-    pub async fn new(
-        context: RuntimeContext<E>,
-        client_config: ClientConfig,
-    ) -> Result<Self, PqStartupError> {
-        let spec = context.eth2_config().spec.clone();
-        client_config.validate_pq_devnet::<E>(&spec)?;
-        Err(beacon_chain::PqRuntimeError::DeferredRuntimeIntegration.into())
-    }
-
-    #[cfg(not(feature = "pq-devnet"))]
     pub async fn new(
         context: RuntimeContext<E>,
         mut client_config: ClientConfig,
@@ -295,8 +405,32 @@ impl<E: EthSpec> ProductionBeaconNode<E> {
 }
 
 #[cfg(feature = "pq-devnet")]
-fn validate_pq_cli_arguments(matches: &ArgMatches) -> Result<(), PqCliConfigError> {
-    parse_pq_launch_cli(matches).map(|_| ())
+impl ProductionBeaconNode {
+    pub async fn new_from_cli(
+        context: RuntimeContext<types::MinimalEthSpec>,
+        matches: ArgMatches,
+    ) -> Result<Self, PqStartupError> {
+        let config = build_pq_runtime_config(&matches)?;
+        Self::new(context, config).await
+    }
+
+    pub async fn new(
+        context: RuntimeContext<types::MinimalEthSpec>,
+        config: client::PqRuntimeConfig,
+    ) -> Result<Self, PqStartupError> {
+        client::PqClient::start_pq_runtime(context, config)
+            .await
+            .map(Self)
+            .map_err(Into::into)
+    }
+
+    pub async fn shutdown(self) -> Result<(), PqStartupError> {
+        self.0.shutdown().await.map_err(Into::into)
+    }
+
+    pub fn into_inner(self) -> client::PqClient {
+        self.0
+    }
 }
 
 #[cfg(not(feature = "pq-devnet"))]
@@ -322,6 +456,7 @@ fn validator_fork_epochs(spec: &ChainSpec) -> Result<(), Vec<(ForkName, Epoch)>>
     }
 }
 
+#[cfg(not(feature = "pq-devnet"))]
 impl<E: EthSpec> Deref for ProductionBeaconNode<E> {
     type Target = ProductionClient<E>;
 
@@ -330,6 +465,7 @@ impl<E: EthSpec> Deref for ProductionBeaconNode<E> {
     }
 }
 
+#[cfg(not(feature = "pq-devnet"))]
 impl<E: EthSpec> DerefMut for ProductionBeaconNode<E> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
@@ -384,7 +520,7 @@ mod pq_test {
             ])
             .expect("plain beacon-node arguments");
         assert_eq!(
-            validate_pq_cli_arguments(&matches),
+            parse_pq_launch_cli(&matches).map(|_| ()),
             Err(PqCliConfigError::MissingTestnetDir),
         );
     }

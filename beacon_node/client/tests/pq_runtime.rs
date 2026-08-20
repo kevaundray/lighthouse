@@ -7,10 +7,13 @@ use client::{
 };
 use consensus_signature::PqPublicKey;
 #[cfg(feature = "pq-proposer")]
+#[cfg(target_feature = "avx2")]
 use consensus_signature::PqValidatorRegistryEntry;
 use sensitive_url::SensitiveUrl;
 use ssz::Encode;
 use std::sync::Arc;
+#[cfg(target_feature = "avx2")]
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use store::{DBColumn, KeyValueStore};
 use types::{EthSpec, ForkName, MinimalEthSpec};
@@ -863,6 +866,337 @@ async fn valid_genesis_disk_configuration_constructs_an_owned_runtime() {
 
 #[cfg(target_feature = "avx2")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verifier_http_binds_after_network_and_normalizes_wildcard_port_zero() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time after epoch")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "lighthouse-pq-runtime-http-port-zero-{}-{unique}",
+        std::process::id()
+    ));
+    let testnet = root.join("testnet");
+    let data_dir = root.join("node");
+    let spec = Arc::new(
+        ForkName::Electra
+            .make_genesis_spec(MinimalEthSpec::default_spec())
+            .set_slot_duration_ms::<MinimalEthSpec>(300_000),
+    );
+    write_exact_public_testnet(&testnet, &spec);
+    let jwt = root.join("jwt.hex");
+    std::fs::write(&jwt, "11".repeat(32)).expect("JWT fixture");
+
+    let mut client = valid_client_config(data_dir);
+    client.network.network_dir = root.join("network");
+    client.http_api.enabled = true;
+    client.http_api.listen_addr = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+    client.http_api.listen_port = 0;
+    client
+        .execution_layer
+        .as_mut()
+        .expect("execution config")
+        .secret_file = Some(jwt);
+    let runtime = task_executor::test_utils::TestRuntime::default();
+    let context = environment::RuntimeContext {
+        executor: runtime.task_executor.clone(),
+        eth_spec_instance: MinimalEthSpec,
+        eth2_config: eth2_config::Eth2Config {
+            eth_spec_id: types::EthSpecId::Minimal,
+            spec,
+        },
+        eth2_network_config: None,
+        sse_logging_components: None,
+    };
+
+    let handle = PqClient::start_pq_runtime(context, PqRuntimeConfig::new(client, testnet))
+        .await
+        .expect("verifier HTTP runtime");
+    let listen = handle
+        .http_api_listen_addr()
+        .expect("enabled PQ HTTP listener");
+    assert_eq!(
+        listen.ip(),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+    );
+    assert_ne!(
+        listen.port(),
+        0,
+        "Warp must report the actual assigned port"
+    );
+    assert_eq!(
+        handle
+            .testing_only_pq_local_http_url()
+            .expect("normalized local HTTP URL"),
+        SensitiveUrl::parse(&format!("http://127.0.0.1:{}/", listen.port()))
+            .expect("expected normalized URL"),
+    );
+    tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, listen.port()))
+        .await
+        .expect("bound PQ Warp listener is live");
+
+    handle.shutdown().await.expect("clean PQ runtime shutdown");
+    let rebound = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, listen.port()))
+        .expect("graceful HTTP shutdown releases the actual port");
+    drop(rebound);
+    std::fs::remove_dir_all(root).expect("remove fixture");
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_bind_failure_drains_network_and_allows_immediate_runtime_restart() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time after epoch")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "lighthouse-pq-runtime-http-bind-failure-{}-{unique}",
+        std::process::id()
+    ));
+    let testnet = root.join("testnet");
+    let data_dir = root.join("node");
+    let spec = Arc::new(
+        ForkName::Electra
+            .make_genesis_spec(MinimalEthSpec::default_spec())
+            .set_slot_duration_ms::<MinimalEthSpec>(300_000),
+    );
+    write_exact_public_testnet(&testnet, &spec);
+    let jwt = root.join("jwt.hex");
+    std::fs::write(&jwt, "11".repeat(32)).expect("JWT fixture");
+    let occupied =
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("reserve HTTP port");
+    let occupied_port = occupied.local_addr().expect("reserved address").port();
+
+    let mut client = valid_client_config(data_dir);
+    client.network.network_dir = root.join("network");
+    client.http_api.enabled = true;
+    client.http_api.listen_addr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    client.http_api.listen_port = occupied_port;
+    client
+        .execution_layer
+        .as_mut()
+        .expect("execution config")
+        .secret_file = Some(jwt);
+    let runtime = task_executor::test_utils::TestRuntime::default();
+    let context = || environment::RuntimeContext {
+        executor: runtime.task_executor.clone(),
+        eth_spec_instance: MinimalEthSpec,
+        eth2_config: eth2_config::Eth2Config {
+            eth_spec_id: types::EthSpecId::Minimal,
+            spec: Arc::clone(&spec),
+        },
+        eth2_network_config: None,
+        sse_logging_components: None,
+    };
+
+    let error = match PqClient::start_pq_runtime(
+        context(),
+        PqRuntimeConfig::new(client.clone(), testnet.clone()),
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(handle) => {
+            handle
+                .shutdown()
+                .await
+                .expect("unexpected runtime shutdown");
+            panic!("occupied HTTP port unexpectedly started")
+        }
+    };
+    assert!(matches!(error, PqRuntimeError::HttpBind(_)), "{error:?}");
+
+    drop(occupied);
+    let restarted = PqClient::start_pq_runtime(context(), PqRuntimeConfig::new(client, testnet))
+        .await
+        .expect("bind failure released network, aggregation, and store owners");
+    assert_eq!(
+        restarted
+            .http_api_listen_addr()
+            .expect("restarted HTTP listener")
+            .port(),
+        occupied_port,
+    );
+    restarted.shutdown().await.expect("restarted shutdown");
+    std::fs::remove_dir_all(root).expect("remove fixture");
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_connection_admission_bounds_idle_partial_headers_and_shutdown() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time after epoch")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "lighthouse-pq-runtime-http-connection-cap-{}-{unique}",
+        std::process::id()
+    ));
+    let testnet = root.join("testnet");
+    let spec = Arc::new(
+        ForkName::Electra
+            .make_genesis_spec(MinimalEthSpec::default_spec())
+            .set_slot_duration_ms::<MinimalEthSpec>(300_000),
+    );
+    write_exact_public_testnet(&testnet, &spec);
+    let jwt = root.join("jwt.hex");
+    std::fs::write(&jwt, "11".repeat(32)).expect("JWT fixture");
+    let mut client = valid_client_config(root.join("node"));
+    client.network.network_dir = root.join("network");
+    client.http_api.enabled = true;
+    client.http_api.listen_port = 0;
+    client
+        .execution_layer
+        .as_mut()
+        .expect("execution config")
+        .secret_file = Some(jwt);
+    let runtime = task_executor::test_utils::TestRuntime::default();
+    let context = environment::RuntimeContext {
+        executor: runtime.task_executor.clone(),
+        eth_spec_instance: MinimalEthSpec,
+        eth2_config: eth2_config::Eth2Config {
+            eth_spec_id: types::EthSpecId::Minimal,
+            spec,
+        },
+        eth2_network_config: None,
+        sse_logging_components: None,
+    };
+    let handle = PqClient::start_pq_runtime(context, PqRuntimeConfig::new(client, testnet))
+        .await
+        .expect("bounded HTTP runtime");
+    let port = handle.http_api_listen_addr().expect("HTTP listener").port();
+
+    let mut admitted = Vec::new();
+    for _ in 0..2 {
+        let mut stream = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .expect("admitted loopback connection");
+        stream
+            .write_all(b"GET /")
+            .await
+            .expect("partial request retained");
+        admitted.push(stream);
+    }
+    let mut overflow = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .expect("kernel accepts overflow before application admission");
+    overflow
+        .write_all(b"GET /")
+        .await
+        .expect("overflow write races safely with close");
+    let mut byte = [0_u8; 1];
+    assert!(
+        matches!(
+            tokio::time::timeout(Duration::from_secs(2), overflow.read(&mut byte))
+                .await
+                .expect("overflow connection must be closed promptly"),
+            Ok(0) | Err(_)
+        ),
+        "overflow must be closed or reset without reaching Hyper",
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), handle.shutdown())
+        .await
+        .expect("shutdown must close bounded partial-header connections")
+        .expect("bounded runtime shutdown");
+    for mut stream in admitted {
+        assert!(
+            matches!(
+                tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+                    .await
+                    .expect("shutdown closes admitted partial request"),
+                Ok(0) | Err(_)
+            ),
+            "admitted connection must be closed or reset during shutdown",
+        );
+    }
+    std::fs::remove_dir_all(root).expect("remove fixture");
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unexpected_http_exit_signals_process_and_shutdown_still_drains_network() {
+    use futures::StreamExt;
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time after epoch")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "lighthouse-pq-runtime-http-unexpected-exit-{}-{unique}",
+        std::process::id()
+    ));
+    let testnet = root.join("testnet");
+    let spec = Arc::new(
+        ForkName::Electra
+            .make_genesis_spec(MinimalEthSpec::default_spec())
+            .set_slot_duration_ms::<MinimalEthSpec>(300_000),
+    );
+    write_exact_public_testnet(&testnet, &spec);
+    let jwt = root.join("jwt.hex");
+    std::fs::write(&jwt, "11".repeat(32)).expect("JWT fixture");
+    let mut client = valid_client_config(root.join("node"));
+    client.network.network_dir = root.join("network");
+    client.http_api.enabled = true;
+    client.http_api.listen_port = 0;
+    client
+        .execution_layer
+        .as_mut()
+        .expect("execution config")
+        .secret_file = Some(jwt);
+
+    let (exit_sender, exit_receiver) = async_channel::bounded(1);
+    let (shutdown_sender, mut shutdown_receiver) = futures::channel::mpsc::channel(1);
+    let executor = task_executor::TaskExecutor::new(
+        tokio::runtime::Handle::current(),
+        exit_receiver,
+        shutdown_sender,
+    );
+    let context = || environment::RuntimeContext {
+        executor: executor.clone(),
+        eth_spec_instance: MinimalEthSpec,
+        eth2_config: eth2_config::Eth2Config {
+            eth_spec_id: types::EthSpecId::Minimal,
+            spec: Arc::clone(&spec),
+        },
+        eth2_network_config: None,
+        sse_logging_components: None,
+    };
+    let handle = PqClient::start_pq_runtime(
+        context(),
+        PqRuntimeConfig::new(client.clone(), testnet.clone()),
+    )
+    .await
+    .expect("HTTP runtime");
+
+    handle
+        .testing_only_stop_pq_http_unexpectedly()
+        .await
+        .expect("unexpected HTTP completion observed");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), shutdown_receiver.next())
+            .await
+            .expect("unexpected HTTP exit must signal process shutdown"),
+        Some(task_executor::ShutdownReason::Failure(
+            "PQ HTTP API exited unexpectedly"
+        )),
+    ));
+    assert!(matches!(
+        handle.shutdown().await,
+        Err(PqRuntimeError::HttpUnexpectedExit),
+    ));
+
+    let restarted = PqClient::start_pq_runtime(context(), PqRuntimeConfig::new(client, testnet))
+        .await
+        .expect("HTTP failure shutdown still drained network and store owners");
+    restarted.shutdown().await.expect("restarted shutdown");
+    drop(exit_sender);
+    std::fs::remove_dir_all(root).expect("remove fixture");
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn from_store_requires_one_exact_public_testnet_load() {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1544,6 +1878,88 @@ async fn proposer_manifest_identity_mismatch_releases_the_prepared_store_without
 }
 
 #[cfg(all(target_feature = "avx2", feature = "pq-proposer"))]
+async fn assert_post_bind_proposer_failure_cleans_all_owners(
+    executor: task_executor::TaskExecutor,
+    spec: Arc<types::ChainSpec>,
+    client: ClientConfig,
+    testnet: std::path::PathBuf,
+    bundle_dir: std::path::PathBuf,
+    root: std::path::PathBuf,
+) {
+    let failure_data_dir = root.join("constructor-failure-node");
+    let failure_network_dir = root.join("constructor-failure-network");
+    let failure_slashing_db = failure_data_dir
+        .join("pq-proposer")
+        .join(slashing_protection::SLASHING_PROTECTION_FILENAME);
+    let reserved_http = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .expect("reserve constructor-failure HTTP port");
+    let failure_http_port = reserved_http
+        .local_addr()
+        .expect("reserved HTTP address")
+        .port();
+    drop(reserved_http);
+    let mut failure_client = client;
+    failure_client.set_data_dir(failure_data_dir);
+    failure_client
+        .network
+        .network_dir
+        .clone_from(&failure_network_dir);
+    failure_client.http_api.listen_port = failure_http_port;
+    let context = || environment::RuntimeContext {
+        executor: executor.clone(),
+        eth_spec_instance: MinimalEthSpec,
+        eth2_config: eth2_config::Eth2Config {
+            eth_spec_id: types::EthSpecId::Minimal,
+            spec: Arc::clone(&spec),
+        },
+        eth2_network_config: None,
+        sse_logging_components: None,
+    };
+    let failure = match PqClient::start_pq_runtime(
+        context(),
+        PqRuntimeConfig::new(failure_client.clone(), testnet.clone())
+            .with_validator_bundle(bundle_dir)
+            .testing_only_fail_proposer_construction(),
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(handle) => {
+            handle.shutdown().await.expect("unexpected shutdown");
+            panic!("injected proposer construction unexpectedly succeeded")
+        }
+    };
+    assert!(
+        matches!(failure, PqRuntimeError::ProposerPreflightInvariant),
+        "the original constructor error must survive staged cleanup: {failure:?}",
+    );
+    let rebound = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, failure_http_port))
+        .expect("constructor failure must stop and await HTTP");
+    drop(rebound);
+    let failure_slashing = slashing_protection::SlashingDatabase::open(&failure_slashing_db)
+        .expect("constructor failure leaves a resumable slashing database");
+    assert_eq!(
+        failure_slashing
+            .num_validator_rows()
+            .expect("registered identity rows"),
+        1,
+    );
+    drop(failure_slashing);
+    let recovered =
+        PqClient::start_pq_runtime(context(), PqRuntimeConfig::new(failure_client, testnet))
+            .await
+            .expect("constructor cleanup releases network, DB, and aggregation owners");
+    assert_eq!(
+        recovered
+            .http_api_listen_addr()
+            .expect("recovered HTTP listener")
+            .port(),
+        failure_http_port,
+    );
+    recovered.shutdown().await.expect("recovered shutdown");
+}
+
+#[cfg(all(target_feature = "avx2", feature = "pq-proposer"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proposer_configuration_constructs_a_sealed_validator_store_owner() {
     let unique = SystemTime::now()
@@ -1640,6 +2056,7 @@ async fn proposer_configuration_constructs_a_sealed_validator_store_owner() {
     std::fs::write(&jwt, "11".repeat(32)).expect("JWT fixture");
     let mut client = valid_client_config(data_dir);
     client.http_api.enabled = true;
+    client.http_api.listen_port = 0;
     client.network.network_dir = root.join("network");
     client
         .execution_layer
@@ -1647,6 +2064,15 @@ async fn proposer_configuration_constructs_a_sealed_validator_store_owner() {
         .expect("execution config")
         .secret_file = Some(jwt);
     let runtime = task_executor::test_utils::TestRuntime::default();
+    Box::pin(assert_post_bind_proposer_failure_cleans_all_owners(
+        runtime.task_executor.clone(),
+        Arc::clone(&spec),
+        client.clone(),
+        testnet.clone(),
+        bundle_dir.clone(),
+        root.clone(),
+    ))
+    .await;
     let context = environment::RuntimeContext {
         executor: runtime.task_executor.clone(),
         eth_spec_instance: MinimalEthSpec,
@@ -1668,6 +2094,19 @@ async fn proposer_configuration_constructs_a_sealed_validator_store_owner() {
             .testing_only_pq_validator_identities()
             .expect("private PQ validator store"),
         vec![(public_key, 0)],
+    );
+    assert!(
+        handle.testing_only_pq_proposer_is_running(),
+        "the sealed store must be consumed only after actual HTTP bind",
+    );
+    handle
+        .testing_only_wait_for_pq_proposer_attempt()
+        .await
+        .expect("slot loop calls the concrete proposer service");
+    assert_eq!(
+        handle.testing_only_pq_proposer_max_retained_receipts(),
+        Some(1),
+        "the process-owned loop retains at most one cloneable receipt",
     );
     assert!(bundle_dir.exists());
     assert!(slashing_db.is_file());

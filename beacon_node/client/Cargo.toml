@@ -17,6 +17,10 @@ pq-devnet = [
     "genesis/pq-devnet",
     "lighthouse_network/pq-devnet",
     "network/pq-devnet",
+    "dep:pq_http_api",
+    "dep:tokio-util",
+    "dep:warp",
+    "pq_http_api/pq-devnet",
     "store/pq-devnet",
     "types/pq-devnet",
 ]
@@ -24,15 +28,19 @@ pq-proposer = [
     "pq-devnet",
     "dep:initialized_validators",
     "dep:lighthouse_validator_store",
+    "dep:pq_proposer_service",
+    "dep:reqwest",
     "dep:slashing_protection",
     "initialized_validators/pq-devnet",
     "lighthouse_validator_store/pq-devnet",
+    "pq_proposer_service/pq-devnet",
     "slashing_protection/pq-devnet",
 ]
 pq-startup-testing = [
     "pq-devnet",
     "beacon_chain/pq-startup-testing",
     "network/pq-startup-testing",
+    "pq_http_api/pq-startup-testing",
 ]
 
 [dependencies]
@@ -59,7 +67,10 @@ logging = { workspace = true }
 metrics = { workspace = true }
 monitoring_api = { workspace = true }
 network = { path = "../network", default-features = false }
+pq_http_api = { workspace = true, optional = true }
+pq_proposer_service = { workspace = true, optional = true }
 rand = { workspace = true }
+reqwest = { workspace = true, optional = true }
 rustix = { workspace = true }
 sensitive_url = { workspace = true }
 serde = { workspace = true }
@@ -74,19 +85,22 @@ task_executor = { workspace = true }
 time = "0.3.5"
 timer = { path = "../timer", optional = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true, optional = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 types = { workspace = true }
+warp = { workspace = true, optional = true }
 yaml_serde = { workspace = true }
 
 [dev-dependencies]
+async-channel = { workspace = true }
 hex = { workspace = true }
 operation_pool = { workspace = true }
 pq_devnet = { path = "../../testing/pq_devnet", default-features = false, features = ["pq-devnet"] }
 pq_signing = { workspace = true, features = ["pq-devnet"] }
 rusqlite = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 validator_dir = { workspace = true, features = ["pq-devnet"] }
 
 [[test]]

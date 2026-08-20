@@ -1646,3 +1646,51 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   client/beacon-node/lighthouse in both PQ profiles, and the ordinary CLI regression. Dependency
   inspection confirmed an empty verifier signer/slashing graph and no `beacon_node_fallback` in the
   proposer graph. No broad workspace gate was run before independent review.
+
+### 2026-08-20: Narrow PQ HTTP, proposer loop, and top-level supervisor assembled (Task 5.3e-e4e)
+
+- The private PQ client owner starts the acknowledged network worker before binding only the
+  `PqHttpApi` routes. Its Warp owner reports the actual bound address, normalizes a wildcard address
+  to loopback for the local client, and uses nonwaiting connection admissions retained for each
+  socket lifetime (two loopback and sixteen remote). Overflow and idle partial-header connections
+  are closed without entering Hyper; unexpected server completion requests process shutdown.
+- Proposer-enabled startup consumes the sealed validator-store resource only after the HTTP address
+  exists. The strict local client preserves the configured builder while disabling redirects and
+  proxies, restricting transport to HTTP/1, and applying the 285-second ceiling. Verifier-only
+  startup constructs neither that client nor a proposer service. Shutdown awaits a retained
+  non-cancellable proposer receipt before closing HTTP, the sole network broadcaster, and the
+  sealed store/aggregation owners. A staged post-bind failure path marks and awaits HTTP, drops the
+  broadcaster, and awaits network before returning the original strict-client/service/loop error.
+- The process-owned slot loop attempts the current non-genesis slot immediately, holds at most one
+  receipt, recomputes slot boundaries, and does not restart a completed same-slot operation.
+  Every synchronous error passes through the closed fatal classifier: capacity, clock-unavailable,
+  stale-slot races, and other nonfatal outcomes use a bounded one-second retry, while executor/task
+  loss and the fatal set request process shutdown. A biased stop/executor-exit gate immediately
+  before admission prevents a ready stop, including a completion/advanced-slot race, from starting
+  new work. Nested beacon failures are classified exhaustively: connect, timeout, 408/429/503, and
+  block/publication conflict remain slot-local; malformed headers/JSON/SSZ, protocol,
+  body/fragment/stream/resource violations, and other status responses are fatal. A stop received
+  with an admitted receipt waits for completion without canceling journal/signing/publication work
+  and propagates any fatal completion after it joins.
+- The PQ binary now builds the exact Minimal/Electra/300-second environment without the ordinary
+  network-config loader or router graph. Pure positive-allowlist config construction precedes I/O;
+  the inline JWT secret, hostname resolution, and unsupported flags fail before startup;
+  `--zero-ports` also force-overrides the default HTTP port without probing. The
+  TaskExecutor-owned supervisor returns ownership before node construction completes, queues stop
+  received during startup, retains the construction future, then drains the resulting `Client`
+  before the environment exit signal. Focused supervisor tests pin two-cycle HTTP/network/DB-owner
+  release and receipt-before-resource teardown.
+- Warning-denied evidence passed the three supervisor lifecycle tests in both verifier and proposer
+  graphs, the nine production-shared slot-loop/policy tests, verifier/proposer early-startup suites (5/5
+  and 6/6), exact Minimal environment construction, and production/default Lighthouse and Client
+  checks. The pre-existing production-shared composition test remains the route-level evidence:
+  it uses the same `PqHttpApi`, publication service, acknowledged broadcast, sealed Engine/DB/head
+  import, and restart-idempotence path now assembled by the client. A separate real multi-process
+  signal and multi-slot launch tracer remains Task e4f; it is not claimed here.
+- The authenticated post-bind constructor-failure regression passed in 167.98 seconds on the
+  default Tokio stack. It preserved the original error, released the exact HTTP port, reopened the
+  one-row slashing database, and immediately restarted and stopped a verifier on the same disk and
+  network configuration. This cycle also moved the large runtime-start future behind an explicit
+  heap box after the initial mutation exposed a production stack overflow.
+- There is a hash-chain/hash-onion RANDAO proposal for a future version. This V1 runtime continues
+  to use the signature-derived, slot-bound RANDAO duty and frozen 14-leaf allocation.

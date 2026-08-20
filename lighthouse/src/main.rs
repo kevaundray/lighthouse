@@ -1,5 +1,6 @@
 #[cfg(feature = "full-cli")]
 mod cli;
+#[cfg(not(feature = "pq-devnet"))]
 mod metrics;
 
 use account_utils::STDIN_INPUTS_FLAG;
@@ -7,35 +8,52 @@ use beacon_node::ProductionBeaconNode;
 use clap::{Arg, ArgAction, ArgMatches, Command};
 #[cfg(feature = "full-cli")]
 use clap::{FromArgMatches, Subcommand};
-use clap_utils::{
-    FLAG_HEADER, flags::DISABLE_MALLOC_TUNING_FLAG, get_color_style, get_eth2_network_config,
-};
+#[cfg(not(feature = "pq-devnet"))]
+use clap_utils::get_eth2_network_config;
+use clap_utils::{FLAG_HEADER, flags::DISABLE_MALLOC_TUNING_FLAG, get_color_style};
 #[cfg(feature = "full-cli")]
 use cli::LighthouseSubcommands;
 #[cfg(feature = "full-cli")]
 use directory::DEFAULT_VALIDATOR_DIR;
+#[cfg(not(feature = "pq-devnet"))]
 use directory::{DEFAULT_BEACON_NODE_DIR, parse_path_or_default};
+use environment::EnvironmentBuilder;
+#[cfg(not(feature = "pq-devnet"))]
+use environment::LoggerConfig;
+#[cfg(not(feature = "pq-devnet"))]
 use environment::tracing_common;
-use environment::{EnvironmentBuilder, LoggerConfig};
-use eth2_network_config::{DEFAULT_HARDCODED_NETWORK, Eth2NetworkConfig, HARDCODED_NET_NAMES};
+use eth2_network_config::HARDCODED_NET_NAMES;
+#[cfg(not(feature = "pq-devnet"))]
+use eth2_network_config::{DEFAULT_HARDCODED_NETWORK, Eth2NetworkConfig};
 use ethereum_hashing::have_sha_extensions;
 #[cfg(feature = "full-cli")]
 use futures::TryFutureExt;
 use lighthouse_version::VERSION;
+#[cfg(not(feature = "pq-devnet"))]
 use logging::{MetricsLayer, build_workspace_filter, crit};
 use malloc_utils::configure_memory_allocator;
+#[cfg(not(feature = "pq-devnet"))]
 use opentelemetry::trace::TracerProvider;
+#[cfg(not(feature = "pq-devnet"))]
 use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
+#[cfg(not(feature = "pq-devnet"))]
 use opentelemetry_otlp::{WithExportConfig, WithTonicConfig};
+#[cfg(not(feature = "pq-devnet"))]
 use std::backtrace::Backtrace;
+#[cfg(not(feature = "pq-devnet"))]
 use std::io::IsTerminal;
+#[cfg(not(feature = "pq-devnet"))]
 use std::path::PathBuf;
 use std::process::exit;
 use std::sync::LazyLock;
 use task_executor::ShutdownReason;
+#[cfg(not(feature = "pq-devnet"))]
 use tracing::{Level, info};
+#[cfg(not(feature = "pq-devnet"))]
 use tracing_samplers::PrefixBasedSampler;
+#[cfg(not(feature = "pq-devnet"))]
 use tracing_subscriber::{Layer, filter::EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+#[cfg(not(feature = "pq-devnet"))]
 use types::{EthSpec, EthSpecId};
 #[cfg(feature = "full-cli")]
 use validator_client::ProductionValidatorClient;
@@ -431,19 +449,24 @@ fn main() {
 
     let matches = cli.get_matches();
 
-    // Task 5.3e-b is a compile-tested startup profile, not a networked node. Stop before allocator
-    // tuning, network-config reads, logging directories, or runtime construction.
+    // The PQ launch profile is parsed into its opaque runtime config before allocator tuning,
+    // filesystem access, environment construction, or service startup.
     #[cfg(feature = "pq-devnet")]
-    if let Some(beacon_node_matches) = matches.subcommand_matches("beacon_node") {
-        let error = match ProductionBeaconNode::<types::MainnetEthSpec>::new_from_cli(
-            beacon_node_matches.clone(),
-        ) {
-            Err(error) => error.to_string(),
-            Ok(_) => "PQ startup unexpectedly crossed its deferred boundary".to_string(),
-        };
-        eprintln!("{error}");
-        exit(1);
-    }
+    let pq_runtime_config = match matches.subcommand_matches("beacon_node") {
+        Some(beacon_node_matches) => {
+            match beacon_node::build_pq_runtime_config(beacon_node_matches) {
+                Ok(config) => config,
+                Err(error) => {
+                    eprintln!("{error}");
+                    exit(1);
+                }
+            }
+        }
+        None => {
+            eprintln!("PQ builds support only the beacon_node subcommand");
+            exit(1);
+        }
+    };
 
     // Configure the allocator early in the process, before it has the chance to use the default values for
     // anything important.
@@ -456,13 +479,16 @@ fn main() {
         && let Err(e) = configure_memory_allocator()
     {
         eprintln!(
-            "Unable to configure the memory allocator: {} \n\
-                Try providing the --{} flag",
-            e, DISABLE_MALLOC_TUNING_FLAG
+            "Unable to configure the memory allocator: {e} \n\
+                Try providing the --{DISABLE_MALLOC_TUNING_FLAG} flag",
         );
         exit(1)
     }
 
+    #[cfg(feature = "pq-devnet")]
+    let result = run_pq(&matches, pq_runtime_config);
+
+    #[cfg(not(feature = "pq-devnet"))]
     let result = get_eth2_network_config(&matches).and_then(|eth2_network_config| {
         let eth_spec_id = eth2_network_config.eth_spec_id()?;
 
@@ -511,13 +537,355 @@ fn main() {
     match result {
         Ok(()) => exit(0),
         Err(e) => {
-            eprintln!("{}", e);
+            eprintln!("{e}");
             drop(e);
             exit(1)
         }
     }
 }
 
+#[cfg(feature = "pq-devnet")]
+fn run_pq(
+    matches: &ArgMatches,
+    runtime_config: beacon_node::PqRuntimeConfig,
+) -> Result<(), String> {
+    if std::mem::size_of::<usize>() != 8 {
+        return Err(format!(
+            "{}-bit architecture is not supported (64-bit only).",
+            std::mem::size_of::<usize>() * 8
+        ));
+    }
+    if let Some(path) = matches.get_one::<String>("dump-config") {
+        std::fs::write(path, format!("{runtime_config:#?}"))
+            .map_err(|error| format!("could not write --dump-config: {error}"))?;
+        return Ok(());
+    }
+    if let Some(path) = matches.get_one::<String>("dump-chain-config") {
+        let spec = types::ForkName::Electra
+            .make_genesis_spec(types::ChainSpec::minimal())
+            .set_slot_duration_ms::<types::MinimalEthSpec>(300_000);
+        let contents = yaml_serde::to_string(&types::Config::from_chain_spec::<
+            types::MinimalEthSpec,
+        >(&spec))
+        .map_err(|error| format!("could not encode --dump-chain-config: {error}"))?;
+        std::fs::write(path, contents)
+            .map_err(|error| format!("could not write --dump-chain-config: {error}"))?;
+        return Ok(());
+    }
+    if matches.get_flag("immediate-shutdown") {
+        return Ok(());
+    }
+
+    let mut environment = EnvironmentBuilder::minimal_pq()
+        .multi_threaded_tokio_runtime()?
+        .build()?;
+    let runtime = std::sync::Arc::clone(environment.runtime());
+    let context = environment.core_context();
+    let supervisor = start_pq_supervisor(context, runtime_config)?;
+
+    let shutdown_reason = environment.block_until_shutdown_requested();
+    let node_shutdown = runtime.block_on(supervisor.shutdown());
+    environment.fire_signal();
+    environment.shutdown_on_idle();
+    node_shutdown?;
+    match shutdown_reason? {
+        ShutdownReason::Success(_) => Ok(()),
+        ShutdownReason::Failure(message) => Err(message.to_string()),
+    }
+}
+
+#[cfg(feature = "pq-devnet")]
+struct PqNodeSupervisor {
+    stop: Option<futures::channel::oneshot::Sender<()>>,
+    outcome: tokio::sync::oneshot::Receiver<Result<Result<(), String>, tokio::task::JoinError>>,
+}
+
+#[cfg(feature = "pq-devnet")]
+trait PqSupervisorNode: Send + 'static {
+    fn shutdown(self) -> futures::future::BoxFuture<'static, Result<(), String>>;
+}
+
+#[cfg(feature = "pq-devnet")]
+impl PqSupervisorNode for ProductionBeaconNode {
+    fn shutdown(self) -> futures::future::BoxFuture<'static, Result<(), String>> {
+        use futures::FutureExt;
+
+        async move { self.shutdown().await.map_err(|error| error.to_string()) }.boxed()
+    }
+}
+
+#[cfg(feature = "pq-devnet")]
+impl PqNodeSupervisor {
+    async fn shutdown(mut self) -> Result<(), String> {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        let task_result = self
+            .outcome
+            .await
+            .map_err(|_| "PQ node supervisor outcome channel closed".to_string())?
+            .map_err(|error| format!("PQ node supervisor task failed: {error}"))?;
+        task_result?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "pq-devnet")]
+fn start_pq_supervisor(
+    context: environment::RuntimeContext<types::MinimalEthSpec>,
+    runtime_config: beacon_node::PqRuntimeConfig,
+) -> Result<PqNodeSupervisor, String> {
+    let executor = context.executor.clone();
+    spawn_pq_supervisor_task(executor, async move {
+        ProductionBeaconNode::new(context, runtime_config)
+            .await
+            .map_err(|error| error.to_string())
+    })
+}
+
+#[cfg(feature = "pq-devnet")]
+fn spawn_pq_supervisor_task<N, F>(
+    executor: task_executor::TaskExecutor,
+    startup: F,
+) -> Result<PqNodeSupervisor, String>
+where
+    N: PqSupervisorNode,
+    F: std::future::Future<Output = Result<N, String>> + Send + 'static,
+{
+    let exit = executor.exit();
+    let (stop_sender, stop_receiver) = futures::channel::oneshot::channel();
+    let mut process_shutdown = executor.shutdown_sender();
+    let task = async move {
+        // Startup is deliberately awaited without cancellation. A stop or executor-exit signal
+        // remains queued until construction resolves, at which point the fully owned node is
+        // drained before the supervisor outcome completes.
+        let node = match startup.await {
+            Ok(node) => node,
+            Err(message) => {
+                let _ =
+                    process_shutdown.try_send(ShutdownReason::Failure("PQ node startup failed"));
+                return Err(message);
+            }
+        };
+        futures::pin_mut!(exit);
+        futures::pin_mut!(stop_receiver);
+        let _ = futures::future::select(exit, stop_receiver).await;
+        node.shutdown().await
+    };
+    let outcome = executor
+        .spawn_handle_without_exit(task, "pq_node_supervisor")
+        .ok_or("PQ task executor unavailable before supervisor start")?;
+    Ok(PqNodeSupervisor {
+        stop: Some(stop_sender),
+        outcome,
+    })
+}
+
+#[cfg(all(test, feature = "pq-devnet"))]
+mod pq_supervisor_tests {
+    use super::*;
+    use futures::FutureExt;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::time::Duration;
+
+    struct TestingNode {
+        listeners: Vec<std::net::TcpListener>,
+        db_owned: Option<Arc<AtomicBool>>,
+        shutdown_entered: Option<tokio::sync::oneshot::Sender<()>>,
+        shutdown_release: Option<tokio::sync::oneshot::Receiver<()>>,
+        shutdown_complete: Arc<AtomicBool>,
+    }
+
+    impl PqSupervisorNode for TestingNode {
+        fn shutdown(mut self) -> futures::future::BoxFuture<'static, Result<(), String>> {
+            async move {
+                if let Some(entered) = self.shutdown_entered.take() {
+                    let _ = entered.send(());
+                }
+                if let Some(release) = self.shutdown_release.take() {
+                    let _ = release.await;
+                }
+                self.listeners.clear();
+                if let Some(db_owned) = self.db_owned.take() {
+                    db_owned.store(false, Ordering::SeqCst);
+                }
+                self.shutdown_complete.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            .boxed()
+        }
+    }
+
+    fn testing_executor() -> (
+        task_executor::TaskExecutor,
+        async_channel::Sender<()>,
+        futures::channel::mpsc::Receiver<ShutdownReason>,
+    ) {
+        let (exit_sender, exit_receiver) = async_channel::bounded(1);
+        let (shutdown_sender, shutdown_receiver) = futures::channel::mpsc::channel(1);
+        (
+            task_executor::TaskExecutor::new(
+                tokio::runtime::Handle::current(),
+                exit_receiver,
+                shutdown_sender,
+            ),
+            exit_sender,
+            shutdown_receiver,
+        )
+    }
+
+    #[tokio::test]
+    async fn stop_during_startup_retains_construction_until_owned_shutdown() {
+        let (executor, _exit_sender, _shutdown_receiver) = testing_executor();
+        let (startup_entered_sender, startup_entered) = tokio::sync::oneshot::channel();
+        let (startup_release_sender, startup_release) = tokio::sync::oneshot::channel();
+        let startup_completed = Arc::new(AtomicBool::new(false));
+        let task_startup_completed = Arc::clone(&startup_completed);
+        let shutdown_completed = Arc::new(AtomicBool::new(false));
+        let task_shutdown_completed = Arc::clone(&shutdown_completed);
+
+        let supervisor = spawn_pq_supervisor_task(executor, async move {
+            let _ = startup_entered_sender.send(());
+            let _ = startup_release.await;
+            task_startup_completed.store(true, Ordering::SeqCst);
+            Ok(TestingNode {
+                listeners: vec![],
+                db_owned: None,
+                shutdown_entered: None,
+                shutdown_release: None,
+                shutdown_complete: task_shutdown_completed,
+            })
+        })
+        .expect("supervisor owns startup before it becomes live");
+        startup_entered.await.expect("startup entered");
+
+        let shutdown = tokio::spawn(supervisor.shutdown());
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished(), "shutdown must not cancel startup");
+        assert!(!startup_completed.load(Ordering::SeqCst));
+        assert!(!shutdown_completed.load(Ordering::SeqCst));
+
+        startup_release_sender.send(()).expect("release startup");
+        tokio::time::timeout(Duration::from_secs(2), shutdown)
+            .await
+            .expect("owned startup and shutdown finish")
+            .expect("supervisor task")
+            .expect("supervisor shutdown");
+        assert!(startup_completed.load(Ordering::SeqCst));
+        assert!(shutdown_completed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn verifier_supervisor_releases_port_and_allows_same_process_restart() {
+        let reserve_port = || {
+            let reserved = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .expect("reserve verifier port");
+            let port = reserved.local_addr().expect("reserved address").port();
+            drop(reserved);
+            port
+        };
+        let http_port = reserve_port();
+        let network_port = reserve_port();
+        let db_owned = Arc::new(AtomicBool::new(false));
+
+        for _ in 0..2 {
+            let (executor, _exit_sender, _shutdown_receiver) = testing_executor();
+            let (live_sender, live) = tokio::sync::oneshot::channel();
+            let shutdown_complete = Arc::new(AtomicBool::new(false));
+            let task_shutdown_complete = Arc::clone(&shutdown_complete);
+            let task_db_owned = Arc::clone(&db_owned);
+            let supervisor = spawn_pq_supervisor_task(executor, async move {
+                task_db_owned
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .map_err(|_| "DB owner was not released before restart".to_string())?;
+                let http = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, http_port))
+                    .map_err(|error| error.to_string())?;
+                let network =
+                    std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, network_port))
+                        .map_err(|error| error.to_string())?;
+                let _ = live_sender.send(());
+                Ok(TestingNode {
+                    listeners: vec![http, network],
+                    db_owned: Some(task_db_owned),
+                    shutdown_entered: None,
+                    shutdown_release: None,
+                    shutdown_complete: task_shutdown_complete,
+                })
+            })
+            .expect("spawn verifier supervisor");
+            live.await.expect("verifier became live");
+            assert!(db_owned.load(Ordering::SeqCst));
+            assert!(
+                std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, http_port)).is_err()
+            );
+            assert!(
+                std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, network_port)).is_err()
+            );
+            supervisor.shutdown().await.expect("verifier shutdown");
+            assert!(shutdown_complete.load(Ordering::SeqCst));
+            assert!(!db_owned.load(Ordering::SeqCst));
+        }
+
+        let rebound = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, http_port))
+            .expect("second shutdown releases the verifier port");
+        drop(rebound);
+    }
+
+    #[tokio::test]
+    async fn proposer_supervisor_awaits_noncancellable_receipt_before_resource_release() {
+        let reserved = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("reserve proposer HTTP port");
+        let port = reserved.local_addr().expect("reserved address").port();
+        drop(reserved);
+        let (executor, _exit_sender, _shutdown_receiver) = testing_executor();
+        let (live_sender, live) = tokio::sync::oneshot::channel();
+        let (shutdown_entered_sender, shutdown_entered) = tokio::sync::oneshot::channel();
+        let (receipt_release_sender, receipt_release) = tokio::sync::oneshot::channel();
+        let shutdown_complete = Arc::new(AtomicBool::new(false));
+        let task_shutdown_complete = Arc::clone(&shutdown_complete);
+        let supervisor = spawn_pq_supervisor_task(executor, async move {
+            let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+                .map_err(|error| error.to_string())?;
+            let _ = live_sender.send(());
+            Ok(TestingNode {
+                listeners: vec![listener],
+                db_owned: None,
+                shutdown_entered: Some(shutdown_entered_sender),
+                shutdown_release: Some(receipt_release),
+                shutdown_complete: task_shutdown_complete,
+            })
+        })
+        .expect("spawn proposer supervisor");
+        live.await.expect("proposer became live");
+
+        let shutdown = tokio::spawn(supervisor.shutdown());
+        shutdown_entered.await.expect("node shutdown entered");
+        assert!(!shutdown.is_finished());
+        assert!(!shutdown_complete.load(Ordering::SeqCst));
+        assert!(
+            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_err(),
+            "HTTP/network ownership must remain live while the admitted receipt completes",
+        );
+
+        receipt_release_sender
+            .send(())
+            .expect("release non-cancellable receipt");
+        tokio::time::timeout(Duration::from_secs(2), shutdown)
+            .await
+            .expect("supervisor drains proposer")
+            .expect("supervisor task")
+            .expect("proposer shutdown");
+        assert!(shutdown_complete.load(Ordering::SeqCst));
+        let rebound = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+            .expect("resources release only after receipt completion");
+        drop(rebound);
+    }
+}
+
+#[cfg(not(feature = "pq-devnet"))]
 fn run<E: EthSpec>(
     environment_builder: EnvironmentBuilder<E>,
     matches: &ArgMatches,
@@ -864,17 +1232,6 @@ fn run<E: EthSpec>(
             let context = environment.core_context();
             let executor = context.executor.clone();
 
-            #[cfg(feature = "pq-devnet")]
-            {
-                if let Err(error) = ProductionBeaconNode::<E>::new_from_cli(matches.clone()) {
-                    crit!(reason = ?error, "Failed to start beacon node");
-                    let _ = executor
-                        .shutdown_sender()
-                        .try_send(ShutdownReason::Failure("Failed to start beacon node"));
-                }
-            }
-
-            #[cfg(not(feature = "pq-devnet"))]
             {
                 let mut config = beacon_node::get_config::<E>(matches, &context)?;
                 config.logger_config = logger_config;
