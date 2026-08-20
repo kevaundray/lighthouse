@@ -106,7 +106,9 @@ pub use prometheus_client;
 
 pub use config::Config as NetworkConfig;
 #[cfg(feature = "pq-devnet")]
-pub use config::{PQ_COMPATIBLE_PEER_CAPACITY, PqGossipValidationAdmission};
+pub use config::{
+    PQ_COMPATIBLE_PEER_CAPACITY, PqCompatiblePeerAdmission, PqGossipValidationAdmission,
+};
 pub use discovery::Eth2Enr;
 pub use discv5;
 pub use libp2p;

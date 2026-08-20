@@ -126,6 +126,19 @@ malloc_utils = { workspace = true, features = [] }
 
 [dev-dependencies]
 async-channel = { workspace = true }
+consensus_signature = { workspace = true }
+discv5 = { workspace = true }
+ethereum_ssz = { workspace = true }
+execution_layer = { workspace = true, features = ["pq-devnet"] }
+fs2 = { workspace = true }
+hex = { workspace = true }
+libc = "0.2"
+pq_devnet = { workspace = true, features = ["pq-devnet"] }
+rusqlite = { workspace = true }
+sha2 = { workspace = true }
+state_processing = { workspace = true }
+tempfile = { workspace = true }
+validator_dir = { workspace = true }
 
 [[test]]
 name = "lighthouse_tests"
@@ -136,3 +149,8 @@ required-features = ["lighthouse-integration-tests"]
 name = "pq_early_startup"
 path = "tests/pq_early_startup.rs"
 required-features = ["pq-devnet"]
+
+[[test]]
+name = "pq_e4f_launch"
+path = "tests/pq_e4f_launch.rs"
+required-features = ["pq-proposer"]

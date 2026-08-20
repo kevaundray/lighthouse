@@ -25,6 +25,7 @@ test_backfill = []
 arbitrary = ["dep:arbitrary", "types/arbitrary"]
 pq-wire = ["consensus_signature/pq-wire", "eth2/pq-wire", "types/pq-devnet"]
 pq-devnet = [
+    "dep:libc",
     "pq-wire",
     "consensus_signature/pq-devnet",
     "execution_layer/pq-devnet",
@@ -61,6 +62,7 @@ hex = { workspace = true }
 int_to_bytes = { workspace = true }
 itertools = { workspace = true }
 kzg = { workspace = true }
+libc = { version = "0.2", optional = true }
 lighthouse_version = { workspace = true }
 logging = { workspace = true }
 merkle_proof = { workspace = true }

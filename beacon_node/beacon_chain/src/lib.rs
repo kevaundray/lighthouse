@@ -122,6 +122,9 @@ mod pq_attestation_gossip;
 #[path = "pq_runtime/import.rs"]
 mod pq_import;
 #[cfg(feature = "pq-devnet")]
+#[path = "pq_runtime/operational_events.rs"]
+mod pq_operational_events;
+#[cfg(feature = "pq-devnet")]
 #[path = "pq_runtime/production.rs"]
 mod pq_production;
 #[cfg(feature = "pq-devnet")]
@@ -213,6 +216,25 @@ pub use self::pq_import::{
     TestingPqGossipClaim, TestingPqGossipFinish, TestingPqGossipObservationCache,
     TestingPqPublishPromotionResolution, testing_only_persisted_pq_execution_head,
     testing_only_reconcile_pq_execution,
+};
+#[cfg(feature = "pq-devnet")]
+pub use self::pq_operational_events::{
+    PqOperationalEvent, PqOperationalEventError, PqOperationalEventRole, PqOperationalEventSink,
+    PqOperationalEventWriter, PqPeerConnectionDirection, PqStatusMessageDirection,
+    PqStatusRejectionCode,
+};
+#[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing", unix))]
+#[doc(hidden)]
+pub use self::pq_operational_events::{
+    PqOperationalEventNonblockingWriterTrace, PqOperationalEventStdoutKindsTrace,
+    testing_only_pq_operational_event_nonblocking_writer,
+    testing_only_pq_operational_event_stdout_kinds,
+};
+#[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
+#[doc(hidden)]
+pub use self::pq_operational_events::{
+    PqOperationalEventTestTrace, testing_only_pq_operational_event_sink,
+    testing_only_running_pq_operational_event_sink,
 };
 #[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
 #[doc(hidden)]

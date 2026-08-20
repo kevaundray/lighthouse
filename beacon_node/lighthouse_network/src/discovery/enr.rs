@@ -13,6 +13,8 @@ use network_utils::enr_ext::{EnrExt, QUIC_ENR_KEY, QUIC6_ENR_KEY};
 use ssz::{Decode, Encode};
 use ssz_types::BitVector;
 use std::fs::File;
+#[cfg(unix)]
+use std::fs::OpenOptions;
 use std::io::prelude::*;
 use std::path::Path;
 use std::str::FromStr;
@@ -344,9 +346,7 @@ pub fn load_enr_from_disk(dir: &Path) -> Result<Enr, String> {
 /// Saves an ENR to disk
 pub fn save_enr_to_disk(dir: &Path, enr: &Enr) {
     let _ = std::fs::create_dir_all(dir);
-    match File::create(dir.join(Path::new(ENR_FILENAME)))
-        .and_then(|mut f| f.write_all(enr.to_base64().as_bytes()))
-    {
+    match write_enr_to_disk(dir, enr) {
         Ok(_) => {
             debug!("ENR written to disk");
         }
@@ -358,6 +358,36 @@ pub fn save_enr_to_disk(dir: &Path, enr: &Enr) {
             );
         }
     }
+}
+
+#[cfg(unix)]
+fn write_enr_to_disk(dir: &Path, enr: &Enr) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let path = dir.join(Path::new(ENR_FILENAME));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .mode(0o644)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "ENR path is not a single-link regular file",
+        ));
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+    file.set_len(0)?;
+    file.write_all(enr.to_base64().as_bytes())
+}
+
+#[cfg(not(unix))]
+fn write_enr_to_disk(dir: &Path, enr: &Enr) -> std::io::Result<()> {
+    File::create(dir.join(Path::new(ENR_FILENAME)))
+        .and_then(|mut file| file.write_all(enr.to_base64().as_bytes()))
 }
 
 #[cfg(test)]
@@ -421,5 +451,57 @@ mod test {
         enr.eth2().unwrap();
         enr.attestation_bitfield::<MainnetEthSpec>().unwrap();
         enr.sync_committee_bitfield::<MainnetEthSpec>().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_enr_repairs_group_writable_mode_and_rejects_symlink() {
+        use std::fs;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(ENR_FILENAME);
+        let enr = build_enr_with_config(NetworkConfig::default(), 4, &E::default_spec()).0;
+
+        fs::write(&path, b"stale").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).unwrap();
+        save_enr_to_disk(root.path(), &enr);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o644
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), enr.to_base64());
+
+        fs::remove_file(&path).unwrap();
+        let target = root.path().join("redirect-target");
+        fs::write(&target, b"unchanged").unwrap();
+        symlink(&target, &path).unwrap();
+        save_enr_to_disk(root.path(), &enr);
+        assert_eq!(fs::read(&target).unwrap(), b"unchanged");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_enr_rejects_fifo_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(ENR_FILENAME);
+        let path_bytes = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path_bytes` is a valid NUL-terminated path and the mode is valid.
+        assert_eq!(unsafe { libc::mkfifo(path_bytes.as_ptr(), 0o600) }, 0);
+        let enr = build_enr_with_config(NetworkConfig::default(), 4, &E::default_spec()).0;
+        let directory = root.path().to_path_buf();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(write_enr_to_disk(&directory, &enr));
+        });
+        let result = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("FIFO rejection must not block the network caller");
+        assert!(result.is_err());
     }
 }

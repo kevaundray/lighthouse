@@ -241,6 +241,49 @@ impl TaskExecutor {
         Some(result_receiver)
     }
 
+    /// Spawn a result-bearing blocking task that is not cancelled by the executor exit signal.
+    ///
+    /// The blocking task is monitored for panics in the same way as asynchronous tasks, and the
+    /// exact join result is sent to the returned receiver. The caller must retain and await that
+    /// receiver when graceful shutdown requires the blocking owner to finish.
+    pub fn spawn_blocking_handle_without_exit<F, R>(
+        &self,
+        task: F,
+        name: &'static str,
+    ) -> Option<tokio::sync::oneshot::Receiver<Result<R, tokio::task::JoinError>>>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let handle = self.handle()?;
+        let timer = metrics::start_timer_vec(&metrics::BLOCKING_TASKS_HISTOGRAM, &[name]);
+        metrics::inc_gauge_vec(&metrics::BLOCKING_TASKS_COUNT, &[name]);
+        let span = Span::current();
+        let task_handle = handle.spawn_blocking(move || {
+            let _guard = span.enter();
+            task()
+        });
+        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+        let mut shutdown_sender = self.shutdown_sender();
+        let monitor = async move {
+            let result = task_handle.await;
+            if result.as_ref().is_err_and(tokio::task::JoinError::is_panic) {
+                let _ = shutdown_sender.try_send(ShutdownReason::Failure("Panic (fatal error)"));
+            }
+            let _ = result_sender.send(result);
+            metrics::dec_gauge_vec(&metrics::BLOCKING_TASKS_COUNT, &[name]);
+            drop(timer);
+        };
+        #[cfg(tokio_unstable)]
+        tokio::task::Builder::new()
+            .name(&format!("{name}-monitor"))
+            .spawn_on(monitor, &handle)
+            .expect("Failed to spawn monitor task");
+        #[cfg(not(tokio_unstable))]
+        handle.spawn(monitor);
+        Some(result_receiver)
+    }
+
     /// Spawn a blocking task on a dedicated tokio thread pool wrapped in an exit future.
     /// This function generates prometheus metrics on number of tasks and task duration.
     pub fn spawn_blocking<F>(&self, task: F, name: &'static str)

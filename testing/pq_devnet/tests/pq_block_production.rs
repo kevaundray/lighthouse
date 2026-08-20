@@ -4,7 +4,8 @@ use beacon_chain::{
     PqImportError, PqNewPayloadTransport, PqPayloadBuildRequest, PqProposerDutiesError,
     TestingPqBlockingHook, TestingPqPayloadBuildObservation, TestingPqPayloadExpectation,
     builder::{BeaconChainBuilder, Witness},
-    testing_only_validate_pq_full_payload, testing_only_validate_pq_production_advance,
+    testing_only_running_pq_operational_event_sink, testing_only_validate_pq_full_payload,
+    testing_only_validate_pq_production_advance,
 };
 #[cfg(target_feature = "avx2")]
 use consensus_signature::{
@@ -1143,6 +1144,7 @@ async fn start_pq_network_worker_for_chain(
         secp256k1::Keypair::generate().into(),
         chain,
         broadcast_receiver,
+        testing_only_running_pq_operational_event_sink(&fixture._runtime.task_executor),
     )
     .await
     .expect("PQ network service");

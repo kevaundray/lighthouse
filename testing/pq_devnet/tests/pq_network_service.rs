@@ -1,3 +1,10 @@
+#[cfg(target_feature = "avx2")]
+use beacon_chain::testing_only_running_pq_operational_event_sink;
+use beacon_chain::{
+    PqOperationalEventError, PqOperationalEventRole, PqStatusRejectionCode,
+    testing_only_pq_operational_event_nonblocking_writer, testing_only_pq_operational_event_sink,
+    testing_only_pq_operational_event_stdout_kinds,
+};
 use consensus_signature::IndividualSignature;
 use network::{
     PQ_NETWORK_BLOCK_COMMIT_CAPACITY, PQ_NETWORK_BLOCK_ENCODING_CAPACITY,
@@ -246,7 +253,10 @@ fn mismatched_status_fork_disconnects_without_starting_block_verification() {
     assert_eq!(
         testing_only_pq_status_lifecycle(PqStatusTestScenario::ForkDigestMismatch),
         PqStatusTestTrace {
-            events: vec![PqStatusTestEvent::DisconnectedIrrelevantNetwork],
+            events: vec![
+                PqStatusTestEvent::EmittedStatusRejected(PqStatusRejectionCode::ForkDigest),
+                PqStatusTestEvent::DisconnectedIrrelevantNetwork,
+            ],
             block_verifications_started: 0,
         }
     );
@@ -254,14 +264,23 @@ fn mismatched_status_fork_disconnects_without_starting_block_verification() {
 
 #[test]
 fn mismatched_status_finalized_fields_disconnect_without_starting_block_verification() {
-    for scenario in [
-        PqStatusTestScenario::FinalizedEpochMismatch,
-        PqStatusTestScenario::FinalizedRootMismatch,
+    for (scenario, code) in [
+        (
+            PqStatusTestScenario::FinalizedEpochMismatch,
+            PqStatusRejectionCode::FinalizedEpoch,
+        ),
+        (
+            PqStatusTestScenario::FinalizedRootMismatch,
+            PqStatusRejectionCode::FinalizedRoot,
+        ),
     ] {
         assert_eq!(
             testing_only_pq_status_lifecycle(scenario),
             PqStatusTestTrace {
-                events: vec![PqStatusTestEvent::DisconnectedIrrelevantNetwork],
+                events: vec![
+                    PqStatusTestEvent::EmittedStatusRejected(code),
+                    PqStatusTestEvent::DisconnectedIrrelevantNetwork,
+                ],
                 block_verifications_started: 0,
             }
         );
@@ -273,16 +292,88 @@ fn compatible_status_marks_peer_and_seventeenth_disconnects_without_verification
     assert_eq!(
         testing_only_pq_status_lifecycle(PqStatusTestScenario::Compatible),
         PqStatusTestTrace {
-            events: vec![PqStatusTestEvent::MarkedCompatible],
+            events: vec![
+                PqStatusTestEvent::MarkedCompatible,
+                PqStatusTestEvent::EmittedPeerCompatible,
+            ],
+            block_verifications_started: 0,
+        }
+    );
+    assert_eq!(
+        testing_only_pq_status_lifecycle(PqStatusTestScenario::CompatibleAlreadyKnown),
+        PqStatusTestTrace {
+            events: vec![
+                PqStatusTestEvent::MarkedCompatible,
+                PqStatusTestEvent::EmittedPeerCompatible,
+            ],
             block_verifications_started: 0,
         }
     );
     assert_eq!(
         testing_only_pq_status_lifecycle(PqStatusTestScenario::CompatibleCapacityFull),
         PqStatusTestTrace {
-            events: vec![PqStatusTestEvent::DisconnectedTooManyPeers],
+            events: vec![
+                PqStatusTestEvent::EmittedStatusRejected(PqStatusRejectionCode::Capacity),
+                PqStatusTestEvent::DisconnectedTooManyPeers,
+            ],
             block_verifications_started: 0,
         }
+    );
+}
+
+#[tokio::test]
+async fn operational_event_sink_is_bounded_sequenced_and_fail_closed() {
+    let trace = testing_only_pq_operational_event_sink().await;
+    assert_eq!(trace.sequences, vec![1, 2]);
+    assert_eq!(
+        trace.roles,
+        vec![
+            PqOperationalEventRole::Proposer,
+            PqOperationalEventRole::Proposer,
+        ]
+    );
+    assert_eq!(trace.capacity_error, PqOperationalEventError::Capacity);
+    assert_eq!(trace.closed_error, PqOperationalEventError::Closed);
+    assert_eq!(
+        trace.output,
+        b"PQ_EVENT_V1 event=PeerCompatible sequence=1 role=proposer \
+peer_digest=01010101010101010101010101010101\n\
+PQ_EVENT_V1 event=PeerCompatible sequence=2 role=proposer \
+peer_digest=02020202020202020202020202020202\n"
+    );
+    assert_eq!(trace.output_error, PqOperationalEventError::OutputClosed);
+    assert_eq!(
+        trace.overflow_error,
+        PqOperationalEventError::SequenceOverflow
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn operational_event_writer_full_pipe_is_nonblocking_and_does_not_starve_tokio() {
+    let runtime = task_executor::test_utils::TestRuntime::default();
+    let trace = testing_only_pq_operational_event_nonblocking_writer(&runtime.task_executor).await;
+    assert_eq!(trace.error, PqOperationalEventError::OutputWouldBlock);
+    assert!(trace.stdout_flags_unchanged);
+    assert!(trace.dedicated_thread);
+    assert!(trace.heartbeat_completed);
+    assert!(trace.completion_bounded);
+}
+
+#[test]
+fn operational_event_writer_preserves_kind_specific_stdout_semantics() {
+    let trace = testing_only_pq_operational_event_stdout_kinds();
+    assert!(trace.nonappend_shared_offset_advanced);
+    assert!(trace.nonappend_prefix_preserved);
+    assert!(trace.append_retained);
+    assert!(trace.socket_flags_unchanged);
+    assert!(matches!(
+        trace.socket_result,
+        Ok(()) | Err(PqOperationalEventError::OutputWouldBlock)
+    ));
+    assert!(trace.pipe_flags_unchanged);
+    assert_eq!(
+        trace.pipe_result,
+        Err(PqOperationalEventError::OutputWouldBlock)
     );
 }
 
@@ -391,6 +482,7 @@ async fn start_network_service(
     Arc<lighthouse_network::NetworkGlobals<MinimalEthSpec>>,
     tokio::sync::mpsc::Sender<lighthouse_network::Multiaddr>,
     Arc<lighthouse_network::PqGossipValidationAdmission>,
+    Arc<beacon_chain::PqOperationalEventSink>,
 ) {
     let head = chain.head_snapshot();
     let genesis_validators_root = head.beacon_state.genesis_validators_root();
@@ -414,6 +506,7 @@ async fn start_network_service(
         libp2p_registry: None,
     };
     let (broadcast_sender, broadcast_receiver) = pq_block_broadcast_channel();
+    let operational_events = testing_only_running_pq_operational_event_sink(&runtime.task_executor);
     let mut service = PqNetworkService::new(
         runtime.task_executor.clone(),
         context,
@@ -421,6 +514,7 @@ async fn start_network_service(
         secp256k1::Keypair::generate().into(),
         chain,
         broadcast_receiver,
+        Arc::clone(&operational_events),
     )
     .await
     .expect("PQ network service");
@@ -431,7 +525,13 @@ async fn start_network_service(
     let dial_sender = service.testing_only_dial_sender();
     let gossip_admission = service.testing_only_gossip_admission();
     service.start().expect("start PQ network service");
-    (broadcast_sender, globals, dial_sender, gossip_admission)
+    (
+        broadcast_sender,
+        globals,
+        dial_sender,
+        gossip_admission,
+        operational_events,
+    )
 }
 
 #[cfg(target_feature = "avx2")]
@@ -486,6 +586,7 @@ async fn result_bearing_network_start_confirms_owner_shutdown() {
         secp256k1::Keypair::generate().into(),
         chain,
         broadcast_receiver,
+        testing_only_running_pq_operational_event_sink(&runtime.task_executor),
     )
     .await
     .expect("PQ network service");
@@ -591,6 +692,7 @@ async fn result_bearing_network_start_rejects_executor_shutdown_before_first_pol
         secp256k1::Keypair::generate().into(),
         chain,
         broadcast_receiver,
+        testing_only_running_pq_operational_event_sink(&runtime.task_executor),
     )
     .await
     .expect("PQ network service");
@@ -640,6 +742,7 @@ async fn result_bearing_network_start_reports_worker_panic_through_task_executor
         secp256k1::Keypair::generate().into(),
         chain,
         broadcast_receiver,
+        testing_only_running_pq_operational_event_sink(&runtime.task_executor),
     )
     .await
     .expect("PQ network service");
@@ -665,15 +768,16 @@ async fn live_worker_negatively_acknowledges_exact_block_without_peers() {
     let runtime = task_executor::test_utils::TestRuntime::default();
     let (chain, spec) = build_chain(&runtime);
     let genesis_root = chain.head_snapshot().beacon_block_root;
-    let (sender, _globals, _dial_sender, gossip_admission) = start_network_service(
-        &runtime,
-        Arc::clone(&chain),
-        Arc::clone(&spec),
-        vec![],
-        true,
-        None,
-    )
-    .await;
+    let (sender, _globals, _dial_sender, gossip_admission, _operational_events) =
+        start_network_service(
+            &runtime,
+            Arc::clone(&chain),
+            Arc::clone(&spec),
+            vec![],
+            true,
+            None,
+        )
+        .await;
     let block = Arc::new(SignedBeaconBlock::from_block(
         BeaconBlock::empty(&spec),
         IndividualSignature::empty(),
@@ -694,7 +798,7 @@ async fn live_worker_negatively_acknowledges_exact_block_without_peers() {
 async fn live_workers_status_and_acknowledge_publish_and_exact_duplicate() {
     let runtime = task_executor::test_utils::TestRuntime::default();
     let (chain, spec) = build_chain(&runtime);
-    let (_receiver_sender, receiver_globals, _receiver_dial, _receiver_admission) =
+    let (_receiver_sender, receiver_globals, _receiver_dial, receiver_admission, receiver_events) =
         start_network_service(
             &runtime,
             Arc::clone(&chain),
@@ -715,7 +819,7 @@ async fn live_workers_status_and_acknowledge_publish_and_exact_duplicate() {
     })
     .await
     .expect("receiver listening ENR");
-    let (sender, sender_globals, sender_dial, sender_admission) =
+    let (sender, sender_globals, sender_dial, sender_admission, sender_events) =
         start_network_service(&runtime, chain, Arc::clone(&spec), vec![], true, None).await;
     sender_dial
         .try_send(receiver_address)
@@ -728,7 +832,11 @@ async fn live_workers_status_and_acknowledge_publish_and_exact_duplicate() {
     .await
     .expect("PQ status-compatible peers connect");
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while !sender_admission.has_compatible_peers() {
+        while !sender_admission.has_compatible_peers()
+            || !receiver_admission.has_compatible_peers()
+            || sender_events.testing_only_peer_compatible_count() != 1
+            || receiver_events.testing_only_peer_compatible_count() != 1
+        {
             tokio::task::yield_now().await;
         }
     })
@@ -775,7 +883,7 @@ async fn block_encoding_is_cap_two_offloop_and_poll_loop_remains_responsive() {
 
     let runtime = task_executor::test_utils::TestRuntime::default();
     let (chain, spec) = build_chain(&runtime);
-    let (_receiver_sender, receiver_globals, _receiver_dial, _receiver_admission) =
+    let (_receiver_sender, receiver_globals, _receiver_dial, _receiver_admission, _receiver_events) =
         start_network_service(
             &runtime,
             Arc::clone(&chain),
@@ -815,7 +923,7 @@ async fn block_encoding_is_cap_two_offloop_and_poll_loop_remains_responsive() {
             }
         }) as Arc<dyn Fn() + Send + Sync>
     };
-    let (sender, sender_globals, sender_dial, sender_admission) =
+    let (sender, sender_globals, sender_dial, sender_admission, _sender_events) =
         start_network_service(&runtime, chain, Arc::clone(&spec), vec![], true, Some(hook)).await;
     sender_dial
         .try_send(receiver_address)

@@ -2,7 +2,10 @@ use crate::Client;
 use crate::config::{ClientGenesis, Config as ClientConfig, PqDevnetConfigError};
 use beacon_chain::builder::{BeaconChainBuilder, Witness};
 use beacon_chain::slot_clock::SystemTimeSlotClock;
-use beacon_chain::{BeaconChain, PqStoreStartup, classify_pq_store_startup, migrate_pq_schema};
+use beacon_chain::{
+    BeaconChain, PqOperationalEvent, PqOperationalEventError, PqOperationalEventRole,
+    PqOperationalEventSink, PqStoreStartup, classify_pq_store_startup, migrate_pq_schema,
+};
 use consensus_signature::AggregationService;
 #[cfg(any(feature = "pq-proposer", feature = "pq-startup-testing"))]
 use consensus_signature::PqValidatorRegistryEntry;
@@ -1340,6 +1343,9 @@ pub(crate) struct PqRuntimeOwner {
     #[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
     validator_identities: Option<Vec<(consensus_signature::ValidatorPublicKeyBytes, u64)>>,
     network_shutdown: PqNetworkServiceShutdown,
+    operational_event_completion: tokio::sync::oneshot::Receiver<
+        Result<Result<(), PqOperationalEventError>, tokio::task::JoinError>,
+    >,
 }
 
 impl PqRuntimeOwner {
@@ -1352,6 +1358,43 @@ impl PqRuntimeOwner {
         let plan = config.validate(&spec)?;
         let executor = context.executor.clone();
         let blocking_executor = context.executor.clone();
+        #[cfg(feature = "pq-proposer")]
+        let operational_event_role = if plan.proposer.is_some() {
+            PqOperationalEventRole::Proposer
+        } else {
+            PqOperationalEventRole::Verifier
+        };
+        #[cfg(not(feature = "pq-proposer"))]
+        let operational_event_role = PqOperationalEventRole::Verifier;
+        let (operational_events, operational_event_writer) =
+            PqOperationalEventSink::channel(operational_event_role);
+        let mut operational_event_failure = executor.shutdown_sender();
+        let (operational_event_live_sender, operational_event_live_receiver) =
+            tokio::sync::oneshot::channel();
+        let operational_event_completion = executor
+            .spawn_blocking_handle_without_exit(
+                move || {
+                    let result = operational_event_writer
+                        .run_with_live_signal(operational_event_live_sender);
+                    if result.is_err() {
+                        let _ = operational_event_failure.try_send(
+                            task_executor::ShutdownReason::Failure(
+                                "PQ operational event writer failed",
+                            ),
+                        );
+                    }
+                    result
+                },
+                "pq-operational-event-writer",
+            )
+            .ok_or(PqRuntimeError::TaskUnavailable)?;
+        operational_event_live_receiver
+            .await
+            .map_err(|_| PqRuntimeError::TaskUnavailable)?;
+        let operational_events = Arc::new(operational_events);
+        operational_events
+            .try_emit(PqOperationalEvent::EventWriterReady)
+            .map_err(PqRuntimeError::OperationalEvent)?;
         let testnet_dir = plan
             .genesis_state_path
             .parent()
@@ -1695,6 +1738,7 @@ impl PqRuntimeOwner {
             local_keypair,
             Arc::clone(&chain),
             broadcast_receiver,
+            Arc::clone(&operational_events),
         )
         .await
         .map_err(PqRuntimeError::Network)?;
@@ -1812,6 +1856,7 @@ impl PqRuntimeOwner {
             #[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
             validator_identities,
             network_shutdown,
+            operational_event_completion,
         })
     }
 
@@ -1838,6 +1883,7 @@ impl PqRuntimeOwner {
             #[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
                 validator_identities: _,
             network_shutdown,
+            operational_event_completion,
         } = self;
         #[cfg(feature = "pq-proposer")]
         let proposer_result = match proposer_loop {
@@ -1854,12 +1900,18 @@ impl PqRuntimeOwner {
             .await
             .map_err(PqRuntimeError::Network);
         chain.close_and_drain_pq_imports().await;
+        let operational_event_result = operational_event_completion
+            .await
+            .map_err(|_| PqRuntimeError::TaskUnavailable)?
+            .map_err(|error| PqRuntimeError::TaskJoin(error.to_string()))?
+            .map_err(PqRuntimeError::OperationalEvent);
         #[cfg(feature = "pq-proposer")]
         drop(proposer_service);
         #[cfg(feature = "pq-proposer")]
         if let Err(error) = proposer_result {
             return Err(error);
         }
+        operational_event_result?;
         match (http_result, network_result) {
             (Err(http_error), _) => Err(http_error),
             (Ok(()), Err(network_error)) => Err(network_error),
@@ -1988,6 +2040,7 @@ pub enum PqRuntimeError {
     Execution(execution_layer::Error),
     Chain(beacon_chain::PqRuntimeError),
     ExecutionReconciliation(beacon_chain::PqImportError),
+    OperationalEvent(PqOperationalEventError),
     Network(PqNetworkServiceError),
     HttpConfiguration(network::PqBlockPublicationConfigurationError),
     HttpBind(std::io::Error),
@@ -2047,6 +2100,7 @@ impl std::fmt::Display for PqRuntimeError {
             }
             Self::Chain(error) => error.fmt(formatter),
             Self::ExecutionReconciliation(error) => error.fmt(formatter),
+            Self::OperationalEvent(error) => error.fmt(formatter),
             Self::Network(error) => error.fmt(formatter),
             Self::HttpConfiguration(error) => error.fmt(formatter),
             Self::HttpBind(error) => write!(formatter, "could not bind PQ HTTP API: {error}"),
@@ -2078,6 +2132,7 @@ impl std::error::Error for PqRuntimeError {
             Self::Aggregation(error) => Some(error),
             Self::Chain(error) => Some(error),
             Self::ExecutionReconciliation(error) => Some(error),
+            Self::OperationalEvent(error) => Some(error),
             Self::Network(error) => Some(error),
             Self::HttpConfiguration(error) => Some(error),
             Self::HttpBind(error) => Some(error),

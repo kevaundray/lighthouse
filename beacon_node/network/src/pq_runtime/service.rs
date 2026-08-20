@@ -4,7 +4,9 @@ use super::{
 };
 use beacon_chain::{
     BeaconChain, BeaconChainTypes, PqBlockImportOutcome, PqGossipCommitToken,
-    PqGossipPropagationToken, PqImportError, PqImportLocalError,
+    PqGossipPropagationToken, PqImportError, PqImportLocalError, PqOperationalEvent,
+    PqOperationalEventSink, PqPeerConnectionDirection, PqStatusMessageDirection,
+    PqStatusRejectionCode,
 };
 use fixed_bytes::FixedBytesExtended;
 use lighthouse_network::libp2p::gossipsub::{
@@ -19,9 +21,11 @@ use lighthouse_network::service::api_types::{AppRequestId, Response};
 use lighthouse_network::types::GossipKind;
 use lighthouse_network::{
     Context, MessageAcceptance, MessageId, NetworkEvent, NetworkGlobals, PeerAction, PeerId,
-    PqBeaconBlockPublishError, PqBeaconBlockPublishOutcome, PqEncodedBeaconBlock,
-    PqGossipValidationAdmission, PubsubMessage, ReportSource, identity::Keypair,
+    PqBeaconBlockPublishError, PqBeaconBlockPublishOutcome, PqCompatiblePeerAdmission,
+    PqEncodedBeaconBlock, PqGossipValidationAdmission, PubsubMessage, ReportSource,
+    identity::Keypair,
 };
+use sha2::{Digest, Sha256};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -472,8 +476,18 @@ fn try_send_completion<Completion>(sender: &mpsc::Sender<Completion>, completion
     let _ = sender.try_send(completion);
 }
 
+fn pq_peer_digest(peer_id: &PeerId) -> [u8; 16] {
+    let digest = Sha256::digest(peer_id.to_bytes());
+    let mut peer_digest = [0; 16];
+    peer_digest.copy_from_slice(&digest[..16]);
+    peer_digest
+}
+
 trait PqStatusLifecycle {
-    fn mark_compatible(&mut self) -> bool;
+    fn mark_compatible(&mut self) -> PqCompatiblePeerAdmission;
+    fn emit_peer_compatible(&mut self) -> bool;
+    fn emit_status_rejected(&mut self, code: PqStatusRejectionCode) -> bool;
+    fn operational_event_failed(&mut self);
     fn disconnect_irrelevant_network(&mut self);
     fn disconnect_too_many_peers(&mut self);
 }
@@ -483,13 +497,35 @@ fn handle_status_lifecycle(
     received: &StatusMessageV2,
     lifecycle: &mut impl PqStatusLifecycle,
 ) {
-    if received.fork_digest != expected.fork_digest
-        || received.finalized_epoch != expected.finalized_epoch
-        || received.finalized_root != expected.finalized_root
-    {
+    let rejection = if received.fork_digest != expected.fork_digest {
+        Some(PqStatusRejectionCode::ForkDigest)
+    } else if received.finalized_epoch != expected.finalized_epoch {
+        Some(PqStatusRejectionCode::FinalizedEpoch)
+    } else if received.finalized_root != expected.finalized_root {
+        Some(PqStatusRejectionCode::FinalizedRoot)
+    } else {
+        None
+    };
+    if let Some(code) = rejection {
+        if !lifecycle.emit_status_rejected(code) {
+            lifecycle.operational_event_failed();
+        }
         lifecycle.disconnect_irrelevant_network();
-    } else if !lifecycle.mark_compatible() {
-        lifecycle.disconnect_too_many_peers();
+    } else {
+        match lifecycle.mark_compatible() {
+            PqCompatiblePeerAdmission::Added => {
+                if !lifecycle.emit_peer_compatible() {
+                    lifecycle.operational_event_failed();
+                }
+            }
+            PqCompatiblePeerAdmission::Existing => {}
+            PqCompatiblePeerAdmission::Capacity => {
+                if !lifecycle.emit_status_rejected(PqStatusRejectionCode::Capacity) {
+                    lifecycle.operational_event_failed();
+                }
+                lifecycle.disconnect_too_many_peers();
+            }
+        }
     }
 }
 
@@ -497,11 +533,40 @@ struct PqNetworkStatusLifecycle<'a, E: EthSpec> {
     network: &'a mut Network<E>,
     peer_id: PeerId,
     gossip_admission: &'a PqGossipValidationAdmission,
+    operational_events: &'a PqOperationalEventSink,
+    task_executor: &'a TaskExecutor,
 }
 
 impl<E: EthSpec> PqStatusLifecycle for PqNetworkStatusLifecycle<'_, E> {
-    fn mark_compatible(&mut self) -> bool {
-        self.gossip_admission.try_add_compatible(self.peer_id)
+    fn mark_compatible(&mut self) -> PqCompatiblePeerAdmission {
+        self.gossip_admission.admit_compatible(self.peer_id)
+    }
+
+    fn emit_peer_compatible(&mut self) -> bool {
+        let peer_digest = pq_peer_digest(&self.peer_id);
+        self.operational_events
+            .try_emit(PqOperationalEvent::PeerCompatible { peer_digest })
+            .is_ok()
+    }
+
+    fn emit_status_rejected(&mut self, code: PqStatusRejectionCode) -> bool {
+        self.operational_events
+            .try_emit(PqOperationalEvent::StatusRejected {
+                peer_digest: pq_peer_digest(&self.peer_id),
+                code,
+            })
+            .is_ok()
+    }
+
+    fn operational_event_failed(&mut self) {
+        self.gossip_admission.remove_compatible(&self.peer_id);
+        warn!(peer_id = %self.peer_id, "PQ operational event sink unavailable");
+        let _ =
+            self.task_executor
+                .shutdown_sender()
+                .try_send(task_executor::ShutdownReason::Failure(
+                    "PQ operational event sink unavailable",
+                ));
     }
 
     fn disconnect_irrelevant_network(&mut self) {
@@ -544,6 +609,7 @@ pub struct PqNetworkService<T: BeaconChainTypes> {
     proof_admission: Arc<Semaphore>,
     encoding_admission: Arc<Semaphore>,
     gossip_admission: Arc<PqGossipValidationAdmission>,
+    operational_events: Arc<PqOperationalEventSink>,
     encoding_sender: mpsc::Sender<PqBlockEncodingCompletion<T::EthSpec>>,
     encoding_receiver: mpsc::Receiver<PqBlockEncodingCompletion<T::EthSpec>>,
     completion_sender: mpsc::Sender<PqBlockVerificationCompletion<T>>,
@@ -573,6 +639,7 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
         local_keypair: Keypair,
         chain: Arc<BeaconChain<T>>,
         broadcast_receiver: PqBlockBroadcastReceiver<T::EthSpec>,
+        operational_events: Arc<PqOperationalEventSink>,
     ) -> Result<Self, PqNetworkServiceError> {
         let fork_digest = context.enr_fork_id.fork_digest;
         let gossip_admission = Arc::new(PqGossipValidationAdmission::new());
@@ -603,6 +670,7 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
             proof_admission: Arc::new(Semaphore::new(PQ_NETWORK_BLOCK_PROOF_CAPACITY)),
             encoding_admission: Arc::new(Semaphore::new(PQ_NETWORK_BLOCK_ENCODING_CAPACITY)),
             gossip_admission,
+            operational_events,
             encoding_sender,
             encoding_receiver,
             completion_sender,
@@ -871,19 +939,23 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
                 );
             }
             NetworkEvent::StatusPeer(peer_id) => {
-                let _ = self.network.send_request(
-                    peer_id,
-                    AppRequestId::Router,
-                    RequestType::Status(self.status_message()),
-                );
+                self.send_status_request(peer_id);
             }
-            NetworkEvent::PeerConnectedOutgoing(peer_id)
-            | NetworkEvent::PeerConnectedIncoming(peer_id) => {
-                let _ = self.network.send_request(
-                    peer_id,
-                    AppRequestId::Router,
-                    RequestType::Status(self.status_message()),
-                );
+            NetworkEvent::PeerConnectedOutgoing(peer_id) => {
+                if self.emit_operational_event(PqOperationalEvent::PeerConnected {
+                    peer_digest: pq_peer_digest(&peer_id),
+                    direction: PqPeerConnectionDirection::Outgoing,
+                }) {
+                    self.send_status_request(peer_id);
+                }
+            }
+            NetworkEvent::PeerConnectedIncoming(peer_id) => {
+                if self.emit_operational_event(PqOperationalEvent::PeerConnected {
+                    peer_digest: pq_peer_digest(&peer_id),
+                    direction: PqPeerConnectionDirection::Incoming,
+                }) {
+                    self.send_status_request(peer_id);
+                }
             }
             NetworkEvent::RequestReceived {
                 peer_id,
@@ -896,6 +968,12 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
                     inbound_request_id,
                     Response::Status(local_status),
                 );
+                if !self.emit_operational_event(PqOperationalEvent::StatusSent {
+                    peer_digest: pq_peer_digest(&peer_id),
+                    direction: PqStatusMessageDirection::Response,
+                }) {
+                    return;
+                }
                 self.validate_status(peer_id, &status);
             }
             NetworkEvent::RequestReceived {
@@ -920,6 +998,37 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
                 self.gossip_admission.remove_compatible(&peer_id);
             }
         }
+    }
+
+    fn send_status_request(&mut self, peer_id: PeerId) {
+        if self
+            .network
+            .send_request(
+                peer_id,
+                AppRequestId::Router,
+                RequestType::Status(self.status_message()),
+            )
+            .is_ok()
+        {
+            let _ = self.emit_operational_event(PqOperationalEvent::StatusSent {
+                peer_digest: pq_peer_digest(&peer_id),
+                direction: PqStatusMessageDirection::Request,
+            });
+        }
+    }
+
+    fn emit_operational_event(&mut self, event: PqOperationalEvent) -> bool {
+        if self.operational_events.try_emit(event).is_ok() {
+            return true;
+        }
+        warn!("PQ operational event sink unavailable");
+        let _ =
+            self.task_executor
+                .shutdown_sender()
+                .try_send(task_executor::ShutdownReason::Failure(
+                    "PQ operational event sink unavailable",
+                ));
+        false
     }
 
     fn start_block_verification(
@@ -1022,6 +1131,8 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
             network: &mut self.network,
             peer_id,
             gossip_admission: &self.gossip_admission,
+            operational_events: &self.operational_events,
+            task_executor: &self.task_executor,
         };
         handle_status_lifecycle(&expected, &received, &mut lifecycle);
     }
@@ -1367,6 +1478,7 @@ pub async fn testing_only_pq_encoding_shutdown<E: EthSpec>(
 #[doc(hidden)]
 pub enum PqStatusTestScenario {
     Compatible,
+    CompatibleAlreadyKnown,
     CompatibleCapacityFull,
     ForkDigestMismatch,
     FinalizedEpochMismatch,
@@ -1378,6 +1490,8 @@ pub enum PqStatusTestScenario {
 #[doc(hidden)]
 pub enum PqStatusTestEvent {
     MarkedCompatible,
+    EmittedPeerCompatible,
+    EmittedStatusRejected(PqStatusRejectionCode),
     DisconnectedIrrelevantNetwork,
     DisconnectedTooManyPeers,
 }
@@ -1400,13 +1514,31 @@ pub fn testing_only_pq_status_lifecycle(scenario: PqStatusTestScenario) -> PqSta
     }
 
     impl PqStatusLifecycle for RecordingStatusLifecycle {
-        fn mark_compatible(&mut self) -> bool {
-            if self.compatible_capacity_available {
-                self.events.push(PqStatusTestEvent::MarkedCompatible);
-                true
-            } else {
-                false
+        fn mark_compatible(&mut self) -> PqCompatiblePeerAdmission {
+            if !self.compatible_capacity_available {
+                return PqCompatiblePeerAdmission::Capacity;
             }
+            if self.events.contains(&PqStatusTestEvent::MarkedCompatible) {
+                PqCompatiblePeerAdmission::Existing
+            } else {
+                self.events.push(PqStatusTestEvent::MarkedCompatible);
+                PqCompatiblePeerAdmission::Added
+            }
+        }
+
+        fn emit_peer_compatible(&mut self) -> bool {
+            self.events.push(PqStatusTestEvent::EmittedPeerCompatible);
+            true
+        }
+
+        fn emit_status_rejected(&mut self, code: PqStatusRejectionCode) -> bool {
+            self.events
+                .push(PqStatusTestEvent::EmittedStatusRejected(code));
+            true
+        }
+
+        fn operational_event_failed(&mut self) {
+            unreachable!("recording event sink is available")
         }
 
         fn disconnect_irrelevant_network(&mut self) {
@@ -1430,7 +1562,9 @@ pub fn testing_only_pq_status_lifecycle(scenario: PqStatusTestScenario) -> PqSta
     };
     let mut received = expected.clone();
     match scenario {
-        PqStatusTestScenario::Compatible | PqStatusTestScenario::CompatibleCapacityFull => {}
+        PqStatusTestScenario::Compatible
+        | PqStatusTestScenario::CompatibleAlreadyKnown
+        | PqStatusTestScenario::CompatibleCapacityFull => {}
         PqStatusTestScenario::ForkDigestMismatch => received.fork_digest = [9; 4],
         PqStatusTestScenario::FinalizedEpochMismatch => {
             received.finalized_epoch = types::Epoch::new(9);
@@ -1445,6 +1579,9 @@ pub fn testing_only_pq_status_lifecycle(scenario: PqStatusTestScenario) -> PqSta
         compatible_capacity_available: scenario != PqStatusTestScenario::CompatibleCapacityFull,
     };
     handle_status_lifecycle(&expected, &received, &mut lifecycle);
+    if scenario == PqStatusTestScenario::CompatibleAlreadyKnown {
+        handle_status_lifecycle(&expected, &received, &mut lifecycle);
+    }
     PqStatusTestTrace {
         events: lifecycle.events,
         block_verifications_started: lifecycle.block_verifications_started,

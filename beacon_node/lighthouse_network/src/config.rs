@@ -31,6 +31,14 @@ pub const DEFAULT_IDONTWANT_MESSAGE_SIZE_THRESHOLD: usize = 1000usize;
 pub const PQ_COMPATIBLE_PEER_CAPACITY: usize = 16;
 
 #[cfg(feature = "pq-devnet")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PqCompatiblePeerAdmission {
+    Added,
+    Existing,
+    Capacity,
+}
+
+#[cfg(feature = "pq-devnet")]
 const PQ_GOSSIP_ACTIVE_CAPACITY: usize = 2;
 
 #[cfg(feature = "pq-devnet")]
@@ -54,15 +62,23 @@ impl PqGossipValidationAdmission {
         Self::default()
     }
 
-    pub fn try_add_compatible(&self, peer: libp2p::PeerId) -> bool {
+    pub fn admit_compatible(&self, peer: libp2p::PeerId) -> PqCompatiblePeerAdmission {
         let mut state = self.state.lock();
         if state.compatible_peers.contains(&peer) {
-            return true;
+            return PqCompatiblePeerAdmission::Existing;
         }
         if state.compatible_peers.len() >= PQ_COMPATIBLE_PEER_CAPACITY {
-            return false;
+            return PqCompatiblePeerAdmission::Capacity;
         }
-        state.compatible_peers.insert(peer)
+        state.compatible_peers.insert(peer);
+        PqCompatiblePeerAdmission::Added
+    }
+
+    pub fn try_add_compatible(&self, peer: libp2p::PeerId) -> bool {
+        !matches!(
+            self.admit_compatible(peer),
+            PqCompatiblePeerAdmission::Capacity
+        )
     }
 
     pub fn remove_compatible(&self, peer: &libp2p::PeerId) {
