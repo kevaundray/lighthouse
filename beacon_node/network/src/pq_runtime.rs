@@ -8,6 +8,7 @@ use types::{SignedAggregateAndProof, SignedBeaconBlock, SingleAttestation, Subne
 
 mod broadcast;
 mod publication;
+mod service;
 
 pub use broadcast::{
     PQ_BLOCK_BROADCAST_QUEUE_CAPACITY, PqBlockBroadcastAcknowledgement, PqBlockBroadcastCommand,
@@ -21,6 +22,20 @@ pub use publication::{
     PqBlockPublicationConfigurationError, PqBlockPublicationDisposition,
     PqBlockPublicationLocalError, PqBlockPublicationService, PqBlockPublicationTerminal,
     PqPublicationBodyLimits, PqPublicationCapacity,
+};
+pub use service::{
+    PQ_NETWORK_BLOCK_COMMIT_CAPACITY, PQ_NETWORK_BLOCK_ENCODING_CAPACITY,
+    PQ_NETWORK_BLOCK_PROOF_CAPACITY, PqNetworkService, PqNetworkServiceError,
+};
+#[cfg(feature = "pq-startup-testing")]
+pub use service::{
+    PqCommitCompletionQueueTestTrace, PqCommitResolutionTestCase, PqCompletionQueueTestScenario,
+    PqCompletionQueueTestTrace, PqCompletionTestDisposition, PqCompletionTestEvent,
+    PqEncodingShutdownTestTrace, PqProofAdmissionTestTrace, PqStatusTestEvent,
+    PqStatusTestScenario, PqStatusTestTrace, testing_only_pq_commit_completion_queue,
+    testing_only_pq_commit_resolution, testing_only_pq_completion_lifecycle,
+    testing_only_pq_completion_queue, testing_only_pq_encoding_shutdown,
+    testing_only_pq_proof_admission, testing_only_pq_status_lifecycle,
 };
 
 /// Result of full contextual and PQ evidence verification for unaggregated gossip.

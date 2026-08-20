@@ -1,3 +1,5 @@
+#[cfg(feature = "pq-devnet")]
+use super::RpcProfile;
 use super::methods::*;
 use crate::rpc::codec::SSZSnappyInboundCodec;
 use consensus_signature::IndividualSignature;
@@ -416,6 +418,29 @@ impl SupportedProtocol {
         }
     }
 
+    #[cfg(feature = "pq-devnet")]
+    fn status_and_control_only(fork_context: &ForkContext) -> Vec<ProtocolId> {
+        let mut supported = vec![
+            ProtocolId::new(Self::StatusV2, Encoding::SSZSnappy),
+            ProtocolId::new(Self::StatusV1, Encoding::SSZSnappy),
+            ProtocolId::new(Self::GoodbyeV1, Encoding::SSZSnappy),
+            ProtocolId::new(Self::PingV1, Encoding::SSZSnappy),
+        ];
+        if fork_context.spec.is_peer_das_scheduled() {
+            supported.extend_from_slice(&[
+                ProtocolId::new(Self::MetaDataV3, Encoding::SSZSnappy),
+                ProtocolId::new(Self::MetaDataV2, Encoding::SSZSnappy),
+                ProtocolId::new(Self::MetaDataV1, Encoding::SSZSnappy),
+            ]);
+        } else {
+            supported.extend_from_slice(&[
+                ProtocolId::new(Self::MetaDataV2, Encoding::SSZSnappy),
+                ProtocolId::new(Self::MetaDataV1, Encoding::SSZSnappy),
+            ]);
+        }
+        supported
+    }
+
     fn currently_supported(fork_context: &ForkContext) -> Vec<ProtocolId> {
         let mut supported = vec![
             ProtocolId::new(Self::StatusV2, Encoding::SSZSnappy),
@@ -490,7 +515,27 @@ pub struct RPCProtocol<E: EthSpec> {
     pub fork_context: Arc<ForkContext>,
     pub max_rpc_size: usize,
     pub enable_light_client_server: bool,
+    #[cfg(feature = "pq-devnet")]
+    pub(crate) profile: RpcProfile,
     pub phantom: PhantomData<E>,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+pub(crate) fn testing_only_protocols(
+    fork_context: Arc<ForkContext>,
+    profile: RpcProfile,
+) -> Vec<String> {
+    RPCProtocol::<MinimalEthSpec> {
+        max_rpc_size: fork_context.spec.max_payload_size as usize,
+        fork_context,
+        enable_light_client_server: false,
+        profile,
+        phantom: PhantomData,
+    }
+    .protocol_info()
+    .into_iter()
+    .map(|protocol| protocol.as_ref().to_owned())
+    .collect()
 }
 
 impl<E: EthSpec> UpgradeInfo for RPCProtocol<E> {
@@ -499,6 +544,10 @@ impl<E: EthSpec> UpgradeInfo for RPCProtocol<E> {
 
     /// The list of supported RPC protocols for Lighthouse.
     fn protocol_info(&self) -> Self::InfoIter {
+        #[cfg(feature = "pq-devnet")]
+        if matches!(self.profile, RpcProfile::StatusAndControlOnly) {
+            return SupportedProtocol::status_and_control_only(&self.fork_context);
+        }
         let mut supported_protocols = SupportedProtocol::currently_supported(&self.fork_context);
         if self.enable_light_client_server {
             supported_protocols.push(ProtocolId::new(
@@ -1241,6 +1290,8 @@ mod tests {
                 fork_context: fork_context.clone(),
                 max_rpc_size: spec.max_payload_size as usize,
                 enable_light_client_server: true,
+                #[cfg(feature = "pq-devnet")]
+                profile: RpcProfile::Full,
                 phantom: PhantomData,
             };
             let protocol_info: HashSet<SupportedProtocol> = rpc_protocol

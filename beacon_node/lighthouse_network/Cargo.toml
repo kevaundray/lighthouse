@@ -12,6 +12,7 @@ pq-devnet = [
     "eth2/pq-devnet",
     "types/pq-devnet",
 ]
+pq-startup-testing = ["pq-devnet"]
 
 [dependencies]
 alloy-primitives = { workspace = true }

@@ -105,6 +105,8 @@ pub use crate::types::{
 pub use prometheus_client;
 
 pub use config::Config as NetworkConfig;
+#[cfg(feature = "pq-devnet")]
+pub use config::{PQ_COMPATIBLE_PEER_CAPACITY, PqGossipValidationAdmission};
 pub use discovery::Eth2Enr;
 pub use discv5;
 pub use libp2p;
@@ -121,3 +123,5 @@ pub use peer_manager::{
 pub use service::api_types::Response;
 pub use service::utils::*;
 pub use service::{Gossipsub, NetworkEvent};
+#[cfg(feature = "pq-devnet")]
+pub use service::{PqBeaconBlockPublishError, PqBeaconBlockPublishOutcome, PqEncodedBeaconBlock};

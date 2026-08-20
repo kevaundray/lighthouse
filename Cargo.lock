@@ -5423,7 +5423,6 @@ dependencies = [
 [[package]]
 name = "libp2p-gossipsub"
 version = "0.50.0"
-source = "git+https://github.com/sigp/rust-libp2p.git?rev=c774d4e71357d7cd2f792c4767d616d2dd369ee3#c774d4e71357d7cd2f792c4767d616d2dd369ee3"
 dependencies = [
  "async-channel 2.5.0",
  "asynchronous-codec",
@@ -7255,8 +7254,10 @@ dependencies = [
  "futures",
  "hex",
  "initialized_validators",
+ "lighthouse_network",
  "lighthouse_validator_store",
  "network",
+ "network_utils",
  "pq_http_api",
  "pq_proposer_service",
  "pq_signing",

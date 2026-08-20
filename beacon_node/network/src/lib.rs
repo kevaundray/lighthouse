@@ -28,14 +28,26 @@ pub use network_beacon_processor::NetworkBeaconProcessor;
 pub use pq_runtime::{
     PQ_BLOCK_BROADCAST_QUEUE_CAPACITY, PQ_BLOCK_PUBLICATION_ADMISSION_CAPACITY,
     PQ_BLOCK_PUBLICATION_BODY_CHUNK_CAPACITY, PQ_BLOCK_PUBLICATION_BODY_CHUNK_METADATA_BYTES,
-    PQ_BLOCK_PUBLICATION_RETAINED_BODY_FIXED_BYTES, PQ_PUBLICATION_FIXED_BODY_ALLOWANCE_BYTES,
-    PqBlockBroadcastAcknowledgement, PqBlockBroadcastCommand, PqBlockBroadcastError,
-    PqBlockBroadcastReceiver, PqBlockBroadcastSender, PqBlockPublicationAdmission,
-    PqBlockPublicationConfigurationError, PqBlockPublicationDisposition,
-    PqBlockPublicationLocalError, PqBlockPublicationService, PqBlockPublicationTerminal,
-    PqGossipAggregateDisposition, PqGossipAttestationDisposition, PqGossipBlockDisposition,
-    PqNetworkBlockProcessor, PqPublicationBodyLimits, PqPublicationCapacity,
-    pq_block_broadcast_channel,
+    PQ_BLOCK_PUBLICATION_RETAINED_BODY_FIXED_BYTES, PQ_NETWORK_BLOCK_COMMIT_CAPACITY,
+    PQ_NETWORK_BLOCK_ENCODING_CAPACITY, PQ_NETWORK_BLOCK_PROOF_CAPACITY,
+    PQ_PUBLICATION_FIXED_BODY_ALLOWANCE_BYTES, PqBlockBroadcastAcknowledgement,
+    PqBlockBroadcastCommand, PqBlockBroadcastError, PqBlockBroadcastReceiver,
+    PqBlockBroadcastSender, PqBlockPublicationAdmission, PqBlockPublicationConfigurationError,
+    PqBlockPublicationDisposition, PqBlockPublicationLocalError, PqBlockPublicationService,
+    PqBlockPublicationTerminal, PqGossipAggregateDisposition, PqGossipAttestationDisposition,
+    PqGossipBlockDisposition, PqNetworkBlockProcessor, PqNetworkService, PqNetworkServiceError,
+    PqPublicationBodyLimits, PqPublicationCapacity, pq_block_broadcast_channel,
+};
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub use pq_runtime::{
+    PqCommitCompletionQueueTestTrace, PqCommitResolutionTestCase, PqCompletionQueueTestScenario,
+    PqCompletionQueueTestTrace, PqCompletionTestDisposition, PqCompletionTestEvent,
+    PqEncodingShutdownTestTrace, PqProofAdmissionTestTrace, PqStatusTestEvent,
+    PqStatusTestScenario, PqStatusTestTrace, testing_only_pq_commit_completion_queue,
+    testing_only_pq_commit_resolution, testing_only_pq_completion_lifecycle,
+    testing_only_pq_completion_queue, testing_only_pq_encoding_shutdown,
+    testing_only_pq_proof_admission, testing_only_pq_status_lifecycle,
 };
 #[cfg(not(feature = "pq-devnet"))]
 pub use service::{

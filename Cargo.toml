@@ -93,6 +93,7 @@ members = [
     "validator_client/validator_services",
     "validator_manager",
 ]
+exclude = ["vendor/libp2p-gossipsub"]
 resolver = "2"
 
 [workspace.package]
@@ -291,3 +292,6 @@ debug = true
 libp2p = { git = "https://github.com/sigp/rust-libp2p.git", rev = "c774d4e71357d7cd2f792c4767d616d2dd369ee3" }
 libp2p-mplex = { git = "https://github.com/sigp/rust-libp2p.git", rev = "c774d4e71357d7cd2f792c4767d616d2dd369ee3" }
 libp2p-quic = { git = "https://github.com/sigp/rust-libp2p.git", rev = "c774d4e71357d7cd2f792c4767d616d2dd369ee3" }
+
+[patch."https://github.com/sigp/rust-libp2p.git"]
+libp2p-gossipsub = { path = "vendor/libp2p-gossipsub" }

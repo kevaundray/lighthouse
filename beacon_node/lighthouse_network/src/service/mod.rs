@@ -1,6 +1,8 @@
 use self::gossip_cache::GossipCache;
 use crate::Eth2Enr;
-use crate::config::{GossipsubConfigParams, NetworkLoad, gossipsub_config};
+#[cfg(feature = "pq-devnet")]
+use crate::config::PqGossipValidationAdmission;
+use crate::config::{GossipsubConfigParams, GossipsubProfile, NetworkLoad, gossipsub_config};
 use crate::discovery::{
     DiscoveredPeers, Discovery, FIND_NODE_QUERY_CLOSEST_PEERS, subnet_predicate,
 };
@@ -9,10 +11,12 @@ use crate::peer_manager::{
     peerdb::score::PeerAction, peerdb::score::ReportSource,
 };
 use crate::peer_manager::{MIN_OUTBOUND_ONLY_FACTOR, PEER_EXCESS_FACTOR, PRIORITY_PEER_EXCESS};
+#[cfg(feature = "pq-devnet")]
+use crate::rpc::RpcErrorResponse;
 use crate::rpc::methods::MetadataRequest;
 use crate::rpc::{
     GoodbyeReason, HandlerErr, InboundRequestId, Protocol, RPC, RPCError, RPCMessage, RPCReceived,
-    RequestType, ResponseTermination, RpcResponse, RpcSuccessResponse,
+    RequestType, ResponseTermination, RpcProfile, RpcResponse, RpcSuccessResponse,
 };
 use crate::service::partial_column_header_tracker::PartialColumnHeaderTracker;
 use crate::types::{
@@ -27,8 +31,12 @@ use api_types::{AppRequestId, Response};
 use futures::stream::StreamExt;
 use gossipsub_scoring_parameters::{PeerScoreSettings, lighthouse_gossip_thresholds};
 use libp2p::gossipsub::{
-    self, Event, IdentTopic as Topic, MessageAcceptance, MessageAuthenticity, MessageId,
-    PublishError, TopicScoreParams,
+    self, AdmittedMessageValidationOutcome, Event, IdentTopic as Topic, MessageAcceptance,
+    MessageAuthenticity, MessageId, PublishError, TopicScoreParams,
+};
+#[cfg(feature = "pq-devnet")]
+use libp2p::gossipsub::{
+    AdmittedMessageCommit, AdmittedMessageCommitOutcome, AdmittedMessageReport,
 };
 use libp2p::identity::Keypair;
 use libp2p::multiaddr::{self, Multiaddr, Protocol as MProtocol};
@@ -105,6 +113,9 @@ pub enum NetworkEvent<E: EthSpec> {
         topic: TopicHash,
         /// The message itself.
         message: PubsubMessage<E>,
+        /// Whether the PQ-only source-aware cache admission owns this message.
+        #[cfg(feature = "pq-devnet")]
+        pq_admitted: bool,
     },
     /// A partial data column sidecar received via gossipsub partial protocol.
     PartialDataColumnSidecar {
@@ -126,6 +137,61 @@ pub enum NetworkEvent<E: EthSpec> {
 pub type Gossipsub = gossipsub::Behaviour<SnappyTransform, SubscriptionFilter>;
 pub type SubscriptionFilter =
     gossipsub::MaxCountSubscriptionFilter<gossipsub::WhitelistSubscriptionFilter>;
+
+/// Positive result from publishing one exact PQ beacon block through gossipsub.
+#[cfg(feature = "pq-devnet")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PqBeaconBlockPublishOutcome {
+    Published,
+    Duplicate,
+}
+
+/// Negative result from publishing one exact PQ beacon block through gossipsub.
+#[cfg(feature = "pq-devnet")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PqBeaconBlockPublishError {
+    NoPeersSubscribed,
+    Rejected,
+}
+
+/// Exact topic and SSZ bytes prepared for a PQ beacon-block publication.
+///
+/// Construct this capability on a blocking executor before entering the mutable network poll
+/// loop. Gossipsub's bounded snappy transform still runs synchronously in the lower behaviour.
+#[cfg(feature = "pq-devnet")]
+pub struct PqEncodedBeaconBlock {
+    topic: Topic,
+    data: Vec<u8>,
+    fork_digest: [u8; 4],
+}
+
+#[cfg(feature = "pq-devnet")]
+impl PqEncodedBeaconBlock {
+    pub fn encode<E: EthSpec>(
+        block: Arc<types::SignedBeaconBlock<E>>,
+        fork_digest: [u8; 4],
+    ) -> Self {
+        let message = PubsubMessage::BeaconBlock(block);
+        let topic = GossipTopic::new(
+            GossipKind::BeaconBlock,
+            GossipEncoding::default(),
+            fork_digest,
+        );
+        Self {
+            topic: Topic::from(topic),
+            data: message.encode(GossipEncoding::default()),
+            fork_digest,
+        }
+    }
+
+    pub fn as_ssz_bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    pub fn fork_digest(&self) -> [u8; 4] {
+        self.fork_digest
+    }
+}
 
 #[derive(NetworkBehaviour)]
 pub(crate) struct Behaviour<E>
@@ -187,9 +253,48 @@ pub struct Network<E: EthSpec> {
 impl<E: EthSpec> Network<E> {
     pub async fn new(
         executor: task_executor::TaskExecutor,
+        ctx: ServiceContext<'_>,
+        custody_group_count: u64,
+        local_keypair: Keypair,
+    ) -> Result<(Self, Arc<NetworkGlobals<E>>), String> {
+        Self::new_with_rpc_profile(
+            executor,
+            ctx,
+            custody_group_count,
+            local_keypair,
+            RpcProfile::Full,
+            #[cfg(feature = "pq-devnet")]
+            None,
+        )
+        .await
+    }
+
+    #[cfg(feature = "pq-devnet")]
+    pub async fn new_pq(
+        executor: task_executor::TaskExecutor,
+        ctx: ServiceContext<'_>,
+        custody_group_count: u64,
+        local_keypair: Keypair,
+        admission: Arc<PqGossipValidationAdmission>,
+    ) -> Result<(Self, Arc<NetworkGlobals<E>>), String> {
+        Self::new_with_rpc_profile(
+            executor,
+            ctx,
+            custody_group_count,
+            local_keypair,
+            RpcProfile::StatusAndControlOnly,
+            Some(admission),
+        )
+        .await
+    }
+
+    async fn new_with_rpc_profile(
+        executor: task_executor::TaskExecutor,
         mut ctx: ServiceContext<'_>,
         custody_group_count: u64,
         local_keypair: Keypair,
+        rpc_profile: RpcProfile,
+        #[cfg(feature = "pq-devnet")] pq_admission: Option<Arc<PqGossipValidationAdmission>>,
     ) -> Result<(Self, Arc<NetworkGlobals<E>>), String> {
         let config = ctx.config.clone();
         trace!("Libp2p Service starting");
@@ -249,7 +354,16 @@ impl<E: EthSpec> Network<E> {
             ctx.chain_spec.get_slot_duration(),
             E::slots_per_epoch(),
             config.idontwant_message_size_threshold,
-        );
+            match rpc_profile {
+                RpcProfile::Full => GossipsubProfile::Full,
+                #[cfg(feature = "pq-devnet")]
+                RpcProfile::StatusAndControlOnly => {
+                    GossipsubProfile::Pq(pq_admission.ok_or_else(|| {
+                        "PQ gossipsub admission controller is required".to_owned()
+                    })?)
+                }
+            },
+        )?;
 
         let score_settings = PeerScoreSettings::new(&ctx.chain_spec, gs_config.mesh_n());
 
@@ -392,6 +506,7 @@ impl<E: EthSpec> Network<E> {
             config.inbound_rate_limiter_config.clone(),
             config.outbound_rate_limiter_config.clone(),
             seq_number,
+            rpc_profile,
         );
 
         let discovery = {
@@ -922,6 +1037,35 @@ impl<E: EthSpec> Network<E> {
         }
     }
 
+    /// Publishes one exact PQ beacon block and reports whether gossipsub accepted it.
+    ///
+    /// Unlike the ordinary multi-message facade, this method never inserts a failed publication
+    /// into the retry cache. Its result is used as an ordering capability before Engine/DB work.
+    #[cfg(feature = "pq-devnet")]
+    pub fn publish_pq_beacon_block(
+        &mut self,
+        block: Arc<types::SignedBeaconBlock<E>>,
+    ) -> Result<PqBeaconBlockPublishOutcome, PqBeaconBlockPublishError> {
+        let encoded = PqEncodedBeaconBlock::encode(block, self.enr_fork_id.fork_digest);
+        self.publish_pq_encoded_beacon_block(encoded)
+    }
+
+    /// Publish exact PQ beacon-block bytes prepared outside the mutable network poll loop.
+    #[cfg(feature = "pq-devnet")]
+    pub fn publish_pq_encoded_beacon_block(
+        &mut self,
+        encoded: PqEncodedBeaconBlock,
+    ) -> Result<PqBeaconBlockPublishOutcome, PqBeaconBlockPublishError> {
+        match self.gossipsub_mut().publish(encoded.topic, encoded.data) {
+            Ok(_) => Ok(PqBeaconBlockPublishOutcome::Published),
+            Err(PublishError::Duplicate) => Ok(PqBeaconBlockPublishOutcome::Duplicate),
+            Err(PublishError::NoPeersSubscribedToTopic) => {
+                Err(PqBeaconBlockPublishError::NoPeersSubscribed)
+            }
+            Err(_) => Err(PqBeaconBlockPublishError::Rejected),
+        }
+    }
+
     /// Publishes partial data column sidecars to the gossipsub network.
     pub fn publish_partial(&mut self, messages: Vec<PubsubPartialMessage<E>>) {
         if !self.network_globals.config.enable_partial_columns {
@@ -997,7 +1141,7 @@ impl<E: EthSpec> Network<E> {
         propagation_source: &PeerId,
         message_id: MessageId,
         validation_result: MessageAcceptance,
-    ) {
+    ) -> bool {
         if let Some(result) = match validation_result {
             MessageAcceptance::Accept => None,
             MessageAcceptance::Ignore => Some("ignore"),
@@ -1019,7 +1163,27 @@ impl<E: EthSpec> Network<E> {
             &message_id,
             propagation_source,
             validation_result,
-        );
+        )
+    }
+
+    #[cfg(feature = "pq-devnet")]
+    pub fn report_pq_admitted_message_outcome(
+        &mut self,
+        message_id: MessageId,
+        outcome: AdmittedMessageValidationOutcome,
+    ) -> AdmittedMessageReport {
+        self.gossipsub_mut()
+            .report_admitted_message_outcome(&message_id, outcome)
+    }
+
+    #[cfg(feature = "pq-devnet")]
+    pub fn resolve_pq_admitted_message_commit(
+        &mut self,
+        commit: AdmittedMessageCommit,
+        outcome: AdmittedMessageCommitOutcome,
+    ) -> bool {
+        self.gossipsub_mut()
+            .resolve_admitted_message_commit(commit, outcome)
     }
 
     /// Informs the gossipsub about the failure of a partial message validation.
@@ -1123,6 +1287,23 @@ impl<E: EthSpec> Network<E> {
                 "Request not found in RPC active requests"
             );
         }
+    }
+
+    /// Reject an RPC outside the deliberately small PQ runtime surface.
+    #[cfg(feature = "pq-devnet")]
+    pub fn send_pq_unsupported_response(
+        &mut self,
+        peer_id: PeerId,
+        inbound_request_id: InboundRequestId,
+    ) {
+        self.send_response(
+            peer_id,
+            inbound_request_id,
+            RpcResponse::Error(
+                RpcErrorResponse::ResourceUnavailable,
+                "unsupported by the minimal PQ runtime".into(),
+            ),
+        );
     }
 
     /* Peer management functions */
@@ -1413,9 +1594,45 @@ impl<E: EthSpec> Network<E> {
                             source: propagation_source,
                             topic: gs_msg.topic,
                             message: msg,
+                            #[cfg(feature = "pq-devnet")]
+                            pq_admitted: false,
                         });
                     }
                 }
+            }
+            #[cfg(feature = "pq-devnet")]
+            Event::AdmittedMessage {
+                propagation_source,
+                admission_id: id,
+                message: gs_msg,
+            } => match PubsubMessage::decode(&gs_msg.topic, &gs_msg.data, &self.fork_context) {
+                Err(error) => {
+                    debug!(topic = ?gs_msg.topic, ?error, "Could not decode admitted PQ gossipsub message");
+                    self.gossipsub_mut().report_admitted_message_outcome(
+                        &id,
+                        AdmittedMessageValidationOutcome::Reject,
+                    );
+                }
+                Ok(message) => {
+                    return Some(NetworkEvent::PubsubMessage {
+                        id,
+                        source: propagation_source,
+                        topic: gs_msg.topic,
+                        message,
+                        pq_admitted: true,
+                    });
+                }
+            },
+            #[cfg(not(feature = "pq-devnet"))]
+            Event::AdmittedMessage {
+                admission_id: id, ..
+            } => {
+                // The ordinary profile never configures source-aware admission. Keep this arm
+                // fail-closed if a future caller constructs an inconsistent lower behaviour.
+                self.gossipsub_mut().report_admitted_message_outcome(
+                    &id,
+                    AdmittedMessageValidationOutcome::RetryableIgnore,
+                );
             }
             Event::Partial {
                 topic_hash,

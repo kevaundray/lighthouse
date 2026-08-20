@@ -16,15 +16,19 @@ use eth2::{BeaconNodeHttpClient, SensitiveUrl, StrictBeaconNodeHttpClient, Timeo
 #[cfg(target_feature = "avx2")]
 use initialized_validators::InitializedValidators;
 #[cfg(target_feature = "avx2")]
-use lighthouse_validator_store::{Config as ValidatorStoreConfig, LighthouseValidatorStore};
+use lighthouse_network::{Context, NetworkConfig, NetworkGlobals, identity::secp256k1};
 #[cfg(target_feature = "avx2")]
-use network::PqNetworkBlockProcessor;
+use lighthouse_validator_store::{Config as ValidatorStoreConfig, LighthouseValidatorStore};
 #[cfg(target_feature = "avx2")]
 use network::{
     PQ_BLOCK_PUBLICATION_ADMISSION_CAPACITY, PqBlockPublicationDisposition,
     PqBlockPublicationService, PqPublicationBodyLimits, PqPublicationCapacity,
     pq_block_broadcast_channel,
 };
+#[cfg(target_feature = "avx2")]
+use network::{PqNetworkBlockProcessor, PqNetworkService};
+#[cfg(target_feature = "avx2")]
+use network_utils::enr_ext::EnrExt;
 #[cfg(target_feature = "avx2")]
 use pq_http_api::{PqHttpApi, TestingPqHttpBlockingHook};
 #[cfg(target_feature = "avx2")]
@@ -56,9 +60,9 @@ use store::{HotColdDB, MemoryStore, StoreConfig};
 use types::{
     Address, BeaconBlock, BeaconState, Blob, ConsolidationRequest, DepositRequest, Domain, Epoch,
     EthSpec, ExecPayload, ExecutionBlockHash, ExecutionPayload, ExecutionPayloadRef,
-    ExecutionRequests, ForkName, FullPayload, Graffiti, Hash256, KzgCommitment, KzgProof,
-    MinimalEthSpec, ProposerPreparationData, SignedBeaconBlock, SignedRoot, Slot, Uint256,
-    Withdrawal, WithdrawalRequest,
+    ExecutionRequests, ForkContext, ForkName, FullPayload, Graffiti, Hash256, KzgCommitment,
+    KzgProof, MinimalEthSpec, ProposerPreparationData, SignedBeaconBlock, SignedRoot, Slot,
+    Uint256, Withdrawal, WithdrawalRequest,
 };
 
 #[cfg(target_feature = "avx2")]
@@ -768,11 +772,30 @@ fn valid_production_fixture_with_hooks(
     persistence_hook: Option<Arc<TestingPqBlockingHook>>,
     duties_hook: Option<Arc<TestingPqBlockingHook>>,
 ) -> ValidProductionFixture {
+    valid_production_fixture_with_hooks_and_spec(
+        stall_payload,
+        omit_payload_bundle,
+        blocking_hook,
+        persistence_hook,
+        duties_hook,
+        electra_spec(),
+    )
+}
+
+#[cfg(target_feature = "avx2")]
+fn valid_production_fixture_with_hooks_and_spec(
+    stall_payload: bool,
+    omit_payload_bundle: bool,
+    blocking_hook: Option<Arc<TestingPqBlockingHook>>,
+    persistence_hook: Option<Arc<TestingPqBlockingHook>>,
+    duties_hook: Option<Arc<TestingPqBlockingHook>>,
+    spec: types::ChainSpec,
+) -> ValidProductionFixture {
     const PASSWORD: &[u8] = b"correct horse battery staple";
 
     let runtime = task_executor::test_utils::TestRuntime::default();
     let temporary_directory = tempfile::TempDir::new().expect("temporary directory");
-    let spec = Arc::new(electra_spec());
+    let spec = Arc::new(spec);
     let mut genesis = state_processing::initialize_beacon_state_from_validators::<MinimalEthSpec>(
         Hash256::ZERO,
         0,
@@ -899,6 +922,219 @@ fn sign_produced_block(
     assert!(proofs.is_empty());
     assert!(blobs.is_empty());
     sign_block(fixture, block)
+}
+
+#[cfg(target_feature = "avx2")]
+async fn start_pq_network_worker(
+    fixture: &ValidProductionFixture,
+    disable_discovery: bool,
+) -> (
+    network::PqBlockBroadcastSender<MinimalEthSpec>,
+    Arc<NetworkGlobals<MinimalEthSpec>>,
+    tokio::sync::mpsc::Sender<lighthouse_network::Multiaddr>,
+    Arc<lighthouse_network::PqGossipValidationAdmission>,
+) {
+    let head = fixture.chain.head_snapshot();
+    let genesis_validators_root = head.beacon_state.genesis_validators_root();
+    let mut network_config = NetworkConfig::default();
+    network_config.set_ipv4_listening_address(std::net::Ipv4Addr::LOCALHOST, 0, 0, 0);
+    network_config.enr_address = (Some(std::net::Ipv4Addr::LOCALHOST), None);
+    network_config.disable_discovery = disable_discovery;
+    network_config.network_dir = tempfile::TempDir::new().expect("network directory").keep();
+    let context = Context {
+        config: Arc::new(network_config),
+        enr_fork_id: fixture
+            .spec
+            .enr_fork_id::<MinimalEthSpec>(head.beacon_block.slot(), genesis_validators_root),
+        fork_context: Arc::new(ForkContext::new::<MinimalEthSpec>(
+            head.beacon_block.slot(),
+            genesis_validators_root,
+            &fixture.spec,
+        )),
+        chain_spec: Arc::clone(&fixture.spec),
+        libp2p_registry: None,
+    };
+    let (broadcast_sender, broadcast_receiver) = pq_block_broadcast_channel();
+    let service = PqNetworkService::new(
+        fixture._runtime.task_executor.clone(),
+        context,
+        fixture.spec.custody_requirement,
+        secp256k1::Keypair::generate().into(),
+        Arc::clone(&fixture.chain),
+        broadcast_receiver,
+    )
+    .await
+    .expect("PQ network service");
+    let globals = service.network_globals();
+    let dial_sender = service.testing_only_dial_sender();
+    let admission = service.testing_only_gossip_admission();
+    service.start().expect("start PQ network service");
+    (broadcast_sender, globals, dial_sender, admission)
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn real_delayed_network_proof_survives_old_history_and_commits_engine_db_head() {
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    let test_started = std::time::Instant::now();
+    let spec = ForkName::Electra
+        .make_genesis_spec(MinimalEthSpec::default_spec())
+        .set_slot_duration_ms::<MinimalEthSpec>(300_000);
+    let import_hook = TestingPqBlockingHook::counting();
+    let fixture = valid_production_fixture_with_hooks_and_spec(
+        false,
+        false,
+        Some(Arc::clone(&import_hook)),
+        None,
+        None,
+        spec,
+    );
+    let produced = fixture
+        .chain
+        .produce_pq_block_v3(Slot::new(1), fixture.randao.clone(), Graffiti::default())
+        .await
+        .expect("valid full block production");
+    eprintln!("PQ delayed proof: produced at {:?}", test_started.elapsed());
+    let signed = sign_produced_block(&fixture, produced);
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        0
+    );
+
+    let (receiver_sender, receiver_globals, _receiver_dial, receiver_admission) =
+        start_pq_network_worker(&fixture, false).await;
+    let receiver_address = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let enr = receiver_globals.local_enr();
+            if let Some(address) = enr.multiaddr_p2p_tcp().into_iter().next() {
+                break address;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("receiver listening ENR");
+    let (sender, sender_globals, sender_dial, sender_admission) =
+        start_pq_network_worker(&fixture, true).await;
+    sender_dial
+        .try_send(receiver_address)
+        .expect("bounded testing dial command");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while sender_globals.connected_peers() == 0
+            || receiver_globals.connected_peers() == 0
+            || !sender_admission.has_compatible_peers()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("compatible PQ Status handshake");
+    eprintln!(
+        "PQ delayed proof: compatible handshake at {:?}",
+        test_started.elapsed()
+    );
+
+    let hook_entries_before_publish = import_hook.entered();
+    import_hook.block();
+
+    let acknowledgement = sender
+        .try_send(Arc::clone(&signed))
+        .expect("bounded exact publication");
+    let publish_result =
+        tokio::time::timeout(Duration::from_secs(30), acknowledgement.wait()).await;
+    let admission_result = tokio::time::timeout(Duration::from_secs(30), async {
+        while receiver_admission.testing_only_active_total() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let hook_entry_result = tokio::time::timeout(Duration::from_secs(5), async {
+        while import_hook.entered() == hook_entries_before_publish {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    if publish_result.is_err() || admission_result.is_err() || hook_entry_result.is_err() {
+        import_hook.release();
+    }
+    publish_result
+        .expect("initial network acknowledgement")
+        .expect("initial exact block publish");
+    admission_result.expect("receiver admits exact block before progress assertion");
+    hook_entry_result.expect("receiver import enters the blocking phase after publication");
+    eprintln!(
+        "PQ delayed proof: receiver import blocked at {:?}",
+        test_started.elapsed()
+    );
+    let proof_started = std::time::Instant::now();
+
+    let pending = receiver_sender
+        .try_send(Arc::clone(&signed))
+        .expect("receiver network loop accepts a command during proof");
+    let pending_result = tokio::time::timeout(Duration::from_secs(5), pending.wait()).await;
+    if pending_result.is_err() {
+        import_hook.release();
+    }
+    assert_eq!(
+        pending_result.expect("receiver network loop remains live while proof runs"),
+        Err(network::PqBlockBroadcastError::Rejected),
+        "local publication of an exact pending validation must remain negative",
+    );
+    tokio::time::sleep(Duration::from_secs(13)).await;
+    let retained_admissions = receiver_admission.testing_only_active_total();
+    let new_payload_calls_before_release =
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst);
+    let head_before_release = fixture.chain.head_snapshot().beacon_block_root;
+    import_hook.release();
+    eprintln!(
+        "PQ delayed proof: released receiver import at {:?}",
+        test_started.elapsed()
+    );
+    assert_eq!(
+        retained_admissions, 1,
+        "one-slot admission must retain the exact raw block beyond twelve heartbeats",
+    );
+    assert_eq!(new_payload_calls_before_release, 0);
+    assert_eq!(head_before_release, fixture.genesis_root);
+
+    tokio::time::timeout(Duration::from_secs(300), async {
+        while fixture.chain.head_snapshot().beacon_block_root != signed.canonical_root() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("full network proof and import before one-slot admission expiry");
+    eprintln!("PQ delayed proof: imported at {:?}", test_started.elapsed());
+    assert!(
+        proof_started.elapsed() > Duration::from_secs(12),
+        "real proof must exceed the ordinary twelve-heartbeat history",
+    );
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        fixture
+            .store
+            .get_full_block(&signed.canonical_root())
+            .expect("persisted block lookup")
+            .expect("persisted exact block"),
+        *signed,
+    );
+    let restarted = BeaconChainBuilder::<TestWitness>::pq_new(MinimalEthSpec)
+        .store(Arc::clone(&fixture.store))
+        .custom_spec(Arc::clone(&fixture.spec))
+        .resume_from_db()
+        .expect("resume network-imported head")
+        .pq_aggregation_service(Arc::clone(&fixture.aggregation_service))
+        .task_executor(fixture._runtime.task_executor.clone())
+        .testing_only_pq_execution_notifier(fixture.execution.clone())
+        .build()
+        .expect("restart network-imported head");
+    assert_eq!(
+        restarted.head_snapshot().beacon_block_root,
+        signed.canonical_root(),
+    );
 }
 
 #[cfg(target_feature = "avx2")]

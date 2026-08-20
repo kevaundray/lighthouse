@@ -8,8 +8,12 @@ use directory::{
 use if_addrs::get_if_addrs;
 use libp2p::{Multiaddr, gossipsub};
 use network_utils::listen_addr::{ListenAddr, ListenAddress};
+#[cfg(feature = "pq-devnet")]
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(feature = "pq-devnet")]
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU16;
 use std::path::PathBuf;
@@ -23,9 +27,130 @@ pub const DEFAULT_DISC_PORT: u16 = 9000u16;
 pub const DEFAULT_QUIC_PORT: u16 = 9001u16;
 pub const DEFAULT_IDONTWANT_MESSAGE_SIZE_THRESHOLD: usize = 1000usize;
 
+#[cfg(feature = "pq-devnet")]
+pub const PQ_COMPATIBLE_PEER_CAPACITY: usize = 16;
+
+#[cfg(feature = "pq-devnet")]
+const PQ_GOSSIP_ACTIVE_CAPACITY: usize = 2;
+
+#[cfg(feature = "pq-devnet")]
+#[derive(Default)]
+struct PqGossipValidationAdmissionState {
+    compatible_peers: HashSet<libp2p::PeerId>,
+    active_by_peer: HashMap<libp2p::PeerId, usize>,
+    active_total: usize,
+}
+
+/// Shared PQ-only source gate used by Status handling and gossipsub pre-cache admission.
+#[cfg(feature = "pq-devnet")]
+#[derive(Default)]
+pub struct PqGossipValidationAdmission {
+    state: Mutex<PqGossipValidationAdmissionState>,
+}
+
+#[cfg(feature = "pq-devnet")]
+impl PqGossipValidationAdmission {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn try_add_compatible(&self, peer: libp2p::PeerId) -> bool {
+        let mut state = self.state.lock();
+        if state.compatible_peers.contains(&peer) {
+            return true;
+        }
+        if state.compatible_peers.len() >= PQ_COMPATIBLE_PEER_CAPACITY {
+            return false;
+        }
+        state.compatible_peers.insert(peer)
+    }
+
+    pub fn remove_compatible(&self, peer: &libp2p::PeerId) {
+        self.state.lock().compatible_peers.remove(peer);
+    }
+
+    pub fn has_compatible_peers(&self) -> bool {
+        !self.state.lock().compatible_peers.is_empty()
+    }
+
+    fn is_compatible(&self, peer: &libp2p::PeerId) -> bool {
+        self.state.lock().compatible_peers.contains(peer)
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_active_total(&self) -> usize {
+        self.state.lock().active_total
+    }
+
+    pub(crate) fn try_admit(
+        self: &Arc<Self>,
+        peer: &libp2p::PeerId,
+    ) -> Option<PqGossipValidationGuard> {
+        let mut state = self.state.lock();
+        if !state.compatible_peers.contains(peer)
+            || state.active_total >= PQ_GOSSIP_ACTIVE_CAPACITY
+            || state.active_by_peer.contains_key(peer)
+        {
+            return None;
+        }
+        state.active_total += 1;
+        state.active_by_peer.insert(*peer, 1);
+        Some(PqGossipValidationGuard {
+            controller: Arc::clone(self),
+            peer: *peer,
+        })
+    }
+}
+
+#[cfg(feature = "pq-devnet")]
+pub(crate) struct PqGossipValidationGuard {
+    controller: Arc<PqGossipValidationAdmission>,
+    peer: libp2p::PeerId,
+}
+
+#[cfg(feature = "pq-devnet")]
+impl Drop for PqGossipValidationGuard {
+    fn drop(&mut self) {
+        let mut state = self.controller.state.lock();
+        state.active_by_peer.remove(&self.peer);
+        state.active_total = state.active_total.saturating_sub(1);
+    }
+}
+
 pub struct GossipsubConfigParams {
     pub message_domain_valid_snappy: [u8; 4],
     pub gossipsub_max_transmit_size: usize,
+}
+
+#[derive(Clone)]
+pub(crate) enum GossipsubProfile {
+    Full,
+    #[cfg(feature = "pq-devnet")]
+    Pq(Arc<PqGossipValidationAdmission>),
+}
+
+#[cfg(feature = "pq-devnet")]
+const PQ_SLOT_DURATION: Duration = Duration::from_secs(300);
+
+#[cfg(feature = "pq-devnet")]
+fn pq_validation_retained_windows(
+    duplicate_cache_time: Duration,
+    window: Duration,
+) -> Result<usize, &'static str> {
+    let window_nanos = window.as_nanos();
+    if window_nanos == 0 {
+        return Err("PQ validation-admission window must be non-zero");
+    }
+    let rounded_up = duplicate_cache_time
+        .as_nanos()
+        .checked_add(window_nanos - 1)
+        .ok_or("PQ validation-admission retention overflow")?
+        / window_nanos;
+    let retained = rounded_up
+        .checked_add(1)
+        .ok_or("PQ validation-admission retention overflow")?;
+    usize::try_from(retained).map_err(|_| "PQ validation-admission retention exceeds usize")
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -447,6 +572,27 @@ impl From<u8> for NetworkLoad {
 }
 
 /// Return a Lighthouse specific `GossipsubConfig` where the `message_id_fn` depends on the current fork.
+#[cfg(feature = "pq-devnet")]
+fn pq_validation_history_length(
+    slot_duration: Duration,
+    heartbeat_interval: Duration,
+) -> Result<usize, &'static str> {
+    let slot_nanos = slot_duration.as_nanos();
+    let heartbeat_nanos = heartbeat_interval.as_nanos();
+    if heartbeat_nanos == 0 {
+        return Err("PQ gossipsub heartbeat interval must be non-zero");
+    }
+
+    let rounded_up = slot_nanos
+        .checked_add(heartbeat_nanos - 1)
+        .ok_or("PQ gossipsub validation history overflow")?
+        / heartbeat_nanos;
+    let history_length = rounded_up
+        .checked_add(2)
+        .ok_or("PQ gossipsub validation history overflow")?;
+    usize::try_from(history_length).map_err(|_| "PQ gossipsub validation history exceeds usize")
+}
+
 pub fn gossipsub_config(
     network_load: u8,
     fork_context: Arc<ForkContext>,
@@ -454,7 +600,13 @@ pub fn gossipsub_config(
     slot_duration: Duration,
     slots_per_epoch: u64,
     idontwant_message_size_threshold: usize,
-) -> gossipsub::Config {
+    profile: GossipsubProfile,
+) -> Result<gossipsub::Config, String> {
+    #[cfg(feature = "pq-devnet")]
+    if matches!(&profile, GossipsubProfile::Pq(_)) && slot_duration != PQ_SLOT_DURATION {
+        return Err("PQ gossipsub requires an exact 300-second slot".to_owned());
+    }
+
     fn prefix(
         prefix: [u8; 4],
         message: &gossipsub::Message,
@@ -489,15 +641,30 @@ pub fn gossipsub_config(
     };
 
     let load = NetworkLoad::from(network_load);
+    let history_length = match &profile {
+        GossipsubProfile::Full => 12,
+        #[cfg(feature = "pq-devnet")]
+        GossipsubProfile::Pq(_) => {
+            pq_validation_history_length(slot_duration, load.heartbeat_interval)
+                .map_err(str::to_owned)?
+        }
+    };
 
     // Since EIP 7045 (activated at the deneb fork), we allow attestations that are
     // 2 epochs old to be circulated around the p2p network.
     // To accommodate the increase, we should increase the duplicate cache time to filter older seen messages.
     // 2 epochs is quite sane for pre-deneb network parameters as well.
     // Hence we keep the same parameters for pre-deneb networks as well to avoid switching at the fork.
-    let duplicate_cache_time = Duration::from_secs(slots_per_epoch * slot_duration.as_secs() * 2);
+    let duplicate_slots = slots_per_epoch
+        .checked_mul(2)
+        .and_then(|slots| u32::try_from(slots).ok())
+        .ok_or_else(|| "gossipsub duplicate-cache slot count overflow".to_owned())?;
+    let duplicate_cache_time = slot_duration
+        .checked_mul(duplicate_slots)
+        .ok_or_else(|| "gossipsub duplicate-cache duration overflow".to_owned())?;
 
-    gossipsub::ConfigBuilder::default()
+    let mut builder = gossipsub::ConfigBuilder::default();
+    builder
         .max_transmit_size(gossipsub_config_params.gossipsub_max_transmit_size)
         .heartbeat_interval(load.heartbeat_interval)
         .mesh_n(load.mesh_n)
@@ -506,7 +673,7 @@ pub fn gossipsub_config(
         .mesh_n_high(load.mesh_n_high)
         .gossip_lazy(load.gossip_lazy)
         .fanout_ttl(Duration::from_secs(60))
-        .history_length(12)
+        .history_length(history_length)
         .flood_publish(false)
         .max_publish_messages(500) // Responses to IWANT can be quite large
         .max_control_messages_sent(500)
@@ -517,9 +684,181 @@ pub fn gossipsub_config(
         .duplicate_cache_time(duplicate_cache_time)
         .message_id_fn(gossip_message_id)
         .allow_self_origin(true)
-        .idontwant_message_size_threshold(idontwant_message_size_threshold)
-        .build()
-        .expect("valid gossipsub configuration")
+        .idontwant_message_size_threshold(idontwant_message_size_threshold);
+
+    #[cfg(feature = "pq-devnet")]
+    if let GossipsubProfile::Pq(admission) = profile {
+        let retained_windows = pq_validation_retained_windows(duplicate_cache_time, slot_duration)
+            .map_err(str::to_owned)?;
+        if retained_windows != 17 {
+            return Err(format!(
+                "PQ gossipsub requires exactly 17 retained validation windows, got {retained_windows}"
+            ));
+        }
+        let publish_admission = Arc::clone(&admission);
+        builder
+            .publish_peer_filter(move |peer, _| publish_admission.is_compatible(peer))
+            .validation_admission(
+                gossipsub::ValidationAdmissionConfig {
+                    pending_capacity: 2,
+                    per_peer_pending_capacity: 1,
+                    remote_unique_capacity_per_window: PQ_COMPATIBLE_PEER_CAPACITY,
+                    local_unique_capacity_per_window: 1,
+                    pending_timeout: slot_duration,
+                    window: slot_duration,
+                    retained_windows,
+                },
+                move |source, _, _, _| match admission.try_admit(source) {
+                    Some(guard) => gossipsub::ValidationAdmission::Admit(
+                        gossipsub::ValidationAdmissionGuard::new(guard),
+                    ),
+                    None => gossipsub::ValidationAdmission::IgnoreWithoutCaching,
+                },
+            );
+    }
+
+    builder.build().map_err(|error| error.to_string())
+}
+
+#[cfg(all(test, feature = "pq-devnet"))]
+mod pq_tests {
+    use super::*;
+    use types::{EthSpec, ForkName, Hash256, MinimalEthSpec};
+
+    #[test]
+    fn pq_validation_history_spans_one_slot_at_every_network_load() {
+        let slot = Duration::from_secs(300);
+
+        assert_eq!(
+            pq_validation_history_length(slot, Duration::from_millis(1_200)),
+            Ok(252)
+        );
+        assert_eq!(
+            pq_validation_history_length(slot, Duration::from_millis(1_000)),
+            Ok(302)
+        );
+        assert_eq!(
+            pq_validation_history_length(slot, Duration::from_millis(700)),
+            Ok(431)
+        );
+        assert!(pq_validation_history_length(slot, Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn pq_gossipsub_profile_retains_validation_for_one_slot_only_in_pq_mode() {
+        let spec = ForkName::Electra
+            .make_genesis_spec(MinimalEthSpec::default_spec())
+            .set_slot_duration_ms::<MinimalEthSpec>(300_000);
+        let fork_context = Arc::new(ForkContext::new::<MinimalEthSpec>(
+            spec.genesis_slot,
+            Hash256::ZERO,
+            &spec,
+        ));
+        let config_params = || GossipsubConfigParams {
+            message_domain_valid_snappy: spec.message_domain_valid_snappy,
+            gossipsub_max_transmit_size: spec.max_message_size(),
+        };
+
+        let full = gossipsub_config(
+            3,
+            Arc::clone(&fork_context),
+            config_params(),
+            spec.get_slot_duration(),
+            MinimalEthSpec::slots_per_epoch(),
+            DEFAULT_IDONTWANT_MESSAGE_SIZE_THRESHOLD,
+            GossipsubProfile::Full,
+        )
+        .expect("full gossipsub config");
+        let pq = gossipsub_config(
+            3,
+            fork_context,
+            config_params(),
+            spec.get_slot_duration(),
+            MinimalEthSpec::slots_per_epoch(),
+            DEFAULT_IDONTWANT_MESSAGE_SIZE_THRESHOLD,
+            GossipsubProfile::Pq(Arc::new(PqGossipValidationAdmission::new())),
+        )
+        .expect("PQ gossipsub config");
+
+        assert_eq!(full.history_length(), 12);
+        assert_eq!(pq.history_length(), 302);
+    }
+
+    #[test]
+    fn pq_gossipsub_rejects_any_slot_duration_other_than_exactly_three_hundred_seconds() {
+        let spec = ForkName::Electra.make_genesis_spec(MinimalEthSpec::default_spec());
+        let fork_context = Arc::new(ForkContext::new::<MinimalEthSpec>(
+            spec.genesis_slot,
+            Hash256::ZERO,
+            &spec,
+        ));
+        let config_params = || GossipsubConfigParams {
+            message_domain_valid_snappy: spec.message_domain_valid_snappy,
+            gossipsub_max_transmit_size: spec.max_message_size(),
+        };
+
+        for seconds in [299, 301] {
+            let error = gossipsub_config(
+                3,
+                Arc::clone(&fork_context),
+                config_params(),
+                Duration::from_secs(seconds),
+                MinimalEthSpec::slots_per_epoch(),
+                DEFAULT_IDONTWANT_MESSAGE_SIZE_THRESHOLD,
+                GossipsubProfile::Pq(Arc::new(PqGossipValidationAdmission::new())),
+            )
+            .expect_err("non-frozen PQ slot duration");
+            assert_eq!(error, "PQ gossipsub requires an exact 300-second slot");
+
+            let full = gossipsub_config(
+                3,
+                Arc::clone(&fork_context),
+                config_params(),
+                Duration::from_secs(seconds),
+                MinimalEthSpec::slots_per_epoch(),
+                DEFAULT_IDONTWANT_MESSAGE_SIZE_THRESHOLD,
+                GossipsubProfile::Full,
+            )
+            .expect("ordinary profile keeps its configured slot timing");
+            let duplicate_slots = u32::try_from(MinimalEthSpec::slots_per_epoch() * 2)
+                .expect("minimal duplicate slot count");
+            assert_eq!(
+                full.duplicate_cache_time(),
+                Duration::from_secs(seconds)
+                    .checked_mul(duplicate_slots)
+                    .expect("ordinary duplicate-cache timing"),
+            );
+            assert_eq!(full.history_length(), 12);
+        }
+    }
+
+    #[test]
+    fn pq_compatible_peer_set_is_hard_sixteen_and_admission_is_two_per_peer_one() {
+        let controller = Arc::new(PqGossipValidationAdmission::new());
+        let peers = (0..17)
+            .map(|_| libp2p::PeerId::random())
+            .collect::<Vec<_>>();
+        for peer in &peers[..16] {
+            assert!(controller.try_add_compatible(*peer));
+        }
+        assert!(!controller.try_add_compatible(peers[16]));
+
+        let first = controller
+            .try_admit(&peers[0])
+            .expect("first peer admitted");
+        assert!(controller.try_admit(&peers[0]).is_none());
+        let second = controller
+            .try_admit(&peers[1])
+            .expect("second peer admitted");
+        assert!(controller.try_admit(&peers[2]).is_none());
+        drop(first);
+        assert!(controller.try_admit(&peers[2]).is_some());
+        drop(second);
+
+        controller.remove_compatible(&peers[0]);
+        assert!(controller.try_add_compatible(peers[16]));
+        assert!(controller.try_admit(&peers[0]).is_none());
+    }
 }
 
 /// Helper function to determine if the IpAddr is a global address or not. The `is_global()`

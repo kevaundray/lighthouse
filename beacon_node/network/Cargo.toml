@@ -21,7 +21,11 @@ pq-devnet = [
     "operation_pool/pq-devnet",
     "types/pq-devnet",
 ]
-pq-startup-testing = ["pq-devnet", "beacon_chain/pq-startup-testing"]
+pq-startup-testing = [
+    "pq-devnet",
+    "beacon_chain/pq-startup-testing",
+    "lighthouse_network/pq-startup-testing",
+]
 
 [dependencies]
 alloy-primitives = { workspace = true }

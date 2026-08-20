@@ -58,7 +58,7 @@ pub fn core_topics_to_subscribe<E: EthSpec>(
                 topics.push(GossipKind::Attestation(index.into()));
             }
         }
-        return topics;
+        topics
     }
 
     #[cfg(not(feature = "pq-devnet"))]

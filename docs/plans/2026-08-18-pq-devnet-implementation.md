@@ -2252,13 +2252,195 @@ checks passed; broad workspace gates remain deferred until independent review.
 #### Task 5.3e-e4: Assemble the PQ network, HTTP, and proposer runtime
 
 Replace the top-level `DeferredRuntimeIntegration` boundary only after e-e1, e-e2a, e-e2b, and e-e3
-are green.
-Construct exactly one aggregation service, task executor, execution layer, bounded BeaconChain,
-network processor/broadcaster, narrow HTTP server, and proposer-only validator service in fail-closed
-order. Keep ordinary router/sync/backfill/history, builders, registration, sync duties, slasher,
-checkpoint modes, and all unsupported APIs absent. Add startup/shutdown/restart and multi-slot AVX
-tests proving a locally produced, HTTP-returned, validator-signed, propagated block commits through
-the same e-c import path and survives restart.
+are green. Do not re-enable `client::builder`, the ordinary network service/router/sync/subnet
+manager, `http_api`, validator services, or the full CLI to obtain a superficially complete graph.
+Assemble the already sealed components through a PQ-only runtime owner in the following vertical
+slices.
+
+##### Task 5.3e-e4a: Add a result-bearing live-block PQ network worker
+
+Add a narrow `network::PqNetworkService` which owns one `lighthouse_network::Network`, one
+`PqNetworkBlockProcessor`, the sole `PqBlockBroadcastReceiver`, and bounded non-waiting ingress and
+completion channels. Construct the libp2p service directly; do not restore the ordinary router,
+sync manager, backfill, subnet service, notifier, or unbounded `NetworkMessage` channel. The worker
+must perform only the minimum status handshake required to keep a same-genesis live peer connected,
+subscribe to the Electra beacon-block topic, and reject unsupported RPC requests. It does not claim
+late-join or historical catch-up support.
+
+Add a production-shared exact-block publish primitive to `lighthouse_network::Network` which
+returns the actual gossipsub result instead of using the existing `publish(Vec<_>)` method that logs
+and discards `PublishError`. A successful publish and `PublishError::Duplicate` acknowledge the
+e-e2a command: the latter is idempotent evidence that the exact encoded message is already known.
+`NoPeersSubscribedToTopic` and every other publish failure return a negative acknowledgment; an
+enqueue alone must never promote the publication capability or permit Engine/DB work. Pin all four
+cases and the exact block/topic bytes.
+
+For inbound blocks, take a bounded permit before spawning verification, run the existing full
+sealed verifier off the mutable libp2p event loop, and return the owned disposition through a
+bounded completion channel. Only the network owner may call gossipsub validation. `Accept` calls
+the result-bearing validation API first and consumes `after_propagation` only when gossipsub still
+holds and accepts that exact `(message id, peer)`; `Reject` reports Reject and the frozen peer
+penalty; `Ignore`, unknown parent, capacity, and local proof/service failures report Ignore with no
+penalty. A `Retry` token may commit without re-propagation. Engine notification and import remain
+detached from the mutable network loop and continue to use the chain-owned import gate. No network,
+observation, state, or cache lock may cross proof, Engine, or persistence awaits.
+
+Implemented e4a evidence: the PQ-only worker owns the lower network, exact-block broadcaster,
+cap-two proof admission, cap-two completion channel, Status/control RPC profile, and block-topic
+subscription. PQ network construction rejects any slot duration other than exactly 300 seconds
+before constructing gossipsub history or deadline state; checked 299/300/301-second tests pin this
+precondition while the ordinary/default profile remains unchanged. A narrow vendored
+`libp2p-gossipsub` patch is selected through an exact source patch, excluded from workspace
+membership, and disabled by default. Its provenance, update procedure, focused tests, and retained
+upstream MIT license are recorded beside the vendored crate.
+
+In the PQ profile the admission hook runs after transform/message-ID derivation but before the
+ordinary duplicate cache and mcache: at most two exact raw messages are pending globally and one per
+compatible peer, each for at most one 300-second slot. Overflow and incompatible peers are ignored
+without caching. The compatible set is hard-capped at 16; each compatible peer reserves at most one
+remote unique ID per window, the local publisher has a separate one-ID allowance, and 17 windows
+retain at most `17 * (16 + 1) = 289` unique reservations. Retryable Ignore/expiry releases the
+pending guard and reservation. Accept moves the exact raw message into ordinary canonical history
+and returns a sealed commit reservation; commit-without-propagation returns the same reservation
+without forwarding. The network owner retains that reservation across detached Engine/DB work.
+Only a genuinely retryable local commit failure removes the exact duplicate-cache, mcache map,
+every matching heartbeat-history entry, and bounded-history entry so the exact block can re-enter;
+terminal failure or successful commit retains them. Terminal Ignore, Reject, Equivocation, and
+Pending also retain only their bounded exact IDs. Exact local publication while the same ID is
+pending is negative `PendingValidation`, never a positive Duplicate. With bounded PQ admission
+configured, local publish commits its duplicate-cache and mcache/history entries only after at least
+one eligible lower peer queue accepts. If every queue is full, it releases only the exact unique
+reservation; repeated failures leave zero heartbeat entries, so expiry of the failed attempt's
+bucket cannot evict a later successful retry. With admission disabled, the exact upstream/default
+cache-before-queue behavior remains intact and an `AllQueuesFull` retry is Duplicate.
+
+The separate pending map, not mcache, keeps a slow proof alive for the 300-second deadline. Accepted
+canonical messages use checked `L = ceil(slot_duration / heartbeat_interval) + 2` mcache history
+(302 heartbeats at the frozen one-second profile); the full/default profile remains 12. A fast
+simulated test proves a pending block is expired by the old 12-second policy but retained at 13
+seconds by the 300-second policy. This distinction avoids claiming that increasing accepted history
+alone protects an unverified block.
+
+Tests prove that validated Status is required before inbound proof admission or outbound publication,
+that the 17th compatible peer is rejected, and that disconnect removes compatibility. Recipient
+selection applies the same exact Status-compatible set inside gossipsub queue selection: a compatible
+but unsubscribed peer plus an incompatible subscribed peer yields `NoPeers`, and publication reaches
+only a peer that is both compatible and subscribed. Real peers prove positive publish and exact
+Duplicate acknowledgment; no-peer and every other publish failure are negative and are not inserted
+in the ordinary retry cache. Full SSZ block encoding runs on the chain-owned blocking executor behind
+cap-two admission and compatibility is rechecked after encoding. The lower snappy transform remains
+synchronous, bounded by the configured maximum gossip message size, and is not described as off-loop.
+Tests pin the received topic/fork digest and decoded block bytes, cap/cap-plus-one ownership, shutdown
+acknowledgment, bounded commit-completion cleanup, and network-loop heartbeat while a large block is
+encoded.
+
+A production-shared private lifecycle harness pins Accept/report-success ordering, report-false
+capability rollback, Retry-without-repropagation, Reject/penalty, Ignore/no penalty, non-waiting
+cap/cap-plus-one admission, and full/closed completion RAII cleanup. Incompatible fork digest or
+finalized epoch/root maps to `IrrelevantNetwork` with zero proof starts. Lower network construction
+errors retain their exact String detail, and dropping the sole broadcaster receiver makes an
+already-pending acknowledgment resolve `WorkerUnavailable`.
+
+The AVX real-worker gate produces and signs an authenticated block, performs the compatible Status
+handshake, admits it on the receiving worker, and then blocks receiver import preparation for 13
+seconds. During that pending proof, submitting the exact block through the receiver's own broadcaster
+returns prompt negative `PendingValidation`, proving the mutable receiver loop remains live rather
+than observing an unrelated publisher loop. Releasing the barrier completes the full sealed proof,
+Engine VALID notification, atomic DB/head publication, exact stored block lookup, and restart at the
+same signed root (1/1 in 93.86 seconds). Independent-store two-node convergence and publisher-side
+HTTP publication ordering remain deliberately deferred to e4b.
+
+##### Task 5.3e-e4b: Prove the bounded two-node live-block boundary
+
+Build a two-node in-process harness from the real PQ network worker, real gossipsub encoding, two
+independent stores/Engine adapters, and the existing e-e2a publication service. Start both nodes
+from the same exact genesis before the proposal slot, establish the status handshake and topic
+subscription, then publish one signed block. Assert publisher gossipsub acceptance precedes its
+Engine/DB commit, the peer performs full sealed verification before Accept and its own Engine/DB
+commit, and both durable heads restore as the exact signed block. Exercise negative acknowledgment
+with zero subscribed peers, idempotent Duplicate, invalid evidence Reject/penalty, local service
+failure Ignore/no penalty/retry, bounded overload, caller cancellation, and shutdown while a
+command is pending.
+
+This slice is deliberately a live-gossip/non-finality proof. V1 has no fork choice or finalized
+checkpoint advancement, and a node that starts behind is not synchronized. Do not advertise range
+sync, lookup, finality, or late-join support. Complete this evidence before adding the attestation
+topics or top-level proposer assembly so failures remain attributable.
+
+##### Task 5.3e-e4c: Add a PQ-only disk-chain and process owner
+
+Add a deep `client::pq_runtime` module, compiled only by `client/pq-devnet`, which owns construction
+order and returns the existing `Client` facade. It must preflight all configuration before I/O,
+open the supported disk store with the existing BeaconChain schema migrator, load exact genesis or
+resume the persisted PQ head, construct one process-wide `AggregationService` on the owned blocking
+executor, construct one production `ExecutionLayer`, install both once in
+`BeaconChainBuilder::pq_new`, and start the e4a network worker. Determine resume from the PQ persisted
+head/initialized anchor rather than blindly replaying `GenesisState`; missing or partially bound
+PQ metadata fails closed. Do not call or cfg-enable the ordinary `ClientBuilder`.
+
+The PQ runtime owner retains the chain, network globals, bound addresses, and closed service
+capabilities. Long-lived network and scheduler loops use `TaskExecutor::spawn` so the environment
+exit signal cancels them. HTTP uses its own graceful-shutdown future and
+`spawn_without_exit`, matching Warp ownership. Dropping/ending the network worker drops the sole
+broadcast receiver so every pending acknowledgment resolves `WorkerUnavailable`; no caller may
+retain a receiver or mutable libp2p handle. Startup failure after a component is launched must fire
+shutdown and must not leave a detached listener or proof worker accepting new work.
+
+##### Task 5.3e-e4d: Make provisioning and configuration launchable and unambiguous
+
+Extend the PQ provisioner with a public, key-free testnet directory containing the frozen minimal
+Electra `config.yaml`, `deposit_contract_block.txt`, empty bootstrap list, and the already generated
+`genesis.ssz`; keep the authenticated validator bundle, passwords, and journal in the private
+bundle root. Make the Lighthouse `pq-devnet` feature select the minimal preset and require the
+generated testnet directory. Add one PQ-only optional beacon-node flag for the authenticated
+validator-bundle root. Absence means verifier-only. Presence enables exactly one local proposer
+authority and defaults its SQLite slashing database to a dedicated path under that node's data
+directory. Never discover or load validator keys from the public network directory.
+
+Reject, before filesystem or network side effects, TLS/CORS/metrics/UI, checkpoint/history modes,
+builders, monitoring, ordinary validator options, an execution layer without a real endpoint, a
+bundle whose manifest root differs from the network genesis, and an HTTP-disabled proposer. A
+verifier-only node must not construct `InitializedValidators`, `LighthouseValidatorStore`, a
+slashing database, strict HTTP client, or proposer service. A proposer node loads the authenticated
+bundle on the process executor, opens/registers the exact sealed identities in slashing protection
+on the blocking executor, constructs the validator store with builder/doppelganger/remote signing
+disabled, and passes only that store snapshot to `PqProposerService`.
+
+##### Task 5.3e-e4e: Bind the narrow HTTP server and drive the proposer
+
+Bind only `PqHttpApi::new(chain, executor, broadcast_sender).routes()` with Warp graceful shutdown.
+Start it after the network receiver is live and before the proposer. If the configured listener is
+wildcard, derive the strict local client URL from loopback plus the actual bound port; never send
+the proposer through an advertised wildcard address. The proposer scheduler is a process-owned,
+exit-aware slot loop which calls only `try_propose_current_slot`; it does not accept caller duties,
+keys, indices, or slots, and it never starts more than the service's cap-one detached operation.
+Monitor the cloneable receipt for typed logging/shutdown policy without exposing signed blocks or
+intermediate authority. Shutdown stops new slots first, closes HTTP/network ingress, resolves
+pending broadcast acknowledgments, and lets the environment own final task draining.
+
+Replace both synchronous PQ `new_from_cli`/`DeferredRuntimeIntegration` branches with the ordinary
+environment sequence: parse and programmatically validate config, honor dump/immediate-shutdown,
+then spawn asynchronous `ProductionBeaconNode::new(context, config)`. Remove the pre-runtime
+hard-exit path. Keep non-beacon-node commands compile-omitted.
+
+##### Task 5.3e-e4f: Wire the remaining PQ gossip topics and run the launch harness
+
+After live block propagation and proposer assembly are independently green, subscribe to
+aggregate-and-proof and the fixed bounded set of Electra attestation subnets (the ordinary dynamic
+subnet service remains absent). Route them through the e-d full proof boundary, call gossipsub
+Accept before consuming `mark_propagated`, and then drop the sealed post-propagation provenance
+honestly until Task 5.2b supplies pool/coordinator consumers. Invalid evidence is Reject/peer
+penalty; duplicate, aged, stale-lineage, capacity, and local service failure are Ignore/no penalty.
+
+Add a process-launch harness using the actual PQ Lighthouse binary, generated public testnet, two
+distinct data/network directories and ports, one proposer-enabled node, one verifier-only node, and
+a mock Engine per node. Launch both before the first proposal slot, wait for libp2p and HTTP
+readiness, observe multiple consecutive 300-second slots without overlapping proof jobs, terminate
+through the real shutdown signal, restart both stores, and assert exact signed heads and publication
+idempotence. This is the final e4 evidence for local V3 production, journal-backed signing, V2
+publication, acknowledged gossipsub, full e-c import, Engine VALID, atomic persistence, and restart.
+It must explicitly assert that finalized epoch/root remain the frozen genesis values and that a
+late-starting node is unsupported rather than presenting this as a sync-capable devnet.
 
 ### Task 5.2b: Wire verified candidates into both beacon-node attestation pools
 

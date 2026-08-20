@@ -1,5 +1,7 @@
 target/
-vendor/
+vendor/*
+!vendor/libp2p-gossipsub/
+!vendor/libp2p-gossipsub/**
 **/*.rs.bk
 *.pk
 *.sk

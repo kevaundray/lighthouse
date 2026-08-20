@@ -2,6 +2,8 @@
 use fixed_bytes::FixedBytesExtended;
 use lighthouse_network::Enr;
 use lighthouse_network::Multiaddr;
+#[cfg(feature = "pq-devnet")]
+use lighthouse_network::PqGossipValidationAdmission;
 use lighthouse_network::service::Network as LibP2PService;
 use lighthouse_network::{NetworkConfig, NetworkEvent};
 use network_utils::enr_ext::EnrExt;
@@ -10,7 +12,7 @@ use std::sync::Weak;
 use tokio::runtime::Runtime;
 use tracing::{Instrument, debug, error, info_span};
 use tracing_subscriber::EnvFilter;
-use types::{ChainSpec, EnrForkId, Epoch, EthSpec, ForkContext, ForkName, Hash256, MinimalEthSpec};
+use types::{ChainSpec, Epoch, EthSpec, ForkContext, ForkName, Hash256, MinimalEthSpec};
 
 type E = MinimalEthSpec;
 
@@ -128,9 +130,13 @@ pub async fn build_libp2p_instance(
     let (shutdown_tx, _) = futures::channel::mpsc::channel(1);
     let executor = task_executor::TaskExecutor::new(rt, exit, shutdown_tx);
     let custody_group_count = chain_spec.custody_requirement;
+    let current_slot = chain_spec
+        .fork_epoch(fork_name)
+        .expect("test fork must be scheduled")
+        .start_slot(E::slots_per_epoch());
     let libp2p_context = lighthouse_network::Context {
         config,
-        enr_fork_id: EnrForkId::default(),
+        enr_fork_id: chain_spec.enr_fork_id::<E>(current_slot, Hash256::zero()),
         fork_context: Arc::new(fork_context(fork_name, &chain_spec)),
         chain_spec,
         libp2p_registry: None,
@@ -147,6 +153,45 @@ pub async fn build_libp2p_instance(
         .0,
         signal,
     )
+}
+
+#[cfg(feature = "pq-devnet")]
+pub async fn build_pq_libp2p_instance(
+    rt: Weak<Runtime>,
+    fork_name: ForkName,
+    chain_spec: Arc<ChainSpec>,
+) -> (
+    Libp2pInstance,
+    Arc<PqGossipValidationAdmission>,
+    lighthouse_network::PeerId,
+) {
+    let config = build_config(vec![], false, None);
+    let (signal, exit) = async_channel::bounded(1);
+    let (shutdown_tx, _) = futures::channel::mpsc::channel(1);
+    let executor = task_executor::TaskExecutor::new(rt, exit, shutdown_tx);
+    let current_slot = chain_spec
+        .fork_epoch(fork_name)
+        .expect("test fork must be scheduled")
+        .start_slot(E::slots_per_epoch());
+    let context = lighthouse_network::Context {
+        config,
+        enr_fork_id: chain_spec.enr_fork_id::<E>(current_slot, Hash256::zero()),
+        fork_context: Arc::new(fork_context(fork_name, &chain_spec)),
+        chain_spec: Arc::clone(&chain_spec),
+        libp2p_registry: None,
+    };
+    let admission = Arc::new(PqGossipValidationAdmission::new());
+    let (network, globals) = LibP2PService::new_pq(
+        executor,
+        context,
+        chain_spec.custody_requirement,
+        secp256k1::Keypair::generate().into(),
+        Arc::clone(&admission),
+    )
+    .await
+    .expect("should build PQ libp2p instance");
+    let peer_id = globals.local_peer_id();
+    (Libp2pInstance(network, signal), admission, peer_id)
 }
 
 #[allow(dead_code)]

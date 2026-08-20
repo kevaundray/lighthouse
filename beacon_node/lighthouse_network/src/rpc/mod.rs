@@ -35,6 +35,18 @@ pub use methods::{
 };
 pub use protocol::{Protocol, RPCError};
 
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub fn testing_only_pq_rpc_protocols(fork_context: Arc<ForkContext>) -> Vec<String> {
+    protocol::testing_only_protocols(fork_context, RpcProfile::StatusAndControlOnly)
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub fn testing_only_full_rpc_protocols(fork_context: Arc<ForkContext>) -> Vec<String> {
+    protocol::testing_only_protocols(fork_context, RpcProfile::Full)
+}
+
 pub(crate) mod codec;
 pub mod config;
 mod handler;
@@ -51,6 +63,13 @@ const MAX_CONCURRENT_REQUESTS: usize = 2;
 /// Composite trait for a request id.
 pub trait ReqId: Send + 'static + std::fmt::Debug + Copy + Clone {}
 impl<T> ReqId for T where T: Send + 'static + std::fmt::Debug + Copy + Clone {}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RpcProfile {
+    Full,
+    #[cfg(feature = "pq-devnet")]
+    StatusAndControlOnly,
+}
 
 /// RPC events sent from Lighthouse.
 #[derive(Debug, Clone)]
@@ -155,18 +174,23 @@ pub struct RPC<Id: ReqId, E: EthSpec> {
     events: Vec<BehaviourAction<Id, E>>,
     fork_context: Arc<ForkContext>,
     enable_light_client_server: bool,
+    #[cfg(feature = "pq-devnet")]
+    profile: RpcProfile,
     /// A sequential counter indicating when data gets modified.
     seq_number: u64,
 }
 
 impl<Id: ReqId, E: EthSpec> RPC<Id, E> {
-    pub fn new(
+    pub(crate) fn new(
         fork_context: Arc<ForkContext>,
         enable_light_client_server: bool,
         inbound_rate_limiter_config: Option<InboundRateLimiterConfig>,
         outbound_rate_limiter_config: Option<OutboundRateLimiterConfig>,
         seq_number: u64,
+        profile: RpcProfile,
     ) -> Self {
+        #[cfg(not(feature = "pq-devnet"))]
+        let _ = profile;
         let response_limiter = inbound_rate_limiter_config.map(|config| {
             debug!(?config, "Using response rate limiting params");
             ResponseLimiter::new(config, fork_context.clone())
@@ -184,6 +208,8 @@ impl<Id: ReqId, E: EthSpec> RPC<Id, E> {
             events: Vec::new(),
             fork_context,
             enable_light_client_server,
+            #[cfg(feature = "pq-devnet")]
+            profile,
             seq_number,
         }
     }
@@ -319,6 +345,8 @@ where
                 fork_context: self.fork_context.clone(),
                 max_rpc_size: self.fork_context.spec.max_payload_size as usize,
                 enable_light_client_server: self.enable_light_client_server,
+                #[cfg(feature = "pq-devnet")]
+                profile: self.profile,
                 phantom: PhantomData,
             },
             (),
@@ -342,6 +370,8 @@ where
                 fork_context: self.fork_context.clone(),
                 max_rpc_size: self.fork_context.spec.max_payload_size as usize,
                 enable_light_client_server: self.enable_light_client_server,
+                #[cfg(feature = "pq-devnet")]
+                profile: self.profile,
                 phantom: PhantomData,
             },
             (),
