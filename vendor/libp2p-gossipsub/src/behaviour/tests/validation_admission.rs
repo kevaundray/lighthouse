@@ -12,8 +12,9 @@ fn bounded_admission_limits() -> ValidationAdmissionConfig {
     ValidationAdmissionConfig {
         pending_capacity: 2,
         per_peer_pending_capacity: 1,
-        remote_unique_capacity_per_window: 16,
-        local_unique_capacity_per_window: 1,
+        remote_unique_capacity_per_window: 96,
+        remote_unique_capacity_per_peer_per_window: 6,
+        local_unique_capacity_per_window: 6,
         pending_timeout: Duration::from_secs(300),
         window: Duration::from_secs(300),
         retained_windows: 17,
@@ -36,6 +37,26 @@ fn bounded_config(admitted_sources: Arc<Mutex<Vec<PeerId>>>) -> Config {
         )
         .build()
         .expect("bounded validation config")
+}
+
+#[test]
+fn local_unique_history_accepts_six_and_rejects_seventh() {
+    let config = bounded_admission_limits();
+    let start = Instant::now();
+    let mut history = ValidationAdmissionHistory::new(config, start)
+        .expect("valid bounded history configuration");
+
+    for byte in 0_u8..6 {
+        assert_eq!(
+            history.reserve_local(&MessageId(vec![byte]), start),
+            ValidationReservation::New,
+            "local retained ID {byte} must fit the frozen two-slot bucket",
+        );
+    }
+    assert_eq!(
+        history.reserve_local(&MessageId(vec![6]), start),
+        ValidationReservation::Full,
+    );
 }
 
 #[test]
@@ -97,6 +118,138 @@ fn default_none_admission_uses_the_unchanged_ordinary_validation_path() {
     assert!(gs.mcache.get(&message_id).is_some());
     assert!(
         gs.report_message_validation_result(&message_id, &peers[0], MessageAcceptance::Accept,)
+    );
+}
+
+#[test]
+fn one_peer_retains_six_sequential_ids_after_each_pending_admission_resolves() {
+    let (mut gs, peers, queues, topics) = DefaultBehaviourTestBuilder::default()
+        .peer_no(1)
+        .topics(vec!["blocks".into()])
+        .to_subscribe(true)
+        .gs_config(bounded_config(Arc::new(Mutex::new(vec![]))))
+        .create_network();
+    let _queues = flush_events(&mut gs, queues);
+
+    for sequence in 0_u64..6 {
+        gs.handle_received_message(random_message(&mut sequence.clone(), &topics), &peers[0]);
+        let admission_id = match gs.events.pop_front().expect("admission below peer cap") {
+            ToSwarm::GenerateEvent(Event::AdmittedMessage { admission_id, .. }) => admission_id,
+            other => panic!("unexpected event: {other:?}"),
+        };
+        assert!(matches!(
+            gs.report_admitted_message_outcome(
+                &admission_id,
+                AdmittedMessageValidationOutcome::TerminalIgnore,
+            ),
+            AdmittedMessageReport::Complete,
+        ));
+    }
+
+    let mut seventh = 6_u64;
+    gs.handle_received_message(random_message(&mut seventh, &topics), &peers[0]);
+    assert!(
+        gs.events.is_empty(),
+        "the seventh retained ID from one peer must be suppressed",
+    );
+}
+
+#[test]
+fn retryable_release_decrements_the_retained_per_peer_count() {
+    let (mut gs, peers, queues, topics) = DefaultBehaviourTestBuilder::default()
+        .peer_no(1)
+        .topics(vec!["blocks".into()])
+        .to_subscribe(true)
+        .gs_config(bounded_config(Arc::new(Mutex::new(vec![]))))
+        .create_network();
+    let _queues = flush_events(&mut gs, queues);
+    let mut seed = 0_u64;
+
+    for _ in 0..5 {
+        gs.handle_received_message(random_message(&mut seed, &topics), &peers[0]);
+        let admission_id = match gs.events.pop_front().expect("terminal retained admission") {
+            ToSwarm::GenerateEvent(Event::AdmittedMessage { admission_id, .. }) => admission_id,
+            other => panic!("unexpected event: {other:?}"),
+        };
+        assert!(matches!(
+            gs.report_admitted_message_outcome(
+                &admission_id,
+                AdmittedMessageValidationOutcome::TerminalIgnore,
+            ),
+            AdmittedMessageReport::Complete,
+        ));
+    }
+
+    gs.handle_received_message(random_message(&mut seed, &topics), &peers[0]);
+    let retryable_id = match gs.events.pop_front().expect("retryable admission") {
+        ToSwarm::GenerateEvent(Event::AdmittedMessage { admission_id, .. }) => admission_id,
+        other => panic!("unexpected event: {other:?}"),
+    };
+    assert!(matches!(
+        gs.report_admitted_message_outcome(
+            &retryable_id,
+            AdmittedMessageValidationOutcome::RetryableIgnore,
+        ),
+        AdmittedMessageReport::Complete,
+    ));
+
+    gs.handle_received_message(random_message(&mut seed, &topics), &peers[0]);
+    let replacement = match gs
+        .events
+        .pop_front()
+        .expect("replacement after retryable release")
+    {
+        ToSwarm::GenerateEvent(Event::AdmittedMessage { admission_id, .. }) => admission_id,
+        other => panic!("unexpected event: {other:?}"),
+    };
+    assert!(matches!(
+        gs.report_admitted_message_outcome(
+            &replacement,
+            AdmittedMessageValidationOutcome::TerminalIgnore,
+        ),
+        AdmittedMessageReport::Complete,
+    ));
+
+    gs.handle_received_message(random_message(&mut seed, &topics), &peers[0]);
+    assert!(
+        gs.events.is_empty(),
+        "replacement must restore the peer cap"
+    );
+}
+
+#[test]
+fn remote_unique_history_accepts_ninety_six_globally_and_rejects_ninety_seventh() {
+    let (mut gs, peers, queues, topics) = DefaultBehaviourTestBuilder::default()
+        .peer_no(17)
+        .topics(vec!["blocks".into()])
+        .to_subscribe(true)
+        .gs_config(bounded_config(Arc::new(Mutex::new(vec![]))))
+        .create_network();
+    let _queues = flush_events(&mut gs, queues);
+    let mut seed = 0_u64;
+
+    for peer in &peers[..16] {
+        for _ in 0..6 {
+            gs.handle_received_message(random_message(&mut seed, &topics), peer);
+            let admission_id = match gs.events.pop_front().expect("admission below global cap") {
+                ToSwarm::GenerateEvent(Event::AdmittedMessage { admission_id, .. }) => admission_id,
+                other => panic!("unexpected event: {other:?}"),
+            };
+            assert!(matches!(
+                gs.report_admitted_message_outcome(
+                    &admission_id,
+                    AdmittedMessageValidationOutcome::TerminalIgnore,
+                ),
+                AdmittedMessageReport::Complete,
+            ));
+        }
+    }
+
+    disconnect_peer(&mut gs, &peers[0]);
+    gs.handle_received_message(random_message(&mut seed, &topics), &peers[16]);
+    assert!(
+        gs.events.is_empty(),
+        "the ninety-seventh global retained ID must be suppressed",
     );
 }
 
@@ -429,75 +582,88 @@ fn accept_moves_exact_pending_raw_message_into_canonical_history() {
 }
 
 #[test]
-fn unique_history_is_remote_sixteen_local_one_and_seventeen_windows() {
-    let config = ValidationAdmissionConfig {
-        pending_capacity: 2,
-        per_peer_pending_capacity: 1,
-        remote_unique_capacity_per_window: 16,
-        local_unique_capacity_per_window: 1,
-        pending_timeout: Duration::from_secs(300),
-        window: Duration::from_secs(300),
-        retained_windows: 17,
-    };
+fn exact_retained_inventory_is_one_thousand_seven_hundred_thirty_four() {
+    let config = bounded_admission_limits();
     let start = Instant::now();
     let mut history = ValidationAdmissionHistory::new(config, start)
         .expect("valid bounded history configuration");
-    let peers = (0..17).map(|_| PeerId::random()).collect::<Vec<_>>();
-    let remote_ids = (0_u8..16)
-        .map(|byte| MessageId(vec![byte]))
-        .collect::<Vec<_>>();
-    for (id, peer) in remote_ids.iter().zip(&peers) {
+    let peers = (0..16).map(|_| PeerId::random()).collect::<Vec<_>>();
+
+    for window in 0_u8..17 {
+        let now = start + config.window * u32::from(window);
+        for (peer_index, peer) in peers.iter().enumerate() {
+            for message_index in 0_u8..6 {
+                let id = MessageId(vec![
+                    0,
+                    window,
+                    u8::try_from(peer_index).expect("sixteen peers fit u8"),
+                    message_index,
+                ]);
+                assert_eq!(
+                    history.reserve_remote(&id, peer, now),
+                    ValidationReservation::New,
+                );
+            }
+        }
+        for message_index in 0_u8..6 {
+            assert_eq!(
+                history.reserve_local(&MessageId(vec![1, window, message_index]), now),
+                ValidationReservation::New,
+            );
+        }
+    }
+    assert_eq!(history.retained_len(), 1_734);
+
+    let rollover_window = 17_u8;
+    let rollover = start + config.window * u32::from(rollover_window);
+    for (peer_index, peer) in peers.iter().enumerate() {
+        for message_index in 0_u8..6 {
+            let id = MessageId(vec![
+                0,
+                rollover_window,
+                u8::try_from(peer_index).expect("sixteen peers fit u8"),
+                message_index,
+            ]);
+            assert_eq!(
+                history.reserve_remote(&id, peer, rollover),
+                ValidationReservation::New,
+            );
+        }
+    }
+    for message_index in 0_u8..6 {
         assert_eq!(
-            history.reserve_remote(id, peer, start),
+            history.reserve_local(
+                &MessageId(vec![1, rollover_window, message_index]),
+                rollover,
+            ),
             ValidationReservation::New,
         );
     }
-    assert_eq!(
-        history.reserve_remote(&remote_ids[0], &peers[16], start),
-        ValidationReservation::Duplicate,
-    );
-    assert_eq!(
-        history.reserve_remote(&MessageId(vec![16]), &peers[16], start),
-        ValidationReservation::Full,
-    );
-    history.release(&remote_ids[1]);
-    assert_eq!(
-        history.reserve_remote(&MessageId(vec![19]), &peers[1], start),
-        ValidationReservation::New,
-    );
-    assert_eq!(
-        history.reserve_remote(&MessageId(vec![20]), &peers[1], start),
-        ValidationReservation::PeerFull,
-    );
-    assert_eq!(
-        history.reserve_local(&MessageId(vec![17]), start),
-        ValidationReservation::New,
-    );
-    assert_eq!(
-        history.reserve_local(&MessageId(vec![18]), start),
-        ValidationReservation::Full,
-    );
+    assert_eq!(history.retained_len(), 1_734);
+}
 
-    for window in 1_u32..17 {
-        let now = start + config.window * window;
-        for offset in 0_u8..17 {
-            let id = MessageId(vec![window as u8, offset]);
-            let reservation = if offset < 16 {
-                history.reserve_remote(&id, &peers[offset as usize], now)
-            } else {
-                history.reserve_local(&id, now)
-            };
-            assert_eq!(reservation, ValidationReservation::New);
-        }
-    }
-    assert_eq!(history.retained_len(), 17 * 17);
-    let next_window = start + config.window * 17;
+#[test]
+fn exact_id_expires_at_retained_window_n_not_n_plus_one() {
+    let config = bounded_admission_limits();
+    let start = Instant::now();
+    let mut history = ValidationAdmissionHistory::new(config, start)
+        .expect("valid bounded history configuration");
+    let id = MessageId(vec![0x51]);
+
     assert_eq!(
-        history.reserve_remote(&remote_ids[0], &peers[0], next_window),
+        history.reserve_local(&id, start),
         ValidationReservation::New,
-        "the oldest of exactly seventeen retained windows expires on rollover",
     );
-    assert!(history.retained_len() <= 17 * 17);
+    assert_eq!(
+        history.reserve_local(&id, start + config.window * 16),
+        ValidationReservation::Duplicate,
+        "the ID remains retained in the final of seventeen windows",
+    );
+    assert_eq!(
+        history.reserve_local(&id, start + config.window * 17),
+        ValidationReservation::New,
+        "the ID expires exactly at N, not N+1",
+    );
 }
 
 #[test]
@@ -518,6 +684,7 @@ fn retryable_ignore_releases_peer_and_guard_but_terminal_reject_retains_peer_win
                 pending_capacity: 2,
                 per_peer_pending_capacity: 1,
                 remote_unique_capacity_per_window: 16,
+                remote_unique_capacity_per_peer_per_window: 1,
                 local_unique_capacity_per_window: 1,
                 pending_timeout: Duration::from_secs(300),
                 window: Duration::from_secs(300),
@@ -583,6 +750,7 @@ fn expired_pending_admission_releases_raw_guard_peer_and_unique_reservation() {
     let callback_drops = Arc::clone(&drops);
     let config = ConfigBuilder::default()
         .validate_messages()
+        .message_id_fn(|message| MessageId(message.data.clone()))
         .validation_admission(
             ValidationAdmissionConfig {
                 pending_timeout: Duration::from_secs(300),
@@ -604,7 +772,27 @@ fn expired_pending_admission_releases_raw_guard_peer_and_unique_reservation() {
         .create_network();
     let _queues = flush_events(&mut gs, queues);
 
-    gs.handle_received_message(random_message(&mut 1, &topics), &peers[0]);
+    let mut seed = 1_u64;
+    for _ in 0..5 {
+        gs.handle_received_message(random_message(&mut seed, &topics), &peers[0]);
+        let retained_id = match gs.events.pop_front().expect("retained admission") {
+            ToSwarm::GenerateEvent(Event::AdmittedMessage { admission_id, .. }) => admission_id,
+            other => panic!("unexpected event: {other:?}"),
+        };
+        assert!(matches!(
+            gs.report_admitted_message_outcome(
+                &retained_id,
+                AdmittedMessageValidationOutcome::TerminalIgnore,
+            ),
+            AdmittedMessageReport::Complete,
+        ));
+    }
+    assert_eq!(*drops.lock().expect("drop count lock"), 5);
+
+    let original = random_message(&mut seed, &topics);
+    let admitted_before = Instant::now();
+    gs.handle_received_message(original.clone(), &peers[0]);
+    let admitted_after = Instant::now();
     let admission_id = match gs.events.pop_front().expect("admitted message") {
         ToSwarm::GenerateEvent(Event::AdmittedMessage { admission_id, .. }) => admission_id,
         other => panic!("unexpected event: {other:?}"),
@@ -614,15 +802,21 @@ fn expired_pending_admission_releases_raw_guard_peer_and_unique_reservation() {
         .get(&admission_id)
         .expect("pending admission")
         .expires;
+    assert!(
+        expiry >= admitted_before + Duration::from_secs(300)
+            && expiry <= admitted_after + Duration::from_secs(300),
+        "pending expiry retains the exact frozen 300-second bound",
+    );
     gs.expire_validation_admissions(expiry);
-    assert_eq!(*drops.lock().expect("drop count lock"), 1);
+    assert_eq!(*drops.lock().expect("drop count lock"), 6);
     assert!(!gs.pending_admissions.contains_key(&admission_id));
 
-    gs.handle_received_message(random_message(&mut 2, &topics), &peers[0]);
-    assert!(matches!(
-        gs.events.pop_front(),
-        Some(ToSwarm::GenerateEvent(Event::AdmittedMessage { .. }))
-    ));
+    gs.handle_received_message(original, &peers[0]);
+    let readmitted_id = match gs.events.pop_front().expect("exact expired ID readmission") {
+        ToSwarm::GenerateEvent(Event::AdmittedMessage { admission_id, .. }) => admission_id,
+        other => panic!("unexpected event: {other:?}"),
+    };
+    assert_eq!(readmitted_id, admission_id);
 }
 
 #[test]
@@ -699,7 +893,7 @@ fn local_publish_of_exact_pending_message_is_negative_not_duplicate() {
 }
 
 #[test]
-fn remote_window_exhaustion_cannot_consume_one_local_publication_allowance() {
+fn remote_window_exhaustion_cannot_consume_six_local_publication_allowances() {
     let (mut gs, peers, queues, topics) = DefaultBehaviourTestBuilder::default()
         .peer_no(16)
         .topics(vec!["blocks".into()])
@@ -707,24 +901,29 @@ fn remote_window_exhaustion_cannot_consume_one_local_publication_allowance() {
         .gs_config(bounded_config(Arc::new(Mutex::new(vec![]))))
         .create_network();
     let _queues = flush_events(&mut gs, queues);
-    for (sequence, peer) in (1_u64..=16).zip(&peers) {
-        gs.handle_received_message(random_message(&mut sequence.clone(), &topics), peer);
-        let admission_id = match gs.events.pop_front().expect("remote admission") {
-            ToSwarm::GenerateEvent(Event::AdmittedMessage { admission_id, .. }) => admission_id,
-            other => panic!("unexpected event: {other:?}"),
-        };
-        assert!(matches!(
-            gs.report_admitted_message_outcome(
-                &admission_id,
-                AdmittedMessageValidationOutcome::Reject,
-            ),
-            AdmittedMessageReport::Complete,
-        ));
+    let mut sequence = 1_u64;
+    for peer in &peers {
+        for _ in 0..6 {
+            gs.handle_received_message(random_message(&mut sequence, &topics), peer);
+            let admission_id = match gs.events.pop_front().expect("remote admission") {
+                ToSwarm::GenerateEvent(Event::AdmittedMessage { admission_id, .. }) => admission_id,
+                other => panic!("unexpected event: {other:?}"),
+            };
+            assert!(matches!(
+                gs.report_admitted_message_outcome(
+                    &admission_id,
+                    AdmittedMessageValidationOutcome::Reject,
+                ),
+                AdmittedMessageReport::Complete,
+            ));
+        }
     }
 
-    assert!(gs.publish(topics[0].clone(), vec![0xaa]).is_ok());
+    for byte in 0_u8..6 {
+        assert!(gs.publish(topics[0].clone(), vec![0xaa, byte]).is_ok());
+    }
     assert!(matches!(
-        gs.publish(topics[0].clone(), vec![0xbb]),
+        gs.publish(topics[0].clone(), vec![0xbb, 6]),
         Err(PublishError::ValidationAdmissionFull)
     ));
 }
@@ -737,4 +936,26 @@ fn validation_history_rejects_checked_capacity_overflow() {
         ..bounded_admission_limits()
     };
     assert!(ValidationAdmissionHistory::new(config, Instant::now()).is_err());
+}
+
+#[test]
+fn validation_history_rejects_invalid_per_peer_retained_capacity() {
+    let zero = ValidationAdmissionConfig {
+        remote_unique_capacity_per_peer_per_window: 0,
+        ..bounded_admission_limits()
+    };
+    assert_eq!(
+        ValidationAdmissionHistory::new(zero, Instant::now()).err(),
+        Some("validation admission bounds must be non-zero"),
+    );
+
+    let above_global = ValidationAdmissionConfig {
+        remote_unique_capacity_per_window: 5,
+        remote_unique_capacity_per_peer_per_window: 6,
+        ..bounded_admission_limits()
+    };
+    assert_eq!(
+        ValidationAdmissionHistory::new(above_global, Instant::now()).err(),
+        Some("per-peer remote validation history exceeds global remote capacity"),
+    );
 }

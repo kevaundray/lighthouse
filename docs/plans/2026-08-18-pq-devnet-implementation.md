@@ -2297,12 +2297,14 @@ upstream MIT license are recorded beside the vendored crate.
 In the PQ profile the admission hook runs after transform/message-ID derivation but before the
 ordinary duplicate cache and mcache: at most two exact raw messages are pending globally and one per
 compatible peer, each for at most one 300-second slot. Overflow and incompatible peers are ignored
-without caching. The compatible set is hard-capped at 16; each compatible peer reserves at most one
-remote unique ID per window, the local publisher has a separate one-ID allowance, and 17 windows
-retain at most `17 * (16 + 1) = 289` unique reservations. Retryable Ignore/expiry releases the
-pending guard and reservation. Accept moves the exact raw message into ordinary canonical history
-and returns a sealed commit reservation; commit-without-propagation returns the same reservation
-without forwarding. The network owner retains that reservation across detached Engine/DB work.
+without caching. The compatible set is hard-capped at 16. A phase-shifted 300-second window can
+intersect two slots containing one block plus two single attestations each, so the checked retained
+allowance is six local IDs and six remote IDs per peer. The remote global allowance is
+`16 * 6 = 96`; 17 windows retain at most `(96 + 6) * 17 = 1,734` unique reservations. Retryable
+Ignore/expiry releases the pending guard and exact per-peer count. Accept moves the exact raw
+message into ordinary canonical history and returns a sealed commit reservation;
+commit-without-propagation returns the same reservation without forwarding. The network owner
+retains that reservation across detached Engine/DB work.
 Only a genuinely retryable local commit failure removes the exact duplicate-cache, mcache map,
 every matching heartbeat-history entry, and bounded-history entry so the exact block can re-enter;
 terminal failure or successful commit retains them. Terminal Ignore, Reject, Equivocation, and
@@ -2318,8 +2320,10 @@ The separate pending map, not mcache, keeps a slow proof alive for the 300-secon
 canonical messages use checked `L = ceil(slot_duration / heartbeat_interval) + 2` mcache history
 (302 heartbeats at the frozen one-second profile); the full/default profile remains 12. A fast
 simulated test proves a pending block is expired by the old 12-second policy but retained at 13
-seconds by the 300-second policy. This distinction avoids claiming that increasing accepted history
-alone protects an unverified block.
+seconds by the 300-second policy. The accepted raw mcache lifetime intersects at most three
+admission windows, so its checked ID inventory bound is `3 * (96 + 6) = 306`; this is distinct from
+the per-RPC publish-message limit. This distinction avoids claiming that increasing accepted
+history alone protects an unverified block.
 
 Tests prove that validated Status is required before inbound proof admission or outbound publication,
 that the 17th compatible peer is rejected, and that disconnect removes compatibility. Recipient
@@ -2687,6 +2691,22 @@ direct_pq_attester_service_authentically_signs_and_proves_slot_once -- --exact -
 Removing the service-owned batch failed with `AtomicBatchMissing` in 459.80 seconds; the restored
 GREEN run recorded clone/authentication/RANDAO/import/complete phases at 0.172/279.315/306.991/
 459.396/460.382 seconds.
+
+**Publication admission prerequisite checkpoint (implemented, publisher still absent):** the PQ
+gossipsub admission profile now checked-derives six retained local IDs and six retained remote IDs
+per peer from two phase-intersecting slots of one block plus two singles. With the hard 16-peer
+compatibility cap, remote global retained capacity is 96. Pending work remains exactly two globally
+and one per peer. Seventeen windows retain at most 1,734 IDs, while the accepted raw mcache can
+intersect three windows and is bounded by 306 IDs. Zero/invalid relationships and checked capacity
+overflow reject configuration.
+
+Tests pin local 6/7, sequential per-peer 6/7 after pending resolution, global 96/97 across peers,
+peer churn without history release, retryable decrement versus terminal retention, exact N rather
+than N+1 rollover, and the full 1,734-entry inventory. The expiry test fills five terminal IDs,
+expires a sixth pending exact ID at 300 seconds, and requires identical redelivery; removing exact
+history release fails. The ordinary no-admission path is unchanged. This checkpoint does not expose
+or implement a production publisher, consume the service-owned verified batch, apply local fork
+choice, or add scheduler, pool, persistence, justification, or finalization behavior.
 
 This checkpoint is not completion of Task 5.2b. The fork-choice receiver remains in-memory Fresh
 evidence, and the local-context Resume evidence is limited to rebuilding ephemeral committee caches

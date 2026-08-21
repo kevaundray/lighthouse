@@ -150,6 +150,16 @@ pub(crate) enum GossipsubProfile {
 const PQ_SLOT_DURATION: Duration = Duration::from_secs(300);
 
 #[cfg(feature = "pq-devnet")]
+fn pq_unique_messages_per_validation_window() -> Result<usize, &'static str> {
+    const INTERSECTING_SLOTS: usize = 2;
+    const MESSAGES_PER_SLOT: usize = 3;
+
+    INTERSECTING_SLOTS
+        .checked_mul(MESSAGES_PER_SLOT)
+        .ok_or("PQ per-source validation-history capacity overflow")
+}
+
+#[cfg(feature = "pq-devnet")]
 fn pq_validation_retained_windows(
     duplicate_cache_time: Duration,
     window: Duration,
@@ -167,6 +177,56 @@ fn pq_validation_retained_windows(
         .checked_add(1)
         .ok_or("PQ validation-admission retention overflow")?;
     usize::try_from(retained).map_err(|_| "PQ validation-admission retention exceeds usize")
+}
+
+#[cfg(feature = "pq-devnet")]
+fn pq_validation_retained_id_capacity(
+    limits: &gossipsub::ValidationAdmissionConfig,
+) -> Result<usize, &'static str> {
+    limits
+        .remote_unique_capacity_per_window
+        .checked_add(limits.local_unique_capacity_per_window)
+        .and_then(|per_window| per_window.checked_mul(limits.retained_windows))
+        .ok_or("PQ retained validation-history capacity overflow")
+}
+
+#[cfg(feature = "pq-devnet")]
+fn pq_validation_raw_mcache_id_bound(
+    limits: &gossipsub::ValidationAdmissionConfig,
+) -> Result<usize, &'static str> {
+    // The PQ mcache lifetime is one slot plus two heartbeat buckets, so it can intersect at most
+    // three 300-second validation-admission windows. `max_publish_messages` is an unrelated
+    // per-RPC wire limit and must not be used as the cache inventory bound.
+    const INTERSECTING_ADMISSION_WINDOWS: usize = 3;
+
+    limits
+        .remote_unique_capacity_per_window
+        .checked_add(limits.local_unique_capacity_per_window)
+        .and_then(|per_window| per_window.checked_mul(INTERSECTING_ADMISSION_WINDOWS))
+        .ok_or("PQ raw mcache validation-ID bound overflow")
+}
+
+#[cfg(feature = "pq-devnet")]
+fn pq_validation_admission_limits(
+    retained_windows: usize,
+) -> Result<gossipsub::ValidationAdmissionConfig, &'static str> {
+    let unique_capacity_per_source = pq_unique_messages_per_validation_window()?;
+    let remote_unique_capacity_per_window = PQ_COMPATIBLE_PEER_CAPACITY
+        .checked_mul(unique_capacity_per_source)
+        .ok_or("PQ global remote validation-history capacity overflow")?;
+    let limits = gossipsub::ValidationAdmissionConfig {
+        pending_capacity: 2,
+        per_peer_pending_capacity: 1,
+        remote_unique_capacity_per_window,
+        remote_unique_capacity_per_peer_per_window: unique_capacity_per_source,
+        local_unique_capacity_per_window: unique_capacity_per_source,
+        pending_timeout: PQ_SLOT_DURATION,
+        window: PQ_SLOT_DURATION,
+        retained_windows,
+    };
+    pq_validation_retained_id_capacity(&limits)?;
+    pq_validation_raw_mcache_id_bound(&limits)?;
+    Ok(limits)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -712,25 +772,18 @@ pub fn gossipsub_config(
             ));
         }
         let publish_admission = Arc::clone(&admission);
+        let admission_limits =
+            pq_validation_admission_limits(retained_windows).map_err(str::to_owned)?;
         builder
             .publish_peer_filter(move |peer, _| publish_admission.is_compatible(peer))
-            .validation_admission(
-                gossipsub::ValidationAdmissionConfig {
-                    pending_capacity: 2,
-                    per_peer_pending_capacity: 1,
-                    remote_unique_capacity_per_window: PQ_COMPATIBLE_PEER_CAPACITY,
-                    local_unique_capacity_per_window: 1,
-                    pending_timeout: slot_duration,
-                    window: slot_duration,
-                    retained_windows,
-                },
-                move |source, _, _, _| match admission.try_admit(source) {
+            .validation_admission(admission_limits, move |source, _, _, _| {
+                match admission.try_admit(source) {
                     Some(guard) => gossipsub::ValidationAdmission::Admit(
                         gossipsub::ValidationAdmissionGuard::new(guard),
                     ),
                     None => gossipsub::ValidationAdmission::IgnoreWithoutCaching,
-                },
-            );
+                }
+            });
     }
 
     builder.build().map_err(|error| error.to_string())
@@ -758,6 +811,60 @@ mod pq_tests {
             Ok(431)
         );
         assert!(pq_validation_history_length(slot, Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn pq_local_retained_unique_capacity_is_exactly_six() {
+        let limits = pq_validation_admission_limits(17).expect("frozen PQ admission limits");
+        assert_eq!(limits.local_unique_capacity_per_window, 6);
+    }
+
+    #[test]
+    fn pq_remote_retained_unique_capacity_per_peer_is_exactly_six() {
+        let limits = pq_validation_admission_limits(17).expect("frozen PQ admission limits");
+        assert_eq!(limits.remote_unique_capacity_per_peer_per_window, 6);
+    }
+
+    #[test]
+    fn pq_remote_retained_unique_global_capacity_is_exactly_ninety_six() {
+        let limits = pq_validation_admission_limits(17).expect("frozen PQ admission limits");
+        assert_eq!(limits.remote_unique_capacity_per_window, 96);
+    }
+
+    #[test]
+    fn pq_pending_admission_capacity_is_global_two_per_peer_one() {
+        let limits = pq_validation_admission_limits(17).expect("frozen PQ admission limits");
+        assert_eq!(limits.pending_capacity, 2);
+        assert_eq!(limits.per_peer_pending_capacity, 1);
+    }
+
+    #[test]
+    fn pq_phase_shifted_window_covers_two_slots_of_block_and_two_singles() {
+        assert_eq!(
+            pq_unique_messages_per_validation_window(),
+            Ok(6),
+            "an arbitrary 300-second window can intersect two slots, each with one block and two singles",
+        );
+    }
+
+    #[test]
+    fn pq_checked_retained_id_inventory_is_exactly_one_thousand_seven_hundred_thirty_four() {
+        let limits = pq_validation_admission_limits(17).expect("frozen PQ admission limits");
+        assert_eq!(pq_validation_retained_id_capacity(&limits), Ok(1_734),);
+    }
+
+    #[test]
+    fn pq_checked_raw_mcache_id_bound_is_exactly_three_hundred_six() {
+        let limits = pq_validation_admission_limits(17).expect("frozen PQ admission limits");
+        assert_eq!(pq_validation_raw_mcache_id_bound(&limits), Ok(306));
+    }
+
+    #[test]
+    fn pq_validation_admission_limits_reject_retained_inventory_overflow() {
+        assert_eq!(
+            pq_validation_admission_limits(usize::MAX).unwrap_err(),
+            "PQ retained validation-history capacity overflow",
+        );
     }
 
     #[test]

@@ -1950,3 +1950,30 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   schedule future slots, expose HTTP, insert into either attestation pool, aggregate attestations,
   persist service/fork-choice state, justify, or finalize. The finalized checkpoint remains genesis;
   none of those later Task 5.2b/7.2 claims are implied.
+
+### 2026-08-21: PQ publication admission inventory expanded (Task 5.2b prerequisite)
+
+- The optional vendored gossipsub validation-admission profile now retains exactly six local IDs
+  and six remote IDs per peer in each 300-second window. The remote global cap is exactly 96: the
+  hard 16-compatible-peer bound multiplied by six. Pending proof admission remains independently
+  bounded at two globally and one per peer; resolving one pending admission does not discard its
+  terminal retained-history identity.
+- The per-source six is checked-derived from the worst phase alignment of two intersecting slots,
+  each containing one block plus two single attestations. Seventeen retained windows therefore
+  hold at most `(96 + 6) * 17 = 1,734` IDs. Accepted raw mcache history can intersect at most three
+  such admission windows, giving the separate checked bound `3 * (96 + 6) = 306`; the unrelated
+  per-RPC `max_publish_messages` limit is unchanged. Zero bounds, per-peer greater than global, and
+  retained-inventory arithmetic overflow fail configuration.
+- Behavioral tests admit local 6/reject 7, retain six sequential IDs from one peer/reject 7, and
+  fill 16 peers before rejecting global ID 97. Disconnecting a contributing peer does not release
+  its retained history, so peer churn cannot evade the global cap. Retryable resolution decrements
+  the exact per-peer count, terminal outcomes retain it, and the exact oldest ID becomes eligible
+  only at window 17 rather than window 18.
+- Expiry sensitivity fills five terminal IDs from one peer, expires its sixth pending exact ID at
+  the bounded 300-second deadline, and proves byte-identical redelivery is admitted. Removing the
+  expiry release leaves the duplicate/count retained and fails. The complete inventory test fills
+  and rolls all 1,734 entries without exceeding the bound. The ordinary profile with no validation
+  admission keeps its pre-existing duplicate-cache and mcache behavior.
+- This is only the bounded lower admission prerequisite. It adds no production attestation
+  publisher, does not transfer or consume the service-owned verified batch, and makes no new local
+  fork-choice application, scheduling, pool, persistence, justification, or finalization claim.

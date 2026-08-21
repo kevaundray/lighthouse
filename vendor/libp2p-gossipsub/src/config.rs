@@ -61,6 +61,7 @@ pub struct ValidationAdmissionConfig {
     pub pending_capacity: usize,
     pub per_peer_pending_capacity: usize,
     pub remote_unique_capacity_per_window: usize,
+    pub remote_unique_capacity_per_peer_per_window: usize,
     pub local_unique_capacity_per_window: usize,
     pub pending_timeout: Duration,
     pub window: Duration,

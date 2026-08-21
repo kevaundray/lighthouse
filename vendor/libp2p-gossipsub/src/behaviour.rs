@@ -460,7 +460,7 @@ enum ValidationReservation {
 struct ValidationAdmissionWindow {
     index: u64,
     remote_ids: HashMap<MessageId, PeerId>,
-    remote_peers: HashMap<PeerId, MessageId>,
+    remote_peer_counts: HashMap<PeerId, usize>,
     local_ids: HashSet<MessageId>,
 }
 
@@ -479,12 +479,18 @@ impl ValidationAdmissionHistory {
         if config.pending_capacity == 0
             || config.per_peer_pending_capacity == 0
             || config.remote_unique_capacity_per_window == 0
+            || config.remote_unique_capacity_per_peer_per_window == 0
             || config.local_unique_capacity_per_window == 0
             || config.pending_timeout.is_zero()
             || config.window.is_zero()
             || config.retained_windows == 0
         {
             return Err("validation admission bounds must be non-zero");
+        }
+        if config.remote_unique_capacity_per_peer_per_window
+            > config.remote_unique_capacity_per_window
+        {
+            return Err("per-peer remote validation history exceeds global remote capacity");
         }
         let retained_windows = u64::try_from(config.retained_windows)
             .map_err(|_| "validation admission retained-window count exceeds u64")?;
@@ -522,7 +528,7 @@ impl ValidationAdmissionHistory {
             self.windows.push_back(ValidationAdmissionWindow {
                 index: current_index,
                 remote_ids: HashMap::new(),
-                remote_peers: HashMap::new(),
+                remote_peer_counts: HashMap::new(),
                 local_ids: HashSet::new(),
             });
         }
@@ -552,14 +558,18 @@ impl ValidationAdmissionHistory {
             .windows
             .back_mut()
             .expect("the current validation admission window was inserted");
-        if window.remote_peers.contains_key(peer) {
+        let peer_count = window.remote_peer_counts.get(peer).copied().unwrap_or(0);
+        if peer_count >= self.config.remote_unique_capacity_per_peer_per_window {
             return ValidationReservation::PeerFull;
         }
+        let Some(next_peer_count) = peer_count.checked_add(1) else {
+            return ValidationReservation::PeerFull;
+        };
         if window.remote_ids.len() >= capacity {
             return ValidationReservation::Full;
         }
         window.remote_ids.insert(id.clone(), *peer);
-        window.remote_peers.insert(*peer, id.clone());
+        window.remote_peer_counts.insert(*peer, next_peer_count);
         ValidationReservation::New
     }
 
@@ -583,7 +593,13 @@ impl ValidationAdmissionHistory {
     fn release(&mut self, id: &MessageId) {
         for window in &mut self.windows {
             if let Some(peer) = window.remote_ids.remove(id) {
-                window.remote_peers.remove(&peer);
+                match window.remote_peer_counts.get_mut(&peer) {
+                    Some(count) if *count > 1 => *count -= 1,
+                    Some(_) => {
+                        window.remote_peer_counts.remove(&peer);
+                    }
+                    None => {}
+                }
             }
             window.local_ids.remove(id);
         }

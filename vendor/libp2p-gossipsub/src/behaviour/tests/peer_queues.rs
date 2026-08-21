@@ -146,6 +146,7 @@ fn all_queues_full_rolls_back_exact_local_admission_and_cache_state() {
                 pending_capacity: 2,
                 per_peer_pending_capacity: 1,
                 remote_unique_capacity_per_window: 16,
+                remote_unique_capacity_per_peer_per_window: 1,
                 local_unique_capacity_per_window: 1,
                 pending_timeout: Duration::from_secs(300),
                 window: Duration::from_secs(300),
