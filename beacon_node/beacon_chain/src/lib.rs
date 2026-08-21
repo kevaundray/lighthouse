@@ -194,13 +194,15 @@ pub use self::historical_blocks::HistoricalBlockError;
 pub use self::pq_attestation_gossip::{
     PQ_ATTESTATION_GOSSIP_ADMISSION_CAPACITY, PqAggregateGossipPropagationToken,
     PqAttestationGossipError, PqAttestationGossipLocalError, PqAttestationGossipObservation,
-    PqAttestationGossipPeerInvalid, PqLocalAttestationInvariant,
-    PqLocalAttestationVerificationError, PqSingleConsumptionResult, PqSingleGossipPropagationToken,
-    PqVerifiedGossipAggregate, PqVerifiedGossipSingle, PqVerifiedLocalSingle,
+    PqAttestationGossipPeerInvalid, PqLocalAttestationBatchVerificationError,
+    PqLocalAttestationInvariant, PqLocalAttestationVerificationError, PqSingleConsumptionResult,
+    PqSingleGossipPropagationToken, PqVerifiedGossipAggregate, PqVerifiedGossipSingle,
+    PqVerifiedLocalSingle,
 };
 #[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
 pub use self::pq_attestation_gossip::{
-    TestingPqAttestationObservationCache, testing_only_pq_attestation_advance_distance,
+    TestingPqAtomicLocalBatchError, TestingPqAttestationObservationCache,
+    testing_only_collect_pq_local_batch_atomically, testing_only_pq_attestation_advance_distance,
     testing_only_pq_attestation_late_window, testing_only_pq_attestation_target_root,
     testing_only_pq_single_prepropagation_retry,
 };
@@ -229,6 +231,7 @@ pub use self::pq_local_attester_context::{
     PqLocalAttestationCandidate, PqLocalAttestationContext, PqLocalAttestationContextError,
     PqLocalAttesterIdentity, PqLocalSingleConstructionError, PqLocallyConstructedSingle,
     PqOwnedLocalAttestationCandidateBatch, PqSealedLocalAttestationBatch,
+    PqVerifiedLocalAttestationBatch,
 };
 #[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
 pub use self::pq_local_attester_context::{

@@ -1,22 +1,31 @@
 #![cfg(all(feature = "pq-proposer", target_os = "linux"))]
 
 use beacon_node::beacon_chain::{
-    PqOperationalEvent, PqOperationalEventRole, PqOperationalEventSink,
+    BeaconChain, PqLocalAttesterIdentity, PqNewPayloadTransport, PqOperationalEvent,
+    PqOperationalEventRole, PqOperationalEventSink,
+    builder::{BeaconChainBuilder, Witness},
 };
-use consensus_signature::PqValidatorRegistryEntry;
+use consensus_signature::{AggregationService, PqValidatorRegistryEntry};
 use execution_layer::auth::JwtKey;
 use execution_layer::test_utils::{DEFAULT_JWT_SECRET, MockEngineAuditEvent, MockServer};
 use fs2::FileExt;
+use initialized_validators::InitializedValidators;
+use lighthouse_validator_store::{Config as ValidatorStoreConfig, LighthouseValidatorStore};
+use network::PqNetworkBlockProcessor;
 use network_utils::enr_ext::EnrExt;
+use pq_attester_service::{PqAttestationCompletion, PqAttesterService};
 use pq_devnet::{production_config, provision_devnet};
 use rusqlite::{Connection, MAIN_DB, params};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use slashing_protection::SlashingDatabase;
+use slot_clock::{SlotClock, SystemTimeSlotClock};
 use ssz::Encode;
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, UdpSocket};
+use std::ops::Deref;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -24,9 +33,14 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use store::{HotColdDB, MemoryStore, StoreConfig};
 use tempfile::TempDir;
-use types::{BeaconState, EthSpec, ExecutionBlockHash, ForkName, Hash256, MinimalEthSpec, Uint256};
+use types::{
+    BeaconBlock, BeaconState, ChainSpec, EthSpec, ExecutionBlockHash, ExecutionPayloadRef,
+    ForkName, Hash256, MinimalEthSpec, SignedBeaconBlock, Slot, SubnetId, Uint256,
+};
 use validator_dir::{PqDevnetBundle, PqDevnetManifest};
+use validator_store::{SignedBlock, UnsignedBlock, ValidatorStore};
 
 const PQ_EVENT_PREFIX: &str = "PQ_EVENT_V1";
 const MAX_LOG_FRAME_BYTES: usize = 64 * 1024;
@@ -51,6 +65,509 @@ fn unix_time_now() -> Result<u64, String> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .map_err(|error| format!("system clock precedes Unix epoch: {error}"))
+}
+
+type DirectAttesterWitness = Witness<SystemTimeSlotClock, MinimalEthSpec, MemoryStore, MemoryStore>;
+
+struct DirectAttesterExecution;
+
+impl PqNewPayloadTransport<MinimalEthSpec> for DirectAttesterExecution {
+    fn notify_new_payload<'a>(
+        &'a self,
+        _request: execution_layer::NewPayloadRequest<'a, MinimalEthSpec>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<execution_layer::PayloadStatus, execution_layer::Error>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async { Ok(execution_layer::PayloadStatus::Valid) })
+    }
+
+    fn notify_forkchoice_updated<'a>(
+        &'a self,
+        _head_block_hash: ExecutionBlockHash,
+        _current_slot: Slot,
+        _head_block_root: Hash256,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<execution_layer::PayloadStatus, execution_layer::Error>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async { Ok(execution_layer::PayloadStatus::Valid) })
+    }
+}
+
+fn direct_attester_store(
+    spec: Arc<ChainSpec>,
+) -> Arc<HotColdDB<MinimalEthSpec, MemoryStore, MemoryStore>> {
+    let mut config = StoreConfig::default();
+    config.hierarchy_config.exponents = vec![0];
+    config.block_cache_size = 0;
+    Arc::new(HotColdDB::open_ephemeral(config, spec).expect("snapshot-every-slot store"))
+}
+
+fn clone_validated_attester_template() -> (TempDir, PqNetworkIdentity) {
+    let target = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target");
+    let target = open_directory_nofollow(&target, None).expect("open target directory once");
+    let lock = open_fixture_lock(&target).expect("anchored fixture lock");
+    lock.lock_exclusive()
+        .expect("exclusive fixture-generation lock");
+    let template = anchored_path(&target).join(TEMPLATE_VERSION);
+    validate_template_structure(&template).expect("validated immutable template structure");
+    let template_root =
+        open_directory_nofollow(&template, Some(0o700)).expect("held immutable template");
+    let expected_inventory = TemplateInventory::decode(
+        &read_named_bounded(&template_root, "inventory", 0o600, 1024)
+            .expect("bounded template inventory"),
+    )
+    .expect("exact template inventory");
+    let source_container = template.join("container");
+    assert_eq!(
+        inventory_tree(&source_container).expect("source raw inventory"),
+        expected_inventory,
+        "the retained cache instance must match its published raw inventory",
+    );
+    let identity =
+        validate_network_identity(&source_container).expect("source semantic network identity");
+    validate_frozen_template_identity(&identity).expect("frozen template identity");
+    validate_semantic_anchor(&identity, PINNED_TEMPLATE_SEMANTIC_SHA256)
+        .expect("pinned deterministic semantic identity");
+
+    let root = tempfile::tempdir().expect("private direct-attester clone root");
+    let destination = root.path().join("container");
+    copy_tree_exact(&source_container, &destination).expect("descriptor-bound private clone");
+    assert_eq!(
+        inventory_tree(&destination).expect("copied raw inventory"),
+        expected_inventory,
+        "the node must never authenticate or mutate the immutable source cache",
+    );
+    FileExt::unlock(&lock).expect("unlock fixture cache");
+    (root, identity)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExpectedDirectAttestation {
+    validator_index: u64,
+    pubkey: consensus_signature::ValidatorPublicKeyBytes,
+    committee_index: u64,
+    committee_position: usize,
+    committee_length: usize,
+    committee_count_at_slot: u64,
+    subnet: SubnetId,
+    bound_head_root: Hash256,
+    dependent_root: Hash256,
+    signing_root: Hash256,
+}
+
+struct RootLastOwner<T> {
+    owner: T,
+    _root: TempDir,
+}
+
+impl<T> Deref for RootLastOwner<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.owner
+    }
+}
+
+struct AuthenticDirectAttesterOwners {
+    _executor_exit_sender: async_channel::Sender<()>,
+    chain: Arc<BeaconChain<DirectAttesterWitness>>,
+    service: Arc<PqAttesterService<DirectAttesterWitness>>,
+    prechecks: Arc<std::sync::atomic::AtomicUsize>,
+    expected: Vec<ExpectedDirectAttestation>,
+}
+
+type AuthenticDirectAttesterFixture = RootLastOwner<AuthenticDirectAttesterOwners>;
+
+struct RootPresenceOnOwnerDrop {
+    root: PathBuf,
+    observed: Arc<Mutex<Option<bool>>>,
+}
+
+impl Drop for RootPresenceOnOwnerDrop {
+    fn drop(&mut self) {
+        *self.observed.lock().expect("drop-order observation lock") = Some(self.root.exists());
+    }
+}
+
+#[test]
+fn direct_attester_fixture_drops_owners_before_root_normally_and_on_unwind() {
+    for unwind in [false, true] {
+        let root = tempfile::tempdir().expect("drop-order root");
+        let root_path = root.path().to_path_buf();
+        let observed = Arc::new(Mutex::new(None));
+        let observed_by_owner = Arc::clone(&observed);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let fixture = RootLastOwner {
+                _root: root,
+                owner: RootPresenceOnOwnerDrop {
+                    root: root_path.clone(),
+                    observed: observed_by_owner,
+                },
+            };
+            if unwind {
+                panic!("exercise fixture unwind cleanup");
+            }
+            drop(fixture);
+        }));
+        assert_eq!(outcome.is_err(), unwind);
+        assert_eq!(
+            *observed.lock().expect("drop-order result"),
+            Some(true),
+            "every runtime owner must observe the fixture root until its own Drop completes",
+        );
+        assert!(
+            !root_path.exists(),
+            "the TempDir must still clean up after every runtime owner",
+        );
+    }
+}
+
+async fn wait_for_direct_attester_slot_one(clock: &SystemTimeSlotClock) {
+    tokio::time::timeout(Duration::from_secs(360), async {
+        loop {
+            match clock.now() {
+                Some(slot) if slot == Slot::new(1) => return,
+                Some(slot) if slot > Slot::new(1) => {
+                    panic!("direct-attester fixture missed slot one: {slot}")
+                }
+                Some(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                None => panic!("system clock unavailable"),
+            }
+        }
+    })
+    .await
+    .expect("bounded wait for direct-attester slot one");
+}
+
+async fn authentic_system_slot_one_attester_fixture() -> AuthenticDirectAttesterFixture {
+    let started = Instant::now();
+    let (root, cached_identity) = clone_validated_attester_template();
+    eprintln!(
+        "PQ direct attester: validated private cache clone after {:?}",
+        started.elapsed()
+    );
+    let (executor_exit_sender, executor_exit) = async_channel::bounded(1);
+    let (shutdown_sender, _shutdown_receiver) = futures::channel::mpsc::channel(2);
+    let task_executor = task_executor::TaskExecutor::new(
+        tokio::runtime::Handle::current(),
+        executor_exit,
+        shutdown_sender,
+    );
+    let container = root.path().join("container");
+    let initialized = InitializedValidators::from_pq_bundle(
+        container.join("bundle"),
+        cached_identity.genesis_validators_root,
+        cached_identity.genesis_time,
+        cached_identity.registry.clone(),
+        task_executor.clone(),
+    )
+    .await
+    .expect("authenticate copied exact 16-key bundle once");
+    eprintln!(
+        "PQ direct attester: copied authority open after {:?}",
+        started.elapsed()
+    );
+
+    let now = unix_time_now().expect("fixture clock");
+    let slot_one_start = now.checked_add(180).expect("slot-one start");
+    let genesis_time = slot_one_start.checked_sub(300).expect("genesis time");
+    rebase_network_identity(&container, genesis_time).expect("late exact clone rebase");
+    let identity = validate_network_identity(&container).expect("rebased identity");
+    assert_eq!(
+        identity.genesis_validators_root,
+        cached_identity.genesis_validators_root
+    );
+    assert_eq!(identity.registry, cached_identity.registry);
+    assert_eq!(identity.genesis_time, genesis_time);
+
+    let spec = Arc::new(
+        ForkName::Electra
+            .make_genesis_spec(MinimalEthSpec::default_spec())
+            .set_slot_duration_ms::<MinimalEthSpec>(300_000),
+    );
+    let mut genesis = BeaconState::<MinimalEthSpec>::from_ssz_bytes(
+        &fs::read(container.join("testnet/genesis.ssz")).expect("rebased genesis bytes"),
+        &spec,
+    )
+    .expect("rebased genesis state");
+    genesis
+        .build_all_committee_caches(&spec)
+        .expect("genesis committee caches");
+    let slashing_path = root.path().join("slashing_protection.sqlite");
+    let slashing = SlashingDatabase::create(&slashing_path).expect("fresh slashing DB");
+    for entry in &identity.registry {
+        slashing
+            .register_validator(entry.public_key())
+            .expect("register exact manifest validator");
+    }
+    let clock = SystemTimeSlotClock::new(
+        Slot::new(0),
+        Duration::from_secs(genesis_time),
+        Duration::from_secs(PQ_SLOT_SECONDS),
+    );
+    let validator_store = Arc::new(LighthouseValidatorStore::new(
+        initialized,
+        slashing,
+        Hash256::from(identity.genesis_validators_root),
+        Arc::clone(&spec),
+        None,
+        clock.clone(),
+        &ValidatorStoreConfig::default(),
+        task_executor.clone(),
+    ));
+    let prechecks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let prechecks_for_hook = Arc::clone(&prechecks);
+    validator_store.testing_only_set_pq_attestation_precheck_hook(Some(Arc::new(move || {
+        prechecks_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    })));
+    let aggregation_service =
+        Arc::new(AggregationService::new().expect("sole PQ aggregation service"));
+    let chain = Arc::new(
+        BeaconChainBuilder::<DirectAttesterWitness>::pq_new(MinimalEthSpec)
+            .store(direct_attester_store(Arc::clone(&spec)))
+            .custom_spec(Arc::clone(&spec))
+            .genesis_state(genesis.clone())
+            .expect("persist exact 16-validator genesis")
+            .pq_aggregation_service(aggregation_service)
+            .task_executor(task_executor.clone())
+            .testing_only_pq_execution_notifier(Arc::new(DirectAttesterExecution))
+            .build()
+            .expect("SystemTime direct-attester chain"),
+    );
+
+    let genesis_root = chain.head_snapshot().beacon_block_root;
+    let mut pre_state = genesis;
+    state_processing::per_slot_processing_pq(&mut pre_state, &spec)
+        .expect("advance exact slot-one parent state");
+    let proposer_index = pre_state
+        .get_beacon_proposer_index(Slot::new(1), &spec)
+        .expect("slot-one proposer");
+    let proposer_pubkey = pre_state
+        .validators()
+        .get(proposer_index)
+        .expect("slot-one proposer validator")
+        .pubkey;
+    let randao = validator_store
+        .randao_reveal(proposer_pubkey, Slot::new(1))
+        .await
+        .expect("real journal-backed RANDAO");
+    let verified_randao = state_processing::prepare_pq_randao(
+        &pre_state,
+        Arc::clone(&chain.pq_validator_key_cache),
+        Slot::new(1),
+        randao.clone(),
+        Arc::clone(&spec),
+    )
+    .expect("prepared RANDAO")
+    .verify(&chain.pq_aggregation_service)
+    .await
+    .expect("authentic RANDAO proof");
+    eprintln!(
+        "PQ direct attester: RANDAO verified after {:?}",
+        started.elapsed()
+    );
+    let mut block: BeaconBlock<MinimalEthSpec> = BeaconBlock::empty(&spec);
+    let BeaconBlock::Electra(inner) = &mut block else {
+        panic!("frozen Electra block")
+    };
+    inner.slot = Slot::new(1);
+    inner.proposer_index = proposer_index as u64;
+    inner.parent_root = genesis_root;
+    inner.body.randao_reveal = randao;
+    inner.body.execution_payload.execution_payload.timestamp = pre_state
+        .genesis_time()
+        .checked_add(spec.get_slot_duration().as_secs())
+        .expect("slot-one timestamp");
+    inner.body.execution_payload.execution_payload.prev_randao = *pre_state
+        .get_randao_mix(pre_state.current_epoch())
+        .expect("current RANDAO mix");
+    inner.body.execution_payload.execution_payload.block_hash =
+        execution_layer::calculate_execution_block_hash(
+            ExecutionPayloadRef::Electra(&inner.body.execution_payload.execution_payload),
+            Some(inner.parent_root),
+            Some(&inner.body.execution_requests),
+        )
+        .0;
+    let local =
+        state_processing::prepare_pq_local_block(&pre_state, block, verified_randao, vec![])
+            .expect("sealed slot-one block");
+    let mut post_state = pre_state.clone();
+    let local_output = state_processing::per_block_processing_pq_local(&mut post_state, local)
+        .expect("slot-one local transition");
+    let (mut block, _) = local_output.into_parts();
+    *block.state_root_mut() = post_state.canonical_root().expect("post-state root");
+    let contents = eth2::types::FullBlockContents::new(
+        block,
+        Some((
+            types::KzgProofs::<MinimalEthSpec>::default(),
+            types::BlobsList::<MinimalEthSpec>::default(),
+        )),
+    );
+    let SignedBlock::Full(signed) = validator_store
+        .sign_block(proposer_pubkey, UnsignedBlock::Full(contents), Slot::new(1))
+        .await
+        .expect("real journal-backed proposal")
+    else {
+        panic!("full block signing preserves shape")
+    };
+    let signed: Arc<SignedBeaconBlock<MinimalEthSpec>> = Arc::clone(signed.signed_block());
+    let block_root = signed.canonical_root();
+    wait_for_direct_attester_slot_one(&clock).await;
+    PqNetworkBlockProcessor::new(Arc::clone(&chain))
+        .import_rpc_block(signed)
+        .await
+        .expect("execution-VALID slot-one import");
+    assert!(chain.testing_only_pq_execution_reconciled(block_root));
+    eprintln!(
+        "PQ direct attester: slot one imported after {:?}",
+        started.elapsed()
+    );
+
+    let identities: Arc<[PqLocalAttesterIdentity]> = identity
+        .registry
+        .iter()
+        .map(|entry| PqLocalAttesterIdentity::new(entry.public_key(), entry.validator_index()))
+        .collect::<Vec<_>>()
+        .into();
+    let context = chain
+        .pq_local_attestation_context(identities)
+        .await
+        .expect("independent exact local context");
+    let context = chain
+        .consume_pq_local_attestation_context(context)
+        .expect("independent coherent local context");
+    let expected = context
+        .candidates()
+        .iter()
+        .map(|candidate| ExpectedDirectAttestation {
+            validator_index: candidate.validator_index(),
+            pubkey: candidate.pubkey(),
+            committee_index: candidate.committee_index(),
+            committee_position: candidate.committee_position(),
+            committee_length: candidate.committee_length(),
+            committee_count_at_slot: candidate.committee_count_at_slot(),
+            subnet: candidate.subnet(),
+            bound_head_root: candidate.bound_head_root(),
+            dependent_root: context.dependent_root(),
+            signing_root: candidate.signing_root(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(expected.len(), 2, "frozen full-16 slot-one duty count");
+    drop(context);
+    let service = Arc::new(
+        PqAttesterService::new(Arc::clone(&chain), validator_store, task_executor)
+            .expect("internally sourced exact 16-key identity snapshot"),
+    );
+    RootLastOwner {
+        _root: root,
+        owner: AuthenticDirectAttesterOwners {
+            _executor_exit_sender: executor_exit_sender,
+            chain,
+            service,
+            prechecks,
+            expected,
+        },
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn direct_pq_attester_service_authentically_signs_and_proves_slot_once() {
+    let started = Instant::now();
+    let fixture = authentic_system_slot_one_attester_fixture().await;
+    assert_eq!(
+        fixture
+            .chain
+            .testing_only_pq_attestation_gossip_observation_count(),
+        0,
+    );
+    let first = fixture
+        .service
+        .try_attest_current_slot()
+        .expect("current slot admitted")
+        .wait()
+        .await
+        .expect("real direct service completion");
+    let PqAttestationCompletion::Verified(first_metadata) = first else {
+        panic!("two exact current-slot duties must verify")
+    };
+    eprintln!(
+        "PQ direct attester: service verified after {:?}",
+        started.elapsed()
+    );
+    assert_eq!(first_metadata.slot, Slot::new(1));
+    assert_eq!(first_metadata.members.len(), fixture.expected.len());
+    for (actual, expected) in first_metadata.members.iter().zip(&fixture.expected) {
+        assert_eq!(actual.validator_index, expected.validator_index);
+        assert_eq!(actual.pubkey, expected.pubkey);
+        assert_eq!(actual.committee_index, expected.committee_index);
+        assert_eq!(actual.committee_position, expected.committee_position);
+        assert_eq!(actual.committee_length, expected.committee_length);
+        assert_eq!(
+            actual.committee_count_at_slot,
+            expected.committee_count_at_slot,
+        );
+        assert_eq!(actual.subnet, expected.subnet);
+        assert_eq!(actual.bound_head_root, expected.bound_head_root);
+        assert_eq!(actual.dependent_root, expected.dependent_root);
+        assert_eq!(actual.signing_root, expected.signing_root);
+        assert_ne!(actual.signed_ssz_digest, [0; 32]);
+    }
+    assert_eq!(
+        fixture.service.testing_only_owned_verified_count(),
+        Some(fixture.expected.len()),
+    );
+    assert_eq!(
+        fixture.service.testing_only_completed_verified_metadata(),
+        Some(first_metadata.clone()),
+    );
+    let cached = fixture
+        .service
+        .try_attest_current_slot()
+        .expect("same-slot result cached")
+        .wait()
+        .await
+        .expect("cached direct completion");
+    assert_eq!(cached, PqAttestationCompletion::Verified(first_metadata));
+    assert_eq!(
+        fixture.prechecks.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "same-slot cache must not invoke SQLite/signing twice",
+    );
+    assert_eq!(
+        fixture
+            .chain
+            .testing_only_pq_local_attestation_batch_verification_count(),
+        1,
+        "same-slot cache must not invoke the real local proof batch twice",
+    );
+    assert_eq!(
+        fixture
+            .chain
+            .testing_only_pq_attestation_gossip_observation_count(),
+        0,
+        "local proof must not enter remote gossip observations",
+    );
+    fixture
+        .service
+        .close_and_drain()
+        .await
+        .expect("drop service-owned real token batch");
+    fixture.chain.close_and_drain_pq_imports().await;
+    assert!(matches!(
+        fixture.service.try_attest_current_slot(),
+        Err(pq_attester_service::PqAttesterServiceError::Closed)
+    ));
+    eprintln!("PQ direct attester: drained after {:?}", started.elapsed());
 }
 
 fn unix_time_now_precise() -> Result<Duration, String> {

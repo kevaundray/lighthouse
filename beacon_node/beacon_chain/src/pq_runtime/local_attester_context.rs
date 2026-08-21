@@ -401,6 +401,59 @@ impl<E: EthSpec> PqSealedLocalAttestationBatch<E> {
     pub fn is_empty(&self) -> bool {
         self.provenances.is_empty()
     }
+
+    pub(crate) fn into_proof_parts(
+        self,
+    ) -> (
+        Vec<PqLocallyConstructedSingle<E>>,
+        PqLocalAttestationProofBatchGuard,
+    ) {
+        (
+            self.provenances,
+            PqLocalAttestationProofBatchGuard {
+                _admission: self._admission,
+                _activity: self._activity,
+            },
+        )
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_into_empty_verified_batch(self) -> PqVerifiedLocalAttestationBatch<E> {
+        let (provenances, candidate_guard) = self.into_proof_parts();
+        drop(provenances);
+        PqVerifiedLocalAttestationBatch {
+            verified: vec![],
+            _candidate_guard: candidate_guard,
+        }
+    }
+}
+
+/// Original Slice-A candidate guards retained across every local proof and final token owner.
+pub(crate) struct PqLocalAttestationProofBatchGuard {
+    _admission: OwnedSemaphorePermit,
+    _activity: Arc<crate::beacon_chain::PqImportActivity>,
+}
+
+/// Atomic, non-Clone result of verifying every member of one sealed local signing batch.
+pub struct PqVerifiedLocalAttestationBatch<E: EthSpec> {
+    pub(crate) verified: Vec<crate::PqVerifiedLocalSingle<E>>,
+    pub(crate) _candidate_guard: PqLocalAttestationProofBatchGuard,
+}
+
+impl<E: EthSpec> PqVerifiedLocalAttestationBatch<E> {
+    pub fn len(&self) -> usize {
+        self.verified.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.verified.is_empty()
+    }
+
+    /// Read-only verified bindings whose lifetime cannot outlive the retained candidate guards.
+    pub fn verified(&self) -> &[crate::PqVerifiedLocalSingle<E>] {
+        &self.verified
+    }
 }
 
 #[derive(Debug)]

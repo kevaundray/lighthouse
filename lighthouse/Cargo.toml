@@ -128,17 +128,25 @@ malloc_utils = { workspace = true, features = [] }
 async-channel = { workspace = true }
 consensus_signature = { workspace = true }
 discv5 = { workspace = true }
+eth2 = { workspace = true, features = ["pq-devnet"] }
 ethereum_ssz = { workspace = true }
 execution_layer = { workspace = true, features = ["pq-devnet"] }
 fs2 = { workspace = true }
 hex = { workspace = true }
+initialized_validators = { workspace = true, features = ["pq-devnet"] }
 libc = "0.2"
+lighthouse_validator_store = { workspace = true, features = ["pq-devnet", "pq-startup-testing"] }
+network = { path = "../beacon_node/network", default-features = false, features = ["pq-devnet"] }
+pq_attester_service = { workspace = true, features = ["pq-startup-testing"] }
 pq_devnet = { workspace = true, features = ["pq-devnet"] }
 rusqlite = { workspace = true }
 sha2 = { workspace = true }
+slashing_protection = { workspace = true, features = ["pq-devnet"] }
+slot_clock = { workspace = true }
 state_processing = { workspace = true }
 tempfile = { workspace = true }
 validator_dir = { workspace = true }
+validator_store = { workspace = true, features = ["pq-devnet"] }
 
 [[test]]
 name = "lighthouse_tests"

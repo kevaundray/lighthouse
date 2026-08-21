@@ -5774,14 +5774,17 @@ dependencies = [
  "initialized_validators",
  "libc",
  "lighthouse_network",
+ "lighthouse_validator_store",
  "lighthouse_version",
  "logging",
  "malloc_utils",
  "metrics",
+ "network",
  "network_utils",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "pq_attester_service",
  "pq_devnet",
  "rusqlite",
  "sensitive_url",
@@ -5790,6 +5793,7 @@ dependencies = [
  "sha2",
  "slasher",
  "slashing_protection",
+ "slot_clock",
  "state_processing",
  "store",
  "task_executor",
@@ -5803,6 +5807,7 @@ dependencies = [
  "validator_client",
  "validator_dir",
  "validator_manager",
+ "validator_store",
  "yaml_serde",
  "zeroize",
 ]
@@ -7277,6 +7282,7 @@ dependencies = [
 name = "pq_attester_service"
 version = "0.1.0"
 dependencies = [
+ "async-channel 1.9.0",
  "beacon_chain",
  "consensus_signature",
  "futures",

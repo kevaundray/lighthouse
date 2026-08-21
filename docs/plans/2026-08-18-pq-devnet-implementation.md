@@ -2650,13 +2650,51 @@ to the cancellable helper loses that signal and fails. Ordinary BLS signing and 
 remain unchanged. A production imported-slot context-transfer proof also pins that batch ownership,
 not a synthetic fixture, retains admission and keeps chain drain pending until batch drop.
 
+**Cycle 3 Slice B2 C1-C3 checkpoint (implemented, direct service without scheduling or
+publication):** the signer-only `pq-proposer` graph now contains a concrete
+`PqAttesterService<MinimalEthSpec, SystemTimeSlotClock>`. Its constructor takes the real chain,
+validator store, and executor and internally seals the store-derived, exact sorted/unique identity
+snapshot capped at 16. The zero-argument current-slot operation supplies no caller-selected signing
+semantics. The `pq-devnet` verifier graph remains free of the validator store, keys, and service.
+
+The cap-one state machine coalesces same-slot callers in one `InFlight` receipt and caches
+`CompletedNoDuty`, service-owned `CompletedVerified`, or `CompletedTerminal`. A verified batch is
+non-`Clone` and blocks a different slot with `PreviousUnconsumed` until a future publisher consumes
+it. The independent monotonic no-duty watermark preserves `NoDuty(N)` across an admitted
+`N+1` retryable pre-sign failure: `N` remains cached, `N-1` is rollback, and `N+1` may retry. One
+monitored without-exit supervisor owns the entire context, consume, signing, and proof operation;
+pre-sign retryable failures restore `Idle`, while the stateful boundary records exact
+validator/index/target-epoch/data/signing-root attempts and makes later partial, empty, panic, or
+proof failure terminal without alternate signing. Nested typed errors retain their source chains.
+
+The service never separates provenance from its guards. It consumes the signed batch through the
+chain's atomic whole-batch verifier, checks the exact proof cap of two before stateful work, and
+collects at most two real local proofs all-or-none. The resulting batch owns the original candidate
+guard and all real proof tokens; cloneable receipts expose only exact bounded metadata and full
+signed-SSZ digests. Shutdown closes admission, drains the supervisor, rechecks completion, and drops
+any batch completed during close before chain drain, fixing the close/completion race. The authentic
+fixture's ordered owner wrapper also drops service/store/chain/executor ownership before its private
+temporary root on both normal and unwind teardown.
+
+The final warning-denied AVX2 direct-service tracer passed 1/1 in 460.39 seconds using the validated
+private 16-key fixture clone and a real execution-VALID reconciled slot-1 Minimal/Electra/300 head.
+It produced two duties through the zero-argument service, observed exactly one SQLite precheck and
+one whole-batch local verification, retained two real tokens, returned byte-identical cached
+same-slot metadata, and kept the remote observation cardinality at `0 -> 0`. The exact command was
+`RUSTFLAGS='-D warnings -C target-feature=+avx2' cargo +1.88 test -p lighthouse
+--no-default-features --features pq-proposer --test pq_e4f_launch
+direct_pq_attester_service_authentically_signs_and_proves_slot_once -- --exact --nocapture`.
+Removing the service-owned batch failed with `AtomicBatchMissing` in 459.80 seconds; the restored
+GREEN run recorded clone/authentication/RANDAO/import/complete phases at 0.172/279.315/306.991/
+459.396/460.382 seconds.
+
 This checkpoint is not completion of Task 5.2b. The fork-choice receiver remains in-memory Fresh
 evidence, and the local-context Resume evidence is limited to rebuilding ephemeral committee caches
 from the selected canonical snapshot. There is no live aggregate-and-proof routing, operation-pool
-or naive-aggregation-pool insertion, full service-owned signing state machine, production
-publication, scheduler, HTTP route, fork-choice/vote or local-context persistence, justification,
-or finalization claim. The finalized checkpoint remains genesis. Those remain the subsequent
-vertical slices described below.
+or naive-aggregation-pool insertion, production publication, scheduler, HTTP route, local
+fork-choice application, service/fork-choice persistence, justification, or finalization claim.
+The finalized checkpoint remains genesis. Those remain the subsequent vertical slices described
+below.
 
 **Files:**
 

@@ -37,6 +37,7 @@ types = { workspace = true, optional = true }
 validator_store = { path = "../validator_store", default-features = false, optional = true }
 
 [dev-dependencies]
+async-channel = { workspace = true }
 consensus_signature = { workspace = true, features = ["pq-devnet"] }
 state_processing = { workspace = true, features = ["pq-attestation"] }
 

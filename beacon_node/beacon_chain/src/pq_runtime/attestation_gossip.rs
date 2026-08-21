@@ -1,4 +1,8 @@
-use crate::{BeaconChain, BeaconChainTypes, BeaconSnapshot, PqLocallyConstructedSingle};
+use crate::{
+    BeaconChain, BeaconChainTypes, BeaconSnapshot, PqLocallyConstructedSingle,
+    PqSealedLocalAttestationBatch, PqVerifiedLocalAttestationBatch,
+};
+use futures::StreamExt;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use slot_clock::SlotClock;
@@ -9,6 +13,7 @@ use state_processing::{
     prepare_pq_aggregate_and_proof, prepare_pq_single_attestation,
 };
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::OwnedSemaphorePermit;
 use tree_hash::TreeHash;
@@ -98,6 +103,89 @@ pub enum PqLocalAttestationInvariant {
 pub enum PqLocalAttestationVerificationError {
     Invariant(PqLocalAttestationInvariant),
     Local(PqAttestationGossipLocalError),
+}
+
+#[derive(Debug)]
+pub enum PqLocalAttestationBatchVerificationError {
+    Capacity { count: usize, maximum: usize },
+    Proof(PqLocalAttestationVerificationError),
+}
+
+enum PqAtomicLocalBatchError<E> {
+    Capacity { count: usize, maximum: usize },
+    Proof(E),
+}
+
+async fn collect_pq_local_batch_atomically<I, O, E, F, Fut>(
+    inputs: Vec<I>,
+    verifier: F,
+) -> Result<Vec<O>, PqAtomicLocalBatchError<E>>
+where
+    F: Fn(I) -> Fut,
+    Fut: Future<Output = Result<O, E>>,
+{
+    if inputs.len() > PQ_ATTESTATION_GOSSIP_ADMISSION_CAPACITY {
+        return Err(PqAtomicLocalBatchError::Capacity {
+            count: inputs.len(),
+            maximum: PQ_ATTESTATION_GOSSIP_ADMISSION_CAPACITY,
+        });
+    }
+    let results = futures::stream::iter(inputs)
+        .map(verifier)
+        .buffered(PQ_ATTESTATION_GOSSIP_ADMISSION_CAPACITY)
+        .collect::<Vec<_>>()
+        .await;
+    let mut outputs = Vec::with_capacity(results.len());
+    for result in results {
+        outputs.push(result.map_err(PqAtomicLocalBatchError::Proof)?);
+    }
+    Ok(outputs)
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+#[derive(Debug, PartialEq, Eq)]
+pub enum TestingPqAtomicLocalBatchError<E> {
+    Capacity { count: usize, maximum: usize },
+    Proof(E),
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub async fn testing_only_collect_pq_local_batch_atomically<I, O, E, F, Fut>(
+    inputs: Vec<I>,
+    verifier: F,
+) -> Result<Vec<O>, TestingPqAtomicLocalBatchError<E>>
+where
+    F: Fn(I) -> Fut,
+    Fut: Future<Output = Result<O, E>>,
+{
+    collect_pq_local_batch_atomically(inputs, verifier)
+        .await
+        .map_err(|error| match error {
+            PqAtomicLocalBatchError::Capacity { count, maximum } => {
+                TestingPqAtomicLocalBatchError::Capacity { count, maximum }
+            }
+            PqAtomicLocalBatchError::Proof(error) => TestingPqAtomicLocalBatchError::Proof(error),
+        })
+}
+
+impl std::fmt::Display for PqLocalAttestationBatchVerificationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "PQ local attestation batch verification failed: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for PqLocalAttestationBatchVerificationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Proof(error) => Some(error),
+            Self::Capacity { .. } => None,
+        }
+    }
 }
 
 impl std::fmt::Display for PqLocalAttestationVerificationError {
@@ -1568,6 +1656,36 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             _activity: Some(verified.activity),
             subnet,
             bound_head_root: verified.bound_head_root,
+        })
+    }
+
+    /// Verifies a complete sealed local signing batch without separating its candidate guards.
+    /// Every proof is awaited, successful siblings are dropped on any error, and no partial
+    /// verified capability escapes.
+    pub async fn verify_pq_local_attestation_batch(
+        &self,
+        sealed: PqSealedLocalAttestationBatch<T::EthSpec>,
+    ) -> Result<PqVerifiedLocalAttestationBatch<T::EthSpec>, PqLocalAttestationBatchVerificationError>
+    {
+        #[cfg(feature = "pq-startup-testing")]
+        self.pq_local_attestation_batch_verification_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (provenances, candidate_guard) = sealed.into_proof_parts();
+        let verified = collect_pq_local_batch_atomically(provenances, |provenance| {
+            self.verify_pq_single_attestation_for_local(provenance)
+        })
+        .await
+        .map_err(|error| match error {
+            PqAtomicLocalBatchError::Capacity { count, maximum } => {
+                PqLocalAttestationBatchVerificationError::Capacity { count, maximum }
+            }
+            PqAtomicLocalBatchError::Proof(error) => {
+                PqLocalAttestationBatchVerificationError::Proof(error)
+            }
+        })?;
+        Ok(PqVerifiedLocalAttestationBatch {
+            verified,
+            _candidate_guard: candidate_guard,
         })
     }
 

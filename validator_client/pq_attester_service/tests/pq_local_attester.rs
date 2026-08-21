@@ -1,18 +1,56 @@
 use beacon_chain::{
     BeaconChain, BeaconChainTypes, PqAttestationGossipLocalError, PqLocalAttestationInvariant,
-    PqLocalAttestationVerificationError, PqLocalSingleConstructionError, PqVerifiedLocalSingle,
+    PqLocalAttestationVerificationError, PqLocalSingleConstructionError,
+    PqVerifiedLocalAttestationBatch, PqVerifiedLocalSingle,
     testing_only_pq_local_candidate_batch_fixture,
     testing_only_pq_local_candidate_batch_fixture_with_guards,
     testing_only_pq_local_candidate_fixture,
 };
 use consensus_signature::{AggregationError, SameMessageEvidence, SigningIdError};
+use lighthouse_validator_store::LighthouseValidatorStore;
+use slot_clock::SystemTimeSlotClock;
 use state_processing::PqAttestationLocalError;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use types::{Attestation, Hash256, SubnetId};
+use types::{Attestation, Hash256, MinimalEthSpec, SubnetId};
 
 use pq_attester_service::PqLocalAttestationBatchValidationError;
-use pq_attester_service::{PqLocalAttestationSigningPlan, plan_pq_local_attestations};
+use pq_attester_service::{
+    PqAttestationCompletion, PqAttestationReceipt, PqAttesterService,
+    PqLocalAttestationSigningPlan, plan_pq_local_attestations,
+};
+
+#[allow(dead_code)]
+async fn wished_process_owned_direct_attester_service<T>(
+    chain: Arc<BeaconChain<T>>,
+    validator_store: Arc<LighthouseValidatorStore<SystemTimeSlotClock, MinimalEthSpec>>,
+    task_executor: task_executor::TaskExecutor,
+) where
+    T: BeaconChainTypes<EthSpec = MinimalEthSpec, SlotClock = SystemTimeSlotClock>,
+{
+    let service = Arc::new(
+        PqAttesterService::new(chain, validator_store, task_executor)
+            .expect("the exact sealed identity set constructs one service"),
+    );
+    let receipt: PqAttestationReceipt = service
+        .try_attest_current_slot()
+        .expect("the current slot is admitted or coalesced");
+    let _completion: PqAttestationCompletion = receipt
+        .wait()
+        .await
+        .expect("the process-owned operation completes independently of its caller");
+}
+
+#[allow(dead_code)]
+async fn wished_chain_owned_atomic_local_batch_verification<T: BeaconChainTypes>(
+    chain: Arc<BeaconChain<T>>,
+    sealed: beacon_chain::PqSealedLocalAttestationBatch<T::EthSpec>,
+) -> PqVerifiedLocalAttestationBatch<T::EthSpec> {
+    chain
+        .verify_pq_local_attestation_batch(sealed)
+        .await
+        .expect("the chain atomically verifies the complete sealed batch")
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn guarded_sign_once_cannot_escape_requests_or_cancel_with_its_receipt() {

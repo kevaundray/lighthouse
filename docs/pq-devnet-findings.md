@@ -1899,3 +1899,54 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   current-slot scheduler, production publication, HTTP route, local fork-choice application,
   aggregate or pool integration, signing retry state machine, persisted vote recovery,
   justification, or finalization. The finalized checkpoint remains genesis.
+
+### 2026-08-21: Direct local PQ attester service completed (Task 5.2b Slice B2 C1-C3)
+
+- The signer-enabled `pq-proposer` graph now owns a concrete `PqAttesterService` for
+  `MinimalEthSpec` and `SystemTimeSlotClock`. Construction accepts only the real `BeaconChain`,
+  `LighthouseValidatorStore`, and `TaskExecutor`; it internally seals the store's exact sorted,
+  unique, nonempty validator identity snapshot with a maximum of 16. Its sole operation samples the
+  owned clock through zero-argument `try_attest_current_slot`, so callers cannot select a slot,
+  validator, committee, subnet, or attestation data. The verifier-only `pq-devnet` graph remains
+  store-, signer-, and service-free.
+- The cap-one service state is `Idle`, shared `InFlight`, cached `CompletedNoDuty`, service-owned
+  `CompletedVerified`, or `CompletedTerminal`. Same-slot callers coalesce on one cloneable metadata
+  receipt and never repeat store, signing, or proof work. A verified completion retains the
+  non-`Clone` token batch inside the service; another slot is rejected as `PreviousUnconsumed` until
+  a future publisher consumes it. A monotonic no-duty watermark survives a later slot's retryable
+  pre-sign failure: the no-duty slot stays cached, rollback is rejected, and the later slot can be
+  retried without losing history.
+- One monitored, without-exit supervisor owns context derivation, coherent consume, the guarded
+  one-shot store call, and whole-batch proof. Pre-sign retryable failures restore `Idle`. Before the
+  stateful boundary it checks the exact local proof cap of two; cap overflow cannot reach SQLite,
+  XMSS signing, or journal state. At the stateful boundary it records every exact validator/index,
+  target epoch, attestation data, and signing root. Empty or partial signer output, validation or
+  proof failure, and panic/join failure then become a terminal completion with no alternate signing.
+  Cloneable service errors preserve nested context, planning, signing, and local-proof causes via
+  `Arc` and `Error::source` rather than flattening them.
+- The chain consumes the sealed signed batch through one atomic whole-batch verifier. It checks the
+  cap before starting proof work, runs the real shared local verifier for at most two singles, and
+  returns a non-`Clone` verified batch retaining the original candidate guard plus every real proof
+  token. No public provenance/guard split exists, and one sibling failure drops all successes. The
+  receipt exposes only exact validator/committee/subnet, slot/head/dependent/signing-root, and
+  SHA-256(full signed SSZ) metadata; no verified capability or raw signing request escapes.
+- Shutdown closes service admission, waits the process-owned operation, then rechecks and drops a
+  verified batch that may have completed during close before waiting for chain drain. This closes
+  the completion-after-close ownership race. Caller or receipt drop and executor exit cannot orphan
+  the operation. The authentic test fixture likewise wraps all service/store/chain/executor owners
+  ahead of its `TempDir`, so normal and unwind teardown drop those owners before deleting the root.
+- The warning-denied AVX2 authentic tracer reused a validated private clone of the frozen 16-key
+  fixture and a real execution-VALID, reconciled slot-1 Minimal/Electra/300 chain. Its final command
+  was `RUSTFLAGS='-D warnings -C target-feature=+avx2' cargo +1.88 test -p lighthouse
+  --no-default-features --features pq-proposer --test pq_e4f_launch
+  direct_pq_attester_service_authentically_signs_and_proves_slot_once -- --exact --nocapture`; it
+  passed 1/1 in 460.39 seconds (clone 0.172s, authority 279.315s, RANDAO 306.991s, slot-1 import
+  459.396s, verified and drained 460.382s). The zero-argument service produced two exact duties,
+  performed one SQLite slashing precheck and one atomic local-proof batch, retained both real tokens,
+  returned byte-identical cached metadata on its second same-slot call, and left remote observations
+  exactly `0 -> 0`. Removing the service-owned verified batch failed the same tracer with
+  `AtomicBatchMissing` in 459.80 seconds before the restored GREEN run.
+- This slice does not publish on the production network, apply the local singles to fork choice,
+  schedule future slots, expose HTTP, insert into either attestation pool, aggregate attestations,
+  persist service/fork-choice state, justify, or finalize. The finalized checkpoint remains genesis;
+  none of those later Task 5.2b/7.2 claims are implied.
