@@ -718,6 +718,11 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         ));
     }
 
+    /// Fail closed after an already-propagated PQ attestation cannot be consumed locally.
+    pub fn fail_pq_attestation_after_propagation(&self) {
+        self.fail_pq_fork_choice_task();
+    }
+
     async fn consume_pq_verified_gossip_single_continuation(
         self: &Arc<Self>,
         verified: crate::PqVerifiedGossipSingle<T::EthSpec>,

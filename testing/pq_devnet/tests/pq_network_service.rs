@@ -13,12 +13,21 @@ use network::{
     PQ_NETWORK_BLOCK_PROOF_CAPACITY, PqBlockBroadcastError, PqCommitCompletionQueueTestTrace,
     PqCommitResolutionTestCase, PqCompletionQueueTestScenario, PqCompletionQueueTestTrace,
     PqCompletionTestDisposition, PqCompletionTestEvent, PqEncodingShutdownTestTrace,
-    PqNetworkServiceError, PqProofAdmissionTestTrace, PqStatusTestEvent, PqStatusTestScenario,
-    PqStatusTestTrace, pq_block_broadcast_channel, testing_only_pq_commit_completion_queue,
-    testing_only_pq_commit_resolution, testing_only_pq_completion_lifecycle,
-    testing_only_pq_completion_queue, testing_only_pq_encoding_shutdown,
-    testing_only_pq_gossip_imported_event_gate, testing_only_pq_proof_admission,
-    testing_only_pq_status_lifecycle,
+    PqNetworkAttestationCompletionTestDisposition, PqNetworkAttestationCompletionTestEvent,
+    PqNetworkAttestationConsumptionTestCase, PqNetworkAttestationConsumptionTestTrace,
+    PqNetworkAttestationDetachedTestTrace, PqNetworkAttestationIgnoreTestCase,
+    PqNetworkAttestationIgnoreTestTrace, PqNetworkAttestationInFlightTestTrace,
+    PqNetworkAttestationRouteTestCase, PqNetworkAttestationRouteTestTrace, PqNetworkServiceError,
+    PqProofAdmissionTestTrace, PqStatusTestEvent, PqStatusTestScenario, PqStatusTestTrace,
+    pq_block_broadcast_channel, testing_only_pq_attestation_completion_lifecycle,
+    testing_only_pq_attestation_consumption_resolution,
+    testing_only_pq_attestation_detached_lifecycle,
+    testing_only_pq_attestation_ignore_classification,
+    testing_only_pq_attestation_in_flight_lifecycle, testing_only_pq_attestation_route,
+    testing_only_pq_commit_completion_queue, testing_only_pq_commit_resolution,
+    testing_only_pq_completion_lifecycle, testing_only_pq_completion_queue,
+    testing_only_pq_encoding_shutdown, testing_only_pq_gossip_imported_event_gate,
+    testing_only_pq_proof_admission, testing_only_pq_status_lifecycle,
 };
 use std::sync::Arc;
 use types::{
@@ -31,7 +40,9 @@ use beacon_chain::{
     builder::{BeaconChainBuilder, Witness},
 };
 #[cfg(target_feature = "avx2")]
-use consensus_signature::{AggregationService, PqPublicKey};
+use consensus_signature::{AggregationService, OneTimeUseId, PqPublicKey, SigningDuty};
+#[cfg(target_feature = "avx2")]
+use lighthouse_network::types::{GossipEncoding, GossipKind, GossipTopic};
 #[cfg(target_feature = "avx2")]
 use lighthouse_network::{Context, NetworkConfig, identity::secp256k1};
 #[cfg(target_feature = "avx2")]
@@ -39,11 +50,16 @@ use network::PqNetworkService;
 #[cfg(target_feature = "avx2")]
 use network_utils::enr_ext::EnrExt;
 #[cfg(target_feature = "avx2")]
+use pq_signing::{PqKeyUnlock, PqKeystore, PqSigningAuthority, provision_usage_journal};
+#[cfg(target_feature = "avx2")]
 use ssz::Encode;
 #[cfg(target_feature = "avx2")]
 use store::{HotColdDB, MemoryStore, StoreConfig};
 #[cfg(target_feature = "avx2")]
-use types::ChainSpec;
+use types::{
+    AttestationData, ChainSpec, Checkpoint, Domain, ExecutionPayloadRef, SignedRoot,
+    SingleAttestation, Slot, SubnetId,
+};
 
 #[test]
 fn pq_network_service_has_the_frozen_bounded_proof_contract() {
@@ -91,6 +107,150 @@ fn pq_network_construction_error_preserves_lower_detail() {
     assert_eq!(
         PqNetworkServiceError::Construction("lower network detail".into()).to_string(),
         "could not construct the PQ libp2p service: lower network detail",
+    );
+}
+
+#[test]
+fn admitted_single_routes_to_exact_subnet_verifier_only() {
+    assert_eq!(
+        testing_only_pq_attestation_route(PqNetworkAttestationRouteTestCase::AdmittedSingle {
+            subnet: types::SubnetId::new(3),
+        }),
+        PqNetworkAttestationRouteTestTrace::VerifySingle {
+            subnet: types::SubnetId::new(3),
+        },
+    );
+    assert_eq!(
+        testing_only_pq_attestation_route(PqNetworkAttestationRouteTestCase::OrdinarySingle {
+            subnet: types::SubnetId::new(3),
+        }),
+        PqNetworkAttestationRouteTestTrace::Ignore,
+    );
+    assert_eq!(
+        testing_only_pq_attestation_route(PqNetworkAttestationRouteTestCase::AdmittedAggregate),
+        PqNetworkAttestationRouteTestTrace::RetryableIgnore,
+    );
+}
+
+#[test]
+fn admitted_single_accept_reports_before_propagation_and_consumption() {
+    assert_eq!(
+        testing_only_pq_attestation_completion_lifecycle(
+            PqNetworkAttestationCompletionTestDisposition::Accept {
+                report_succeeded: true,
+            },
+        ),
+        vec![
+            PqNetworkAttestationCompletionTestEvent::ReportedAccept,
+            PqNetworkAttestationCompletionTestEvent::MarkedPropagated,
+            PqNetworkAttestationCompletionTestEvent::ConsumptionSpawned,
+        ],
+    );
+}
+
+#[test]
+fn admitted_single_failed_report_rolls_back_without_consumption() {
+    assert_eq!(
+        testing_only_pq_attestation_completion_lifecycle(
+            PqNetworkAttestationCompletionTestDisposition::Accept {
+                report_succeeded: false,
+            },
+        ),
+        vec![
+            PqNetworkAttestationCompletionTestEvent::ReportedAccept,
+            PqNetworkAttestationCompletionTestEvent::PropagationCapabilityDropped,
+        ],
+    );
+}
+
+#[test]
+fn remote_attestation_redelivery_is_terminal_while_local_capacity_is_retryable() {
+    for case in [
+        PqNetworkAttestationIgnoreTestCase::RemoteDuplicate,
+        PqNetworkAttestationIgnoreTestCase::Aged,
+        PqNetworkAttestationIgnoreTestCase::StaleHead,
+        PqNetworkAttestationIgnoreTestCase::ShuttingDown,
+        PqNetworkAttestationIgnoreTestCase::GenerationExhausted,
+        PqNetworkAttestationIgnoreTestCase::TerminalWindow,
+    ] {
+        assert_eq!(
+            testing_only_pq_attestation_ignore_classification(case),
+            PqNetworkAttestationIgnoreTestTrace {
+                retryable_ignore: false,
+                terminal_ignore: true,
+                retained_history: true,
+            },
+        );
+    }
+    assert_eq!(
+        testing_only_pq_attestation_ignore_classification(
+            PqNetworkAttestationIgnoreTestCase::LocalCapacity,
+        ),
+        PqNetworkAttestationIgnoreTestTrace {
+            retryable_ignore: true,
+            terminal_ignore: false,
+            retained_history: false,
+        },
+    );
+}
+
+#[test]
+fn dropped_prepropagation_single_rolls_back_and_exact_retry_reclaims() {
+    assert!(beacon_chain::testing_only_pq_single_prepropagation_retry());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn attestation_proofs_are_cap_two_and_shutdown_drains_owned_work() {
+    assert_eq!(
+        testing_only_pq_attestation_in_flight_lifecycle().await,
+        PqNetworkAttestationInFlightTestTrace {
+            admitted: vec![true, true, false],
+            retryable_ignored: 1,
+            heartbeat_completed: true,
+            drain_pending_with_two: true,
+            drain_pending_with_one: true,
+            drained_after_release: true,
+            available_permits_after_release: 2,
+        },
+    );
+}
+
+#[test]
+fn post_accept_attestation_failures_retain_history_and_signal_shutdown() {
+    assert_eq!(
+        testing_only_pq_attestation_consumption_resolution(
+            PqNetworkAttestationConsumptionTestCase::Success,
+        ),
+        PqNetworkAttestationConsumptionTestTrace {
+            terminal_history: true,
+            signal_shutdown: false,
+        },
+    );
+    for case in [
+        PqNetworkAttestationConsumptionTestCase::ReconciliationFailed,
+        PqNetworkAttestationConsumptionTestCase::TaskUnavailable,
+        PqNetworkAttestationConsumptionTestCase::ResolutionLost,
+    ] {
+        assert_eq!(
+            testing_only_pq_attestation_consumption_resolution(case),
+            PqNetworkAttestationConsumptionTestTrace {
+                terminal_history: true,
+                signal_shutdown: true,
+            },
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn attestation_task_survives_caller_drop_and_executor_exit_until_release() {
+    assert_eq!(
+        testing_only_pq_attestation_detached_lifecycle().await,
+        PqNetworkAttestationDetachedTestTrace {
+            entered: true,
+            caller_drop_retained: true,
+            executor_exit_retained: true,
+            drained_after_release: true,
+        },
     );
 }
 
@@ -539,6 +699,270 @@ fn build_chain(
 }
 
 #[cfg(target_feature = "avx2")]
+struct LiveSingleAttestationFixture {
+    _temporary_directory: tempfile::TempDir,
+    chain: Arc<beacon_chain::BeaconChain<TestWitness>>,
+    processor: Arc<network::PqNetworkBlockProcessor<TestWitness>>,
+    signed_block: Arc<SignedBeaconBlock<MinimalEthSpec>>,
+    block_root: Hash256,
+    genesis_root: Hash256,
+    post_state: types::BeaconState<MinimalEthSpec>,
+    attester_index: u64,
+    authority: PqSigningAuthority,
+    spec: Arc<ChainSpec>,
+}
+
+#[cfg(target_feature = "avx2")]
+async fn live_single_attestation_fixture(
+    runtime: &task_executor::test_utils::TestRuntime,
+) -> LiveSingleAttestationFixture {
+    const PASSWORD: &[u8] = b"correct horse battery staple";
+
+    let temporary_directory = tempfile::TempDir::new().expect("temporary directory");
+    let journal_path = temporary_directory.path().join("xmss_usage.sqlite");
+    let spec = Arc::new(
+        ForkName::Electra
+            .make_genesis_spec(MinimalEthSpec::default_spec())
+            .set_slot_duration_ms::<MinimalEthSpec>(300_000),
+    );
+    let mut genesis = state_processing::initialize_beacon_state_from_validators::<MinimalEthSpec>(
+        Hash256::ZERO,
+        0,
+        (1..=16)
+            .map(|byte| state_processing::DirectGenesisValidator {
+                public_key: PqPublicKey::deserialize(&[byte; 32])
+                    .expect("canonical synthetic public key"),
+                withdrawal_credentials: Hash256::ZERO,
+            })
+            .collect(),
+        None,
+        &spec,
+    )
+    .expect("direct PQ genesis");
+    genesis
+        .build_all_committee_caches(&spec)
+        .expect("genesis committee caches");
+    let proposer_index = genesis
+        .get_beacon_proposer_index(Slot::new(1), &spec)
+        .expect("slot-one proposer");
+    let attester_index = *genesis
+        .get_beacon_committee(Slot::new(1), 0)
+        .expect("slot-one committee")
+        .committee
+        .iter()
+        .find(|validator_index| **validator_index != proposer_index)
+        .expect("slot-one attester distinct from proposer");
+    let maximum_leaf = [SigningDuty::BeaconBlockProposal, SigningDuty::Attestation]
+        .into_iter()
+        .map(|duty| {
+            OneTimeUseId::for_lean_pq_devnet_v1(1, duty)
+                .expect("slot-one V1 leaf")
+                .as_u32()
+        })
+        .max()
+        .expect("nonempty duty set");
+    let proposer_keystore = PqKeystore::from_seed([0xa5; 32], 0..=maximum_leaf, PASSWORD)
+        .expect("fixture proposer keystore");
+    let proposer_authenticated = proposer_keystore
+        .authenticate(PASSWORD)
+        .expect("authenticated proposer key");
+    let attester_keystore = PqKeystore::from_seed([0xb5; 32], 0..=maximum_leaf, PASSWORD)
+        .expect("fixture attester keystore");
+    let attester_authenticated = attester_keystore
+        .authenticate(PASSWORD)
+        .expect("authenticated attester key");
+    genesis
+        .validators_mut()
+        .get_mut(proposer_index)
+        .expect("proposer validator")
+        .pubkey = *proposer_authenticated.public_key();
+    genesis
+        .validators_mut()
+        .get_mut(attester_index)
+        .expect("attester validator")
+        .pubkey = *attester_authenticated.public_key();
+    let genesis_validators_root = genesis.genesis_validators_root().0;
+    provision_usage_journal(
+        &journal_path,
+        genesis_validators_root,
+        &[proposer_authenticated, attester_authenticated],
+    )
+    .expect("usage journal");
+    let authority = PqSigningAuthority::open(
+        &journal_path,
+        genesis_validators_root,
+        vec![
+            PqKeyUnlock::new(proposer_keystore, PASSWORD).expect("proposer unlock"),
+            PqKeyUnlock::new(attester_keystore, PASSWORD).expect("attester unlock"),
+        ],
+    )
+    .expect("signing authority");
+    let aggregation_service = Arc::new(AggregationService::new().expect("PQ aggregation service"));
+    let chain = Arc::new(
+        BeaconChainBuilder::<TestWitness>::pq_new(MinimalEthSpec)
+            .store(exact_snapshot_store(Arc::clone(&spec)))
+            .custom_spec(Arc::clone(&spec))
+            .genesis_state(genesis.clone())
+            .expect("persist genesis")
+            .pq_aggregation_service(Arc::clone(&aggregation_service))
+            .task_executor(runtime.task_executor.clone())
+            .testing_only_pq_execution_notifier(Arc::new(UnusedValidTransport))
+            .build()
+            .expect("PQ chain"),
+    );
+    let genesis_root = chain.head_snapshot().beacon_block_root;
+    let mut pre_state = genesis;
+    state_processing::per_slot_processing_pq(&mut pre_state, &spec)
+        .expect("advance exact parent state");
+    let sign = |duty: SigningDuty, signing_root: [u8; 32]| {
+        let public_key = pre_state
+            .validators()
+            .get(proposer_index)
+            .expect("proposer validator")
+            .pubkey;
+        authority
+            .signer(&public_key)
+            .expect("bound signer")
+            .sign(consensus_signature::pq::PqSigningClaim::new(
+                signing_root,
+                OneTimeUseId::for_lean_pq_devnet_v1(1, duty).expect("V1 leaf"),
+            ))
+            .expect("journal-backed signature")
+    };
+    let randao_domain = spec.get_domain(
+        pre_state.current_epoch(),
+        Domain::Randao,
+        &pre_state.fork(),
+        pre_state.genesis_validators_root(),
+    );
+    let randao_signature = sign(
+        SigningDuty::RandaoReveal,
+        pre_state.current_epoch().signing_root(randao_domain).0,
+    );
+    let verified_randao = state_processing::prepare_pq_randao(
+        &pre_state,
+        Arc::clone(&chain.pq_validator_key_cache),
+        Slot::new(1),
+        randao_signature.clone(),
+        Arc::clone(&spec),
+    )
+    .expect("prepared RANDAO")
+    .verify(&aggregation_service)
+    .await
+    .expect("verified RANDAO");
+
+    let mut block: BeaconBlock<MinimalEthSpec> = BeaconBlock::empty(&spec);
+    let BeaconBlock::Electra(inner) = &mut block else {
+        panic!("Electra fixture")
+    };
+    inner.slot = Slot::new(1);
+    inner.proposer_index = proposer_index as u64;
+    inner.parent_root = genesis_root;
+    inner.body.randao_reveal = randao_signature;
+    inner.body.execution_payload.execution_payload.timestamp = pre_state
+        .genesis_time()
+        .checked_add(spec.get_slot_duration().as_secs())
+        .expect("slot-one timestamp");
+    inner.body.execution_payload.execution_payload.prev_randao = *pre_state
+        .get_randao_mix(pre_state.current_epoch())
+        .expect("current RANDAO mix");
+    inner.body.execution_payload.execution_payload.block_hash =
+        execution_layer::calculate_execution_block_hash(
+            ExecutionPayloadRef::Electra(&inner.body.execution_payload.execution_payload),
+            Some(inner.parent_root),
+            Some(&inner.body.execution_requests),
+        )
+        .0;
+    let local =
+        state_processing::prepare_pq_local_block(&pre_state, block, verified_randao, vec![])
+            .expect("sealed local block");
+    let mut post_state = pre_state.clone();
+    let local_output = state_processing::per_block_processing_pq_local(&mut post_state, local)
+        .expect("local transition");
+    let (mut block, _) = local_output.into_parts();
+    *block.state_root_mut() = post_state.canonical_root().expect("post-state root");
+    let proposal_domain = spec.get_domain(
+        pre_state.current_epoch(),
+        Domain::BeaconProposer,
+        &pre_state.fork(),
+        pre_state.genesis_validators_root(),
+    );
+    let proposal_signature = sign(
+        SigningDuty::BeaconBlockProposal,
+        block.signing_root(proposal_domain).0,
+    );
+    let signed_block = Arc::new(SignedBeaconBlock::from_block(block, proposal_signature));
+    let block_root = signed_block.canonical_root();
+    let processor = Arc::new(network::PqNetworkBlockProcessor::new(Arc::clone(&chain)));
+    LiveSingleAttestationFixture {
+        _temporary_directory: temporary_directory,
+        chain,
+        processor,
+        signed_block,
+        block_root,
+        genesis_root,
+        post_state,
+        attester_index: attester_index as u64,
+        authority,
+        spec,
+    }
+}
+
+#[cfg(target_feature = "avx2")]
+fn slot_one_single_attestation(
+    fixture: &LiveSingleAttestationFixture,
+) -> (SingleAttestation, SubnetId) {
+    let data = AttestationData {
+        slot: Slot::new(1),
+        index: 0,
+        beacon_block_root: fixture.block_root,
+        source: Checkpoint::default(),
+        target: Checkpoint {
+            epoch: types::Epoch::new(0),
+            root: fixture.genesis_root,
+        },
+    };
+    let domain = fixture.spec.get_domain(
+        types::Epoch::new(0),
+        Domain::BeaconAttester,
+        &fixture.post_state.fork(),
+        fixture.post_state.genesis_validators_root(),
+    );
+    let public_key = fixture
+        .post_state
+        .validators()
+        .get(fixture.attester_index as usize)
+        .expect("attester validator")
+        .pubkey;
+    let signature = fixture
+        .authority
+        .signer(&public_key)
+        .expect("bound attester signer")
+        .sign(consensus_signature::pq::PqSigningClaim::new(
+            data.signing_root(domain).0,
+            OneTimeUseId::for_lean_pq_devnet_v1(1, SigningDuty::Attestation)
+                .expect("slot-one attestation leaf"),
+        ))
+        .expect("attestation signature");
+    let single = SingleAttestation {
+        committee_index: 0,
+        attester_index: fixture.attester_index,
+        data,
+        signature: (&signature).into(),
+    };
+    let subnet = SubnetId::compute_subnet_for_single_attestation::<MinimalEthSpec>(
+        &single,
+        fixture
+            .post_state
+            .get_committee_count_at_slot(Slot::new(1))
+            .expect("slot-one committee count"),
+        &fixture.spec,
+    )
+    .expect("slot-one subnet");
+    (single, subnet)
+}
+
+#[cfg(target_feature = "avx2")]
 async fn start_network_service(
     runtime: &task_executor::test_utils::TestRuntime,
     chain: Arc<beacon_chain::BeaconChain<TestWitness>>,
@@ -548,6 +972,36 @@ async fn start_network_service(
     encoding_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> (
     network::PqBlockBroadcastSender<MinimalEthSpec>,
+    network::PqTestingAttestationPublishSender<MinimalEthSpec>,
+    Arc<lighthouse_network::NetworkGlobals<MinimalEthSpec>>,
+    tokio::sync::mpsc::Sender<lighthouse_network::Multiaddr>,
+    Arc<lighthouse_network::PqGossipValidationAdmission>,
+    Arc<beacon_chain::PqOperationalEventSink>,
+) {
+    start_network_service_with_topics(
+        runtime,
+        chain,
+        spec,
+        boot_nodes,
+        disable_discovery,
+        encoding_hook,
+        vec![],
+    )
+    .await
+}
+
+#[cfg(target_feature = "avx2")]
+async fn start_network_service_with_topics(
+    runtime: &task_executor::test_utils::TestRuntime,
+    chain: Arc<beacon_chain::BeaconChain<TestWitness>>,
+    spec: Arc<ChainSpec>,
+    boot_nodes: Vec<lighthouse_network::Enr>,
+    disable_discovery: bool,
+    encoding_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    configured_topics: Vec<GossipKind>,
+) -> (
+    network::PqBlockBroadcastSender<MinimalEthSpec>,
+    network::PqTestingAttestationPublishSender<MinimalEthSpec>,
     Arc<lighthouse_network::NetworkGlobals<MinimalEthSpec>>,
     tokio::sync::mpsc::Sender<lighthouse_network::Multiaddr>,
     Arc<lighthouse_network::PqGossipValidationAdmission>,
@@ -560,6 +1014,7 @@ async fn start_network_service(
     network_config.enr_address = (Some(std::net::Ipv4Addr::LOCALHOST), None);
     network_config.boot_nodes_enr = boot_nodes;
     network_config.disable_discovery = disable_discovery;
+    network_config.topics = configured_topics;
     network_config.network_dir = tempfile::TempDir::new().expect("network directory").keep();
     let network_config = Arc::new(network_config);
     let context = Context {
@@ -591,16 +1046,65 @@ async fn start_network_service(
         service.testing_only_set_block_encoding_hook(hook);
     }
     let globals = service.network_globals();
+    let attestation_sender = service.testing_only_attestation_publish_sender();
     let dial_sender = service.testing_only_dial_sender();
     let gossip_admission = service.testing_only_gossip_admission();
     service.start().expect("start PQ network service");
     (
         broadcast_sender,
+        attestation_sender,
         globals,
         dial_sender,
         gossip_admission,
         operational_events,
     )
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn pq_network_subscribes_only_block_and_all_minimal_attestation_subnets() {
+    let runtime = task_executor::test_utils::TestRuntime::default();
+    let (chain, spec) = build_chain(&runtime);
+    let fork_digest = spec
+        .enr_fork_id::<MinimalEthSpec>(
+            chain.head_snapshot().beacon_block.slot(),
+            chain.head_snapshot().beacon_state.genesis_validators_root(),
+        )
+        .fork_digest;
+    let (_sender, _attestation_sender, globals, _dial_sender, _admission, _events) =
+        start_network_service_with_topics(
+            &runtime,
+            chain,
+            spec,
+            vec![],
+            true,
+            None,
+            vec![
+                GossipKind::BeaconAggregateAndProof,
+                GossipKind::VoluntaryExit,
+            ],
+        )
+        .await;
+
+    let subscriptions = globals.gossipsub_subscriptions.read();
+    assert_eq!(subscriptions.len(), 9);
+    assert!(subscriptions.contains(&GossipTopic::new(
+        GossipKind::BeaconBlock,
+        GossipEncoding::default(),
+        fork_digest,
+    )));
+    for subnet in 0..8 {
+        assert!(subscriptions.contains(&GossipTopic::new(
+            GossipKind::Attestation(types::SubnetId::new(subnet)),
+            GossipEncoding::default(),
+            fork_digest,
+        )));
+    }
+    assert!(!subscriptions.contains(&GossipTopic::new(
+        GossipKind::BeaconAggregateAndProof,
+        GossipEncoding::default(),
+        fork_digest,
+    )));
 }
 
 #[cfg(target_feature = "avx2")]
@@ -837,16 +1341,22 @@ async fn live_worker_negatively_acknowledges_exact_block_without_peers() {
     let runtime = task_executor::test_utils::TestRuntime::default();
     let (chain, spec) = build_chain(&runtime);
     let genesis_root = chain.head_snapshot().beacon_block_root;
-    let (sender, _globals, _dial_sender, gossip_admission, _operational_events) =
-        start_network_service(
-            &runtime,
-            Arc::clone(&chain),
-            Arc::clone(&spec),
-            vec![],
-            true,
-            None,
-        )
-        .await;
+    let (
+        sender,
+        _attestation_sender,
+        _globals,
+        _dial_sender,
+        gossip_admission,
+        _operational_events,
+    ) = start_network_service(
+        &runtime,
+        Arc::clone(&chain),
+        Arc::clone(&spec),
+        vec![],
+        true,
+        None,
+    )
+    .await;
     let block = Arc::new(SignedBeaconBlock::from_block(
         BeaconBlock::empty(&spec),
         IndividualSignature::empty(),
@@ -867,16 +1377,22 @@ async fn live_worker_negatively_acknowledges_exact_block_without_peers() {
 async fn live_workers_status_and_acknowledge_publish_and_exact_duplicate() {
     let runtime = task_executor::test_utils::TestRuntime::default();
     let (chain, spec) = build_chain(&runtime);
-    let (_receiver_sender, receiver_globals, _receiver_dial, receiver_admission, receiver_events) =
-        start_network_service(
-            &runtime,
-            Arc::clone(&chain),
-            Arc::clone(&spec),
-            vec![],
-            false,
-            None,
-        )
-        .await;
+    let (
+        _receiver_sender,
+        _receiver_attestation_sender,
+        receiver_globals,
+        _receiver_dial,
+        receiver_admission,
+        receiver_events,
+    ) = start_network_service(
+        &runtime,
+        Arc::clone(&chain),
+        Arc::clone(&spec),
+        vec![],
+        false,
+        None,
+    )
+    .await;
     let receiver_address = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let enr = receiver_globals.local_enr();
@@ -888,7 +1404,7 @@ async fn live_workers_status_and_acknowledge_publish_and_exact_duplicate() {
     })
     .await
     .expect("receiver listening ENR");
-    let (sender, sender_globals, sender_dial, sender_admission, sender_events) =
+    let (sender, _attestation_sender, sender_globals, sender_dial, sender_admission, sender_events) =
         start_network_service(&runtime, chain, Arc::clone(&spec), vec![], true, None).await;
     sender_dial
         .try_send(receiver_address)
@@ -944,6 +1460,187 @@ async fn live_workers_status_and_acknowledge_publish_and_exact_duplicate() {
 
 #[cfg(target_feature = "avx2")]
 #[tokio::test(flavor = "current_thread")]
+async fn live_workers_route_one_authentic_single_to_fork_choice_exactly_once() {
+    let runtime = task_executor::test_utils::TestRuntime::default();
+    let fixture = live_single_attestation_fixture(&runtime).await;
+    fixture.chain.slot_clock.set_slot(1);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(240),
+        fixture
+            .processor
+            .import_rpc_block(Arc::clone(&fixture.signed_block)),
+    )
+    .await
+    .expect("slot-one block proof deadline")
+    .expect("real imported slot-one block");
+    assert!(
+        fixture
+            .chain
+            .testing_only_pq_fork_choice_contains_block(fixture.block_root)
+    );
+    let (single, subnet) = slot_one_single_attestation(&fixture);
+
+    let (
+        receiver_block_sender,
+        _receiver_attestation_sender,
+        receiver_globals,
+        _receiver_dial,
+        receiver_admission,
+        receiver_events,
+    ) = start_network_service(
+        &runtime,
+        Arc::clone(&fixture.chain),
+        Arc::clone(&fixture.spec),
+        vec![],
+        false,
+        None,
+    )
+    .await;
+    let receiver_address = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(address) = receiver_globals
+                .local_enr()
+                .multiaddr_p2p_tcp()
+                .into_iter()
+                .next()
+            {
+                break address;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("receiver listening ENR");
+    let (
+        _sender_block_sender,
+        attestation_sender,
+        sender_globals,
+        sender_dial,
+        sender_admission,
+        sender_events,
+    ) = start_network_service(
+        &runtime,
+        Arc::clone(&fixture.chain),
+        Arc::clone(&fixture.spec),
+        vec![],
+        true,
+        None,
+    )
+    .await;
+    sender_dial
+        .try_send(receiver_address)
+        .expect("bounded testing dial command");
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while sender_globals.connected_peers() == 0 || receiver_globals.connected_peers() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("PQ workers connect");
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !sender_admission.has_compatible_peers()
+            || !receiver_admission.has_compatible_peers()
+            || sender_events.testing_only_peer_compatible_count() != 1
+            || receiver_events.testing_only_peer_compatible_count() != 1
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both PQ workers admit compatible Status");
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let acknowledgement = attestation_sender
+                .try_send(single.clone(), subnet)
+                .expect("bounded attestation publication ingress");
+            match acknowledgement.wait().await {
+                Ok(()) => break,
+                Err(network::PqTestingAttestationPublishError::NoPeersSubscribed) => {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("attestation publication failed: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("attestation subnet publication becomes live");
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while receiver_admission.testing_only_active_total() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("receiver retains one admitted attestation during proof");
+    let progress = receiver_block_sender
+        .try_send(Arc::clone(&fixture.signed_block))
+        .expect("receiver broadcaster remains responsive");
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), progress.wait())
+            .await
+            .expect("receiver network loop progress during attestation proof"),
+        Ok(()),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(240), async {
+        while fixture
+            .chain
+            .testing_only_pq_fork_choice_attestation_calls()
+            != 1
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("receiver verifies and consumes authentic single");
+    assert_eq!(
+        fixture
+            .chain
+            .testing_only_pq_fork_choice_queued_attestation_count(),
+        1,
+    );
+    assert_eq!(
+        fixture
+            .chain
+            .testing_only_pq_fork_choice_latest_message(fixture.attester_index),
+        None,
+    );
+
+    fixture.chain.slot_clock.set_slot(2);
+    fixture
+        .chain
+        .on_pq_fork_choice_tick(Slot::new(2))
+        .await
+        .expect("checked slot-two tick");
+    assert_eq!(
+        fixture
+            .chain
+            .testing_only_pq_fork_choice_latest_message(fixture.attester_index),
+        Some((Slot::new(1), fixture.block_root)),
+    );
+    assert_eq!(
+        fixture
+            .chain
+            .testing_only_pq_fork_choice_attestation_calls(),
+        1,
+    );
+
+    let duplicate = attestation_sender
+        .try_send(single, subnet)
+        .expect("bounded exact duplicate publication");
+    assert_eq!(
+        duplicate.wait().await,
+        Err(network::PqTestingAttestationPublishError::Duplicate),
+    );
+    assert_eq!(
+        fixture
+            .chain
+            .testing_only_pq_fork_choice_attestation_calls(),
+        1,
+    );
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
 async fn block_encoding_is_cap_two_offloop_and_poll_loop_remains_responsive() {
     use std::sync::{
         Condvar, Mutex,
@@ -952,16 +1649,22 @@ async fn block_encoding_is_cap_two_offloop_and_poll_loop_remains_responsive() {
 
     let runtime = task_executor::test_utils::TestRuntime::default();
     let (chain, spec) = build_chain(&runtime);
-    let (_receiver_sender, receiver_globals, _receiver_dial, _receiver_admission, _receiver_events) =
-        start_network_service(
-            &runtime,
-            Arc::clone(&chain),
-            Arc::clone(&spec),
-            vec![],
-            false,
-            None,
-        )
-        .await;
+    let (
+        _receiver_sender,
+        _receiver_attestation_sender,
+        receiver_globals,
+        _receiver_dial,
+        _receiver_admission,
+        _receiver_events,
+    ) = start_network_service(
+        &runtime,
+        Arc::clone(&chain),
+        Arc::clone(&spec),
+        vec![],
+        false,
+        None,
+    )
+    .await;
     let receiver_address = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let enr = receiver_globals.local_enr();
@@ -992,8 +1695,14 @@ async fn block_encoding_is_cap_two_offloop_and_poll_loop_remains_responsive() {
             }
         }) as Arc<dyn Fn() + Send + Sync>
     };
-    let (sender, sender_globals, sender_dial, sender_admission, _sender_events) =
-        start_network_service(&runtime, chain, Arc::clone(&spec), vec![], true, Some(hook)).await;
+    let (
+        sender,
+        _attestation_sender,
+        sender_globals,
+        sender_dial,
+        sender_admission,
+        _sender_events,
+    ) = start_network_service(&runtime, chain, Arc::clone(&spec), vec![], true, Some(hook)).await;
     sender_dial
         .try_send(receiver_address)
         .expect("bounded testing dial command");

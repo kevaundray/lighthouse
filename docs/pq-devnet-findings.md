@@ -1773,3 +1773,35 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   topic or live two-node route, no operation-pool or aggregation-pool insertion, no persisted
   fork-choice/vote recovery, and no justification or finalization advancement. The finalized
   checkpoint remains genesis; Task 7.2 finality evidence is not claimed.
+
+### 2026-08-21: Live PQ single-attestation routing completed (Task 5.2b cycle 2)
+
+- The PQ-only network owner now subscribes to exactly nine fixed Minimal/Electra topics: the beacon
+  block topic and unaggregated attestation subnets 0 through 7. `Network::new_pq` discards caller
+  `NetworkConfig.topics` before lower-network startup, so aggregate-and-proof, voluntary-exit, or
+  other ordinary caller topics are never transiently subscribed. The ordinary/default constructor
+  retains its prior topic behavior.
+- A source-admitted unaggregated `SingleAttestation` is routed with its exact `SubnetId` through the
+  existing awaited PQ verifier. At most two proof jobs are admitted without waiting, and the same
+  process-owned in-flight accounting covers proof and consumption continuations through caller
+  cancellation, executor exit, and network shutdown. Overflow reports retryable ignore without
+  spawning work; mutable network polling and block-broadcast acknowledgement remain live while an
+  attestation proof is pending.
+- Successful verification first reports gossipsub `Accept`. Only a successful result-bearing report
+  atomically marks the sealed propagation capability propagated and starts chain-owned consumption.
+  Report failure or `NotFound` drops the pre-propagation capability, rolls the observation back, and
+  permits one exact retry. After propagation, consumption resolves the admitted history terminally;
+  local terminal failure closes ingress and signals process shutdown. Retryable local verifier
+  errors alone report `RetryableIgnore`; duplicates, aged/stale work, shutdown, exhausted
+  generations, and other nonretryable outcomes report `TerminalIgnore` and retain bounded history.
+- The authentic AVX2 two-worker tracer exchanged compatible Status, published one real PQ-signed
+  single attestation on its exact wire topic, observed receiver `Accept`, queued the vote at slot 1,
+  advanced the checked fork-choice tick to slot 2, and obtained the exact latest-message block root
+  once. A concurrent receiver block broadcast completed while proof work was active, and exact
+  redelivery caused neither a second proof nor a second fork-choice application. The focused run
+  passed 1/1 in 132.64 seconds.
+- The outbound attestation publisher is a bounded `pq-startup-testing`-only capability; its command,
+  acknowledgement, error, channel, owner fields, and lower exact publish method are absent from the
+  production `pq-devnet` graph. This checkpoint adds no aggregate-and-proof routing, operation or
+  aggregation pool, local attester/signer, persisted vote/fork-choice recovery, justification, or
+  finalization. The finalized checkpoint remains genesis and Task 7.2 finality is still unclaimed.

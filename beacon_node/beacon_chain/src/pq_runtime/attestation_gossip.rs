@@ -1011,6 +1011,44 @@ impl<E: EthSpec> Drop for PqSingleGossipPropagationToken<E> {
     }
 }
 
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub fn testing_only_pq_single_prepropagation_retry() -> bool {
+    let observations = Arc::new(Mutex::new(PqAttestationGossipObservationCache::<
+        types::MinimalEthSpec,
+    >::default()));
+    let key = (Epoch::new(0), 1);
+    let identity = Hash256::repeat_byte(2);
+    let Ok(generation) = observations
+        .lock()
+        .claim_single(key, identity, Slot::new(0))
+    else {
+        return false;
+    };
+    drop(PqSingleGossipPropagationToken {
+        verified: None,
+        observations: Arc::clone(&observations),
+        binding: Some(SingleObservationBinding {
+            key,
+            identity,
+            generation,
+        }),
+        _admission: None,
+        _activity: None,
+        subnet: SubnetId::new(0),
+        bound_head_root: Hash256::ZERO,
+    });
+    if observations.lock().single_status(key, identity) != PqAttestationGossipObservation::Unseen {
+        return false;
+    }
+    matches!(
+        observations
+            .lock()
+            .claim_single(key, identity, Slot::new(0)),
+        Ok(retry_generation) if retry_generation != generation
+    )
+}
+
 struct AggregateObservationBinding<E: EthSpec> {
     aggregator_key: (Epoch, u64),
     data_key: (Slot, Hash256, u64),

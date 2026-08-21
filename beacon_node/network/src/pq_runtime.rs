@@ -33,8 +33,19 @@ pub use service::{
 pub use service::{
     PqCommitCompletionQueueTestTrace, PqCommitResolutionTestCase, PqCompletionQueueTestScenario,
     PqCompletionQueueTestTrace, PqCompletionTestDisposition, PqCompletionTestEvent,
-    PqEncodingShutdownTestTrace, PqGossipImportedEventGateTestTrace, PqProofAdmissionTestTrace,
-    PqStatusTestEvent, PqStatusTestScenario, PqStatusTestTrace,
+    PqEncodingShutdownTestTrace, PqGossipImportedEventGateTestTrace,
+    PqNetworkAttestationCompletionTestDisposition, PqNetworkAttestationCompletionTestEvent,
+    PqNetworkAttestationConsumptionTestCase, PqNetworkAttestationConsumptionTestTrace,
+    PqNetworkAttestationDetachedTestTrace, PqNetworkAttestationIgnoreTestCase,
+    PqNetworkAttestationIgnoreTestTrace, PqNetworkAttestationInFlightTestTrace,
+    PqNetworkAttestationRouteTestCase, PqNetworkAttestationRouteTestTrace,
+    PqProofAdmissionTestTrace, PqStatusTestEvent, PqStatusTestScenario, PqStatusTestTrace,
+    PqTestingAttestationPublishAcknowledgement, PqTestingAttestationPublishError,
+    PqTestingAttestationPublishSender, testing_only_pq_attestation_completion_lifecycle,
+    testing_only_pq_attestation_consumption_resolution,
+    testing_only_pq_attestation_detached_lifecycle,
+    testing_only_pq_attestation_ignore_classification,
+    testing_only_pq_attestation_in_flight_lifecycle, testing_only_pq_attestation_route,
     testing_only_pq_commit_completion_queue, testing_only_pq_commit_resolution,
     testing_only_pq_completion_lifecycle, testing_only_pq_completion_queue,
     testing_only_pq_encoding_shutdown, testing_only_pq_gossip_imported_event_gate,
@@ -103,6 +114,10 @@ impl<T: BeaconChainTypes> PqNetworkBlockProcessor<T> {
             }
             Err(error) => PqGossipAttestationDisposition::Ignore(error),
         }
+    }
+
+    pub fn fail_gossip_attestation_consumption(&self) {
+        self.chain.fail_pq_attestation_after_propagation();
     }
 
     pub async fn verify_gossip_aggregate(

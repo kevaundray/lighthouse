@@ -2576,10 +2576,26 @@ releasing ownership. Pre-propagation cancellation alone may reopen an observatio
 is marked, the exact identity is ConsumptionPending, survives bounded pruning, suppresses duplicate
 or conflicting propagation, and resolves only Applied or Terminal.
 
+**Cycle 2 checkpoint (implemented, live single routing):** the PQ network owns exactly the beacon
+block topic plus Minimal/Electra unaggregated attestation subnets 0 through 7 and ignores all caller
+configured topics during PQ lower-network construction. An admitted single is verified under the
+shared nonwaiting two-item proof cap, reported `Accept`, atomically promoted, and consumed by the
+cycle-1 chain-owned continuation. Failed reporting rolls the pre-propagation observation back;
+post-propagation ownership survives cancellation/executor exit and is included in network drain.
+Only retryable local verifier failures release history; duplicate, aged/stale, shutdown,
+generation-exhausted, and terminal outcomes retain it without peer penalty.
+
+The authentic two-worker AVX2 tracer passed a real signed single over its exact subnet topic after
+compatible Status, proved a queued slot-1 vote and exact latest message after the checked slot-2
+tick, kept the receiver network loop responsive during proof work, and applied neither proof nor
+vote twice on exact redelivery. The outbound attestation injection seam is bounded and entirely
+`pq-startup-testing`-only.
+
 This checkpoint is not completion of Task 5.2b. It is in-memory Fresh evidence only: no live
-attestation network topic/routing, no operation-pool or naive-aggregation-pool insertion, no
-fork-choice/vote persistence or Resume recovery, and no justification/finalization claim. Those
-remain the subsequent vertical slices described below.
+aggregate-and-proof routing, no operation-pool or naive-aggregation-pool insertion, no local
+attester/signer, no fork-choice/vote persistence or Resume recovery, and no
+justification/finalization claim. The finalized checkpoint remains genesis. Those remain the
+subsequent vertical slices described below.
 
 **Files:**
 

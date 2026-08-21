@@ -122,6 +122,9 @@ pub use peer_manager::{
     peerdb::score::{PeerAction, ReportSource},
 };
 // pub use service::{load_private_key, Context, Libp2pEvent, Service, NETWORK_KEY_FILENAME};
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub use service::PqTestingAttestationLowerPublishError;
 pub use service::api_types::Response;
 pub use service::utils::*;
 pub use service::{Gossipsub, NetworkEvent};

@@ -154,6 +154,15 @@ pub enum PqBeaconBlockPublishError {
     Rejected,
 }
 
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum PqTestingAttestationLowerPublishError {
+    Duplicate,
+    NoPeersSubscribed,
+    Rejected,
+}
+
 /// Exact topic and SSZ bytes prepared for a PQ beacon-block publication.
 ///
 /// Construct this capability on a blocking executor before entering the mutable network poll
@@ -272,11 +281,14 @@ impl<E: EthSpec> Network<E> {
     #[cfg(feature = "pq-devnet")]
     pub async fn new_pq(
         executor: task_executor::TaskExecutor,
-        ctx: ServiceContext<'_>,
+        mut ctx: ServiceContext<'_>,
         custody_group_count: u64,
         local_keypair: Keypair,
         admission: Arc<PqGossipValidationAdmission>,
     ) -> Result<(Self, Arc<NetworkGlobals<E>>), String> {
+        let mut config = ctx.config.as_ref().clone();
+        config.topics.clear();
+        ctx.config = Arc::new(config);
         Self::new_with_rpc_profile(
             executor,
             ctx,
@@ -1063,6 +1075,32 @@ impl<E: EthSpec> Network<E> {
                 Err(PqBeaconBlockPublishError::NoPeersSubscribed)
             }
             Err(_) => Err(PqBeaconBlockPublishError::Rejected),
+        }
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_publish_pq_attestation(
+        &mut self,
+        attestation: types::SingleAttestation,
+        subnet: types::SubnetId,
+    ) -> Result<(), PqTestingAttestationLowerPublishError> {
+        let message: PubsubMessage<E> = PubsubMessage::Attestation(Box::new((subnet, attestation)));
+        let topic = GossipTopic::new(
+            message.kind(),
+            GossipEncoding::default(),
+            self.enr_fork_id.fork_digest,
+        );
+        match self.gossipsub_mut().publish(
+            Topic::from(topic),
+            message.encode(GossipEncoding::default()),
+        ) {
+            Ok(_) => Ok(()),
+            Err(PublishError::Duplicate) => Err(PqTestingAttestationLowerPublishError::Duplicate),
+            Err(PublishError::NoPeersSubscribedToTopic) => {
+                Err(PqTestingAttestationLowerPublishError::NoPeersSubscribed)
+            }
+            Err(_) => Err(PqTestingAttestationLowerPublishError::Rejected),
         }
     }
 

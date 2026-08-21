@@ -1,13 +1,16 @@
 use super::{
-    PqBlockBroadcastError, PqBlockBroadcastReceiver, PqGossipBlockDisposition,
-    PqNetworkBlockProcessor,
+    PqBlockBroadcastError, PqBlockBroadcastReceiver, PqGossipAttestationDisposition,
+    PqGossipBlockDisposition, PqNetworkBlockProcessor,
 };
 use beacon_chain::{
-    BeaconChain, BeaconChainTypes, PqBlockImportOutcome, PqGossipCommitToken,
+    BeaconChain, BeaconChainTypes, PqAttestationGossipError, PqBlockImportOutcome,
+    PqForkChoiceAttestationError, PqForkChoiceAttestationOutcome, PqGossipCommitToken,
     PqGossipPropagationToken, PqImportError, PqImportLocalError, PqOperationalEvent,
-    PqOperationalEventSink, PqPeerConnectionDirection, PqStatusMessageDirection,
-    PqStatusRejectionCode,
+    PqOperationalEventSink, PqPeerConnectionDirection, PqSingleGossipPropagationToken,
+    PqStatusMessageDirection, PqStatusRejectionCode, PqVerifiedGossipSingle,
 };
+#[cfg(feature = "pq-startup-testing")]
+use beacon_chain::{PqAttestationGossipLocalError, PqAttestationGossipObservation};
 use fixed_bytes::FixedBytesExtended;
 use lighthouse_network::libp2p::gossipsub::{
     AdmittedMessageCommit, AdmittedMessageCommitOutcome, AdmittedMessageReport,
@@ -25,7 +28,9 @@ use lighthouse_network::{
     PqEncodedBeaconBlock, PqGossipValidationAdmission, PubsubMessage, ReportSource,
     identity::Keypair,
 };
+use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
+use std::future::Future;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -33,7 +38,7 @@ use std::sync::{
 use task_executor::TaskExecutor;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing::{debug, warn};
-use types::{EthSpec, Hash256};
+use types::{EthSpec, Hash256, SubnetId};
 
 /// Maximum number of raw blocks retained by detached full-proof jobs.
 pub const PQ_NETWORK_BLOCK_PROOF_CAPACITY: usize = 2;
@@ -43,6 +48,8 @@ pub const PQ_NETWORK_BLOCK_ENCODING_CAPACITY: usize = 2;
 
 /// Maximum number of detached Engine/DB commits whose exact gossipsub reservations are retained.
 pub const PQ_NETWORK_BLOCK_COMMIT_CAPACITY: usize = 2;
+
+const PQ_NETWORK_ATTESTATION_SUBNET_COUNT: u64 = 8;
 
 #[derive(Default)]
 struct PqNetworkInFlight {
@@ -85,6 +92,85 @@ impl Drop for PqNetworkInFlightGuard {
 type PqBlockEncodingHook = Arc<dyn Fn() + Send + Sync>;
 #[cfg(feature = "pq-startup-testing")]
 type PqNetworkRunHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(feature = "pq-startup-testing")]
+const PQ_TESTING_ATTESTATION_PUBLISH_CAPACITY: usize = 2;
+
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum PqTestingAttestationPublishError {
+    Capacity,
+    WorkerUnavailable,
+    Duplicate,
+    NoPeersSubscribed,
+    Rejected,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct PqTestingAttestationPublishSender<E: EthSpec> {
+    sender: mpsc::Sender<PqTestingAttestationPublishCommand<E>>,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+impl<E: EthSpec> PqTestingAttestationPublishSender<E> {
+    pub fn try_send(
+        &self,
+        attestation: types::SingleAttestation,
+        subnet: SubnetId,
+    ) -> Result<PqTestingAttestationPublishAcknowledgement, PqTestingAttestationPublishError> {
+        let (acknowledgement, receiver) = tokio::sync::oneshot::channel();
+        self.sender
+            .try_send(PqTestingAttestationPublishCommand {
+                attestation,
+                subnet,
+                acknowledgement: Some(acknowledgement),
+                _phantom: std::marker::PhantomData,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => PqTestingAttestationPublishError::Capacity,
+                mpsc::error::TrySendError::Closed(_) => {
+                    PqTestingAttestationPublishError::WorkerUnavailable
+                }
+            })?;
+        Ok(PqTestingAttestationPublishAcknowledgement { receiver })
+    }
+}
+
+#[cfg(feature = "pq-startup-testing")]
+struct PqTestingAttestationPublishCommand<E: EthSpec> {
+    attestation: types::SingleAttestation,
+    subnet: SubnetId,
+    acknowledgement:
+        Option<tokio::sync::oneshot::Sender<Result<(), PqTestingAttestationPublishError>>>,
+    _phantom: std::marker::PhantomData<E>,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+impl<E: EthSpec> PqTestingAttestationPublishCommand<E> {
+    fn acknowledge(mut self, result: Result<(), PqTestingAttestationPublishError>) {
+        if let Some(sender) = self.acknowledgement.take() {
+            let _ = sender.send(result);
+        }
+    }
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub struct PqTestingAttestationPublishAcknowledgement {
+    receiver: tokio::sync::oneshot::Receiver<Result<(), PqTestingAttestationPublishError>>,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+impl PqTestingAttestationPublishAcknowledgement {
+    pub async fn wait(self) -> Result<(), PqTestingAttestationPublishError> {
+        self.receiver
+            .await
+            .unwrap_or(Err(PqTestingAttestationPublishError::WorkerUnavailable))
+    }
+}
 
 #[cfg(feature = "pq-startup-testing")]
 struct PqNetworkShutdownTestGuard(Option<tokio::sync::oneshot::Sender<()>>);
@@ -133,6 +219,7 @@ impl PqNetworkServiceShutdown {
 pub enum PqNetworkServiceError {
     Construction(String),
     BeaconBlockSubscription,
+    AttestationSubnetSubscription(SubnetId),
     TaskUnavailable,
 }
 
@@ -148,6 +235,12 @@ impl std::fmt::Display for PqNetworkServiceError {
             Self::BeaconBlockSubscription => {
                 formatter.write_str("could not subscribe to the PQ beacon-block topic")
             }
+            Self::AttestationSubnetSubscription(subnet) => {
+                write!(
+                    formatter,
+                    "could not subscribe to PQ attestation subnet {subnet:?}"
+                )
+            }
             Self::TaskUnavailable => formatter.write_str("PQ network task executor is unavailable"),
         }
     }
@@ -162,6 +255,13 @@ struct PqBlockVerificationCompletion<T: BeaconChainTypes> {
     _permit: OwnedSemaphorePermit,
 }
 
+struct PqAttestationVerificationCompletion<T: BeaconChainTypes> {
+    message_id: MessageId,
+    source: PeerId,
+    disposition: PqGossipAttestationDisposition<T::EthSpec>,
+    _permit: OwnedSemaphorePermit,
+}
+
 struct PqBlockEncodingCompletion<E: EthSpec> {
     command: super::PqBlockBroadcastCommand<E>,
     encoded: PqEncodedBeaconBlock,
@@ -172,6 +272,11 @@ struct PqBlockCommitCompletion {
     admission: AdmittedMessageCommit,
     result: Result<PqBlockImportOutcome, PqImportError>,
     identity: Option<(types::Slot, Hash256, [u8; 32])>,
+}
+
+struct PqAttestationConsumptionCompletion {
+    admission: AdmittedMessageCommit,
+    result: Result<PqForkChoiceAttestationOutcome, PqForkChoiceAttestationError>,
 }
 
 enum PqCompletionDisposition<Propagation, Commit, Error> {
@@ -344,6 +449,110 @@ impl<T: BeaconChainTypes>
     }
 }
 
+struct PqNetworkAttestationCompletionLifecycle<'a, T: BeaconChainTypes> {
+    network: &'a mut Network<T::EthSpec>,
+    processor: Arc<PqNetworkBlockProcessor<T>>,
+    task_executor: TaskExecutor,
+    consumption_sender: mpsc::Sender<PqAttestationConsumptionCompletion>,
+    message_id: MessageId,
+    source: PeerId,
+    in_flight: Arc<PqNetworkInFlight>,
+}
+
+impl<T: BeaconChainTypes>
+    PqCompletionLifecycle<
+        PqSingleGossipPropagationToken<T::EthSpec>,
+        PqVerifiedGossipSingle<T::EthSpec>,
+        beacon_chain::PqAttestationGossipError,
+    > for PqNetworkAttestationCompletionLifecycle<'_, T>
+{
+    type Reservation = AdmittedMessageCommit;
+
+    fn report(
+        &mut self,
+        outcome: AdmittedMessageValidationOutcome,
+    ) -> PqAdmissionReport<Self::Reservation> {
+        match self
+            .network
+            .report_pq_admitted_message_outcome(self.message_id.clone(), outcome)
+        {
+            AdmittedMessageReport::NotFound => PqAdmissionReport::NotFound,
+            AdmittedMessageReport::Complete => PqAdmissionReport::Complete,
+            AdmittedMessageReport::Commit(commit) => PqAdmissionReport::Commit(commit),
+        }
+    }
+
+    fn after_propagation(
+        &mut self,
+        propagation: PqSingleGossipPropagationToken<T::EthSpec>,
+    ) -> Result<PqVerifiedGossipSingle<T::EthSpec>, beacon_chain::PqAttestationGossipError> {
+        propagation.mark_propagated()
+    }
+
+    fn commit(
+        &mut self,
+        admission: Self::Reservation,
+        verified: PqVerifiedGossipSingle<T::EthSpec>,
+    ) {
+        let chain = Arc::clone(&self.processor.chain);
+        let completion_sender = self.consumption_sender.clone();
+        let admission = Arc::new(Mutex::new(Some(admission)));
+        let task_admission = Arc::clone(&admission);
+        if !spawn_owned_attestation_task(
+            &self.task_executor,
+            &self.in_flight,
+            async move {
+                let Some(admission) = task_admission.lock().take() else {
+                    return;
+                };
+                let result = chain.consume_pq_verified_gossip_single(verified).await;
+                try_send_completion(
+                    &completion_sender,
+                    PqAttestationConsumptionCompletion { admission, result },
+                );
+            },
+            "pq_network_attestation_consumption",
+        ) {
+            if let Some(admission) = admission.lock().take() {
+                let _ = self.network.resolve_pq_admitted_message_commit(
+                    admission,
+                    AdmittedMessageCommitOutcome::Terminal,
+                );
+            }
+            self.processor.fail_gossip_attestation_consumption();
+        }
+    }
+
+    fn resolve_promotion_failed(
+        &mut self,
+        admission: Self::Reservation,
+        _error: &beacon_chain::PqAttestationGossipError,
+    ) {
+        let _ = self
+            .network
+            .resolve_pq_admitted_message_commit(admission, AdmittedMessageCommitOutcome::Terminal);
+    }
+
+    fn reject(&mut self, error: beacon_chain::PqAttestationGossipError) {
+        self.network.report_peer(
+            &self.source,
+            PeerAction::LowToleranceError,
+            ReportSource::Gossipsub,
+            "pq_gossip_attestation_invalid",
+        );
+        debug!(?error, "Rejected invalid PQ gossip attestation");
+    }
+
+    fn promotion_failed(&mut self, error: beacon_chain::PqAttestationGossipError) {
+        debug!(?error, "PQ attestation propagation promotion failed");
+        self.processor.fail_gossip_attestation_consumption();
+    }
+
+    fn ignored_error(&mut self, error: beacon_chain::PqAttestationGossipError) {
+        debug!(?error, "Ignored PQ gossip attestation without peer penalty");
+    }
+}
+
 fn completion_disposition<T: BeaconChainTypes>(
     disposition: PqGossipBlockDisposition<T>,
 ) -> PqCompletionDisposition<PqGossipPropagationToken<T>, PqGossipCommitToken<T>, PqImportError> {
@@ -369,6 +578,14 @@ fn commit_resolution(
     result: &Result<PqBlockImportOutcome, PqImportError>,
 ) -> AdmittedMessageCommitOutcome {
     commit_error_resolution(result.as_ref().err())
+}
+
+fn attestation_consumption_commit_outcome() -> AdmittedMessageCommitOutcome {
+    AdmittedMessageCommitOutcome::Terminal
+}
+
+fn attestation_consumption_requires_shutdown(result_failed: bool, resolved: bool) -> bool {
+    result_failed || !resolved
 }
 
 fn commit_error_resolution(error: Option<&PqImportError>) -> AdmittedMessageCommitOutcome {
@@ -518,6 +735,97 @@ fn try_send_completion<Completion>(sender: &mpsc::Sender<Completion>, completion
     let _ = sender.try_send(completion);
 }
 
+fn spawn_owned_attestation_task<R: Send + 'static>(
+    task_executor: &TaskExecutor,
+    in_flight: &Arc<PqNetworkInFlight>,
+    task: impl Future<Output = R> + Send + 'static,
+    name: &'static str,
+) -> bool {
+    let in_flight = in_flight.start();
+    let Some(receipt) = task_executor.spawn_handle_without_exit(
+        async move {
+            let _in_flight = in_flight;
+            task.await
+        },
+        name,
+    ) else {
+        return false;
+    };
+    drop(receipt);
+    true
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PqNetworkAttestationRoute {
+    VerifySingle(SubnetId),
+    RetryableIgnore,
+    Ignore,
+}
+
+fn pq_attestation_route(
+    pq_admitted: bool,
+    single_subnet: Option<SubnetId>,
+) -> PqNetworkAttestationRoute {
+    match (pq_admitted, single_subnet) {
+        (true, Some(subnet)) => PqNetworkAttestationRoute::VerifySingle(subnet),
+        (true, None) => PqNetworkAttestationRoute::RetryableIgnore,
+        (false, _) => PqNetworkAttestationRoute::Ignore,
+    }
+}
+
+fn pq_attestation_ignore_outcome(
+    error: &PqAttestationGossipError,
+) -> AdmittedMessageValidationOutcome {
+    if error.is_retryable() {
+        AdmittedMessageValidationOutcome::RetryableIgnore
+    } else {
+        AdmittedMessageValidationOutcome::TerminalIgnore
+    }
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum PqNetworkAttestationRouteTestCase {
+    AdmittedSingle { subnet: SubnetId },
+    OrdinarySingle { subnet: SubnetId },
+    AdmittedAggregate,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum PqNetworkAttestationRouteTestTrace {
+    VerifySingle { subnet: SubnetId },
+    RetryableIgnore,
+    Ignore,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub fn testing_only_pq_attestation_route(
+    case: PqNetworkAttestationRouteTestCase,
+) -> PqNetworkAttestationRouteTestTrace {
+    let route = match case {
+        PqNetworkAttestationRouteTestCase::AdmittedSingle { subnet } => {
+            pq_attestation_route(true, Some(subnet))
+        }
+        PqNetworkAttestationRouteTestCase::OrdinarySingle { subnet } => {
+            pq_attestation_route(false, Some(subnet))
+        }
+        PqNetworkAttestationRouteTestCase::AdmittedAggregate => pq_attestation_route(true, None),
+    };
+    match route {
+        PqNetworkAttestationRoute::VerifySingle(subnet) => {
+            PqNetworkAttestationRouteTestTrace::VerifySingle { subnet }
+        }
+        PqNetworkAttestationRoute::RetryableIgnore => {
+            PqNetworkAttestationRouteTestTrace::RetryableIgnore
+        }
+        PqNetworkAttestationRoute::Ignore => PqNetworkAttestationRouteTestTrace::Ignore,
+    }
+}
+
 fn pq_peer_digest(peer_id: &PeerId) -> [u8; 16] {
     let digest = Sha256::digest(peer_id.to_bytes());
     let mut peer_digest = [0; 16];
@@ -635,9 +943,25 @@ enum PqNetworkServiceEvent<T: BeaconChainTypes> {
     Broadcast(Option<super::PqBlockBroadcastCommand<T::EthSpec>>),
     Encoding(Option<PqBlockEncodingCompletion<T::EthSpec>>),
     Verification(Option<Box<PqBlockVerificationCompletion<T>>>),
+    AttestationVerification(Option<Box<PqAttestationVerificationCompletion<T>>>),
+    AttestationConsumption(Option<Box<PqAttestationConsumptionCompletion>>),
     Commit(Option<Box<PqBlockCommitCompletion>>),
     Network(Box<NetworkEvent<T::EthSpec>>),
     TestingDial(Option<lighthouse_network::Multiaddr>),
+    #[cfg(feature = "pq-startup-testing")]
+    TestingAttestationPublish(Option<PqTestingAttestationPublishCommand<T::EthSpec>>),
+}
+
+#[cfg(feature = "pq-startup-testing")]
+async fn next_testing_attestation_publish_event<T: BeaconChainTypes>(
+    receiver: &mut mpsc::Receiver<PqTestingAttestationPublishCommand<T::EthSpec>>,
+) -> PqNetworkServiceEvent<T> {
+    PqNetworkServiceEvent::TestingAttestationPublish(receiver.recv().await)
+}
+
+#[cfg(not(feature = "pq-startup-testing"))]
+async fn next_testing_attestation_publish_event<T: BeaconChainTypes>() -> PqNetworkServiceEvent<T> {
+    std::future::pending().await
 }
 
 /// Minimal PQ network owner. It deliberately has no router, sync manager, or unbounded message
@@ -656,12 +980,22 @@ pub struct PqNetworkService<T: BeaconChainTypes> {
     encoding_receiver: mpsc::Receiver<PqBlockEncodingCompletion<T::EthSpec>>,
     completion_sender: mpsc::Sender<PqBlockVerificationCompletion<T>>,
     completion_receiver: mpsc::Receiver<PqBlockVerificationCompletion<T>>,
+    attestation_completion_sender: mpsc::Sender<PqAttestationVerificationCompletion<T>>,
+    attestation_completion_receiver: mpsc::Receiver<PqAttestationVerificationCompletion<T>>,
+    attestation_consumption_sender: mpsc::Sender<PqAttestationConsumptionCompletion>,
+    attestation_consumption_receiver: mpsc::Receiver<PqAttestationConsumptionCompletion>,
     commit_sender: mpsc::Sender<PqBlockCommitCompletion>,
     commit_receiver: mpsc::Receiver<PqBlockCommitCompletion>,
     task_executor: TaskExecutor,
     fork_digest: [u8; 4],
     _testing_dial_sender: mpsc::Sender<lighthouse_network::Multiaddr>,
     testing_dial_receiver: mpsc::Receiver<lighthouse_network::Multiaddr>,
+    #[cfg(feature = "pq-startup-testing")]
+    testing_attestation_publish_sender:
+        mpsc::Sender<PqTestingAttestationPublishCommand<T::EthSpec>>,
+    #[cfg(feature = "pq-startup-testing")]
+    testing_attestation_publish_receiver:
+        mpsc::Receiver<PqTestingAttestationPublishCommand<T::EthSpec>>,
     #[cfg(feature = "pq-startup-testing")]
     testing_block_encoding_hook: Option<PqBlockEncodingHook>,
     #[cfg(feature = "pq-startup-testing")]
@@ -697,12 +1031,25 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
         if !network.subscribe_kind(GossipKind::BeaconBlock) {
             return Err(PqNetworkServiceError::BeaconBlockSubscription);
         }
+        for subnet in 0..PQ_NETWORK_ATTESTATION_SUBNET_COUNT {
+            let subnet = SubnetId::new(subnet);
+            if !network.subscribe_kind(GossipKind::Attestation(subnet)) {
+                return Err(PqNetworkServiceError::AttestationSubnetSubscription(subnet));
+            }
+        }
         let (completion_sender, completion_receiver) =
+            mpsc::channel(PQ_NETWORK_BLOCK_PROOF_CAPACITY);
+        let (attestation_completion_sender, attestation_completion_receiver) =
+            mpsc::channel(PQ_NETWORK_BLOCK_PROOF_CAPACITY);
+        let (attestation_consumption_sender, attestation_consumption_receiver) =
             mpsc::channel(PQ_NETWORK_BLOCK_PROOF_CAPACITY);
         let (encoding_sender, encoding_receiver) =
             mpsc::channel(PQ_NETWORK_BLOCK_ENCODING_CAPACITY);
         let (commit_sender, commit_receiver) = mpsc::channel(PQ_NETWORK_BLOCK_COMMIT_CAPACITY);
         let (testing_dial_sender, testing_dial_receiver) = mpsc::channel(1);
+        #[cfg(feature = "pq-startup-testing")]
+        let (testing_attestation_publish_sender, testing_attestation_publish_receiver) =
+            mpsc::channel(PQ_TESTING_ATTESTATION_PUBLISH_CAPACITY);
         Ok(Self {
             network,
             network_globals,
@@ -717,12 +1064,20 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
             encoding_receiver,
             completion_sender,
             completion_receiver,
+            attestation_completion_sender,
+            attestation_completion_receiver,
+            attestation_consumption_sender,
+            attestation_consumption_receiver,
             commit_sender,
             commit_receiver,
             task_executor,
             fork_digest,
             _testing_dial_sender: testing_dial_sender,
             testing_dial_receiver,
+            #[cfg(feature = "pq-startup-testing")]
+            testing_attestation_publish_sender,
+            #[cfg(feature = "pq-startup-testing")]
+            testing_attestation_publish_receiver,
             #[cfg(feature = "pq-startup-testing")]
             testing_block_encoding_hook: None,
             #[cfg(feature = "pq-startup-testing")]
@@ -749,6 +1104,16 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
     #[doc(hidden)]
     pub fn testing_only_gossip_admission(&self) -> Arc<PqGossipValidationAdmission> {
         Arc::clone(&self.gossip_admission)
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_attestation_publish_sender(
+        &self,
+    ) -> PqTestingAttestationPublishSender<T::EthSpec> {
+        PqTestingAttestationPublishSender {
+            sender: self.testing_attestation_publish_sender.clone(),
+        }
     }
 
     #[cfg(feature = "pq-startup-testing")]
@@ -833,6 +1198,12 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
             PqNetworkShutdownTestGuard(self.testing_shutdown_sender.take());
         let mut shutdown_receiver = self.shutdown_receiver.take();
         loop {
+            #[cfg(feature = "pq-startup-testing")]
+            let testing_attestation_publish_event = next_testing_attestation_publish_event::<T>(
+                &mut self.testing_attestation_publish_receiver,
+            );
+            #[cfg(not(feature = "pq-startup-testing"))]
+            let testing_attestation_publish_event = next_testing_attestation_publish_event::<T>();
             let event = tokio::select! {
                 biased;
                 _ = &mut executor_exit => break,
@@ -853,6 +1224,12 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
                 completion = self.completion_receiver.recv() => {
                     PqNetworkServiceEvent::Verification(completion.map(Box::new))
                 }
+                completion = self.attestation_completion_receiver.recv() => {
+                    PqNetworkServiceEvent::AttestationVerification(completion.map(Box::new))
+                }
+                completion = self.attestation_consumption_receiver.recv() => {
+                    PqNetworkServiceEvent::AttestationConsumption(completion.map(Box::new))
+                }
                 completion = self.commit_receiver.recv() => {
                     PqNetworkServiceEvent::Commit(completion.map(Box::new))
                 }
@@ -860,6 +1237,7 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
                 address = self.testing_dial_receiver.recv() => {
                     PqNetworkServiceEvent::TestingDial(address)
                 }
+                event = testing_attestation_publish_event => event,
             };
             match event {
                 PqNetworkServiceEvent::Broadcast(Some(command)) => {
@@ -894,6 +1272,14 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
                     self.handle_verification_completion(*completion);
                 }
                 PqNetworkServiceEvent::Verification(None) => break,
+                PqNetworkServiceEvent::AttestationVerification(Some(completion)) => {
+                    self.handle_attestation_verification_completion(*completion);
+                }
+                PqNetworkServiceEvent::AttestationVerification(None) => break,
+                PqNetworkServiceEvent::AttestationConsumption(Some(completion)) => {
+                    self.handle_attestation_consumption_completion(*completion);
+                }
+                PqNetworkServiceEvent::AttestationConsumption(None) => break,
                 PqNetworkServiceEvent::Commit(Some(completion)) => {
                     self.handle_commit_completion(*completion);
                 }
@@ -903,6 +1289,12 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
                     let _ = self.network.testing_dial(address);
                 }
                 PqNetworkServiceEvent::TestingDial(None) => break,
+                #[cfg(feature = "pq-startup-testing")]
+                PqNetworkServiceEvent::TestingAttestationPublish(Some(command)) => {
+                    self.handle_testing_attestation_publish(command);
+                }
+                #[cfg(feature = "pq-startup-testing")]
+                PqNetworkServiceEvent::TestingAttestationPublish(None) => break,
             }
         }
         self.shutdown_and_drain().await;
@@ -910,6 +1302,13 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
 
     async fn shutdown_and_drain(&mut self) {
         self.broadcast_receiver.close_and_reject_pending();
+        #[cfg(feature = "pq-startup-testing")]
+        {
+            self.testing_attestation_publish_receiver.close();
+            while let Ok(command) = self.testing_attestation_publish_receiver.try_recv() {
+                command.acknowledge(Err(PqTestingAttestationPublishError::WorkerUnavailable));
+            }
+        }
         self.in_flight.wait_until_drained().await;
     }
 
@@ -964,22 +1363,36 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
             } => self.start_block_verification(id, source, block),
             NetworkEvent::PubsubMessage {
                 id,
-                source: _,
-                pq_admitted: true,
+                source,
+                message,
+                pq_admitted,
                 ..
-            } => {
-                let _ = self.network.report_pq_admitted_message_outcome(
-                    id,
-                    AdmittedMessageValidationOutcome::RetryableIgnore,
-                );
-            }
-            NetworkEvent::PubsubMessage { id, source, .. } => {
-                let _ = self.network.report_message_validation_result(
-                    &source,
-                    id,
-                    MessageAcceptance::Ignore,
-                );
-            }
+            } => match pq_attestation_route(
+                pq_admitted,
+                match &message {
+                    PubsubMessage::Attestation(single) => Some(single.0),
+                    _ => None,
+                },
+            ) {
+                PqNetworkAttestationRoute::VerifySingle(subnet) => {
+                    if let PubsubMessage::Attestation(single) = message {
+                        self.start_attestation_verification(id, source, single.1, subnet);
+                    }
+                }
+                PqNetworkAttestationRoute::RetryableIgnore => {
+                    let _ = self.network.report_pq_admitted_message_outcome(
+                        id,
+                        AdmittedMessageValidationOutcome::RetryableIgnore,
+                    );
+                }
+                PqNetworkAttestationRoute::Ignore => {
+                    let _ = self.network.report_message_validation_result(
+                        &source,
+                        id,
+                        MessageAcceptance::Ignore,
+                    );
+                }
+            },
             NetworkEvent::StatusPeer(peer_id) => {
                 self.send_status_request(peer_id);
             }
@@ -1040,6 +1453,127 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
                 self.gossip_admission.remove_compatible(&peer_id);
             }
         }
+    }
+
+    fn start_attestation_verification(
+        &mut self,
+        message_id: MessageId,
+        source: PeerId,
+        attestation: types::SingleAttestation,
+        subnet: SubnetId,
+    ) {
+        let Some(permit) = try_admit_proof(&self.proof_admission) else {
+            let _ = self.network.report_pq_admitted_message_outcome(
+                message_id,
+                AdmittedMessageValidationOutcome::RetryableIgnore,
+            );
+            return;
+        };
+        let processor = Arc::clone(&self.processor);
+        let completion_sender = self.attestation_completion_sender.clone();
+        let retry_message_id = message_id.clone();
+        if !spawn_owned_attestation_task(
+            &self.task_executor,
+            &self.in_flight,
+            async move {
+                let disposition = processor
+                    .verify_gossip_attestation(attestation, subnet)
+                    .await;
+                try_send_completion(
+                    &completion_sender,
+                    PqAttestationVerificationCompletion {
+                        message_id,
+                        source,
+                        disposition,
+                        _permit: permit,
+                    },
+                );
+            },
+            "pq_network_attestation_verification",
+        ) {
+            let _ = self.network.report_pq_admitted_message_outcome(
+                retry_message_id,
+                AdmittedMessageValidationOutcome::RetryableIgnore,
+            );
+        }
+    }
+
+    fn handle_attestation_verification_completion(
+        &mut self,
+        completion: PqAttestationVerificationCompletion<T>,
+    ) {
+        let PqAttestationVerificationCompletion {
+            message_id,
+            source,
+            disposition,
+            _permit,
+        } = completion;
+        let disposition = match disposition {
+            PqGossipAttestationDisposition::Accept(token) => {
+                PqCompletionDisposition::Accept(*token)
+            }
+            PqGossipAttestationDisposition::Reject(error) => PqCompletionDisposition::Reject(error),
+            PqGossipAttestationDisposition::Ignore(error) => {
+                if matches!(
+                    pq_attestation_ignore_outcome(&error),
+                    AdmittedMessageValidationOutcome::RetryableIgnore
+                ) {
+                    PqCompletionDisposition::RetryableIgnore(error)
+                } else {
+                    PqCompletionDisposition::TerminalIgnoreError(error)
+                }
+            }
+        };
+        let mut lifecycle = PqNetworkAttestationCompletionLifecycle {
+            network: &mut self.network,
+            processor: Arc::clone(&self.processor),
+            task_executor: self.task_executor.clone(),
+            consumption_sender: self.attestation_consumption_sender.clone(),
+            message_id,
+            source,
+            in_flight: Arc::clone(&self.in_flight),
+        };
+        handle_completion_lifecycle(disposition, &mut lifecycle);
+        drop(_permit);
+    }
+
+    fn handle_attestation_consumption_completion(
+        &mut self,
+        completion: PqAttestationConsumptionCompletion,
+    ) {
+        let PqAttestationConsumptionCompletion { admission, result } = completion;
+        let resolved = self.network.resolve_pq_admitted_message_commit(
+            admission,
+            attestation_consumption_commit_outcome(),
+        );
+        if attestation_consumption_requires_shutdown(result.is_err(), resolved) {
+            self.processor.fail_gossip_attestation_consumption();
+        }
+        if let Err(error) = result {
+            debug!(?error, "PQ gossip attestation consumption failed");
+        }
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    fn handle_testing_attestation_publish(
+        &mut self,
+        command: PqTestingAttestationPublishCommand<T::EthSpec>,
+    ) {
+        let result = self
+            .network
+            .testing_only_publish_pq_attestation(command.attestation.clone(), command.subnet)
+            .map_err(|error| match error {
+                lighthouse_network::PqTestingAttestationLowerPublishError::Duplicate => {
+                    PqTestingAttestationPublishError::Duplicate
+                }
+                lighthouse_network::PqTestingAttestationLowerPublishError::NoPeersSubscribed => {
+                    PqTestingAttestationPublishError::NoPeersSubscribed
+                }
+                lighthouse_network::PqTestingAttestationLowerPublishError::Rejected => {
+                    PqTestingAttestationPublishError::Rejected
+                }
+            });
+        command.acknowledge(result);
     }
 
     fn send_status_request(&mut self, peer_id: PeerId) {
@@ -1232,6 +1766,91 @@ pub enum PqCompletionTestEvent {
 }
 
 #[cfg(feature = "pq-startup-testing")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum PqNetworkAttestationCompletionTestDisposition {
+    Accept { report_succeeded: bool },
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum PqNetworkAttestationCompletionTestEvent {
+    ReportedAccept,
+    MarkedPropagated,
+    ConsumptionSpawned,
+    PropagationCapabilityDropped,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum PqNetworkAttestationIgnoreTestCase {
+    RemoteDuplicate,
+    Aged,
+    StaleHead,
+    ShuttingDown,
+    GenerationExhausted,
+    TerminalWindow,
+    LocalCapacity,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct PqNetworkAttestationIgnoreTestTrace {
+    pub retryable_ignore: bool,
+    pub terminal_ignore: bool,
+    pub retained_history: bool,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub fn testing_only_pq_attestation_ignore_classification(
+    case: PqNetworkAttestationIgnoreTestCase,
+) -> PqNetworkAttestationIgnoreTestTrace {
+    let error = match case {
+        PqNetworkAttestationIgnoreTestCase::RemoteDuplicate => {
+            PqAttestationGossipError::Duplicate(PqAttestationGossipObservation::Observed)
+        }
+        PqNetworkAttestationIgnoreTestCase::Aged => {
+            PqAttestationGossipError::Local(PqAttestationGossipLocalError::ReceiptAfterWindow {
+                attestation: types::Slot::new(1),
+                earliest_permissible: types::Slot::new(2),
+            })
+        }
+        PqNetworkAttestationIgnoreTestCase::StaleHead => PqAttestationGossipError::Local(
+            PqAttestationGossipLocalError::BoundHeadNoLongerCanonical {
+                bound: Hash256::ZERO,
+                current: Hash256::repeat_byte(1),
+            },
+        ),
+        PqNetworkAttestationIgnoreTestCase::ShuttingDown => {
+            PqAttestationGossipError::Local(PqAttestationGossipLocalError::ShuttingDown)
+        }
+        PqNetworkAttestationIgnoreTestCase::GenerationExhausted => PqAttestationGossipError::Local(
+            PqAttestationGossipLocalError::ObservationGenerationExhausted,
+        ),
+        PqNetworkAttestationIgnoreTestCase::TerminalWindow => PqAttestationGossipError::Local(
+            PqAttestationGossipLocalError::ProofOutlivedPropagationWindow {
+                attestation: types::Slot::new(1),
+            },
+        ),
+        PqNetworkAttestationIgnoreTestCase::LocalCapacity => {
+            PqAttestationGossipError::Local(PqAttestationGossipLocalError::IngressCapacity)
+        }
+    };
+    let outcome = pq_attestation_ignore_outcome(&error);
+    let retryable_ignore = matches!(outcome, AdmittedMessageValidationOutcome::RetryableIgnore);
+    let terminal_ignore = matches!(outcome, AdmittedMessageValidationOutcome::TerminalIgnore);
+    PqNetworkAttestationIgnoreTestTrace {
+        retryable_ignore,
+        terminal_ignore,
+        retained_history: terminal_ignore,
+    }
+}
+
+#[cfg(feature = "pq-startup-testing")]
 #[doc(hidden)]
 pub fn testing_only_pq_completion_lifecycle(
     disposition: PqCompletionTestDisposition,
@@ -1379,6 +1998,32 @@ pub fn testing_only_pq_completion_lifecycle(
 }
 
 #[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub fn testing_only_pq_attestation_completion_lifecycle(
+    disposition: PqNetworkAttestationCompletionTestDisposition,
+) -> Vec<PqNetworkAttestationCompletionTestEvent> {
+    let PqNetworkAttestationCompletionTestDisposition::Accept { report_succeeded } = disposition;
+    testing_only_pq_completion_lifecycle(PqCompletionTestDisposition::Accept { report_succeeded })
+        .into_iter()
+        .filter_map(|event| match event {
+            PqCompletionTestEvent::ReportedAccept => {
+                Some(PqNetworkAttestationCompletionTestEvent::ReportedAccept)
+            }
+            PqCompletionTestEvent::PromotedAfterPropagation => {
+                Some(PqNetworkAttestationCompletionTestEvent::MarkedPropagated)
+            }
+            PqCompletionTestEvent::CommitSpawned => {
+                Some(PqNetworkAttestationCompletionTestEvent::ConsumptionSpawned)
+            }
+            PqCompletionTestEvent::PropagationCapabilityDropped => {
+                Some(PqNetworkAttestationCompletionTestEvent::PropagationCapabilityDropped)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[cfg(feature = "pq-startup-testing")]
 #[derive(Debug, PartialEq, Eq)]
 #[doc(hidden)]
 pub struct PqProofAdmissionTestTrace {
@@ -1408,6 +2053,176 @@ pub fn testing_only_pq_proof_admission() -> PqProofAdmissionTestTrace {
         admitted,
         proofs_started,
         admitted_after_drop,
+    }
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct PqNetworkAttestationInFlightTestTrace {
+    pub admitted: Vec<bool>,
+    pub retryable_ignored: usize,
+    pub heartbeat_completed: bool,
+    pub drain_pending_with_two: bool,
+    pub drain_pending_with_one: bool,
+    pub drained_after_release: bool,
+    pub available_permits_after_release: usize,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub async fn testing_only_pq_attestation_in_flight_lifecycle()
+-> PqNetworkAttestationInFlightTestTrace {
+    let admission = Arc::new(Semaphore::new(PQ_NETWORK_BLOCK_PROOF_CAPACITY));
+    let in_flight = Arc::new(PqNetworkInFlight::default());
+    let mut owned = vec![];
+    let mut admitted = vec![];
+    let mut retryable_ignored = 0;
+    for _ in 0..=PQ_NETWORK_BLOCK_PROOF_CAPACITY {
+        match try_admit_proof(&admission) {
+            Some(permit) => {
+                admitted.push(true);
+                owned.push((permit, in_flight.start()));
+            }
+            None => {
+                admitted.push(false);
+                retryable_ignored += 1;
+            }
+        }
+    }
+    let heartbeat_completed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        tokio::task::yield_now().await;
+        true
+    })
+    .await
+    .unwrap_or(false);
+    let drain_tracker = Arc::clone(&in_flight);
+    let mut drain = Box::pin(async move { drain_tracker.wait_until_drained().await });
+    let drain_pending_with_two =
+        tokio::time::timeout(std::time::Duration::from_millis(1), &mut drain)
+            .await
+            .is_err();
+    drop(owned.pop());
+    let drain_pending_with_one =
+        tokio::time::timeout(std::time::Duration::from_millis(1), &mut drain)
+            .await
+            .is_err();
+    drop(owned.pop());
+    let drained_after_release = tokio::time::timeout(std::time::Duration::from_secs(1), &mut drain)
+        .await
+        .is_ok();
+    PqNetworkAttestationInFlightTestTrace {
+        admitted,
+        retryable_ignored,
+        heartbeat_completed,
+        drain_pending_with_two,
+        drain_pending_with_one,
+        drained_after_release,
+        available_permits_after_release: admission.available_permits(),
+    }
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum PqNetworkAttestationConsumptionTestCase {
+    Success,
+    ReconciliationFailed,
+    TaskUnavailable,
+    ResolutionLost,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct PqNetworkAttestationConsumptionTestTrace {
+    pub terminal_history: bool,
+    pub signal_shutdown: bool,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub fn testing_only_pq_attestation_consumption_resolution(
+    case: PqNetworkAttestationConsumptionTestCase,
+) -> PqNetworkAttestationConsumptionTestTrace {
+    let (result_failed, resolved) = match case {
+        PqNetworkAttestationConsumptionTestCase::Success => (false, true),
+        PqNetworkAttestationConsumptionTestCase::ReconciliationFailed
+        | PqNetworkAttestationConsumptionTestCase::TaskUnavailable => (true, true),
+        PqNetworkAttestationConsumptionTestCase::ResolutionLost => (false, false),
+    };
+    PqNetworkAttestationConsumptionTestTrace {
+        terminal_history: matches!(
+            attestation_consumption_commit_outcome(),
+            AdmittedMessageCommitOutcome::Terminal
+        ),
+        signal_shutdown: attestation_consumption_requires_shutdown(result_failed, resolved),
+    }
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct PqNetworkAttestationDetachedTestTrace {
+    pub entered: bool,
+    pub caller_drop_retained: bool,
+    pub executor_exit_retained: bool,
+    pub drained_after_release: bool,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub async fn testing_only_pq_attestation_detached_lifecycle()
+-> PqNetworkAttestationDetachedTestTrace {
+    let (executor_owner, executor_exit) = async_channel::bounded(1);
+    let (shutdown_sender, _shutdown_receiver) = futures::channel::mpsc::channel(1);
+    let executor = TaskExecutor::new(
+        tokio::runtime::Handle::current(),
+        executor_exit,
+        shutdown_sender,
+    );
+    let in_flight = Arc::new(PqNetworkInFlight::default());
+    let release = Arc::new(Semaphore::new(0));
+    let task_release = Arc::clone(&release);
+    let (entered_sender, entered_receiver) = tokio::sync::oneshot::channel();
+    let spawned = spawn_owned_attestation_task(
+        &executor,
+        &in_flight,
+        async move {
+            let _ = entered_sender.send(());
+            if let Ok(permit) = task_release.acquire().await {
+                permit.forget();
+            }
+        },
+        "pq_testing_attestation_detached",
+    );
+    let entered = tokio::time::timeout(std::time::Duration::from_secs(1), entered_receiver)
+        .await
+        .is_ok();
+    debug_assert!(spawned);
+    let drain_tracker = Arc::clone(&in_flight);
+    let mut drain = Box::pin(async move { drain_tracker.wait_until_drained().await });
+    let caller_drop_retained =
+        tokio::time::timeout(std::time::Duration::from_millis(1), &mut drain)
+            .await
+            .is_err();
+    drop(executor_owner);
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    let executor_exit_retained =
+        tokio::time::timeout(std::time::Duration::from_millis(1), &mut drain)
+            .await
+            .is_err();
+    release.add_permits(1);
+    let drained_after_release = tokio::time::timeout(std::time::Duration::from_secs(1), &mut drain)
+        .await
+        .is_ok();
+    PqNetworkAttestationDetachedTestTrace {
+        entered,
+        caller_drop_retained,
+        executor_exit_retained,
+        drained_after_release,
     }
 }
 

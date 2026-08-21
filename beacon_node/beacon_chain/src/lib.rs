@@ -198,6 +198,7 @@ pub use self::pq_attestation_gossip::{
 pub use self::pq_attestation_gossip::{
     TestingPqAttestationObservationCache, testing_only_pq_attestation_advance_distance,
     testing_only_pq_attestation_late_window, testing_only_pq_attestation_target_root,
+    testing_only_pq_single_prepropagation_retry,
 };
 #[cfg(feature = "pq-devnet")]
 pub use self::pq_import::{
