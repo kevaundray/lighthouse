@@ -8,7 +8,7 @@ use state_processing::{
     PqImportedTransitionOutput, PqValidatorKeyCache, validate_lean_pq_devnet_v1,
 };
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use store::metadata::{ANCHOR_UNINITIALIZED, STATE_UPPER_LIMIT_NO_RETAIN};
 use store::{AnchorInfo, DBColumn, HotColdDB, ItemStore, StoreItem, StoreOp};
@@ -196,6 +196,7 @@ pub struct BeaconChainBuilder<T: BeaconChainTypes> {
     key_cache: Option<Arc<PqValidatorKeyCache>>,
     aggregation_service: Option<Arc<AggregationService>>,
     execution_notifier: crate::pq_import::PqExecutionNotifier<T::EthSpec>,
+    operational_events: Option<Weak<crate::PqOperationalEventSink>>,
     task_executor: Option<TaskExecutor>,
     #[cfg(feature = "pq-startup-testing")]
     pq_blocking_test_hook: Option<Arc<crate::TestingPqBlockingHook>>,
@@ -223,6 +224,7 @@ where
             key_cache: None,
             aggregation_service: None,
             execution_notifier: crate::pq_import::PqExecutionNotifier::Deferred,
+            operational_events: None,
             task_executor: None,
             #[cfg(feature = "pq-startup-testing")]
             pq_blocking_test_hook: None,
@@ -423,6 +425,12 @@ where
         self
     }
 
+    /// Installs the one process-owned operational event sink shared by the PQ runtime owners.
+    pub fn pq_operational_events(mut self, events: Weak<crate::PqOperationalEventSink>) -> Self {
+        self.operational_events = Some(events);
+        self
+    }
+
     /// Installs the process-owned executor used for all synchronous PQ import phases.
     pub fn task_executor(mut self, task_executor: TaskExecutor) -> Self {
         self.task_executor = Some(task_executor);
@@ -505,6 +513,7 @@ where
                 consensus_signature::AggregationError::Unavailable,
             ))?,
             self.execution_notifier,
+            self.operational_events,
             self.task_executor
                 .ok_or(PqRuntimeError::MissingTaskExecutor)?,
             #[cfg(feature = "pq-startup-testing")]

@@ -1,4 +1,4 @@
-use super::Context;
+use super::{Context, MockEngineAuditEvent};
 use crate::engine_api::{http::*, *};
 use crate::json_structures::*;
 use crate::test_utils::{DEFAULT_CLIENT_VERSION, DEFAULT_MOCK_EL_PAYLOAD_VALUE_WEI};
@@ -131,6 +131,28 @@ pub async fn handle_rpc<E: EthSpec>(
                     .map_err(|s| (s, BAD_PARAMS_ERROR_CODE))?,
                 _ => unreachable!(),
             };
+            let blob_count =
+                params
+                    .get(1)
+                    .and_then(JsonValue::as_array)
+                    .map_or(Ok(0), |hashes| {
+                        u64::try_from(hashes.len()).map_err(|_| {
+                            (
+                                "mock engine blob-count overflow".to_owned(),
+                                GENERIC_ERROR_CODE,
+                            )
+                        })
+                    })?;
+            ctx.record_engine_audit(MockEngineAuditEvent::NewPayload {
+                block_hash: *request.block_hash(),
+                blob_count,
+            })
+            .map_err(|_| {
+                (
+                    "mock engine audit capacity exhausted".to_owned(),
+                    GENERIC_ERROR_CODE,
+                )
+            })?;
 
             let fork = ctx
                 .execution_block_generator
@@ -295,6 +317,24 @@ pub async fn handle_rpc<E: EthSpec>(
                 })?;
 
             let maybe_blobs = ctx.execution_block_generator.write().get_blobs_bundle(&id);
+            let blob_count = maybe_blobs.as_ref().map_or(Ok(0), |bundle| {
+                u64::try_from(bundle.blobs.len()).map_err(|_| {
+                    (
+                        "mock engine blob-count overflow".to_owned(),
+                        GENERIC_ERROR_CODE,
+                    )
+                })
+            })?;
+            ctx.record_engine_audit(MockEngineAuditEvent::GetPayload {
+                block_hash: response.block_hash(),
+                blob_count,
+            })
+            .map_err(|_| {
+                (
+                    "mock engine audit capacity exhausted".to_owned(),
+                    GENERIC_ERROR_CODE,
+                )
+            })?;
             let maybe_execution_requests = ctx
                 .execution_block_generator
                 .read()
@@ -572,6 +612,19 @@ pub async fn handle_rpc<E: EthSpec>(
                 ?forkchoice_state,
                 "ENGINE_FORKCHOICE_UPDATED"
             );
+
+            ctx.record_engine_audit(MockEngineAuditEvent::ForkchoiceUpdated {
+                head_block_hash: forkchoice_state.head_block_hash,
+                safe_block_hash: forkchoice_state.safe_block_hash,
+                finalized_block_hash: forkchoice_state.finalized_block_hash,
+                has_payload_attributes: payload_attributes.is_some(),
+            })
+            .map_err(|_| {
+                (
+                    "mock engine audit capacity exhausted".to_owned(),
+                    GENERIC_ERROR_CODE,
+                )
+            })?;
 
             // validate method called correctly according to fork time
             if let Some(pa) = payload_attributes.as_ref() {

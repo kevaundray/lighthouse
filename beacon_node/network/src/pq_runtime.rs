@@ -33,10 +33,11 @@ pub use service::{
 pub use service::{
     PqCommitCompletionQueueTestTrace, PqCommitResolutionTestCase, PqCompletionQueueTestScenario,
     PqCompletionQueueTestTrace, PqCompletionTestDisposition, PqCompletionTestEvent,
-    PqEncodingShutdownTestTrace, PqProofAdmissionTestTrace, PqStatusTestEvent,
-    PqStatusTestScenario, PqStatusTestTrace, testing_only_pq_commit_completion_queue,
-    testing_only_pq_commit_resolution, testing_only_pq_completion_lifecycle,
-    testing_only_pq_completion_queue, testing_only_pq_encoding_shutdown,
+    PqEncodingShutdownTestTrace, PqGossipImportedEventGateTestTrace, PqProofAdmissionTestTrace,
+    PqStatusTestEvent, PqStatusTestScenario, PqStatusTestTrace,
+    testing_only_pq_commit_completion_queue, testing_only_pq_commit_resolution,
+    testing_only_pq_completion_lifecycle, testing_only_pq_completion_queue,
+    testing_only_pq_encoding_shutdown, testing_only_pq_gossip_imported_event_gate,
     testing_only_pq_proof_admission, testing_only_pq_status_lifecycle,
 };
 

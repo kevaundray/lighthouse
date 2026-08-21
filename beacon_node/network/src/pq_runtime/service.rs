@@ -171,6 +171,7 @@ struct PqBlockEncodingCompletion<E: EthSpec> {
 struct PqBlockCommitCompletion {
     admission: AdmittedMessageCommit,
     result: Result<PqBlockImportOutcome, PqImportError>,
+    identity: Option<(types::Slot, Hash256, [u8; 32])>,
 }
 
 enum PqCompletionDisposition<Propagation, Commit, Error> {
@@ -292,6 +293,7 @@ impl<T: BeaconChainTypes>
     }
 
     fn commit(&mut self, admission: Self::Reservation, commit: PqGossipCommitToken<T>) {
+        let identity = commit.operational_identity().ok();
         let processor = Arc::clone(&self.processor);
         let commit_sender = self.commit_sender.clone();
         let _in_flight = self.in_flight.start();
@@ -301,7 +303,11 @@ impl<T: BeaconChainTypes>
                 let result = processor.commit_gossip_block(commit).await;
                 try_send_completion(
                     &commit_sender,
-                    PqBlockCommitCompletion { admission, result },
+                    PqBlockCommitCompletion {
+                        admission,
+                        result,
+                        identity,
+                    },
                 );
             },
             "pq_network_block_commit",
@@ -378,11 +384,46 @@ fn commit_error_resolution(error: Option<&PqImportError>) -> AdmittedMessageComm
             PqImportError::PeerInvalid(_)
             | PqImportError::ExecutionRejected(_)
             | PqImportError::ExecutionReconciliation(_)
+            | PqImportError::OperationalEvent(_)
             | PqImportError::DurableStateUnknown { .. }
             | PqImportError::TerminalObservation { .. }
             | PqImportError::StaleHeadAfterVerification { .. }
             | PqImportError::Local(_),
         ) => AdmittedMessageCommitOutcome::Terminal,
+    }
+}
+
+fn gossip_imported_event(
+    identity: Option<(types::Slot, Hash256, [u8; 32])>,
+    commit_succeeded: bool,
+    resolution_succeeded: bool,
+) -> Option<PqOperationalEvent> {
+    let (slot, block_root, signed_ssz_digest) =
+        identity.filter(|_| commit_succeeded && resolution_succeeded)?;
+    Some(PqOperationalEvent::GossipImported {
+        slot,
+        block_root,
+        signed_ssz_digest,
+    })
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct PqGossipImportedEventGateTestTrace {
+    pub committed_and_resolved: Option<PqOperationalEvent>,
+    pub committed_but_unresolved: Option<PqOperationalEvent>,
+    pub resolved_but_failed: Option<PqOperationalEvent>,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub fn testing_only_pq_gossip_imported_event_gate() -> PqGossipImportedEventGateTestTrace {
+    let identity = Some((types::Slot::new(3), Hash256::repeat_byte(4), [5; 32]));
+    PqGossipImportedEventGateTestTrace {
+        committed_and_resolved: gossip_imported_event(identity, true, true),
+        committed_but_unresolved: gossip_imported_event(identity, true, false),
+        resolved_but_failed: gossip_imported_event(identity, false, true),
     }
 }
 
@@ -609,7 +650,7 @@ pub struct PqNetworkService<T: BeaconChainTypes> {
     proof_admission: Arc<Semaphore>,
     encoding_admission: Arc<Semaphore>,
     gossip_admission: Arc<PqGossipValidationAdmission>,
-    operational_events: Arc<PqOperationalEventSink>,
+    operational_events: std::sync::Weak<PqOperationalEventSink>,
     encoding_sender: mpsc::Sender<PqBlockEncodingCompletion<T::EthSpec>>,
     encoding_receiver: mpsc::Receiver<PqBlockEncodingCompletion<T::EthSpec>>,
     completion_sender: mpsc::Sender<PqBlockVerificationCompletion<T>>,
@@ -670,7 +711,7 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
             proof_admission: Arc::new(Semaphore::new(PQ_NETWORK_BLOCK_PROOF_CAPACITY)),
             encoding_admission: Arc::new(Semaphore::new(PQ_NETWORK_BLOCK_ENCODING_CAPACITY)),
             gossip_admission,
-            operational_events,
+            operational_events: Arc::downgrade(&operational_events),
             encoding_sender,
             encoding_receiver,
             completion_sender,
@@ -1018,7 +1059,11 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
     }
 
     fn emit_operational_event(&mut self, event: PqOperationalEvent) -> bool {
-        if self.operational_events.try_emit(event).is_ok() {
+        if self
+            .operational_events
+            .upgrade()
+            .is_some_and(|events| events.try_emit(event).is_ok())
+        {
             return true;
         }
         warn!("PQ operational event sink unavailable");
@@ -1093,11 +1138,26 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
     }
 
     fn handle_commit_completion(&mut self, completion: PqBlockCommitCompletion) {
-        let PqBlockCommitCompletion { admission, result } = completion;
+        let PqBlockCommitCompletion {
+            admission,
+            result,
+            identity,
+        } = completion;
         let resolution = commit_resolution(&result);
-        let _ = self
+        let resolved = self
             .network
             .resolve_pq_admitted_message_commit(admission, resolution);
+        if let Some(PqOperationalEvent::GossipImported {
+            slot,
+            block_root,
+            signed_ssz_digest,
+        }) = gossip_imported_event(identity, result.is_ok(), resolved)
+        {
+            let _ =
+                self.processor
+                    .chain
+                    .emit_pq_gossip_imported(slot, block_root, signed_ssz_digest);
+        }
         if let Err(error) = result {
             debug!(
                 ?error,
@@ -1127,11 +1187,18 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
     fn validate_status(&mut self, peer_id: PeerId, status: &StatusMessage) {
         let expected = self.status_message().status_v2();
         let received = status.status_v2();
+        let Some(operational_events) = self.operational_events.upgrade() else {
+            warn!("PQ operational event sink unavailable");
+            let _ = self.task_executor.shutdown_sender().try_send(
+                task_executor::ShutdownReason::Failure("PQ operational event sink unavailable"),
+            );
+            return;
+        };
         let mut lifecycle = PqNetworkStatusLifecycle {
             network: &mut self.network,
             peer_id,
             gossip_admission: &self.gossip_admission,
-            operational_events: &self.operational_events,
+            operational_events: &operational_events,
             task_executor: &self.task_executor,
         };
         handle_status_lifecycle(&expected, &received, &mut lifecycle);

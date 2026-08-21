@@ -114,6 +114,7 @@ pub enum PqBlockPublicationTerminal {
 pub enum PqBlockPublicationLocalError {
     Import(PqImportError),
     Broadcast(PqBlockBroadcastError),
+    OperationalEvent(beacon_chain::PqOperationalEventError),
     TaskUnavailable,
 }
 
@@ -122,6 +123,7 @@ impl std::fmt::Display for PqBlockPublicationLocalError {
         match self {
             Self::Import(error) => error.fmt(formatter),
             Self::Broadcast(error) => error.fmt(formatter),
+            Self::OperationalEvent(error) => error.fmt(formatter),
             Self::TaskUnavailable => {
                 formatter.write_str("PQ block publication task is unavailable")
             }
@@ -134,6 +136,7 @@ impl std::error::Error for PqBlockPublicationLocalError {
         match self {
             Self::Import(error) => Some(error),
             Self::Broadcast(error) => Some(error),
+            Self::OperationalEvent(error) => Some(error),
             Self::TaskUnavailable => None,
         }
     }
@@ -227,6 +230,10 @@ impl<T: BeaconChainTypes> PqBlockPublicationService<T> {
         };
         match self.chain.observe_verified_pq_publish_block(verified) {
             PqPublishObservation::New(token) => {
+                let operational_identity = match token.operational_identity() {
+                    Ok(identity) => identity,
+                    Err(error) => return classify_import_error(error),
+                };
                 let block = match token.block() {
                     Ok(block) => Arc::clone(block),
                     Err(error) => return classify_import_error(error),
@@ -245,7 +252,18 @@ impl<T: BeaconChainTypes> PqBlockPublicationService<T> {
                 match promotion {
                     PqPublishPromotion::Commit(commit) => match commit.commit().await {
                         Ok(PqPublishCommitOutcome::Imported(outcome)) => {
-                            PqBlockPublicationDisposition::Published(outcome)
+                            let (slot, block_root, signed_ssz_digest) = operational_identity;
+                            if let Err(error) = self.chain.emit_pq_proposal_published(
+                                slot,
+                                block_root,
+                                signed_ssz_digest,
+                            ) {
+                                PqBlockPublicationDisposition::Local(
+                                    PqBlockPublicationLocalError::OperationalEvent(error),
+                                )
+                            } else {
+                                PqBlockPublicationDisposition::Published(outcome)
+                            }
                         }
                         Ok(PqPublishCommitOutcome::Committed) => {
                             PqBlockPublicationDisposition::Committed
@@ -348,6 +366,9 @@ fn classify_import_error(error: PqImportError) -> PqBlockPublicationDisposition 
         | PqImportError::DurableStateUnknown { .. }
         | PqImportError::TerminalObservation { .. } => {
             PqBlockPublicationDisposition::Terminal(PqBlockPublicationTerminal::Rejected)
+        }
+        PqImportError::OperationalEvent(_) => {
+            PqBlockPublicationDisposition::Local(PqBlockPublicationLocalError::Import(error))
         }
         PqImportError::StaleHeadAfterVerification { .. } => {
             PqBlockPublicationDisposition::Terminal(PqBlockPublicationTerminal::Stale)

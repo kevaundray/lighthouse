@@ -2,6 +2,8 @@
 use beacon_chain::testing_only_running_pq_operational_event_sink;
 use beacon_chain::{
     PqOperationalEventError, PqOperationalEventRole, PqStatusRejectionCode,
+    testing_only_pq_extended_operational_event_contract,
+    testing_only_pq_operational_event_acknowledgement,
     testing_only_pq_operational_event_nonblocking_writer, testing_only_pq_operational_event_sink,
     testing_only_pq_operational_event_stdout_kinds,
 };
@@ -15,7 +17,8 @@ use network::{
     PqStatusTestTrace, pq_block_broadcast_channel, testing_only_pq_commit_completion_queue,
     testing_only_pq_commit_resolution, testing_only_pq_completion_lifecycle,
     testing_only_pq_completion_queue, testing_only_pq_encoding_shutdown,
-    testing_only_pq_proof_admission, testing_only_pq_status_lifecycle,
+    testing_only_pq_gossip_imported_event_gate, testing_only_pq_proof_admission,
+    testing_only_pq_status_lifecycle,
 };
 use std::sync::Arc;
 use types::{
@@ -346,6 +349,36 @@ peer_digest=02020202020202020202020202020202\n"
         trace.overflow_error,
         PqOperationalEventError::SequenceOverflow
     );
+    assert_eq!(trace.forced_closed_error, PqOperationalEventError::Closed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operational_event_acknowledges_only_after_the_complete_line_is_written() {
+    let trace = testing_only_pq_operational_event_acknowledgement().await;
+    assert!(trace.pending_before_output);
+    assert!(trace.heartbeat_completed);
+    assert_eq!(trace.result, Ok(()));
+    assert_eq!(
+        trace.output,
+        b"PQ_EVENT_V1 event=EventWriterReady sequence=1 role=proposer\n"
+    );
+}
+
+#[test]
+fn gossip_imported_event_requires_commit_and_gossipsub_resolution() {
+    let trace = testing_only_pq_gossip_imported_event_gate();
+    assert!(matches!(
+        trace.committed_and_resolved,
+        Some(beacon_chain::PqOperationalEvent::GossipImported {
+            slot,
+            block_root,
+            signed_ssz_digest,
+        }) if slot == types::Slot::new(3)
+            && block_root == types::Hash256::repeat_byte(4)
+            && signed_ssz_digest == [5; 32]
+    ));
+    assert_eq!(trace.committed_but_unresolved, None);
+    assert_eq!(trace.resolved_but_failed, None);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -374,6 +407,42 @@ fn operational_event_writer_preserves_kind_specific_stdout_semantics() {
     assert_eq!(
         trace.pipe_result,
         Err(PqOperationalEventError::OutputWouldBlock)
+    );
+}
+
+#[test]
+fn extended_operational_event_contract_is_fixed_and_bounded() {
+    let output = testing_only_pq_extended_operational_event_contract();
+    assert_eq!(
+        output,
+        b"PQ_EVENT_V1 event=RuntimeReady sequence=1 role=proposer startup=fresh slot=1 \
+block_root=0x0101010101010101010101010101010101010101010101010101010101010101 \
+execution_hash=0x0202020202020202020202020202020202020202020202020202020202020202 \
+finalized_epoch=0 finalized_root=0x0303030303030303030303030303030303030303030303030303030303030303 \
+signed_ssz_digest=0404040404040404040404040404040404040404040404040404040404040404\n\
+PQ_EVENT_V1 event=ProposalStarted sequence=2 role=proposer slot=2 \
+parent_root=0x0505050505050505050505050505050505050505050505050505050505050505\n\
+PQ_EVENT_V1 event=BlockPersisted sequence=3 role=proposer source=publish slot=2 \
+block_root=0x0606060606060606060606060606060606060606060606060606060606060606 \
+execution_hash=0x0707070707070707070707070707070707070707070707070707070707070707 \
+finalized_epoch=0 finalized_root=0x0303030303030303030303030303030303030303030303030303030303030303 \
+signed_ssz_digest=0808080808080808080808080808080808080808080808080808080808080808\n\
+PQ_EVENT_V1 event=ExecutionReconciled sequence=4 role=proposer source=publish slot=2 \
+block_root=0x0606060606060606060606060606060606060606060606060606060606060606 \
+execution_hash=0x0707070707070707070707070707070707070707070707070707070707070707 \
+finalized_epoch=0 finalized_root=0x0303030303030303030303030303030303030303030303030303030303030303 \
+signed_ssz_digest=0808080808080808080808080808080808080808080808080808080808080808\n\
+PQ_EVENT_V1 event=ProposalPublished sequence=5 role=proposer slot=2 \
+block_root=0x0606060606060606060606060606060606060606060606060606060606060606 \
+signed_ssz_digest=0808080808080808080808080808080808080808080808080808080808080808\n\
+PQ_EVENT_V1 event=GossipImported sequence=6 role=proposer slot=2 \
+block_root=0x0606060606060606060606060606060606060606060606060606060606060606 \
+signed_ssz_digest=0808080808080808080808080808080808080808080808080808080808080808\n"
+    );
+    assert!(
+        output
+            .split(|byte| *byte == b'\n')
+            .all(|line| line.len() <= 4096)
     );
 }
 

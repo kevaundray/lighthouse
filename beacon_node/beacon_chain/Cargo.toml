@@ -26,6 +26,7 @@ arbitrary = ["dep:arbitrary", "types/arbitrary"]
 pq-wire = ["consensus_signature/pq-wire", "eth2/pq-wire", "types/pq-devnet"]
 pq-devnet = [
     "dep:libc",
+    "dep:sha2",
     "pq-wire",
     "consensus_signature/pq-devnet",
     "execution_layer/pq-devnet",
@@ -79,6 +80,7 @@ safe_arith = { workspace = true }
 sensitive_url = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true, optional = true }
 slasher = { workspace = true, optional = true }
 slot_clock = { workspace = true }
 smallvec = { workspace = true }

@@ -19,7 +19,10 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::{Arc, LazyLock};
+use std::sync::{
+    Arc, LazyLock,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio::{runtime, sync::oneshot};
 use tracing::info;
 use types::{EthSpec, ExecutionBlockHash, Uint256};
@@ -38,6 +41,36 @@ pub use mock_execution_layer::MockExecutionLayer;
 pub const DEFAULT_JWT_SECRET: [u8; 32] = [42; 32];
 pub const DEFAULT_MOCK_EL_PAYLOAD_VALUE_WEI: u128 = 10_000_000_000_000_000;
 pub const DEFAULT_BUILDER_PAYLOAD_VALUE_WEI: u128 = 20_000_000_000_000_000;
+pub const MOCK_ENGINE_AUDIT_CAPACITY: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MockEngineAuditEvent {
+    NewPayload {
+        block_hash: ExecutionBlockHash,
+        blob_count: u64,
+    },
+    GetPayload {
+        block_hash: ExecutionBlockHash,
+        blob_count: u64,
+    },
+    ForkchoiceUpdated {
+        head_block_hash: ExecutionBlockHash,
+        safe_block_hash: ExecutionBlockHash,
+        finalized_block_hash: ExecutionBlockHash,
+        has_payload_attributes: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MockEngineAuditError {
+    Overflow,
+}
+
+#[derive(Default)]
+struct MockEngineAuditHistory {
+    entries: Vec<MockEngineAuditEvent>,
+    overflowed: bool,
+}
 pub const DEFAULT_ENGINE_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     new_payload_v1: true,
     new_payload_v2: true,
@@ -154,6 +187,8 @@ impl<E: EthSpec> MockServer<E> {
             last_echo_request: last_echo_request.clone(),
             execution_block_generator: RwLock::new(execution_block_generator),
             previous_request: <_>::default(),
+            audit_history: <_>::default(),
+            audit_enabled: AtomicBool::new(false),
             preloaded_responses,
             static_new_payload_response: <_>::default(),
             static_forkchoice_updated_response: <_>::default(),
@@ -248,6 +283,20 @@ impl<E: EthSpec> MockServer<E> {
 
     pub fn take_previous_request(&self) -> Option<serde_json::Value> {
         self.ctx.previous_request.lock().take()
+    }
+
+    pub fn engine_audit_history(&self) -> Result<Vec<MockEngineAuditEvent>, MockEngineAuditError> {
+        let history = self.ctx.audit_history.lock();
+        if history.overflowed {
+            Err(MockEngineAuditError::Overflow)
+        } else {
+            Ok(history.entries.clone())
+        }
+    }
+
+    pub fn enable_engine_audit(&self) {
+        *self.ctx.audit_history.lock() = MockEngineAuditHistory::default();
+        self.ctx.audit_enabled.store(true, Ordering::SeqCst);
     }
 
     pub fn set_new_payload_response(&self, response: StaticNewPayloadResponse) {
@@ -521,6 +570,8 @@ pub struct Context<E: EthSpec> {
     pub execution_block_generator: RwLock<ExecutionBlockGenerator<E>>,
     pub preloaded_responses: Arc<Mutex<Vec<serde_json::Value>>>,
     pub previous_request: Arc<Mutex<Option<serde_json::Value>>>,
+    audit_history: Arc<Mutex<MockEngineAuditHistory>>,
+    audit_enabled: AtomicBool,
     pub static_new_payload_response: Arc<Mutex<Option<StaticNewPayloadResponse>>>,
     pub static_forkchoice_updated_response: Arc<Mutex<Option<PayloadStatusV1>>>,
     pub static_get_block_by_hash_response: Arc<Mutex<Option<Option<ExecutionBlock>>>>,
@@ -541,6 +592,19 @@ pub struct Context<E: EthSpec> {
 }
 
 impl<E: EthSpec> Context<E> {
+    fn record_engine_audit(&self, event: MockEngineAuditEvent) -> Result<(), MockEngineAuditError> {
+        if !self.audit_enabled.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let mut history = self.audit_history.lock();
+        if history.entries.len() >= MOCK_ENGINE_AUDIT_CAPACITY {
+            history.overflowed = true;
+            return Err(MockEngineAuditError::Overflow);
+        }
+        history.entries.push(event);
+        Ok(())
+    }
+
     pub fn get_new_payload_status(
         &self,
         block_hash: &ExecutionBlockHash,
@@ -738,4 +802,44 @@ pub fn serve<E: EthSpec>(
     );
 
     Ok((listening_socket, server))
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn engine_audit_history_is_typed_and_fails_closed_at_64() {
+        let server = MockServer::<types::MinimalEthSpec>::unit_testing();
+        server.enable_engine_audit();
+        let request = serde_json::json!({
+            "method": "engine_forkchoiceUpdatedV3",
+            "params": [{
+                "headBlockHash": types::ExecutionBlockHash::repeat_byte(0),
+                "safeBlockHash": types::ExecutionBlockHash::repeat_byte(0),
+                "finalizedBlockHash": types::ExecutionBlockHash::repeat_byte(0),
+            }, null],
+        });
+        for _ in 0..64 {
+            let _ = handle_rpc(request.clone(), Arc::clone(&server.ctx)).await;
+        }
+        let audit = server.engine_audit_history().expect("bounded audit");
+        assert_eq!(audit.len(), 64);
+        assert!(audit.iter().all(|event| matches!(
+            event,
+            MockEngineAuditEvent::ForkchoiceUpdated {
+                head_block_hash,
+                safe_block_hash,
+                finalized_block_hash,
+                has_payload_attributes: false,
+            } if *head_block_hash == types::ExecutionBlockHash::repeat_byte(0)
+                && *safe_block_hash == types::ExecutionBlockHash::repeat_byte(0)
+                && *finalized_block_hash == types::ExecutionBlockHash::repeat_byte(0)
+        )));
+        assert!(handle_rpc(request, Arc::clone(&server.ctx)).await.is_err());
+        assert_eq!(
+            server.engine_audit_history(),
+            Err(MockEngineAuditError::Overflow)
+        );
+    }
 }

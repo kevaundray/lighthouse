@@ -4,11 +4,12 @@ use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(feature = "pq-startup-testing")]
 use std::sync::Arc;
 #[cfg(feature = "pq-startup-testing")]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::mpsc;
+use types::{Epoch, ExecutionBlockHash, Hash256, Slot};
 
 const PQ_OPERATIONAL_EVENT_CAPACITY: usize = 64;
-const PQ_OPERATIONAL_EVENT_MAX_LINE_BYTES: usize = 256;
+const PQ_OPERATIONAL_EVENT_MAX_LINE_BYTES: usize = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PqOperationalEventRole {
@@ -75,8 +76,79 @@ impl PqStatusRejectionCode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PqRuntimeStartup {
+    Fresh,
+    Resume,
+}
+
+impl PqRuntimeStartup {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Resume => "resume",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PqBlockEventSource {
+    Publish,
+    Gossip,
+}
+
+impl PqBlockEventSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Publish => "publish",
+            Self::Gossip => "gossip",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PqOperationalEvent {
     EventWriterReady,
+    RuntimeReady {
+        startup: PqRuntimeStartup,
+        slot: Slot,
+        block_root: Hash256,
+        execution_hash: ExecutionBlockHash,
+        finalized_epoch: Epoch,
+        finalized_root: Hash256,
+        signed_ssz_digest: [u8; 32],
+    },
+    ProposalStarted {
+        slot: Slot,
+        parent_root: Hash256,
+    },
+    BlockPersisted {
+        source: PqBlockEventSource,
+        slot: Slot,
+        block_root: Hash256,
+        execution_hash: ExecutionBlockHash,
+        finalized_epoch: Epoch,
+        finalized_root: Hash256,
+        signed_ssz_digest: [u8; 32],
+    },
+    ExecutionReconciled {
+        source: PqBlockEventSource,
+        slot: Slot,
+        block_root: Hash256,
+        execution_hash: ExecutionBlockHash,
+        finalized_epoch: Epoch,
+        finalized_root: Hash256,
+        signed_ssz_digest: [u8; 32],
+    },
+    ProposalPublished {
+        slot: Slot,
+        block_root: Hash256,
+        signed_ssz_digest: [u8; 32],
+    },
+    GossipImported {
+        slot: Slot,
+        block_root: Hash256,
+        signed_ssz_digest: [u8; 32],
+    },
     PeerConnected {
         peer_digest: [u8; 16],
         direction: PqPeerConnectionDirection,
@@ -125,11 +197,20 @@ impl std::error::Error for PqOperationalEventError {}
 
 #[derive(Clone)]
 pub struct PqOperationalEventSink {
-    sender: mpsc::Sender<PqOperationalEvent>,
+    sender: mpsc::Sender<PqOperationalEventCommand>,
     #[cfg(feature = "pq-startup-testing")]
     emitted: Arc<AtomicUsize>,
     #[cfg(feature = "pq-startup-testing")]
     peer_compatible_emitted: Arc<AtomicUsize>,
+    #[cfg(feature = "pq-startup-testing")]
+    observed: Arc<std::sync::Mutex<Vec<PqOperationalEvent>>>,
+    #[cfg(feature = "pq-startup-testing")]
+    fail_closed: Arc<AtomicBool>,
+}
+
+struct PqOperationalEventCommand {
+    event: PqOperationalEvent,
+    acknowledgement: Option<tokio::sync::oneshot::Sender<Result<(), PqOperationalEventError>>>,
 }
 
 impl PqOperationalEventSink {
@@ -149,6 +230,10 @@ impl PqOperationalEventSink {
                 emitted: Arc::new(AtomicUsize::new(0)),
                 #[cfg(feature = "pq-startup-testing")]
                 peer_compatible_emitted: Arc::new(AtomicUsize::new(0)),
+                #[cfg(feature = "pq-startup-testing")]
+                observed: Arc::new(std::sync::Mutex::new(Vec::new())),
+                #[cfg(feature = "pq-startup-testing")]
+                fail_closed: Arc::new(AtomicBool::new(false)),
             },
             PqOperationalEventWriter {
                 role,
@@ -159,17 +244,56 @@ impl PqOperationalEventSink {
     }
 
     pub fn try_emit(&self, event: PqOperationalEvent) -> Result<(), PqOperationalEventError> {
+        self.try_enqueue(event, None)
+    }
+
+    pub async fn emit_and_wait(
+        &self,
+        event: PqOperationalEvent,
+    ) -> Result<(), PqOperationalEventError> {
+        let (acknowledgement, completion) = tokio::sync::oneshot::channel();
+        self.try_enqueue(event, Some(acknowledgement))?;
+        completion
+            .await
+            .map_err(|_| PqOperationalEventError::Closed)?
+    }
+
+    fn try_enqueue(
+        &self,
+        event: PqOperationalEvent,
+        acknowledgement: Option<tokio::sync::oneshot::Sender<Result<(), PqOperationalEventError>>>,
+    ) -> Result<(), PqOperationalEventError> {
+        #[cfg(feature = "pq-startup-testing")]
+        if self.fail_closed.load(Ordering::SeqCst) {
+            return Err(PqOperationalEventError::Closed);
+        }
         #[cfg(feature = "pq-startup-testing")]
         let is_peer_compatible = matches!(event, PqOperationalEvent::PeerCompatible { .. });
-        self.sender.try_send(event).map_err(|error| match error {
-            mpsc::error::TrySendError::Full(_) => PqOperationalEventError::Capacity,
-            mpsc::error::TrySendError::Closed(_) => PqOperationalEventError::Closed,
-        })?;
+        self.sender
+            .try_send(PqOperationalEventCommand {
+                event,
+                acknowledgement,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => PqOperationalEventError::Capacity,
+                mpsc::error::TrySendError::Closed(_) => PqOperationalEventError::Closed,
+            })?;
         #[cfg(feature = "pq-startup-testing")]
         self.emitted.fetch_add(1, Ordering::SeqCst);
         #[cfg(feature = "pq-startup-testing")]
         if is_peer_compatible {
             self.peer_compatible_emitted.fetch_add(1, Ordering::SeqCst);
+        }
+        #[cfg(feature = "pq-startup-testing")]
+        {
+            let mut observed = self
+                .observed
+                .lock()
+                .expect("PQ operational event testing observer lock");
+            if observed.len() == PQ_OPERATIONAL_EVENT_CAPACITY {
+                observed.remove(0);
+            }
+            observed.push(event);
         }
         Ok(())
     }
@@ -193,11 +317,26 @@ impl PqOperationalEventSink {
     pub fn testing_only_peer_compatible_count(&self) -> usize {
         self.peer_compatible_emitted.load(Ordering::SeqCst)
     }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_events(&self) -> Vec<PqOperationalEvent> {
+        self.observed
+            .lock()
+            .expect("PQ operational event testing observer lock")
+            .clone()
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_fail_closed(&self) {
+        self.fail_closed.store(true, Ordering::SeqCst);
+    }
 }
 
 pub struct PqOperationalEventWriter {
     role: PqOperationalEventRole,
-    receiver: mpsc::Receiver<PqOperationalEvent>,
+    receiver: mpsc::Receiver<PqOperationalEventCommand>,
     sequence: u64,
 }
 
@@ -255,7 +394,7 @@ impl PqOperationalEventWriter {
     async fn next_record(
         &mut self,
     ) -> Result<Option<PqOperationalEventRecord>, PqOperationalEventError> {
-        let Some(event) = self.receiver.recv().await else {
+        let Some(command) = self.receiver.recv().await else {
             return Ok(None);
         };
         self.sequence = self
@@ -265,7 +404,7 @@ impl PqOperationalEventWriter {
         Ok(Some(PqOperationalEventRecord {
             sequence: self.sequence,
             role: self.role,
-            event,
+            event: command.event,
         }))
     }
 
@@ -275,6 +414,85 @@ impl PqOperationalEventWriter {
                 "PQ_EVENT_V1 event=EventWriterReady sequence={} role={}",
                 record.sequence,
                 record.role.as_str(),
+            ),
+            PqOperationalEvent::RuntimeReady {
+                startup,
+                slot,
+                block_root,
+                execution_hash,
+                finalized_epoch,
+                finalized_root,
+                signed_ssz_digest,
+            } => format!(
+                "PQ_EVENT_V1 event=RuntimeReady sequence={} role={} startup={} slot={} block_root={block_root:?} execution_hash={execution_hash:?} finalized_epoch={} finalized_root={finalized_root:?} signed_ssz_digest={}",
+                record.sequence,
+                record.role.as_str(),
+                startup.as_str(),
+                slot.as_u64(),
+                finalized_epoch.as_u64(),
+                hex::encode(signed_ssz_digest),
+            ),
+            PqOperationalEvent::ProposalStarted { slot, parent_root } => format!(
+                "PQ_EVENT_V1 event=ProposalStarted sequence={} role={} slot={} parent_root={parent_root:?}",
+                record.sequence,
+                record.role.as_str(),
+                slot.as_u64(),
+            ),
+            PqOperationalEvent::BlockPersisted {
+                source,
+                slot,
+                block_root,
+                execution_hash,
+                finalized_epoch,
+                finalized_root,
+                signed_ssz_digest,
+            } => format!(
+                "PQ_EVENT_V1 event=BlockPersisted sequence={} role={} source={} slot={} block_root={block_root:?} execution_hash={execution_hash:?} finalized_epoch={} finalized_root={finalized_root:?} signed_ssz_digest={}",
+                record.sequence,
+                record.role.as_str(),
+                source.as_str(),
+                slot.as_u64(),
+                finalized_epoch.as_u64(),
+                hex::encode(signed_ssz_digest),
+            ),
+            PqOperationalEvent::ExecutionReconciled {
+                source,
+                slot,
+                block_root,
+                execution_hash,
+                finalized_epoch,
+                finalized_root,
+                signed_ssz_digest,
+            } => format!(
+                "PQ_EVENT_V1 event=ExecutionReconciled sequence={} role={} source={} slot={} block_root={block_root:?} execution_hash={execution_hash:?} finalized_epoch={} finalized_root={finalized_root:?} signed_ssz_digest={}",
+                record.sequence,
+                record.role.as_str(),
+                source.as_str(),
+                slot.as_u64(),
+                finalized_epoch.as_u64(),
+                hex::encode(signed_ssz_digest),
+            ),
+            PqOperationalEvent::ProposalPublished {
+                slot,
+                block_root,
+                signed_ssz_digest,
+            } => format!(
+                "PQ_EVENT_V1 event=ProposalPublished sequence={} role={} slot={} block_root={block_root:?} signed_ssz_digest={}",
+                record.sequence,
+                record.role.as_str(),
+                slot.as_u64(),
+                hex::encode(signed_ssz_digest),
+            ),
+            PqOperationalEvent::GossipImported {
+                slot,
+                block_root,
+                signed_ssz_digest,
+            } => format!(
+                "PQ_EVENT_V1 event=GossipImported sequence={} role={} slot={} block_root={block_root:?} signed_ssz_digest={}",
+                record.sequence,
+                record.role.as_str(),
+                slot.as_u64(),
+                hex::encode(signed_ssz_digest),
             ),
             PqOperationalEvent::PeerConnected {
                 peer_digest,
@@ -350,21 +568,37 @@ impl PqOperationalEventWriter {
 
     #[cfg(any(test, feature = "pq-startup-testing"))]
     fn run_with_output(mut self, output: &mut impl Write) -> Result<(), PqOperationalEventError> {
-        while let Some(event) = self.receiver.blocking_recv() {
-            self.sequence = self
+        while let Some(command) = self.receiver.blocking_recv() {
+            let result = self
                 .sequence
                 .checked_add(1)
-                .ok_or(PqOperationalEventError::SequenceOverflow)?;
-            Self::write_record(
-                output,
-                PqOperationalEventRecord {
-                    sequence: self.sequence,
-                    role: self.role,
-                    event,
-                },
-            )?;
+                .ok_or(PqOperationalEventError::SequenceOverflow)
+                .and_then(|sequence| {
+                    self.sequence = sequence;
+                    Self::write_record(
+                        output,
+                        PqOperationalEventRecord {
+                            sequence: self.sequence,
+                            role: self.role,
+                            event: command.event,
+                        },
+                    )
+                });
+            if let Some(acknowledgement) = command.acknowledgement {
+                let _ = acknowledgement.send(result);
+            }
+            result?;
         }
         Ok(())
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_run_with_output(
+        self,
+        output: &mut impl Write,
+    ) -> Result<(), PqOperationalEventError> {
+        self.run_with_output(output)
     }
 
     #[cfg(unix)]
@@ -489,17 +723,24 @@ impl PqOperationalEventWriter {
         mut self,
         mut output: PqOperationalEventOutput,
     ) -> Result<(), PqOperationalEventError> {
-        while let Some(event) = self.receiver.blocking_recv() {
-            self.sequence = self
+        while let Some(command) = self.receiver.blocking_recv() {
+            let result = self
                 .sequence
                 .checked_add(1)
-                .ok_or(PqOperationalEventError::SequenceOverflow)?;
-            let line = Self::format_record_line(PqOperationalEventRecord {
-                sequence: self.sequence,
-                role: self.role,
-                event,
-            })?;
-            output.write_line(line.as_bytes())?;
+                .ok_or(PqOperationalEventError::SequenceOverflow)
+                .and_then(|sequence| {
+                    self.sequence = sequence;
+                    Self::format_record_line(PqOperationalEventRecord {
+                        sequence,
+                        role: self.role,
+                        event: command.event,
+                    })
+                })
+                .and_then(|line| output.write_line(line.as_bytes()));
+            if let Some(acknowledgement) = command.acknowledgement {
+                let _ = acknowledgement.send(result);
+            }
+            result?;
         }
         Ok(())
     }
@@ -569,6 +810,79 @@ pub struct PqOperationalEventTestTrace {
     pub capacity_error: PqOperationalEventError,
     pub closed_error: PqOperationalEventError,
     pub overflow_error: PqOperationalEventError,
+    pub forced_closed_error: PqOperationalEventError,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct PqOperationalEventAcknowledgementTrace {
+    pub pending_before_output: bool,
+    pub heartbeat_completed: bool,
+    pub result: Result<(), PqOperationalEventError>,
+    pub output: Vec<u8>,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub async fn testing_only_pq_operational_event_acknowledgement()
+-> PqOperationalEventAcknowledgementTrace {
+    struct BlockedOutput {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for BlockedOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.entered
+                .send(())
+                .map_err(|_| std::io::ErrorKind::BrokenPipe)?;
+            self.release
+                .recv()
+                .map_err(|_| std::io::ErrorKind::BrokenPipe)?;
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let (sink, writer) =
+        PqOperationalEventSink::testing_channel(PqOperationalEventRole::Proposer, 1);
+    let (entered_sender, entered_receiver) = std::sync::mpsc::channel();
+    let (release_sender, release_receiver) = std::sync::mpsc::channel();
+    let writer_thread = std::thread::spawn(move || {
+        let mut output = BlockedOutput {
+            entered: entered_sender,
+            release: release_receiver,
+            bytes: vec![],
+        };
+        let result = writer.run_with_output(&mut output);
+        (result, output.bytes)
+    });
+    let confirmation = tokio::spawn(async move {
+        sink.emit_and_wait(PqOperationalEvent::EventWriterReady)
+            .await
+    });
+
+    entered_receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("writer entered the exact line write");
+    let pending_before_output = !confirmation.is_finished();
+    let heartbeat_completed = matches!(tokio::spawn(async { 41 }).await, Ok(41));
+    release_sender.send(()).expect("release exact line write");
+    let result = confirmation.await.expect("acknowledgement task");
+    let (writer_result, output) = writer_thread.join().expect("writer thread");
+    writer_result.expect("writer completion");
+    PqOperationalEventAcknowledgementTrace {
+        pending_before_output,
+        heartbeat_completed,
+        result,
+        output,
+    }
 }
 
 #[cfg(feature = "pq-startup-testing")]
@@ -631,6 +945,12 @@ pub async fn testing_only_pq_operational_event_sink() -> PqOperationalEventTestT
         .testing_next_record()
         .await
         .expect_err("checked testing event sequence");
+    let (forced_closed_sink, _forced_closed_writer) =
+        PqOperationalEventSink::testing_channel(PqOperationalEventRole::Verifier, 1);
+    forced_closed_sink.testing_only_fail_closed();
+    let forced_closed_error = forced_closed_sink
+        .try_emit(first)
+        .expect_err("testing forced event failure");
     PqOperationalEventTestTrace {
         sequences: vec![first_record.sequence, second_record.sequence],
         roles: vec![first_record.role, second_record.role],
@@ -639,7 +959,73 @@ pub async fn testing_only_pq_operational_event_sink() -> PqOperationalEventTestT
         capacity_error,
         closed_error,
         overflow_error,
+        forced_closed_error,
     }
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub fn testing_only_pq_extended_operational_event_contract() -> Vec<u8> {
+    let finalized_root = Hash256::repeat_byte(3);
+    let block_root = Hash256::repeat_byte(6);
+    let execution_hash = ExecutionBlockHash::repeat_byte(7);
+    let signed_ssz_digest = [8; 32];
+    let events = [
+        PqOperationalEvent::RuntimeReady {
+            startup: PqRuntimeStartup::Fresh,
+            slot: Slot::new(1),
+            block_root: Hash256::repeat_byte(1),
+            execution_hash: ExecutionBlockHash::repeat_byte(2),
+            finalized_epoch: Epoch::new(0),
+            finalized_root,
+            signed_ssz_digest: [4; 32],
+        },
+        PqOperationalEvent::ProposalStarted {
+            slot: Slot::new(2),
+            parent_root: Hash256::repeat_byte(5),
+        },
+        PqOperationalEvent::BlockPersisted {
+            source: PqBlockEventSource::Publish,
+            slot: Slot::new(2),
+            block_root,
+            execution_hash,
+            finalized_epoch: Epoch::new(0),
+            finalized_root,
+            signed_ssz_digest,
+        },
+        PqOperationalEvent::ExecutionReconciled {
+            source: PqBlockEventSource::Publish,
+            slot: Slot::new(2),
+            block_root,
+            execution_hash,
+            finalized_epoch: Epoch::new(0),
+            finalized_root,
+            signed_ssz_digest,
+        },
+        PqOperationalEvent::ProposalPublished {
+            slot: Slot::new(2),
+            block_root,
+            signed_ssz_digest,
+        },
+        PqOperationalEvent::GossipImported {
+            slot: Slot::new(2),
+            block_root,
+            signed_ssz_digest,
+        },
+    ];
+    let mut output = vec![];
+    for (offset, event) in events.into_iter().enumerate() {
+        PqOperationalEventWriter::write_record(
+            &mut output,
+            PqOperationalEventRecord {
+                sequence: u64::try_from(offset + 1).expect("bounded testing sequence"),
+                role: PqOperationalEventRole::Proposer,
+                event,
+            },
+        )
+        .expect("bounded extended testing event");
+    }
+    output
 }
 
 #[cfg(feature = "pq-startup-testing")]
@@ -963,6 +1349,67 @@ mod tests {
         assert_eq!(
             PqOperationalEventWriter::write_record(&mut BrokenOutput, record),
             Err(PqOperationalEventError::OutputClosed)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn result_bearing_emit_waits_for_the_complete_output_line() {
+        struct BlockedOutput {
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+            bytes: Vec<u8>,
+        }
+
+        impl Write for BlockedOutput {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.entered
+                    .send(())
+                    .map_err(|_| std::io::ErrorKind::BrokenPipe)?;
+                self.release
+                    .recv()
+                    .map_err(|_| std::io::ErrorKind::BrokenPipe)?;
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (sink, writer) =
+            PqOperationalEventSink::testing_channel(PqOperationalEventRole::Proposer, 1);
+        let (entered_sender, entered_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let writer_thread = std::thread::spawn(move || {
+            let mut output = BlockedOutput {
+                entered: entered_sender,
+                release: release_receiver,
+                bytes: vec![],
+            };
+            let result = writer.run_with_output(&mut output);
+            (result, output.bytes)
+        });
+        let confirmation = tokio::spawn(async move {
+            sink.emit_and_wait(PqOperationalEvent::EventWriterReady)
+                .await
+        });
+
+        entered_receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("writer entered the exact line write");
+        assert!(
+            !confirmation.is_finished(),
+            "enqueue alone must not acknowledge RuntimeReady"
+        );
+        assert_eq!(tokio::spawn(async { 41 }).await.unwrap(), 41);
+        release_sender.send(()).expect("release exact line write");
+        assert_eq!(confirmation.await.unwrap(), Ok(()));
+        let (result, bytes) = writer_thread.join().expect("writer thread");
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            bytes,
+            b"PQ_EVENT_V1 event=EventWriterReady sequence=1 role=proposer\n"
         );
     }
 }

@@ -39,6 +39,8 @@ use pq_proposer_service::{PqProposalCompletion, PqProposerService};
 #[cfg(target_feature = "avx2")]
 use pq_signing::{PqKeyUnlock, PqKeystore, PqSigningAuthority, provision_usage_journal};
 #[cfg(target_feature = "avx2")]
+use sha2::{Digest, Sha256};
+#[cfg(target_feature = "avx2")]
 use slashing_protection::SlashingDatabase;
 #[cfg(target_feature = "avx2")]
 use slot_clock::SlotClock;
@@ -621,6 +623,7 @@ fn exact_snapshot_store(
 #[cfg(target_feature = "avx2")]
 struct ValidProductionFixture {
     chain: Arc<beacon_chain::BeaconChain<TestWitness>>,
+    operational_events: Arc<beacon_chain::PqOperationalEventSink>,
     store: Arc<HotColdDB<MinimalEthSpec, MemoryStore, MemoryStore>>,
     aggregation_service: Arc<AggregationService>,
     execution: Arc<RecordingExecution>,
@@ -1008,12 +1011,14 @@ fn valid_production_fixture_with_hooks_spec_and_executor(
     });
     let store = exact_snapshot_store(Arc::clone(&spec));
     let aggregation_service = Arc::new(AggregationService::new().expect("PQ aggregation service"));
+    let operational_events = testing_only_running_pq_operational_event_sink(&runtime.task_executor);
     let mut builder = BeaconChainBuilder::<TestWitness>::pq_new(MinimalEthSpec)
         .store(Arc::clone(&store))
         .custom_spec(Arc::clone(&spec))
         .genesis_state(genesis.clone())
         .expect("persist genesis")
         .pq_aggregation_service(Arc::clone(&aggregation_service))
+        .pq_operational_events(Arc::downgrade(&operational_events))
         .task_executor(task_executor)
         .testing_only_pq_execution_notifier(execution.clone());
     if let Some(blocking_hook) = blocking_hook {
@@ -1055,6 +1060,7 @@ fn valid_production_fixture_with_hooks_spec_and_executor(
 
     ValidProductionFixture {
         chain,
+        operational_events,
         store,
         aggregation_service,
         execution,
@@ -1814,6 +1820,14 @@ async fn valid_randao_produces_one_full_canonical_empty_block_without_head_mutat
     assert!(sync_aggregate.sync_committee_signature.is_empty());
     assert_eq!(chain.head_snapshot().beacon_state.slot(), Slot::new(0));
     assert_eq!(chain.head_snapshot().beacon_block_root, genesis_root);
+    assert_eq!(
+        fixture.operational_events.testing_only_events(),
+        vec![beacon_chain::PqOperationalEvent::ProposalStarted {
+            slot: Slot::new(1),
+            parent_root: genesis_root,
+        }],
+        "production emits only after RANDAO and the late parent/slot check",
+    );
 }
 
 #[cfg(target_feature = "avx2")]
@@ -2571,6 +2585,47 @@ async fn produced_block_publication_broadcasts_exact_verified_block_before_impor
         fixture.execution.new_payload_calls.load(Ordering::SeqCst),
         1
     );
+    let block_root = signed.canonical_root();
+    let signed_ssz_digest: [u8; 32] = Sha256::digest(signed.as_ssz_bytes()).into();
+    let execution_hash = signed
+        .message()
+        .body()
+        .execution_payload()
+        .expect("published execution payload")
+        .block_hash();
+    assert_eq!(
+        fixture.operational_events.testing_only_events(),
+        vec![
+            beacon_chain::PqOperationalEvent::ProposalStarted {
+                slot: Slot::new(1),
+                parent_root: fixture.genesis_root,
+            },
+            beacon_chain::PqOperationalEvent::BlockPersisted {
+                source: beacon_chain::PqBlockEventSource::Publish,
+                slot: Slot::new(1),
+                block_root,
+                execution_hash,
+                finalized_epoch: fixture.genesis_checkpoint.epoch,
+                finalized_root: fixture.genesis_checkpoint.root,
+                signed_ssz_digest,
+            },
+            beacon_chain::PqOperationalEvent::ExecutionReconciled {
+                source: beacon_chain::PqBlockEventSource::Publish,
+                slot: Slot::new(1),
+                block_root,
+                execution_hash,
+                finalized_epoch: fixture.genesis_checkpoint.epoch,
+                finalized_root: fixture.genesis_checkpoint.root,
+                signed_ssz_digest,
+            },
+            beacon_chain::PqOperationalEvent::ProposalPublished {
+                slot: Slot::new(1),
+                block_root,
+                signed_ssz_digest,
+            },
+        ],
+        "fresh publication events are exact and ordered",
+    );
 
     let duplicate = publisher.try_admit().expect("duplicate admission");
     assert!(matches!(
@@ -2589,6 +2644,67 @@ async fn produced_block_publication_broadcasts_exact_verified_block_before_impor
     assert_eq!(
         fixture.execution.new_payload_calls.load(Ordering::SeqCst),
         1
+    );
+    assert_eq!(
+        fixture.operational_events.testing_only_events().len(),
+        4,
+        "a committed duplicate must not emit ProposalPublished again",
+    );
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn block_persisted_event_failure_still_reconciles_then_returns_fatal() {
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    let fixture = valid_production_fixture(false, false);
+    let produced = fixture
+        .chain
+        .produce_pq_block_v3(Slot::new(1), fixture.randao.clone(), Graffiti::default())
+        .await
+        .expect("valid full block production");
+    let signed = sign_produced_block(&fixture, produced);
+    let block_root = signed.canonical_root();
+    let (broadcast_sender, mut broadcast_receiver) = pq_block_broadcast_channel();
+    let publisher = Arc::new(
+        PqBlockPublicationService::new(
+            Arc::clone(&fixture.chain),
+            fixture._runtime.task_executor.clone(),
+            broadcast_sender,
+        )
+        .expect("publication service"),
+    );
+    fixture.operational_events.testing_only_fail_closed();
+    let admission = publisher.try_admit().expect("publication admission");
+    let publication = tokio::spawn(async move { admission.publish(signed).await });
+    broadcast_receiver
+        .recv()
+        .await
+        .expect("broadcast command")
+        .acknowledge(Ok(()));
+
+    assert!(matches!(
+        publication.await.expect("publication task"),
+        PqBlockPublicationDisposition::Local(network::PqBlockPublicationLocalError::Import(
+            PqImportError::OperationalEvent(beacon_chain::PqOperationalEventError::Closed)
+        ))
+    ));
+    assert_eq!(
+        fixture.chain.head_snapshot().beacon_block_root,
+        block_root,
+        "the atomic DB/head publication remains authoritative",
+    );
+    assert_eq!(
+        fixture.execution.new_payload_calls.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(fixture.execution.forkchoice_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture.operational_events.testing_only_events(),
+        vec![beacon_chain::PqOperationalEvent::ProposalStarted {
+            slot: Slot::new(1),
+            parent_root: fixture.genesis_root,
+        }],
+        "failed BlockPersisted and later events are never misreported",
     );
 }
 

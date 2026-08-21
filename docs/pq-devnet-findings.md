@@ -1661,8 +1661,10 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   non-cancellable proposer receipt before closing HTTP, the sole network broadcaster, and the
   sealed store/aggregation owners. A staged post-bind failure path marks and awaits HTTP, drops the
   broadcaster, and awaits network before returning the original strict-client/service/loop error.
-- The process-owned slot loop attempts the current non-genesis slot immediately, holds at most one
-  receipt, recomputes slot boundaries, and does not restart a completed same-slot operation.
+- On Fresh startup, the process-owned slot loop attempts the current non-genesis slot immediately,
+  holds at most one receipt, recomputes slot boundaries, and does not restart a completed same-slot
+  operation. On Resume, it samples the clock only after the acknowledged ready gate is released,
+  marks that observed startup slot skipped, and waits for the next checked boundary.
   Every synchronous error passes through the closed fatal classifier: capacity, clock-unavailable,
   stale-slot races, and other nonfatal outcomes use a bounded one-second retry, while executor/task
   loss and the fatal set request process shutdown. A biased stop/executor-exit gate immediately
@@ -1694,3 +1696,41 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   heap box after the initial mutation exposed a production stack overflow.
 - There is a hash-chain/hash-onion RANDAO proposal for a future version. This V1 runtime continues
   to use the signature-derived, slot-bound RANDAO duty and frozen 14-leaf allocation.
+
+### 2026-08-21: Real two-process PQ block launch and restart completed (Task 5.3e-e4f)
+
+- The launch tracer starts the actual `CARGO_BIN_EXE_lighthouse` twice: one proposer-enabled
+  process and one verifier-only process. They use separate data directories, network identities,
+  ports, JWT files, and independently stateful authenticated mock Engines. Both Engines start from
+  the explicit zero execution block required by the frozen V1 genesis and retain full payload
+  verification with zero blobs. Fixed, bounded, versioned operational events prove that both
+  processes reach `RuntimeReady`, exchange compatible Status messages with the exact counterpart
+  peer identity, and remain live before proposal work begins.
+- The proposer produced three consecutive blocks at slots 1, 2, and 3. For every slot the trace
+  proves `ProposalStarted -> BlockPersisted -> ExecutionReconciled -> ProposalPublished`, while the
+  verifier independently proves `BlockPersisted -> ExecutionReconciled -> GossipImported` for the
+  byte-identical signed block. Canonical roots and SHA-256 digests of the full signed SSZ agree
+  across processes. The proposer Engine history is exactly attributes FCU, `getPayloadV4`,
+  `newPayloadV4`, and no-attributes FCU per slot; the verifier history is exactly `newPayloadV4`
+  and no-attributes FCU. The resulting execution hashes were respectively
+  `0x6632fd023cff5e4b6657535b1701a0300f8d3aa96519f300374c99a11b7df779`,
+  `0xeb1b2b8f478464b499fd233d4124c72f357333bbc8d9dc6362ce16b5297674f4`, and
+  `0xacc904941ca95a6e56715ccc02e8ce3bacd6908467c73cc7777323e8b3e2c260`.
+- After a real SIGINT shutdown, both processes restarted from their original data and network
+  directories against the same retained independent Engines. Each performed exactly one
+  no-attributes startup FCU for the persisted slot-3 execution hash and emitted `RuntimeReady`
+  with `Resume`, the exact slot-3 canonical root and full-signed-SSZ digest, and the unchanged
+  genesis finalized checkpoint. Resume deliberately treats the slot first observed after the
+  ready/release gate as already skipped and waits for the next checked slot boundary; the tracer
+  therefore observed no slot-4 proposal, payload, import, or commit before stopping both processes
+  ahead of slot 5. The restart added no `getPayload` or `newPayload` calls.
+- Both shutdowns completed through process SIGINT. The tracer then rebound both TCP and UDP ports,
+  reopened the proposer slashing database with an exclusive cross-process probe, and independently
+  opened the proposer and verifier `chain_db`, `freezer_db`, and `blobs_db`, proving release of the
+  process, SQLite, and LevelDB owners. ENRs were byte-stable across restart.
+- The warning-denied AVX2 command
+  `RUSTFLAGS='-D warnings -C target-feature=+avx2' cargo +1.88 test -p lighthouse --no-default-features --features pq-proposer --test pq_e4f_launch two_real_processes_emit_compatible_status_before_any_proposal -- --exact --nocapture`
+  passed 1/1 in 2386.88 seconds. This milestone is block-only: it neither produces nor exchanges
+  attestations, and it does not advance justification or finality. The full finalized checkpoint
+  remained byte-equal to the genesis checkpoint throughout. Attestation gossip, late join, range
+  sync, and non-genesis finalization remain explicit future work.

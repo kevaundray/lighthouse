@@ -2492,11 +2492,13 @@ local client from the actual URL with redirects and proxies disabled, HTTP/1 onl
 
 The proposer scheduler is a process-owned, exit-aware slot loop which calls only
 `try_propose_current_slot`; it does not accept caller duties, keys, indices, or slots, and it never
-retains more than the service's cap-one detached receipt. It attempts the current non-genesis slot
-immediately, recomputes each slot boundary, coalesces a completed same-slot result, and boundedly
-retries every closed-policy nonfatal synchronous outcome (including capacity, unavailable clock,
-and a stale-slot admission race) after a one-second backoff. Immediately before every admission it
-uses a biased stop/executor-exit gate, so an already-ready or same-poll stop cannot start new
+retains more than the service's cap-one detached receipt. Fresh startup attempts the current
+non-genesis slot immediately. Resume samples the clock only after the acknowledged ready gate is
+released, marks that observed startup slot skipped, and waits for the next checked boundary. The
+loop recomputes each later boundary, coalesces a completed same-slot result, and boundedly retries
+every closed-policy nonfatal synchronous outcome (including capacity, unavailable clock, and a
+stale-slot admission race) after a one-second backoff. Immediately before every admission it uses
+a biased stop/executor-exit gate, so an already-ready or same-poll stop cannot start new
 non-cancellable work. Executor/task loss and configuration/signing invariants terminate the
 process. Malformed local response headers/JSON/SSZ, protocol violations, and impossible
 bounded-body/resource outcomes are fatal, while allowlisted transport/status and block/publication
@@ -2531,6 +2533,28 @@ idempotence. This is the final e4 evidence for local V3 production, journal-back
 publication, acknowledged gossipsub, full e-c import, Engine VALID, atomic persistence, and restart.
 It must explicitly assert that finalized epoch/root remain the frozen genesis values and that a
 late-starting node is unsupported rather than presenting this as a sync-capable devnet.
+
+Implemented e4f evidence currently closes the block-launch portion of this task, not the remaining
+attestation topics. The actual `CARGO_BIN_EXE_lighthouse` starts one proposer and one verifier as
+separate OS processes with separate disk/network identities and independent authenticated,
+stateful Engines. Exact bounded operational events prove compatible Status before proposals and
+three consecutive slot-1/2/3 lifecycles. For each slot, the proposer and verifier agree on the
+canonical block root and SHA-256 digest of the full signed SSZ, independently execute `newPayload`
+and a no-attributes FCU, and converge on the same persisted head. The proposer alone performs the
+corresponding attributes FCU and `getPayload`; all payload bundles contain zero blobs.
+
+After graceful SIGINT, both processes restart from the same respective data directories against
+the retained Engines. Startup replays exactly one no-attributes FCU to the slot-3 execution hash
+and reports the exact resumed root/signed digest before any proposal event. A resumed proposer does
+not immediately admit the slot observed when its ready gate is released: it marks that startup
+slot skipped and waits for the next checked boundary. The tracer stops both resumed
+processes before that boundary, observes no additional payload/import lifecycle, then proves TCP,
+UDP, proposer SQLite, and all six LevelDB owners are released. The finalized checkpoint remains
+exactly genesis before and after restart.
+
+The warning-denied AVX2 process test passed 1/1 in 2386.88 seconds. This evidence makes no
+attestation, justification/finalization advancement, late-join, or range-sync claim. Attestation
+subnet and aggregate-and-proof wiring described at the start of this task remains future work.
 
 ### Task 5.2b: Wire verified candidates into both beacon-node attestation pools
 

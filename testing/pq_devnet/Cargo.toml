@@ -84,8 +84,8 @@ environment = { workspace = true, optional = true }
 eth2 = { workspace = true, optional = true }
 ethereum_ssz = { workspace = true, optional = true }
 execution_layer = { workspace = true, optional = true, features = ["pq-devnet"] }
-futures = { workspace = true, optional = true }
 fork_choice = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
 initialized_validators = { path = "../../validator_client/initialized_validators", optional = true, default-features = false, features = ["pq-devnet"] }
 lighthouse_network = { path = "../../beacon_node/lighthouse_network", optional = true, default-features = false }

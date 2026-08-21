@@ -5,11 +5,11 @@ use beacon_node::beacon_chain::{
 };
 use consensus_signature::PqValidatorRegistryEntry;
 use execution_layer::auth::JwtKey;
-use execution_layer::test_utils::{DEFAULT_JWT_SECRET, MockServer};
+use execution_layer::test_utils::{DEFAULT_JWT_SECRET, MockEngineAuditEvent, MockServer};
 use fs2::FileExt;
 use network_utils::enr_ext::EnrExt;
 use pq_devnet::{production_config, provision_devnet};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, MAIN_DB, params};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use ssz::Encode;
@@ -25,7 +25,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
-use types::{BeaconState, EthSpec, ExecutionBlockHash, ForkName, MinimalEthSpec, Uint256};
+use types::{BeaconState, EthSpec, ExecutionBlockHash, ForkName, Hash256, MinimalEthSpec, Uint256};
 use validator_dir::{PqDevnetBundle, PqDevnetManifest};
 
 const PQ_EVENT_PREFIX: &str = "PQ_EVENT_V1";
@@ -41,6 +41,57 @@ const PINNED_TEMPLATE_SEMANTIC_SHA256: &str =
 const PROCESS_START_TIMEOUT: Duration = Duration::from_secs(900);
 const STATUS_EVENT_TIMEOUT: Duration = Duration::from_secs(240);
 const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+const PQ_SLOT_SECONDS: u64 = 300;
+const THREE_SLOT_TARGET: u64 = 3;
+const PROPOSAL_COMPLETION_SECONDS: u64 = 285;
+const RESTART_STOP_MARGIN_SECONDS: u64 = 5;
+
+fn unix_time_now() -> Result<u64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|error| format!("system clock precedes Unix epoch: {error}"))
+}
+
+fn unix_time_now_precise() -> Result<Duration, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("system clock precedes Unix epoch: {error}"))
+}
+
+fn three_slot_wait_remaining(genesis_time: u64, now: u64) -> Result<Duration, String> {
+    let slot_three_boundary = THREE_SLOT_TARGET
+        .checked_mul(PQ_SLOT_SECONDS)
+        .and_then(|offset| genesis_time.checked_add(offset))
+        .ok_or("three-slot absolute deadline overflow")?;
+    let deadline = slot_three_boundary
+        .checked_add(PROPOSAL_COMPLETION_SECONDS)
+        .ok_or("three-slot completion deadline overflow")?;
+    let remaining = deadline
+        .checked_sub(now)
+        .filter(|remaining| *remaining > 0)
+        .ok_or("three-slot absolute deadline expired")?;
+    Ok(Duration::from_secs(remaining))
+}
+
+fn restart_ready_remaining(genesis_time: u64, now: u64) -> Result<Duration, String> {
+    restart_ready_remaining_precise(genesis_time, Duration::from_secs(now))
+}
+
+fn restart_ready_remaining_precise(genesis_time: u64, now: Duration) -> Result<Duration, String> {
+    let slot_five_boundary = 5_u64
+        .checked_mul(PQ_SLOT_SECONDS)
+        .and_then(|offset| genesis_time.checked_add(offset))
+        .ok_or("restart slot-5 boundary overflow")?;
+    let ready_deadline = slot_five_boundary
+        .checked_sub(RESTART_STOP_MARGIN_SECONDS)
+        .ok_or("restart stop margin underflow")?;
+    let remaining = Duration::from_secs(ready_deadline)
+        .checked_sub(now)
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or("restart can no longer stop safely before slot 5")?;
+    Ok(remaining)
+}
 
 #[derive(Default)]
 struct BoundedProcessLog {
@@ -93,8 +144,61 @@ enum PqProcessStatusRejection {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PqProcessStartup {
+    Fresh,
+    Resume,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PqProcessBlockSource {
+    Publish,
+    Gossip,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PqProcessEventKind {
     EventWriterReady,
+    RuntimeReady {
+        startup: PqProcessStartup,
+        slot: u64,
+        block_root: Hash256,
+        execution_hash: ExecutionBlockHash,
+        finalized_epoch: u64,
+        finalized_root: Hash256,
+        signed_ssz_digest: [u8; 32],
+    },
+    ProposalStarted {
+        slot: u64,
+        parent_root: Hash256,
+    },
+    BlockPersisted {
+        source: PqProcessBlockSource,
+        slot: u64,
+        block_root: Hash256,
+        execution_hash: ExecutionBlockHash,
+        finalized_epoch: u64,
+        finalized_root: Hash256,
+        signed_ssz_digest: [u8; 32],
+    },
+    ExecutionReconciled {
+        source: PqProcessBlockSource,
+        slot: u64,
+        block_root: Hash256,
+        execution_hash: ExecutionBlockHash,
+        finalized_epoch: u64,
+        finalized_root: Hash256,
+        signed_ssz_digest: [u8; 32],
+    },
+    ProposalPublished {
+        slot: u64,
+        block_root: Hash256,
+        signed_ssz_digest: [u8; 32],
+    },
+    GossipImported {
+        slot: u64,
+        block_root: Hash256,
+        signed_ssz_digest: [u8; 32],
+    },
     PeerConnected {
         peer_digest: [u8; 16],
         direction: PqProcessConnectionDirection,
@@ -143,6 +247,48 @@ fn parse_peer_digest(field: &str) -> Result<[u8; 16], PqProcessEventFailure> {
     Ok(digest)
 }
 
+fn parse_canonical_u64(field: &str, name: &str) -> Result<u64, PqProcessEventFailure> {
+    let text = exact_field(field, name)?;
+    let value = text
+        .parse::<u64>()
+        .map_err(|_| PqProcessEventFailure::Malformed)?;
+    if value.to_string() != text {
+        return Err(PqProcessEventFailure::Malformed);
+    }
+    Ok(value)
+}
+
+fn parse_hash256(field: &str, name: &str) -> Result<Hash256, PqProcessEventFailure> {
+    let encoded = exact_field(field, name)?;
+    let Some(hex) = encoded.strip_prefix("0x") else {
+        return Err(PqProcessEventFailure::Malformed);
+    };
+    if hex.len() != 64 || hex.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return Err(PqProcessEventFailure::Malformed);
+    }
+    let mut bytes = [0; 32];
+    hex::decode_to_slice(hex, &mut bytes).map_err(|_| PqProcessEventFailure::Malformed)?;
+    Ok(Hash256::from(bytes))
+}
+
+fn parse_signed_ssz_digest(field: &str) -> Result<[u8; 32], PqProcessEventFailure> {
+    let encoded = exact_field(field, "signed_ssz_digest=")?;
+    if encoded.len() != 64 || encoded.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return Err(PqProcessEventFailure::Malformed);
+    }
+    let mut digest = [0; 32];
+    hex::decode_to_slice(encoded, &mut digest).map_err(|_| PqProcessEventFailure::Malformed)?;
+    Ok(digest)
+}
+
+fn parse_block_source(field: &str) -> Result<PqProcessBlockSource, PqProcessEventFailure> {
+    match exact_field(field, "source=")? {
+        "publish" => Ok(PqProcessBlockSource::Publish),
+        "gossip" => Ok(PqProcessBlockSource::Gossip),
+        _ => Err(PqProcessEventFailure::Malformed),
+    }
+}
+
 fn parse_pq_process_event(line: &str) -> Result<PqProcessEvent, PqProcessEventFailure> {
     let fields = line.split(' ').collect::<Vec<_>>();
     if fields.iter().any(|field| field.is_empty()) || fields.first() != Some(&PQ_EVENT_PREFIX) {
@@ -181,6 +327,60 @@ fn parse_pq_process_event(line: &str) -> Result<PqProcessEvent, PqProcessEventFa
     };
     let kind = match event {
         "EventWriterReady" if fields.len() == 4 => PqProcessEventKind::EventWriterReady,
+        "RuntimeReady" if fields.len() == 11 => PqProcessEventKind::RuntimeReady {
+            startup: match exact_field(fields[4], "startup=")? {
+                "fresh" => PqProcessStartup::Fresh,
+                "resume" => PqProcessStartup::Resume,
+                _ => return Err(PqProcessEventFailure::Malformed),
+            },
+            slot: parse_canonical_u64(fields[5], "slot=")?,
+            block_root: parse_hash256(fields[6], "block_root=")?,
+            execution_hash: ExecutionBlockHash::from_root(parse_hash256(
+                fields[7],
+                "execution_hash=",
+            )?),
+            finalized_epoch: parse_canonical_u64(fields[8], "finalized_epoch=")?,
+            finalized_root: parse_hash256(fields[9], "finalized_root=")?,
+            signed_ssz_digest: parse_signed_ssz_digest(fields[10])?,
+        },
+        "ProposalStarted" if fields.len() == 6 => PqProcessEventKind::ProposalStarted {
+            slot: parse_canonical_u64(fields[4], "slot=")?,
+            parent_root: parse_hash256(fields[5], "parent_root=")?,
+        },
+        "BlockPersisted" if fields.len() == 11 => PqProcessEventKind::BlockPersisted {
+            source: parse_block_source(fields[4])?,
+            slot: parse_canonical_u64(fields[5], "slot=")?,
+            block_root: parse_hash256(fields[6], "block_root=")?,
+            execution_hash: ExecutionBlockHash::from_root(parse_hash256(
+                fields[7],
+                "execution_hash=",
+            )?),
+            finalized_epoch: parse_canonical_u64(fields[8], "finalized_epoch=")?,
+            finalized_root: parse_hash256(fields[9], "finalized_root=")?,
+            signed_ssz_digest: parse_signed_ssz_digest(fields[10])?,
+        },
+        "ExecutionReconciled" if fields.len() == 11 => PqProcessEventKind::ExecutionReconciled {
+            source: parse_block_source(fields[4])?,
+            slot: parse_canonical_u64(fields[5], "slot=")?,
+            block_root: parse_hash256(fields[6], "block_root=")?,
+            execution_hash: ExecutionBlockHash::from_root(parse_hash256(
+                fields[7],
+                "execution_hash=",
+            )?),
+            finalized_epoch: parse_canonical_u64(fields[8], "finalized_epoch=")?,
+            finalized_root: parse_hash256(fields[9], "finalized_root=")?,
+            signed_ssz_digest: parse_signed_ssz_digest(fields[10])?,
+        },
+        "ProposalPublished" if fields.len() == 7 => PqProcessEventKind::ProposalPublished {
+            slot: parse_canonical_u64(fields[4], "slot=")?,
+            block_root: parse_hash256(fields[5], "block_root=")?,
+            signed_ssz_digest: parse_signed_ssz_digest(fields[6])?,
+        },
+        "GossipImported" if fields.len() == 7 => PqProcessEventKind::GossipImported {
+            slot: parse_canonical_u64(fields[4], "slot=")?,
+            block_root: parse_hash256(fields[5], "block_root=")?,
+            signed_ssz_digest: parse_signed_ssz_digest(fields[6])?,
+        },
         "PeerConnected" if fields.len() == 6 => PqProcessEventKind::PeerConnected {
             peer_digest: parse_peer_digest(fields[4])?,
             direction: match exact_field(fields[5], "direction=")? {
@@ -232,48 +432,596 @@ fn validate_compatible_event_trace(
     connection_direction: PqProcessConnectionDirection,
     peer_digest: [u8; 16],
 ) -> Result<(), String> {
-    let expected_prefix = [
-        PqProcessEvent {
-            sequence: 1,
-            role,
-            kind: PqProcessEventKind::EventWriterReady,
-        },
-        PqProcessEvent {
-            sequence: 2,
-            role,
-            kind: PqProcessEventKind::PeerConnected {
-                peer_digest,
-                direction: connection_direction,
-            },
-        },
-        PqProcessEvent {
-            sequence: 3,
-            role,
-            kind: PqProcessEventKind::StatusSent {
-                peer_digest,
-                direction: PqProcessStatusDirection::Request,
-            },
-        },
-    ];
-    if events.len() != 5 || events[..3] != expected_prefix {
-        return Err(format!("invalid PQ compatible event prefix: {events:?}"));
+    if events.len() != 6
+        || events[0]
+            != (PqProcessEvent {
+                sequence: 1,
+                role,
+                kind: PqProcessEventKind::EventWriterReady,
+            })
+        || events.iter().enumerate().any(|(offset, event)| {
+            event.role != role || event.sequence != u64::try_from(offset + 1).unwrap_or(u64::MAX)
+        })
+    {
+        return Err(format!("invalid PQ compatible event frame: {events:?}"));
     }
-    let response = PqProcessEventKind::StatusSent {
-        peer_digest,
-        direction: PqProcessStatusDirection::Response,
+    let positions = |predicate: fn(&PqProcessEventKind) -> bool| {
+        events
+            .iter()
+            .enumerate()
+            .filter_map(|(position, event)| predicate(&event.kind).then_some(position))
+            .collect::<Vec<_>>()
     };
-    let compatible = PqProcessEventKind::PeerCompatible { peer_digest };
-    let suffix = [events[3].kind, events[4].kind];
-    if suffix != [response, compatible] && suffix != [compatible, response] {
-        return Err(format!("invalid PQ compatible event suffix: {events:?}"));
+    let ready = positions(|event| {
+        matches!(
+            event,
+            PqProcessEventKind::RuntimeReady {
+                startup: PqProcessStartup::Fresh,
+                slot: 0,
+                block_root,
+                execution_hash,
+                finalized_epoch: 0,
+                finalized_root,
+                signed_ssz_digest,
+            } if *block_root != Hash256::ZERO
+                && *execution_hash == ExecutionBlockHash::zero()
+                && *finalized_root == Hash256::ZERO
+                && *signed_ssz_digest != [0; 32]
+        )
+    });
+    let connected = events
+        .iter()
+        .enumerate()
+        .filter_map(|(position, event)| {
+            (event.kind
+                == PqProcessEventKind::PeerConnected {
+                    peer_digest,
+                    direction: connection_direction,
+                })
+            .then_some(position)
+        })
+        .collect::<Vec<_>>();
+    let request = events
+        .iter()
+        .enumerate()
+        .filter_map(|(position, event)| {
+            (event.kind
+                == PqProcessEventKind::StatusSent {
+                    peer_digest,
+                    direction: PqProcessStatusDirection::Request,
+                })
+            .then_some(position)
+        })
+        .collect::<Vec<_>>();
+    let response = events
+        .iter()
+        .enumerate()
+        .filter_map(|(position, event)| {
+            (event.kind
+                == PqProcessEventKind::StatusSent {
+                    peer_digest,
+                    direction: PqProcessStatusDirection::Response,
+                })
+            .then_some(position)
+        })
+        .collect::<Vec<_>>();
+    let compatible = events
+        .iter()
+        .enumerate()
+        .filter_map(|(position, event)| {
+            (event.kind == PqProcessEventKind::PeerCompatible { peer_digest }).then_some(position)
+        })
+        .collect::<Vec<_>>();
+    if ready.len() != 1
+        || connected.len() != 1
+        || request.len() != 1
+        || response.len() != 1
+        || compatible.len() != 1
+        || !(connected[0] < request[0] && request[0] < response[0] && request[0] < compatible[0])
+    {
+        return Err(format!("invalid PQ compatible event topology: {events:?}"));
     }
-    for (offset, event) in events[3..].iter().enumerate() {
-        if event.sequence != u64::try_from(offset + 4).map_err(|error| error.to_string())?
-            || event.role != role
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PqProcessBlockIdentity {
+    slot: u64,
+    block_root: Hash256,
+    execution_hash: ExecutionBlockHash,
+    finalized_epoch: u64,
+    finalized_root: Hash256,
+    signed_ssz_digest: [u8; 32],
+}
+
+fn persisted_identity(
+    event: &PqProcessEvent,
+    expected_role: PqProcessRole,
+    expected_source: PqProcessBlockSource,
+) -> Option<PqProcessBlockIdentity> {
+    match event {
+        PqProcessEvent {
+            role,
+            kind:
+                PqProcessEventKind::BlockPersisted {
+                    source,
+                    slot,
+                    block_root,
+                    execution_hash,
+                    finalized_epoch,
+                    finalized_root,
+                    signed_ssz_digest,
+                },
+            ..
+        } if *role == expected_role && *source == expected_source => Some(PqProcessBlockIdentity {
+            slot: *slot,
+            block_root: *block_root,
+            execution_hash: *execution_hash,
+            finalized_epoch: *finalized_epoch,
+            finalized_root: *finalized_root,
+            signed_ssz_digest: *signed_ssz_digest,
+        }),
+        _ => None,
+    }
+}
+
+fn reconciled_identity(
+    event: &PqProcessEvent,
+    expected_role: PqProcessRole,
+    expected_source: PqProcessBlockSource,
+) -> Option<PqProcessBlockIdentity> {
+    match event {
+        PqProcessEvent {
+            role,
+            kind:
+                PqProcessEventKind::ExecutionReconciled {
+                    source,
+                    slot,
+                    block_root,
+                    execution_hash,
+                    finalized_epoch,
+                    finalized_root,
+                    signed_ssz_digest,
+                },
+            ..
+        } if *role == expected_role && *source == expected_source => Some(PqProcessBlockIdentity {
+            slot: *slot,
+            block_root: *block_root,
+            execution_hash: *execution_hash,
+            finalized_epoch: *finalized_epoch,
+            finalized_root: *finalized_root,
+            signed_ssz_digest: *signed_ssz_digest,
+        }),
+        _ => None,
+    }
+}
+
+fn validate_engine_history(
+    history: &[MockEngineAuditEvent],
+    identities: &[PqProcessBlockIdentity],
+    expect_get_payload: bool,
+) -> Result<(), String> {
+    let mut expected = vec![MockEngineAuditEvent::ForkchoiceUpdated {
+        head_block_hash: ExecutionBlockHash::zero(),
+        safe_block_hash: ExecutionBlockHash::zero(),
+        finalized_block_hash: ExecutionBlockHash::zero(),
+        has_payload_attributes: false,
+    }];
+    let mut parent_execution_hash = ExecutionBlockHash::zero();
+    for identity in identities {
+        if expect_get_payload {
+            expected.extend([
+                MockEngineAuditEvent::ForkchoiceUpdated {
+                    head_block_hash: parent_execution_hash,
+                    safe_block_hash: ExecutionBlockHash::zero(),
+                    finalized_block_hash: ExecutionBlockHash::zero(),
+                    has_payload_attributes: true,
+                },
+                MockEngineAuditEvent::GetPayload {
+                    block_hash: identity.execution_hash,
+                    blob_count: 0,
+                },
+            ]);
+        }
+        expected.extend([
+            MockEngineAuditEvent::NewPayload {
+                block_hash: identity.execution_hash,
+                blob_count: 0,
+            },
+            MockEngineAuditEvent::ForkchoiceUpdated {
+                head_block_hash: identity.execution_hash,
+                safe_block_hash: ExecutionBlockHash::zero(),
+                finalized_block_hash: ExecutionBlockHash::zero(),
+                has_payload_attributes: false,
+            },
+        ]);
+        parent_execution_hash = identity.execution_hash;
+    }
+    if history != expected {
+        return Err(format!(
+            "unexpected complete Engine audit:\nexpected={expected:?}\nactual={history:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_restart_idempotence(
+    proposer_events: &[PqProcessEvent],
+    verifier_events: &[PqProcessEvent],
+    expected: PqProcessBlockIdentity,
+    proposer_engine_before: &[MockEngineAuditEvent],
+    proposer_engine_after: &[MockEngineAuditEvent],
+    verifier_engine_before: &[MockEngineAuditEvent],
+    verifier_engine_after: &[MockEngineAuditEvent],
+) -> Result<(), String> {
+    let validate_events = |events: &[PqProcessEvent], role: PqProcessRole| {
+        if events.first()
+            != Some(&PqProcessEvent {
+                sequence: 1,
+                role,
+                kind: PqProcessEventKind::EventWriterReady,
+            })
+            || events.iter().enumerate().any(|(offset, event)| {
+                event.role != role
+                    || event.sequence != u64::try_from(offset + 1).unwrap_or(u64::MAX)
+            })
         {
-            return Err(format!("invalid PQ compatible event topology: {events:?}"));
+            return Err(format!("invalid resumed event frame: {events:?}"));
+        }
+        let runtime_ready = events
+            .iter()
+            .filter_map(|event| match event.kind {
+                PqProcessEventKind::RuntimeReady {
+                    startup,
+                    slot,
+                    block_root,
+                    execution_hash,
+                    finalized_epoch,
+                    finalized_root,
+                    signed_ssz_digest,
+                } => Some((
+                    startup,
+                    PqProcessBlockIdentity {
+                        slot,
+                        block_root,
+                        execution_hash,
+                        finalized_epoch,
+                        finalized_root,
+                        signed_ssz_digest,
+                    },
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if runtime_ready != [(PqProcessStartup::Resume, expected)] {
+            return Err(format!(
+                "resume RuntimeReady does not match the persisted slot-3 identity: {runtime_ready:?}"
+            ));
+        }
+        if events.iter().any(|event| {
+            matches!(
+                event.kind,
+                PqProcessEventKind::ProposalStarted { .. }
+                    | PqProcessEventKind::BlockPersisted { .. }
+                    | PqProcessEventKind::ExecutionReconciled { .. }
+                    | PqProcessEventKind::ProposalPublished { .. }
+                    | PqProcessEventKind::GossipImported { .. }
+            )
+        }) {
+            return Err("block lifecycle began during the idempotent restart window".into());
+        }
+        Ok(())
+    };
+    validate_events(proposer_events, PqProcessRole::Proposer)?;
+    validate_events(verifier_events, PqProcessRole::Verifier)?;
+
+    let validate_engine = |before: &[MockEngineAuditEvent], after: &[MockEngineAuditEvent]| {
+        let expected_replay = MockEngineAuditEvent::ForkchoiceUpdated {
+            head_block_hash: expected.execution_hash,
+            safe_block_hash: ExecutionBlockHash::zero(),
+            finalized_block_hash: ExecutionBlockHash::zero(),
+            has_payload_attributes: false,
+        };
+        if after.len()
+            != before
+                .len()
+                .checked_add(1)
+                .ok_or("Engine history overflow")?
+            || !after.starts_with(before)
+            || after.last() != Some(&expected_replay)
+        {
+            return Err(format!(
+                "restart Engine history is not one exact no-attributes replay:\nbefore={before:?}\nafter={after:?}"
+            ));
+        }
+        Ok(())
+    };
+    validate_engine(proposer_engine_before, proposer_engine_after)?;
+    validate_engine(verifier_engine_before, verifier_engine_after)?;
+    Ok(())
+}
+
+fn validate_three_slot_process_convergence(
+    proposer: &[PqProcessEvent],
+    verifier: &[PqProcessEvent],
+    proposer_engine: &[MockEngineAuditEvent],
+    verifier_engine: &[MockEngineAuditEvent],
+) -> Result<(), String> {
+    let proposer_runtime_events = proposer
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| matches!(event.kind, PqProcessEventKind::RuntimeReady { .. }))
+        .collect::<Vec<_>>();
+    if proposer_runtime_events.len() != 1 {
+        return Err("proposer lacks exactly one genesis RuntimeReady identity".into());
+    }
+    let (proposer_ready_position, proposer_runtime_event) = proposer_runtime_events[0];
+    let runtime_root = match proposer_runtime_event.kind {
+        PqProcessEventKind::RuntimeReady {
+            slot: 0,
+            block_root,
+            finalized_epoch: 0,
+            finalized_root,
+            ..
+        } if finalized_root == Hash256::ZERO => block_root,
+        _ => return Err("proposer RuntimeReady is not the genesis identity".into()),
+    };
+    let verifier_runtime_events = verifier
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| matches!(event.kind, PqProcessEventKind::RuntimeReady { .. }))
+        .collect::<Vec<_>>();
+    if verifier_runtime_events.len() != 1 {
+        return Err("verifier RuntimeReady does not match proposer genesis".into());
+    }
+    let (verifier_ready_position, verifier_runtime_event) = verifier_runtime_events[0];
+    if !matches!(
+        verifier_runtime_event.kind,
+        PqProcessEventKind::RuntimeReady {
+            slot: 0,
+            block_root,
+            finalized_epoch: 0,
+            finalized_root,
+            ..
+        } if block_root == runtime_root && finalized_root == Hash256::ZERO
+    ) {
+        return Err("verifier RuntimeReady does not match proposer genesis".into());
+    }
+    let proposer_compatible = proposer
+        .iter()
+        .position(|event| matches!(event.kind, PqProcessEventKind::PeerCompatible { .. }))
+        .ok_or("proposer lacks compatible peer")?;
+    let verifier_compatible = verifier
+        .iter()
+        .position(|event| matches!(event.kind, PqProcessEventKind::PeerCompatible { .. }))
+        .ok_or("verifier lacks compatible peer")?;
+    let starts = proposer
+        .iter()
+        .enumerate()
+        .filter_map(|(position, event)| match event.kind {
+            PqProcessEventKind::ProposalStarted { slot, parent_root } => {
+                Some((position, slot, parent_root))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if starts.len() != 3
+        || starts[0].0 <= proposer_compatible
+        || starts[0].0 <= proposer_ready_position
+    {
+        return Err(format!(
+            "expected three post-compatibility proposals: {starts:?}"
+        ));
+    }
+    if starts[1].1 != starts[0].1.checked_add(1).ok_or("slot overflow")?
+        || starts[2].1 != starts[1].1.checked_add(1).ok_or("slot overflow")?
+    {
+        return Err(format!("proposal slots are not consecutive: {starts:?}"));
+    }
+    let proposer_persisted = proposer
+        .iter()
+        .filter_map(|event| {
+            persisted_identity(
+                event,
+                PqProcessRole::Proposer,
+                PqProcessBlockSource::Publish,
+            )
+        })
+        .collect::<Vec<_>>();
+    let proposer_reconciled = proposer
+        .iter()
+        .filter_map(|event| {
+            reconciled_identity(
+                event,
+                PqProcessRole::Proposer,
+                PqProcessBlockSource::Publish,
+            )
+        })
+        .collect::<Vec<_>>();
+    let verifier_persisted = verifier
+        .iter()
+        .filter_map(|event| {
+            persisted_identity(event, PqProcessRole::Verifier, PqProcessBlockSource::Gossip)
+        })
+        .collect::<Vec<_>>();
+    let verifier_reconciled = verifier
+        .iter()
+        .filter_map(|event| {
+            reconciled_identity(event, PqProcessRole::Verifier, PqProcessBlockSource::Gossip)
+        })
+        .collect::<Vec<_>>();
+    if proposer_persisted.len() != 3
+        || proposer_persisted != proposer_reconciled
+        || proposer_persisted != verifier_persisted
+        || proposer_persisted != verifier_reconciled
+    {
+        return Err("persisted/reconciled identities do not converge exactly".into());
+    }
+    let published = proposer
+        .iter()
+        .filter_map(|event| match event.kind {
+            PqProcessEventKind::ProposalPublished {
+                slot,
+                block_root,
+                signed_ssz_digest,
+            } => Some((slot, block_root, signed_ssz_digest)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let imported = verifier
+        .iter()
+        .filter_map(|event| match event.kind {
+            PqProcessEventKind::GossipImported {
+                slot,
+                block_root,
+                signed_ssz_digest,
+            } => Some((slot, block_root, signed_ssz_digest)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let expected_publications = proposer_persisted
+        .iter()
+        .map(|identity| {
+            (
+                identity.slot,
+                identity.block_root,
+                identity.signed_ssz_digest,
+            )
+        })
+        .collect::<Vec<_>>();
+    if published != expected_publications || imported != expected_publications {
+        return Err("published/gossip signed SSZ identities do not converge".into());
+    }
+    for (index, ((_, slot, parent_root), identity)) in
+        starts.iter().zip(&proposer_persisted).enumerate()
+    {
+        let expected_parent = if index == 0 {
+            runtime_root
+        } else {
+            proposer_persisted[index - 1].block_root
+        };
+        if *slot != identity.slot
+            || *parent_root != expected_parent
+            || identity.finalized_epoch != 0
+            || identity.finalized_root != Hash256::ZERO
+        {
+            return Err("proposal parent/finalized identity mismatch".into());
+        }
+        let proposer_positions = (
+            starts[index].0,
+            proposer
+                .iter()
+                .position(|event| {
+                    matches!(
+                        event.kind,
+                        PqProcessEventKind::BlockPersisted {
+                            source: PqProcessBlockSource::Publish,
+                            slot: event_slot,
+                            ..
+                        } if event_slot == identity.slot
+                    )
+                })
+                .ok_or("missing proposer persistence")?,
+            proposer
+                .iter()
+                .position(|event| {
+                    matches!(
+                        event.kind,
+                        PqProcessEventKind::ExecutionReconciled {
+                            source: PqProcessBlockSource::Publish,
+                            slot: event_slot,
+                            ..
+                        } if event_slot == identity.slot
+                    )
+                })
+                .ok_or("missing proposer reconciliation")?,
+            proposer
+                .iter()
+                .position(|event| {
+                    matches!(
+                        event.kind,
+                        PqProcessEventKind::ProposalPublished {
+                            slot: event_slot,
+                            ..
+                        } if event_slot == identity.slot
+                    )
+                })
+                .ok_or("missing proposer publication")?,
+        );
+        if !(proposer_positions.0 < proposer_positions.1
+            && proposer_positions.1 < proposer_positions.2
+            && proposer_positions.2 < proposer_positions.3)
+        {
+            return Err("proposer event order is not start/persist/reconcile/publish".into());
+        }
+        let verifier_positions = (
+            verifier
+                .iter()
+                .position(|event| {
+                    matches!(
+                        event.kind,
+                        PqProcessEventKind::BlockPersisted {
+                            source: PqProcessBlockSource::Gossip,
+                            slot: event_slot,
+                            ..
+                        } if event_slot == identity.slot
+                    )
+                })
+                .ok_or("missing verifier persistence")?,
+            verifier
+                .iter()
+                .position(|event| {
+                    matches!(
+                        event.kind,
+                        PqProcessEventKind::ExecutionReconciled {
+                            source: PqProcessBlockSource::Gossip,
+                            slot: event_slot,
+                            ..
+                        } if event_slot == identity.slot
+                    )
+                })
+                .ok_or("missing verifier reconciliation")?,
+            verifier
+                .iter()
+                .position(|event| {
+                    matches!(
+                        event.kind,
+                        PqProcessEventKind::GossipImported {
+                            slot: event_slot,
+                            ..
+                        } if event_slot == identity.slot
+                    )
+                })
+                .ok_or("missing verifier gossip import")?,
+        );
+        if verifier_positions.0 <= verifier_compatible
+            || verifier_positions.0 <= verifier_ready_position
+            || !(verifier_positions.0 < verifier_positions.1
+                && verifier_positions.1 < verifier_positions.2)
+        {
+            return Err("verifier event order is not compatible/persist/reconcile/import".into());
+        }
+        if index > 0 {
+            let previous_slot = proposer_persisted[index - 1].slot;
+            let previous_publication = proposer
+                .iter()
+                .position(|event| {
+                    matches!(
+                        event.kind,
+                        PqProcessEventKind::ProposalPublished {
+                            slot: event_slot,
+                            ..
+                        } if event_slot == previous_slot
+                    )
+                })
+                .ok_or("missing previous proposer publication")?;
+            if starts[index].0 <= previous_publication {
+                return Err("next proposal started before previous publication completed".into());
+            }
         }
     }
+    validate_engine_history(proposer_engine, &proposer_persisted, true)?;
+    validate_engine_history(verifier_engine, &proposer_persisted, false)?;
     Ok(())
 }
 
@@ -447,6 +1195,58 @@ impl ChildNode {
         }
     }
 
+    async fn wait_for_event_kind_count(
+        &mut self,
+        event_count: usize,
+        timeout: Duration,
+        predicate: impl Fn(&PqProcessEventKind) -> bool,
+    ) -> Vec<PqProcessEvent> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .expect("bounded process event deadline");
+        self.wait_for_event_kind_count_until(event_count, deadline, predicate)
+            .await
+    }
+
+    async fn wait_for_event_kind_count_until(
+        &mut self,
+        event_count: usize,
+        deadline: Instant,
+        predicate: impl Fn(&PqProcessEventKind) -> bool,
+    ) -> Vec<PqProcessEvent> {
+        loop {
+            match self.log.events() {
+                Ok(events)
+                    if events.iter().filter(|event| predicate(&event.kind)).count()
+                        >= event_count =>
+                {
+                    return events;
+                }
+                Ok(_) => {}
+                Err(error) => panic!(
+                    "{} emitted an invalid PQ event stream: {error:?}\n{}",
+                    self.name,
+                    self.log.snapshot()
+                ),
+            }
+            if let Some(status) = self.child.try_wait().expect("poll Lighthouse child") {
+                panic!(
+                    "{} exited before {event_count} target PQ events: {status}\n{}",
+                    self.name,
+                    self.log.snapshot()
+                );
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "{} did not emit {event_count} target PQ events before timeout\n{}",
+                    self.name,
+                    self.log.snapshot()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     async fn wait_for_enr(
         &mut self,
         network_dir: &Path,
@@ -512,6 +1312,10 @@ impl ChildNode {
 
     async fn stop(mut self) {
         self.signal_interrupt();
+        self.finish_stop_after_signal().await;
+    }
+
+    async fn finish_stop_after_signal(mut self) {
         let deadline = Instant::now() + PROCESS_STOP_TIMEOUT;
         let status = loop {
             if let Some(status) = self.child.try_wait().expect("poll stopped child") {
@@ -591,6 +1395,7 @@ struct LaunchFixture {
     proposer_network: PathBuf,
     verifier_data: PathBuf,
     verifier_network: PathBuf,
+    genesis_time: u64,
 }
 
 impl LaunchFixture {
@@ -659,6 +1464,7 @@ impl LaunchFixture {
             bundle_dir,
             jwt_proposer,
             jwt_verifier,
+            genesis_time,
         }
     }
 }
@@ -1630,6 +2436,762 @@ fn reserve_udp_port() -> u16 {
         .port()
 }
 
+fn probe_network_ports_released(tcp_ports: &[u16], udp_ports: &[u16]) -> Result<(), String> {
+    let mut tcp = Vec::with_capacity(tcp_ports.len());
+    for port in tcp_ports {
+        tcp.push(
+            TcpListener::bind((Ipv4Addr::LOCALHOST, *port))
+                .map_err(|error| format!("TCP port {port} remains owned: {error}"))?,
+        );
+    }
+    let mut udp = Vec::with_capacity(udp_ports.len());
+    for port in udp_ports {
+        udp.push(
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, *port))
+                .map_err(|error| format!("UDP port {port} remains owned: {error}"))?,
+        );
+    }
+    Ok(())
+}
+
+const PQ_LEVELDB_LOCK_PATH_ENV: &str = "LIGHTHOUSE_PQ_E4F_LEVELDB_LOCK_PATH";
+const PQ_LEVELDB_LOCK_READY_ENV: &str = "LIGHTHOUSE_PQ_E4F_LEVELDB_LOCK_READY";
+const PQ_SQLITE_LOCK_PATH_ENV: &str = "LIGHTHOUSE_PQ_E4F_SQLITE_LOCK_PATH";
+const PQ_SQLITE_LOCK_READY_ENV: &str = "LIGHTHOUSE_PQ_E4F_SQLITE_LOCK_READY";
+
+struct HeldLevelDbProcess {
+    child: Child,
+}
+
+impl HeldLevelDbProcess {
+    fn spawn(path: &Path, ready: &Path) -> Result<Self, String> {
+        let child = Command::new(
+            std::env::current_exe().map_err(|error| format!("resolve test binary: {error}"))?,
+        )
+        .arg("pq_leveldb_lock_holder_process")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(PQ_LEVELDB_LOCK_PATH_ENV, path)
+        .env(PQ_LEVELDB_LOCK_READY_ENV, ready)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("spawn LevelDB lock holder: {error}"))?;
+        let mut held = Self { child };
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(5))
+            .ok_or("LevelDB lock-holder deadline overflow")?;
+        while !ready.exists() {
+            if let Some(status) = held
+                .child
+                .try_wait()
+                .map_err(|error| format!("poll LevelDB lock holder: {error}"))?
+            {
+                return Err(format!("LevelDB lock holder exited before ready: {status}"));
+            }
+            if Instant::now() >= deadline {
+                return Err("LevelDB lock holder did not become ready".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(held)
+    }
+
+    fn stop(mut self) -> Result<(), String> {
+        let mut stdin = self
+            .child
+            .stdin
+            .take()
+            .ok_or("LevelDB lock holder has no stdin")?;
+        stdin
+            .write_all(&[0])
+            .map_err(|error| format!("stop LevelDB lock holder: {error}"))?;
+        drop(stdin);
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(5))
+            .ok_or("LevelDB lock-holder stop deadline overflow")?;
+        loop {
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .map_err(|error| format!("poll stopped LevelDB lock holder: {error}"))?
+            {
+                if status.success() {
+                    return Ok(());
+                }
+                return Err(format!("LevelDB lock holder failed: {status}"));
+            }
+            if Instant::now() >= deadline {
+                return Err("LevelDB lock holder did not stop".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for HeldLevelDbProcess {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+struct HeldSqliteProcess {
+    child: Child,
+}
+
+impl HeldSqliteProcess {
+    fn spawn(path: &Path, ready: &Path) -> Result<Self, String> {
+        let child = Command::new(
+            std::env::current_exe().map_err(|error| format!("resolve test binary: {error}"))?,
+        )
+        .arg("pq_sqlite_lock_holder_process")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(PQ_SQLITE_LOCK_PATH_ENV, path)
+        .env(PQ_SQLITE_LOCK_READY_ENV, ready)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("spawn SQLite lock holder: {error}"))?;
+        let mut held = Self { child };
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(5))
+            .ok_or("SQLite lock-holder deadline overflow")?;
+        while !ready.exists() {
+            if let Some(status) = held
+                .child
+                .try_wait()
+                .map_err(|error| format!("poll SQLite lock holder: {error}"))?
+            {
+                return Err(format!("SQLite lock holder exited before ready: {status}"));
+            }
+            if Instant::now() >= deadline {
+                return Err("SQLite lock holder did not become ready".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(held)
+    }
+
+    fn stop(mut self) -> Result<(), String> {
+        let mut stdin = self
+            .child
+            .stdin
+            .take()
+            .ok_or("SQLite lock holder has no stdin")?;
+        stdin
+            .write_all(&[0])
+            .map_err(|error| format!("stop SQLite lock holder: {error}"))?;
+        drop(stdin);
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(5))
+            .ok_or("SQLite lock-holder stop deadline overflow")?;
+        loop {
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .map_err(|error| format!("poll stopped SQLite lock holder: {error}"))?
+            {
+                if status.success() {
+                    return Ok(());
+                }
+                return Err(format!("SQLite lock holder failed: {status}"));
+            }
+            if Instant::now() >= deadline {
+                return Err("SQLite lock holder did not stop".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for HeldSqliteProcess {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+fn pq_node_data_dir(cli_data_dir: &Path) -> PathBuf {
+    cli_data_dir.join(directory::DEFAULT_BEACON_NODE_DIR)
+}
+
+fn pq_store_paths(cli_data_dir: &Path) -> [PathBuf; 3] {
+    let data_dir = pq_node_data_dir(cli_data_dir);
+    [
+        data_dir.join("chain_db"),
+        data_dir.join("freezer_db"),
+        data_dir.join("blobs_db"),
+    ]
+}
+
+fn validate_safe_database_directory(directory: &File, label: &str) -> Result<(u64, u64), String> {
+    let metadata = directory
+        .metadata()
+        .map_err(|error| format!("inspect held {label} directory: {error}"))?;
+    let mode = metadata.mode() & 0o7777;
+    if !metadata.file_type().is_dir()
+        || !matches!(mode, 0o700 | 0o705 | 0o750 | 0o755 | 0o770 | 0o775)
+    {
+        return Err(format!("{label} directory has unsafe mode/type {mode:o}"));
+    }
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+fn validate_safe_leveldb_file(file: &File, label: &str, max_len: u64) -> Result<(), String> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect held LevelDB {label}: {error}"))?;
+    let mode = metadata.mode() & 0o7777;
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || !matches!(mode, 0o600 | 0o604 | 0o640 | 0o644)
+        || metadata.len() > max_len
+    {
+        return Err(format!("unsafe LevelDB {label} mode/type/length"));
+    }
+    Ok(())
+}
+
+fn validate_existing_leveldb(directory: &File) -> Result<(), String> {
+    const CURRENT_MAX_BYTES: u64 = 64;
+    const MANIFEST_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+    let mut current = open_anchored_file(directory, "CURRENT", None)?;
+    validate_safe_leveldb_file(&current, "CURRENT", CURRENT_MAX_BYTES)?;
+    let current_bytes = read_held_bounded(&mut current, CURRENT_MAX_BYTES)?;
+    let current_name = std::str::from_utf8(&current_bytes)
+        .map_err(|_| "LevelDB CURRENT is not UTF-8")?
+        .strip_suffix('\n')
+        .ok_or("LevelDB CURRENT lacks its exact newline")?;
+    let manifest_digits = current_name
+        .strip_prefix("MANIFEST-")
+        .ok_or("LevelDB CURRENT does not name a manifest")?;
+    if !(6..=20).contains(&manifest_digits.len())
+        || !manifest_digits.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err("LevelDB CURRENT contains an unsafe manifest name".into());
+    }
+
+    let manifest = open_anchored_file(directory, current_name, None)?;
+    validate_safe_leveldb_file(&manifest, "manifest", MANIFEST_MAX_BYTES)?;
+    if manifest
+        .metadata()
+        .map_err(|error| format!("inspect held LevelDB manifest: {error}"))?
+        .len()
+        == 0
+    {
+        return Err("LevelDB manifest is empty".into());
+    }
+
+    let lock = open_anchored_file(directory, "LOCK", None)?;
+    validate_safe_leveldb_file(&lock, "LOCK", 0)?;
+    Ok(())
+}
+
+fn probe_chain_store_released(data_dir: &Path) -> Result<(), String> {
+    probe_chain_store_released_with_hooks(data_dir, || {}, || {})
+}
+
+fn probe_chain_store_released_with_hooks<BeforeFirstOpen, AfterFirstOpen>(
+    data_dir: &Path,
+    before_first_open: BeforeFirstOpen,
+    after_first_open: AfterFirstOpen,
+) -> Result<(), String>
+where
+    BeforeFirstOpen: FnOnce(),
+    AfterFirstOpen: FnOnce(),
+{
+    struct HeldStoreDirectory {
+        path: PathBuf,
+        directory: File,
+        dev: u64,
+        ino: u64,
+    }
+
+    let beacon_path = pq_node_data_dir(data_dir);
+    let beacon_directory = open_directory_nofollow(&beacon_path, None)?;
+    let (beacon_dev, beacon_ino) =
+        validate_safe_database_directory(&beacon_directory, "beacon data")?;
+    let current_beacon = std::fs::symlink_metadata(&beacon_path)
+        .map_err(|error| format!("inspect beacon data binding: {error}"))?;
+    if !current_beacon.file_type().is_dir()
+        || current_beacon.dev() != beacon_dev
+        || current_beacon.ino() != beacon_ino
+    {
+        return Err("beacon data directory binding changed".into());
+    }
+
+    let mut held_directories = Vec::with_capacity(3);
+    for (name, path) in ["chain_db", "freezer_db", "blobs_db"]
+        .into_iter()
+        .zip(pq_store_paths(data_dir))
+    {
+        let directory = open_anchored_directory(&beacon_directory, name, None)?;
+        let (dev, ino) = validate_safe_database_directory(&directory, "store")?;
+        validate_existing_leveldb(&directory)?;
+        let current = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("inspect store binding {}: {error}", path.display()))?;
+        if !current.file_type().is_dir() || current.dev() != dev || current.ino() != ino {
+            return Err(format!(
+                "store directory binding changed: {}",
+                path.display()
+            ));
+        }
+        held_directories.push(HeldStoreDirectory {
+            path,
+            directory,
+            dev,
+            ino,
+        });
+    }
+
+    let config = store::StoreConfig::default();
+    let mut databases = Vec::with_capacity(3);
+    let mut before_first_open = Some(before_first_open);
+    let mut after_first_open = Some(after_first_open);
+    for (index, held) in held_directories.iter().enumerate() {
+        let verify_binding = || {
+            let current = std::fs::symlink_metadata(&held.path).map_err(|error| {
+                format!("reinspect store binding {}: {error}", held.path.display())
+            })?;
+            let held_metadata = held.directory.metadata().map_err(|error| {
+                format!("reinspect held store {}: {error}", held.path.display())
+            })?;
+            if !current.file_type().is_dir()
+                || current.dev() != held.dev
+                || current.ino() != held.ino
+                || held_metadata.dev() != held.dev
+                || held_metadata.ino() != held.ino
+            {
+                return Err(format!(
+                    "store directory binding changed: {}",
+                    held.path.display()
+                ));
+            }
+            Ok::<(), String>(())
+        };
+        verify_binding()?;
+        if index == 0 {
+            before_first_open
+                .take()
+                .ok_or("first store pre-open hook already consumed")?();
+        }
+        let held_path = bundle_loader_path(&held.directory);
+        databases.push(
+            store::database::interface::BeaconNodeBackend::open(&config, &held_path).map_err(
+                |error| {
+                    format!(
+                        "store path {} remains owned: {error:?}",
+                        held.path.display()
+                    )
+                },
+            )?,
+        );
+        if index == 0 {
+            after_first_open
+                .take()
+                .ok_or("first store post-open hook already consumed")?();
+        }
+        verify_binding()?;
+    }
+    Ok(())
+}
+
+fn probe_slashing_db_released(cli_data_dir: &Path) -> Result<(), String> {
+    probe_slashing_db_released_with_hooks(cli_data_dir, || {}, || {})
+}
+
+fn probe_slashing_db_released_with_hooks<BeforeSqliteOpen, AfterSqliteOpen>(
+    cli_data_dir: &Path,
+    before_sqlite_open: BeforeSqliteOpen,
+    after_sqlite_open: AfterSqliteOpen,
+) -> Result<(), String>
+where
+    BeforeSqliteOpen: FnOnce(),
+    AfterSqliteOpen: FnOnce(),
+{
+    probe_slashing_db_released_with_all_hooks(
+        cli_data_dir,
+        || {},
+        before_sqlite_open,
+        after_sqlite_open,
+    )
+}
+
+fn probe_slashing_db_released_with_parent_hooks<BeforeRawOpen, AfterSqliteOpen>(
+    cli_data_dir: &Path,
+    before_raw_open: BeforeRawOpen,
+    after_sqlite_open: AfterSqliteOpen,
+) -> Result<(), String>
+where
+    BeforeRawOpen: FnOnce(),
+    AfterSqliteOpen: FnOnce(),
+{
+    probe_slashing_db_released_with_all_hooks(
+        cli_data_dir,
+        before_raw_open,
+        || {},
+        after_sqlite_open,
+    )
+}
+
+fn probe_slashing_db_released_with_all_hooks<BeforeRawOpen, BeforeSqliteOpen, AfterSqliteOpen>(
+    cli_data_dir: &Path,
+    before_raw_open: BeforeRawOpen,
+    before_sqlite_open: BeforeSqliteOpen,
+    after_sqlite_open: AfterSqliteOpen,
+) -> Result<(), String>
+where
+    BeforeRawOpen: FnOnce(),
+    BeforeSqliteOpen: FnOnce(),
+    AfterSqliteOpen: FnOnce(),
+{
+    // This test-harness probe runs inside its ephemeral 0700 run root. The standard SQLite VFS
+    // cannot eliminate its internal fullpath-to-open window against a hostile same-UID mutator,
+    // which is outside this harness's trust boundary. Held directory/file descriptors and the raw
+    // O_NOFOLLOW open prevent accidental pathname redirection in the tested lifecycle.
+    let beacon_path = pq_node_data_dir(cli_data_dir);
+    let beacon_directory = open_directory_nofollow(&beacon_path, None)?;
+    let (beacon_dev, beacon_ino) =
+        validate_safe_database_directory(&beacon_directory, "beacon data")?;
+    let current_beacon = std::fs::symlink_metadata(&beacon_path)
+        .map_err(|error| format!("inspect beacon data binding: {error}"))?;
+    if !current_beacon.file_type().is_dir()
+        || current_beacon.dev() != beacon_dev
+        || current_beacon.ino() != beacon_ino
+    {
+        return Err("beacon data directory binding changed".into());
+    }
+    let proposer_path = beacon_path.join("pq-proposer");
+    let proposer_directory = open_anchored_directory(&beacon_directory, "pq-proposer", None)?;
+    let (proposer_dev, proposer_ino) =
+        validate_safe_database_directory(&proposer_directory, "proposer")?;
+    let current_proposer = std::fs::symlink_metadata(&proposer_path)
+        .map_err(|error| format!("inspect proposer directory binding: {error}"))?;
+    if !current_proposer.file_type().is_dir()
+        || current_proposer.dev() != proposer_dev
+        || current_proposer.ino() != proposer_ino
+    {
+        return Err("proposer directory binding changed".into());
+    }
+    before_raw_open();
+    let anchored_path = bundle_loader_path(&proposer_directory).join("slashing_protection.sqlite");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&anchored_path)
+        .map_err(|error| {
+            format!(
+                "open existing proposer DB {}: {error}",
+                anchored_path.display()
+            )
+        })?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect proposer DB {}: {error}", anchored_path.display()))?;
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.len() == 0
+    {
+        return Err("proposer DB must be one nonempty private regular inode".into());
+    }
+
+    before_sqlite_open();
+    let sqlite_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+    let canonical_sqlite_path = std::fs::canonicalize(&sqlite_path)
+        .map_err(|error| format!("canonicalize held proposer DB: {error}"))?;
+    let connection = Connection::open_with_flags(
+        &sqlite_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("open proposer DB read-write: {error}"))?;
+    connection
+        .busy_timeout(Duration::from_millis(100))
+        .map_err(|error| format!("set bounded proposer DB timeout: {error}"))?;
+    after_sqlite_open();
+    let current = std::fs::metadata(&sqlite_path)
+        .map_err(|error| format!("reinspect proposer DB binding: {error}"))?;
+    if !current.file_type().is_file()
+        || current.dev() != metadata.dev()
+        || current.ino() != metadata.ino()
+    {
+        return Err("proposer DB binding changed during inspection".into());
+    }
+    if connection
+        .is_readonly(MAIN_DB)
+        .map_err(|error| format!("inspect proposer DB write mode: {error}"))?
+    {
+        return Err("proposer DB unexpectedly opened read-only".into());
+    }
+    let database_list = {
+        let mut statement = connection
+            .prepare("PRAGMA database_list")
+            .map_err(|error| format!("prepare proposer database_list: {error}"))?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| format!("query proposer database_list: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("decode proposer database_list: {error}"))?
+    };
+    if database_list
+        != [(
+            0,
+            "main".into(),
+            canonical_sqlite_path.to_string_lossy().into_owned(),
+        )]
+    {
+        return Err(format!(
+            "unexpected proposer database_list: {database_list:?}"
+        ));
+    }
+    let journal_mode: String = connection
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .map_err(|error| format!("inspect proposer journal mode: {error}"))?;
+    if journal_mode != "delete" {
+        return Err(format!("unexpected proposer journal mode: {journal_mode}"));
+    }
+    let sidecars = ["-journal", "-wal", "-shm"].map(|suffix| {
+        let mut path = canonical_sqlite_path.as_os_str().to_owned();
+        path.push(suffix);
+        PathBuf::from(path)
+    });
+    if sidecars.iter().any(|path| path.exists()) {
+        return Err("unexpected proposer DB sidecar before inspection".into());
+    }
+    connection
+        .pragma_update(None, "locking_mode", "EXCLUSIVE")
+        .map_err(|error| format!("set exclusive proposer DB inspection: {error}"))?;
+    connection
+        .execute_batch("BEGIN EXCLUSIVE;")
+        .map_err(|error| format!("proposer DB remains owned: {error}"))?;
+
+    let validation = (|| {
+        let mut statement = connection
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .map_err(|error| format!("query proposer DB schema: {error}"))?;
+        let tables = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("read proposer DB schema: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("decode proposer DB schema: {error}"))?;
+        if tables != ["signed_attestations", "signed_blocks", "validators"] {
+            return Err(format!("unexpected proposer DB tables: {tables:?}"));
+        }
+
+        type Column = (i64, String, String, i64, Option<String>, i64);
+        let columns = |table: &str| -> Result<Vec<Column>, String> {
+            let sql = match table {
+                "validators" => "PRAGMA table_info('validators')",
+                "signed_blocks" => "PRAGMA table_info('signed_blocks')",
+                "signed_attestations" => "PRAGMA table_info('signed_attestations')",
+                _ => return Err("unrecognized proposer DB table".into()),
+            };
+            let mut statement = connection
+                .prepare(sql)
+                .map_err(|error| format!("inspect {table} schema: {error}"))?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                })
+                .map_err(|error| format!("query {table} columns: {error}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("decode {table} columns: {error}"))
+        };
+        if columns("validators")?
+            != [
+                (0, "id".into(), "INTEGER".into(), 0, None, 1),
+                (1, "public_key".into(), "BLOB".into(), 1, None, 0),
+                (
+                    2,
+                    "enabled".into(),
+                    "BOOL".into(),
+                    1,
+                    Some("TRUE".into()),
+                    0,
+                ),
+            ]
+            || columns("signed_blocks")?
+                != [
+                    (0, "validator_id".into(), "INTEGER".into(), 1, None, 0),
+                    (1, "slot".into(), "INTEGER".into(), 1, None, 0),
+                    (2, "signing_root".into(), "BLOB".into(), 1, None, 0),
+                ]
+            || columns("signed_attestations")?
+                != [
+                    (0, "validator_id".into(), "INTEGER".into(), 0, None, 0),
+                    (1, "source_epoch".into(), "INTEGER".into(), 1, None, 0),
+                    (2, "target_epoch".into(), "INTEGER".into(), 1, None, 0),
+                    (3, "signing_root".into(), "BLOB".into(), 1, None, 0),
+                ]
+        {
+            return Err("unexpected proposer DB column schema".into());
+        }
+
+        type Index = (i64, String, i64, String, i64);
+        let indexes = |table: &str| -> Result<Vec<Index>, String> {
+            let sql = match table {
+                "validators" => "PRAGMA index_list('validators')",
+                "signed_blocks" => "PRAGMA index_list('signed_blocks')",
+                "signed_attestations" => "PRAGMA index_list('signed_attestations')",
+                _ => return Err("unrecognized proposer DB index table".into()),
+            };
+            let mut statement = connection
+                .prepare(sql)
+                .map_err(|error| format!("inspect {table} indexes: {error}"))?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })
+                .map_err(|error| format!("query {table} indexes: {error}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("decode {table} indexes: {error}"))
+        };
+        if indexes("validators")? != [(0, "sqlite_autoindex_validators_1".into(), 1, "u".into(), 0)]
+            || indexes("signed_blocks")?
+                != [(
+                    0,
+                    "sqlite_autoindex_signed_blocks_1".into(),
+                    1,
+                    "u".into(),
+                    0,
+                )]
+            || indexes("signed_attestations")?
+                != [(
+                    0,
+                    "sqlite_autoindex_signed_attestations_1".into(),
+                    1,
+                    "u".into(),
+                    0,
+                )]
+        {
+            return Err("unexpected proposer DB unique indexes".into());
+        }
+
+        type IndexedColumn = (i64, i64, String);
+        let indexed_columns = |index: &str| -> Result<Vec<IndexedColumn>, String> {
+            let sql = match index {
+                "validators" => "PRAGMA index_info('sqlite_autoindex_validators_1')",
+                "signed_blocks" => "PRAGMA index_info('sqlite_autoindex_signed_blocks_1')",
+                "signed_attestations" => {
+                    "PRAGMA index_info('sqlite_autoindex_signed_attestations_1')"
+                }
+                _ => return Err("unrecognized proposer DB index".into()),
+            };
+            let mut statement = connection
+                .prepare(sql)
+                .map_err(|error| format!("inspect {index} indexed columns: {error}"))?;
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .map_err(|error| format!("query {index} indexed columns: {error}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("decode {index} indexed columns: {error}"))
+        };
+        if indexed_columns("validators")? != [(0, 1, "public_key".into())]
+            || indexed_columns("signed_blocks")?
+                != [(0, 0, "validator_id".into()), (1, 1, "slot".into())]
+            || indexed_columns("signed_attestations")?
+                != [(0, 0, "validator_id".into()), (1, 2, "target_epoch".into())]
+        {
+            return Err("unexpected proposer DB unique index columns".into());
+        }
+
+        type ForeignKey = (i64, i64, String, String, String, String, String, String);
+        let foreign_keys = |table: &str| -> Result<Vec<ForeignKey>, String> {
+            let sql = match table {
+                "validators" => "PRAGMA foreign_key_list('validators')",
+                "signed_blocks" => "PRAGMA foreign_key_list('signed_blocks')",
+                "signed_attestations" => "PRAGMA foreign_key_list('signed_attestations')",
+                _ => return Err("unrecognized proposer DB foreign-key table".into()),
+            };
+            let mut statement = connection
+                .prepare(sql)
+                .map_err(|error| format!("inspect {table} foreign keys: {error}"))?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                })
+                .map_err(|error| format!("query {table} foreign keys: {error}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("decode {table} foreign keys: {error}"))
+        };
+        let expected_foreign_key = [(
+            0,
+            0,
+            "validators".into(),
+            "validator_id".into(),
+            "id".into(),
+            "NO ACTION".into(),
+            "NO ACTION".into(),
+            "NONE".into(),
+        )];
+        if !foreign_keys("validators")?.is_empty()
+            || foreign_keys("signed_blocks")? != expected_foreign_key.clone()
+            || foreign_keys("signed_attestations")? != expected_foreign_key
+        {
+            return Err("unexpected proposer DB foreign keys".into());
+        }
+
+        let validator_rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM validators", [], |row| row.get(0))
+            .map_err(|error| format!("count proposer validators: {error}"))?;
+        if validator_rows != 16 {
+            return Err(format!(
+                "expected 16 proposer validators, found {validator_rows}"
+            ));
+        }
+        Ok(())
+    })();
+    let rollback = connection
+        .execute_batch("ROLLBACK;")
+        .map_err(|error| format!("release proposer DB inspection: {error}"));
+    validation?;
+    rollback?;
+    if sidecars.iter().any(|path| path.exists()) {
+        return Err("proposer DB inspection left a sidecar".into());
+    }
+    drop(connection);
+    drop(file);
+    Ok(())
+}
+
 fn require_pq_avx2_launch_profile() {
     #[cfg(target_arch = "x86_64")]
     {
@@ -2079,17 +3641,22 @@ peer_digest=02020202020202020202020202020202",
         PqProcessEvent {
             sequence: 2,
             role: PqProcessRole::Proposer,
-            kind: PqProcessEventKind::PeerConnected {
-                peer_digest,
-                direction: PqProcessConnectionDirection::Incoming,
+            kind: PqProcessEventKind::RuntimeReady {
+                startup: PqProcessStartup::Fresh,
+                slot: 0,
+                block_root: Hash256::repeat_byte(1),
+                execution_hash: ExecutionBlockHash::zero(),
+                finalized_epoch: 0,
+                finalized_root: Hash256::ZERO,
+                signed_ssz_digest: [2; 32],
             },
         },
         PqProcessEvent {
             sequence: 3,
             role: PqProcessRole::Proposer,
-            kind: PqProcessEventKind::StatusSent {
+            kind: PqProcessEventKind::PeerConnected {
                 peer_digest,
-                direction: PqProcessStatusDirection::Request,
+                direction: PqProcessConnectionDirection::Incoming,
             },
         },
         PqProcessEvent {
@@ -2097,11 +3664,19 @@ peer_digest=02020202020202020202020202020202",
             role: PqProcessRole::Proposer,
             kind: PqProcessEventKind::StatusSent {
                 peer_digest,
-                direction: PqProcessStatusDirection::Response,
+                direction: PqProcessStatusDirection::Request,
             },
         },
         PqProcessEvent {
             sequence: 5,
+            role: PqProcessRole::Proposer,
+            kind: PqProcessEventKind::StatusSent {
+                peer_digest,
+                direction: PqProcessStatusDirection::Response,
+            },
+        },
+        PqProcessEvent {
+            sequence: 6,
             role: PqProcessRole::Proposer,
             kind: PqProcessEventKind::PeerCompatible { peer_digest },
         },
@@ -2113,8 +3688,20 @@ peer_digest=02020202020202020202020202020202",
         peer_digest,
     )
     .unwrap();
+    let mut network_first = valid_trace.clone();
+    let runtime_ready = network_first[1].kind;
+    network_first[1].kind = network_first[2].kind;
+    network_first[2].kind = network_first[3].kind;
+    network_first[3].kind = runtime_ready;
+    validate_compatible_event_trace(
+        &network_first,
+        PqProcessRole::Proposer,
+        PqProcessConnectionDirection::Incoming,
+        peer_digest,
+    )
+    .expect("network Status may race ahead of RuntimeReady acknowledgement");
     let mut wrong_role = valid_trace.clone();
-    wrong_role[4].role = PqProcessRole::Verifier;
+    wrong_role[5].role = PqProcessRole::Verifier;
     assert!(
         validate_compatible_event_trace(
             &wrong_role,
@@ -2125,7 +3712,7 @@ peer_digest=02020202020202020202020202020202",
         .is_err()
     );
     let mut wrong_order = valid_trace.clone();
-    wrong_order.swap(1, 2);
+    wrong_order.swap(2, 3);
     assert!(
         validate_compatible_event_trace(
             &wrong_order,
@@ -2175,6 +3762,1223 @@ peer_digest=02020202020202020202020202020202"
         PqProcessEventFailure::Capacity
     );
     assert!(overflow.contains_frame("ordinary-after-overflow"));
+}
+
+#[test]
+fn extended_structured_event_parser_is_exact_and_mutation_sensitive() {
+    let runtime = parse_pq_process_event(
+        "PQ_EVENT_V1 event=RuntimeReady sequence=6 role=proposer startup=resume slot=3 \
+block_root=0x0101010101010101010101010101010101010101010101010101010101010101 \
+execution_hash=0x0202020202020202020202020202020202020202020202020202020202020202 \
+finalized_epoch=0 finalized_root=0x0303030303030303030303030303030303030303030303030303030303030303 \
+signed_ssz_digest=0404040404040404040404040404040404040404040404040404040404040404",
+    )
+    .expect("exact runtime-ready event");
+    assert!(matches!(
+        runtime.kind,
+        PqProcessEventKind::RuntimeReady {
+            startup: PqProcessStartup::Resume,
+            slot: 3,
+            block_root,
+            execution_hash,
+            finalized_epoch: 0,
+            finalized_root,
+            signed_ssz_digest,
+        } if block_root == types::Hash256::repeat_byte(1)
+            && execution_hash == ExecutionBlockHash::repeat_byte(2)
+            && finalized_root == types::Hash256::repeat_byte(3)
+            && signed_ssz_digest == [4; 32]
+    ));
+    let block = parse_pq_process_event(
+        "PQ_EVENT_V1 event=BlockPersisted sequence=7 role=verifier source=gossip slot=4 \
+block_root=0x0505050505050505050505050505050505050505050505050505050505050505 \
+execution_hash=0x0606060606060606060606060606060606060606060606060606060606060606 \
+finalized_epoch=0 finalized_root=0x0303030303030303030303030303030303030303030303030303030303030303 \
+signed_ssz_digest=0707070707070707070707070707070707070707070707070707070707070707",
+    )
+    .expect("exact persisted event");
+    assert!(matches!(
+        block.kind,
+        PqProcessEventKind::BlockPersisted {
+            source: PqProcessBlockSource::Gossip,
+            slot: 4,
+            signed_ssz_digest,
+            ..
+        } if signed_ssz_digest == [7; 32]
+    ));
+    for invalid in [
+        "PQ_EVENT_V1 event=RuntimeReady sequence=1 role=proposer startup=future slot=1 block_root=0x0101010101010101010101010101010101010101010101010101010101010101 execution_hash=0x0202020202020202020202020202020202020202020202020202020202020202 finalized_epoch=0 finalized_root=0x0303030303030303030303030303030303030303030303030303030303030303 signed_ssz_digest=0404040404040404040404040404040404040404040404040404040404040404",
+        "PQ_EVENT_V1 event=BlockPersisted sequence=1 role=verifier source=rpc slot=1 block_root=0x0505050505050505050505050505050505050505050505050505050505050505 execution_hash=0x0606060606060606060606060606060606060606060606060606060606060606 finalized_epoch=0 finalized_root=0x0303030303030303030303030303030303030303030303030303030303030303 signed_ssz_digest=0707070707070707070707070707070707070707070707070707070707070707",
+        "PQ_EVENT_V1 event=ProposalStarted sequence=1 role=proposer slot=01 parent_root=0x0505050505050505050505050505050505050505050505050505050505050505",
+        "PQ_EVENT_V1 event=ProposalPublished sequence=1 role=proposer slot=2 block_root=0x0505050505050505050505050505050505050505050505050505050505050505 signed_ssz_digest=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    ] {
+        assert!(
+            parse_pq_process_event(invalid).is_err(),
+            "accepted {invalid}"
+        );
+    }
+}
+
+#[test]
+fn three_slot_convergence_contract_is_exact_and_mutation_sensitive() {
+    fn status_prefix(role: PqProcessRole) -> Vec<PqProcessEvent> {
+        let peer_digest = [9; 16];
+        vec![
+            PqProcessEvent {
+                sequence: 1,
+                role,
+                kind: PqProcessEventKind::EventWriterReady,
+            },
+            PqProcessEvent {
+                sequence: 2,
+                role,
+                kind: PqProcessEventKind::RuntimeReady {
+                    startup: PqProcessStartup::Fresh,
+                    slot: 0,
+                    block_root: Hash256::repeat_byte(1),
+                    execution_hash: ExecutionBlockHash::zero(),
+                    finalized_epoch: 0,
+                    finalized_root: Hash256::ZERO,
+                    signed_ssz_digest: [2; 32],
+                },
+            },
+            PqProcessEvent {
+                sequence: 3,
+                role,
+                kind: PqProcessEventKind::PeerConnected {
+                    peer_digest,
+                    direction: PqProcessConnectionDirection::Incoming,
+                },
+            },
+            PqProcessEvent {
+                sequence: 4,
+                role,
+                kind: PqProcessEventKind::StatusSent {
+                    peer_digest,
+                    direction: PqProcessStatusDirection::Request,
+                },
+            },
+            PqProcessEvent {
+                sequence: 5,
+                role,
+                kind: PqProcessEventKind::StatusSent {
+                    peer_digest,
+                    direction: PqProcessStatusDirection::Response,
+                },
+            },
+            PqProcessEvent {
+                sequence: 6,
+                role,
+                kind: PqProcessEventKind::PeerCompatible { peer_digest },
+            },
+        ]
+    }
+
+    let mut proposer = status_prefix(PqProcessRole::Proposer);
+    let mut verifier = status_prefix(PqProcessRole::Verifier);
+    let mut proposer_engine = vec![];
+    let mut verifier_engine = vec![];
+    proposer_engine.push(MockEngineAuditEvent::ForkchoiceUpdated {
+        head_block_hash: ExecutionBlockHash::zero(),
+        safe_block_hash: ExecutionBlockHash::zero(),
+        finalized_block_hash: ExecutionBlockHash::zero(),
+        has_payload_attributes: false,
+    });
+    verifier_engine.push(MockEngineAuditEvent::ForkchoiceUpdated {
+        head_block_hash: ExecutionBlockHash::zero(),
+        safe_block_hash: ExecutionBlockHash::zero(),
+        finalized_block_hash: ExecutionBlockHash::zero(),
+        has_payload_attributes: false,
+    });
+    let mut parent_root = Hash256::repeat_byte(1);
+    let mut parent_execution_hash = ExecutionBlockHash::zero();
+    for slot in 1_u64..=3 {
+        let marker = u8::try_from(slot + 10).unwrap();
+        let block_root = Hash256::repeat_byte(marker);
+        let execution_hash = ExecutionBlockHash::repeat_byte(marker + 10);
+        let digest = [marker + 20; 32];
+        let proposer_sequence = u64::try_from(proposer.len() + 1).unwrap();
+        proposer.extend([
+            PqProcessEvent {
+                sequence: proposer_sequence,
+                role: PqProcessRole::Proposer,
+                kind: PqProcessEventKind::ProposalStarted { slot, parent_root },
+            },
+            PqProcessEvent {
+                sequence: proposer_sequence + 1,
+                role: PqProcessRole::Proposer,
+                kind: PqProcessEventKind::BlockPersisted {
+                    source: PqProcessBlockSource::Publish,
+                    slot,
+                    block_root,
+                    execution_hash,
+                    finalized_epoch: 0,
+                    finalized_root: Hash256::ZERO,
+                    signed_ssz_digest: digest,
+                },
+            },
+            PqProcessEvent {
+                sequence: proposer_sequence + 2,
+                role: PqProcessRole::Proposer,
+                kind: PqProcessEventKind::ExecutionReconciled {
+                    source: PqProcessBlockSource::Publish,
+                    slot,
+                    block_root,
+                    execution_hash,
+                    finalized_epoch: 0,
+                    finalized_root: Hash256::ZERO,
+                    signed_ssz_digest: digest,
+                },
+            },
+            PqProcessEvent {
+                sequence: proposer_sequence + 3,
+                role: PqProcessRole::Proposer,
+                kind: PqProcessEventKind::ProposalPublished {
+                    slot,
+                    block_root,
+                    signed_ssz_digest: digest,
+                },
+            },
+        ]);
+        let verifier_sequence = u64::try_from(verifier.len() + 1).unwrap();
+        verifier.extend([
+            PqProcessEvent {
+                sequence: verifier_sequence,
+                role: PqProcessRole::Verifier,
+                kind: PqProcessEventKind::BlockPersisted {
+                    source: PqProcessBlockSource::Gossip,
+                    slot,
+                    block_root,
+                    execution_hash,
+                    finalized_epoch: 0,
+                    finalized_root: Hash256::ZERO,
+                    signed_ssz_digest: digest,
+                },
+            },
+            PqProcessEvent {
+                sequence: verifier_sequence + 1,
+                role: PqProcessRole::Verifier,
+                kind: PqProcessEventKind::ExecutionReconciled {
+                    source: PqProcessBlockSource::Gossip,
+                    slot,
+                    block_root,
+                    execution_hash,
+                    finalized_epoch: 0,
+                    finalized_root: Hash256::ZERO,
+                    signed_ssz_digest: digest,
+                },
+            },
+            PqProcessEvent {
+                sequence: verifier_sequence + 2,
+                role: PqProcessRole::Verifier,
+                kind: PqProcessEventKind::GossipImported {
+                    slot,
+                    block_root,
+                    signed_ssz_digest: digest,
+                },
+            },
+        ]);
+        proposer_engine.extend([
+            MockEngineAuditEvent::ForkchoiceUpdated {
+                head_block_hash: parent_execution_hash,
+                safe_block_hash: ExecutionBlockHash::zero(),
+                finalized_block_hash: ExecutionBlockHash::zero(),
+                has_payload_attributes: true,
+            },
+            MockEngineAuditEvent::GetPayload {
+                block_hash: execution_hash,
+                blob_count: 0,
+            },
+            MockEngineAuditEvent::NewPayload {
+                block_hash: execution_hash,
+                blob_count: 0,
+            },
+            MockEngineAuditEvent::ForkchoiceUpdated {
+                head_block_hash: execution_hash,
+                safe_block_hash: ExecutionBlockHash::zero(),
+                finalized_block_hash: ExecutionBlockHash::zero(),
+                has_payload_attributes: false,
+            },
+        ]);
+        verifier_engine.extend([
+            MockEngineAuditEvent::NewPayload {
+                block_hash: execution_hash,
+                blob_count: 0,
+            },
+            MockEngineAuditEvent::ForkchoiceUpdated {
+                head_block_hash: execution_hash,
+                safe_block_hash: ExecutionBlockHash::zero(),
+                finalized_block_hash: ExecutionBlockHash::zero(),
+                has_payload_attributes: false,
+            },
+        ]);
+        parent_root = block_root;
+        parent_execution_hash = execution_hash;
+    }
+    validate_three_slot_process_convergence(
+        &proposer,
+        &verifier,
+        &proposer_engine,
+        &verifier_engine,
+    )
+    .expect("exact synthetic three-slot convergence");
+
+    let mut wrong_digest = verifier.clone();
+    if let PqProcessEventKind::GossipImported {
+        signed_ssz_digest, ..
+    } = &mut wrong_digest.last_mut().unwrap().kind
+    {
+        *signed_ssz_digest = [0xff; 32];
+    }
+    assert!(
+        validate_three_slot_process_convergence(
+            &proposer,
+            &wrong_digest,
+            &proposer_engine,
+            &verifier_engine,
+        )
+        .is_err()
+    );
+    let mut wrong_order = proposer.clone();
+    wrong_order.swap(7, 8);
+    assert!(
+        validate_three_slot_process_convergence(
+            &wrong_order,
+            &verifier,
+            &proposer_engine,
+            &verifier_engine,
+        )
+        .is_err()
+    );
+    let mut overlapping_slots = proposer.clone();
+    let first_publication = overlapping_slots[9].kind;
+    overlapping_slots[9].kind = overlapping_slots[10].kind;
+    overlapping_slots[10].kind = first_publication;
+    assert!(
+        validate_three_slot_process_convergence(
+            &overlapping_slots,
+            &verifier,
+            &proposer_engine,
+            &verifier_engine,
+        )
+        .is_err()
+    );
+    let mut skipped_slot = proposer.clone();
+    if let PqProcessEventKind::ProposalStarted { slot, .. } = &mut skipped_slot[10].kind {
+        *slot += 1;
+    }
+    assert!(
+        validate_three_slot_process_convergence(
+            &skipped_slot,
+            &verifier,
+            &proposer_engine,
+            &verifier_engine,
+        )
+        .is_err()
+    );
+    let mut blobbed = proposer_engine.clone();
+    if let MockEngineAuditEvent::GetPayload { blob_count, .. } = &mut blobbed[2] {
+        *blob_count = 1;
+    } else {
+        panic!("expected first proposer getPayload audit at index 2");
+    }
+    assert!(
+        validate_three_slot_process_convergence(&proposer, &verifier, &blobbed, &verifier_engine,)
+            .is_err()
+    );
+    let mut missing_attributes = proposer_engine.clone();
+    missing_attributes.remove(1);
+    assert!(
+        validate_three_slot_process_convergence(
+            &proposer,
+            &verifier,
+            &missing_attributes,
+            &verifier_engine,
+        )
+        .is_err()
+    );
+    let mut extra_attributes = proposer_engine.clone();
+    extra_attributes.insert(1, extra_attributes[1]);
+    assert!(
+        validate_three_slot_process_convergence(
+            &proposer,
+            &verifier,
+            &extra_attributes,
+            &verifier_engine,
+        )
+        .is_err()
+    );
+    let mut wrong_attributes = proposer_engine.clone();
+    if let MockEngineAuditEvent::ForkchoiceUpdated {
+        has_payload_attributes,
+        ..
+    } = &mut wrong_attributes[1]
+    {
+        *has_payload_attributes = false;
+    }
+    assert!(
+        validate_three_slot_process_convergence(
+            &proposer,
+            &verifier,
+            &wrong_attributes,
+            &verifier_engine,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn three_slot_wait_uses_a_checked_absolute_genesis_deadline() {
+    assert_eq!(
+        three_slot_wait_remaining(900, 0).unwrap(),
+        Duration::from_secs(2_085),
+        "genesis lead plus slot-3 boundary plus 285-second completion budget",
+    );
+    assert_eq!(
+        three_slot_wait_remaining(900, 2_084).unwrap(),
+        Duration::from_secs(1),
+    );
+    assert!(three_slot_wait_remaining(900, 2_085).is_err());
+    assert!(three_slot_wait_remaining(u64::MAX, 0).is_err());
+}
+
+#[test]
+fn restart_ready_deadline_is_checked_and_precedes_slot_five() {
+    assert_eq!(
+        restart_ready_remaining(0, 1_494).unwrap(),
+        Duration::from_secs(1),
+    );
+    assert!(restart_ready_remaining(0, 1_495).is_err());
+    assert!(restart_ready_remaining(0, 1_500).is_err());
+    assert!(restart_ready_remaining(u64::MAX, 0).is_err());
+}
+
+#[test]
+fn restart_idempotence_contract_is_exact_and_mutation_sensitive() {
+    let identity = PqProcessBlockIdentity {
+        slot: 3,
+        block_root: Hash256::repeat_byte(0x33),
+        execution_hash: ExecutionBlockHash::from_root(Hash256::repeat_byte(0x44)),
+        finalized_epoch: 0,
+        finalized_root: Hash256::ZERO,
+        signed_ssz_digest: [0x55; 32],
+    };
+    let events = |role| {
+        vec![
+            PqProcessEvent {
+                sequence: 1,
+                role,
+                kind: PqProcessEventKind::EventWriterReady,
+            },
+            PqProcessEvent {
+                sequence: 2,
+                role,
+                kind: PqProcessEventKind::RuntimeReady {
+                    startup: PqProcessStartup::Resume,
+                    slot: identity.slot,
+                    block_root: identity.block_root,
+                    execution_hash: identity.execution_hash,
+                    finalized_epoch: identity.finalized_epoch,
+                    finalized_root: identity.finalized_root,
+                    signed_ssz_digest: identity.signed_ssz_digest,
+                },
+            },
+        ]
+    };
+    let proposer = events(PqProcessRole::Proposer);
+    let verifier = events(PqProcessRole::Verifier);
+    let proposer_before = vec![MockEngineAuditEvent::ForkchoiceUpdated {
+        head_block_hash: identity.execution_hash,
+        safe_block_hash: ExecutionBlockHash::zero(),
+        finalized_block_hash: ExecutionBlockHash::zero(),
+        has_payload_attributes: false,
+    }];
+    let verifier_before = proposer_before.clone();
+    let mut proposer_after = proposer_before.clone();
+    proposer_after.push(MockEngineAuditEvent::ForkchoiceUpdated {
+        head_block_hash: identity.execution_hash,
+        safe_block_hash: ExecutionBlockHash::zero(),
+        finalized_block_hash: ExecutionBlockHash::zero(),
+        has_payload_attributes: false,
+    });
+    let verifier_after = proposer_after.clone();
+    validate_restart_idempotence(
+        &proposer,
+        &verifier,
+        identity,
+        &proposer_before,
+        &proposer_after,
+        &verifier_before,
+        &verifier_after,
+    )
+    .expect("exact resume is idempotent");
+
+    let mut wrong_digest = proposer.clone();
+    if let PqProcessEventKind::RuntimeReady {
+        signed_ssz_digest, ..
+    } = &mut wrong_digest[1].kind
+    {
+        *signed_ssz_digest = [0xff; 32];
+    }
+    assert!(
+        validate_restart_idempotence(
+            &wrong_digest,
+            &verifier,
+            identity,
+            &proposer_before,
+            &proposer_after,
+            &verifier_before,
+            &verifier_after,
+        )
+        .is_err()
+    );
+    let mut proposal_after_ready = proposer.clone();
+    proposal_after_ready.push(PqProcessEvent {
+        sequence: 3,
+        role: PqProcessRole::Proposer,
+        kind: PqProcessEventKind::ProposalStarted {
+            slot: 4,
+            parent_root: identity.block_root,
+        },
+    });
+    assert!(
+        validate_restart_idempotence(
+            &proposal_after_ready,
+            &verifier,
+            identity,
+            &proposer_before,
+            &proposer_after,
+            &verifier_before,
+            &verifier_after,
+        )
+        .is_err()
+    );
+
+    for mutation in [
+        PqProcessEventKind::RuntimeReady {
+            startup: PqProcessStartup::Fresh,
+            slot: identity.slot,
+            block_root: identity.block_root,
+            execution_hash: identity.execution_hash,
+            finalized_epoch: identity.finalized_epoch,
+            finalized_root: identity.finalized_root,
+            signed_ssz_digest: identity.signed_ssz_digest,
+        },
+        PqProcessEventKind::RuntimeReady {
+            startup: PqProcessStartup::Resume,
+            slot: identity.slot + 1,
+            block_root: identity.block_root,
+            execution_hash: identity.execution_hash,
+            finalized_epoch: identity.finalized_epoch,
+            finalized_root: identity.finalized_root,
+            signed_ssz_digest: identity.signed_ssz_digest,
+        },
+        PqProcessEventKind::RuntimeReady {
+            startup: PqProcessStartup::Resume,
+            slot: identity.slot,
+            block_root: Hash256::repeat_byte(0xee),
+            execution_hash: identity.execution_hash,
+            finalized_epoch: identity.finalized_epoch,
+            finalized_root: identity.finalized_root,
+            signed_ssz_digest: identity.signed_ssz_digest,
+        },
+        PqProcessEventKind::RuntimeReady {
+            startup: PqProcessStartup::Resume,
+            slot: identity.slot,
+            block_root: identity.block_root,
+            execution_hash: ExecutionBlockHash::from_root(Hash256::repeat_byte(0xee)),
+            finalized_epoch: identity.finalized_epoch,
+            finalized_root: identity.finalized_root,
+            signed_ssz_digest: identity.signed_ssz_digest,
+        },
+        PqProcessEventKind::RuntimeReady {
+            startup: PqProcessStartup::Resume,
+            slot: identity.slot,
+            block_root: identity.block_root,
+            execution_hash: identity.execution_hash,
+            finalized_epoch: 1,
+            finalized_root: Hash256::repeat_byte(0xee),
+            signed_ssz_digest: identity.signed_ssz_digest,
+        },
+    ] {
+        let mut mutated = proposer.clone();
+        mutated[1].kind = mutation;
+        assert!(
+            validate_restart_idempotence(
+                &mutated,
+                &verifier,
+                identity,
+                &proposer_before,
+                &proposer_after,
+                &verifier_before,
+                &verifier_after,
+            )
+            .is_err()
+        );
+    }
+
+    let mut proposal_race = proposer.clone();
+    proposal_race.insert(
+        1,
+        PqProcessEvent {
+            sequence: 2,
+            role: PqProcessRole::Proposer,
+            kind: PqProcessEventKind::ProposalStarted {
+                slot: 4,
+                parent_root: identity.block_root,
+            },
+        },
+    );
+    proposal_race[2].sequence = 3;
+    assert!(
+        validate_restart_idempotence(
+            &proposal_race,
+            &verifier,
+            identity,
+            &proposer_before,
+            &proposer_after,
+            &verifier_before,
+            &verifier_after,
+        )
+        .is_err()
+    );
+
+    let mut extra_engine_call = proposer_after.clone();
+    extra_engine_call.push(MockEngineAuditEvent::NewPayload {
+        block_hash: identity.execution_hash,
+        blob_count: 0,
+    });
+    assert!(
+        validate_restart_idempotence(
+            &proposer,
+            &verifier,
+            identity,
+            &proposer_before,
+            &extra_engine_call,
+            &verifier_before,
+            &verifier_after,
+        )
+        .is_err()
+    );
+
+    let mut wrong_replay = proposer_after.clone();
+    if let MockEngineAuditEvent::ForkchoiceUpdated {
+        head_block_hash, ..
+    } = wrong_replay.last_mut().expect("restart replay")
+    {
+        *head_block_hash = ExecutionBlockHash::zero();
+    }
+    assert!(
+        validate_restart_idempotence(
+            &proposer,
+            &verifier,
+            identity,
+            &proposer_before,
+            &wrong_replay,
+            &verifier_before,
+            &verifier_after,
+        )
+        .is_err()
+    );
+    assert!(
+        validate_restart_idempotence(
+            &proposer,
+            &verifier,
+            identity,
+            &proposer_before,
+            &proposer_before,
+            &verifier_before,
+            &verifier_after,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn pq_leveldb_lock_holder_process() {
+    let Some(path) = std::env::var_os(PQ_LEVELDB_LOCK_PATH_ENV) else {
+        return;
+    };
+    let ready =
+        std::env::var_os(PQ_LEVELDB_LOCK_READY_ENV).expect("LevelDB lock-holder ready path");
+    let database = store::database::interface::BeaconNodeBackend::open(
+        &store::StoreConfig::default(),
+        Path::new(&path),
+    )
+    .expect("hold LevelDB in helper process");
+    File::create(ready).expect("publish LevelDB lock-holder readiness");
+    let mut stop = [0];
+    std::io::stdin()
+        .read_exact(&mut stop)
+        .expect("wait for parent stop");
+    drop(database);
+}
+
+#[test]
+fn pq_sqlite_lock_holder_process() {
+    let Some(path) = std::env::var_os(PQ_SQLITE_LOCK_PATH_ENV) else {
+        return;
+    };
+    let ready = std::env::var_os(PQ_SQLITE_LOCK_READY_ENV).expect("SQLite lock-holder ready path");
+    let connection = Connection::open_with_flags(
+        Path::new(&path),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .expect("open SQLite in helper process");
+    connection
+        .busy_timeout(Duration::from_millis(100))
+        .expect("bounded SQLite lock-holder timeout");
+    connection
+        .pragma_update(None, "locking_mode", "EXCLUSIVE")
+        .expect("exclusive SQLite lock-holder mode");
+    connection
+        .execute_batch("BEGIN EXCLUSIVE;")
+        .expect("hold SQLite transaction in helper process");
+    File::create(ready).expect("publish SQLite lock-holder readiness");
+    let mut stop = [0];
+    std::io::stdin()
+        .read_exact(&mut stop)
+        .expect("wait for parent stop");
+    connection
+        .execute_batch("ROLLBACK;")
+        .expect("release SQLite helper transaction");
+}
+
+#[test]
+fn restart_resource_probe_is_mutation_sensitive() {
+    let held_tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("held TCP listener");
+    let held_tcp_port = held_tcp.local_addr().expect("held TCP address").port();
+    let held_udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("held UDP socket");
+    let held_udp_port = held_udp.local_addr().expect("held UDP address").port();
+    assert!(probe_network_ports_released(&[held_tcp_port], &[held_udp_port]).is_err());
+    drop(held_tcp);
+    drop(held_udp);
+    probe_network_ports_released(&[held_tcp_port], &[held_udp_port])
+        .expect("stopped runtime releases its network listeners");
+
+    let data_dir = tempfile::tempdir().expect("store resource probe");
+    let config = store::StoreConfig::default();
+    for name in ["chain_db", "freezer_db", "blobs_db"] {
+        drop(
+            store::database::interface::BeaconNodeBackend::open(
+                &config,
+                &data_dir.path().join(name),
+            )
+            .expect("closed direct-root decoy store"),
+        );
+    }
+    let actual_data_dir = data_dir.path().join(directory::DEFAULT_BEACON_NODE_DIR);
+    fs::create_dir(&actual_data_dir).expect("actual beacon-node data directory");
+    let actual_paths = pq_store_paths(data_dir.path());
+    for path in &actual_paths {
+        drop(
+            store::database::interface::BeaconNodeBackend::open(&config, path)
+                .expect("closed real chain store"),
+        );
+    }
+    for (index, path) in actual_paths.iter().enumerate() {
+        let ready = data_dir.path().join(format!("leveldb-lock-ready-{index}"));
+        let held_store = HeldLevelDbProcess::spawn(path, &ready)
+            .expect("held real chain store in an independent process");
+        assert!(
+            probe_chain_store_released(data_dir.path()).is_err(),
+            "a held {} store must be detected",
+            path.file_name().expect("store basename").to_string_lossy(),
+        );
+        held_store.stop().expect("stop LevelDB lock holder");
+        probe_chain_store_released(data_dir.path())
+            .expect("released individual store permits exact inspection");
+    }
+    probe_chain_store_released(data_dir.path())
+        .expect("stopped runtime releases all three chain databases");
+}
+
+#[test]
+fn chain_store_probe_rejects_wrong_or_missing_effective_paths_without_creating() {
+    let cli_data_dir = tempfile::tempdir().expect("missing store resource probe");
+    let config = store::StoreConfig::default();
+    for name in ["chain_db", "freezer_db", "blobs_db"] {
+        drop(
+            store::database::interface::BeaconNodeBackend::open(
+                &config,
+                &cli_data_dir.path().join(name),
+            )
+            .expect("closed wrong-root decoy store"),
+        );
+    }
+    fs::create_dir(pq_node_data_dir(cli_data_dir.path()))
+        .expect("existing effective beacon data directory");
+    let effective_paths = pq_store_paths(cli_data_dir.path());
+    assert!(probe_chain_store_released(cli_data_dir.path()).is_err());
+    assert!(
+        effective_paths.iter().all(|path| !path.exists()),
+        "a release probe must never create missing effective store directories",
+    );
+}
+
+#[test]
+fn chain_store_probe_rejects_empty_decoys_without_creating_leveldb_identity() {
+    let cli_data_dir = tempfile::tempdir().expect("empty store resource probe");
+    fs::create_dir(pq_node_data_dir(cli_data_dir.path()))
+        .expect("existing effective beacon data directory");
+    let effective_paths = pq_store_paths(cli_data_dir.path());
+    for path in &effective_paths {
+        fs::create_dir(path).expect("empty decoy store directory");
+    }
+
+    assert!(probe_chain_store_released(cli_data_dir.path()).is_err());
+    for path in &effective_paths {
+        assert!(
+            fs::read_dir(path)
+                .expect("read unchanged empty store")
+                .next()
+                .is_none(),
+            "release inspection must not initialize an empty store directory",
+        );
+    }
+}
+
+#[test]
+fn chain_store_probe_rejects_effective_beacon_directory_symlink() {
+    let cli_data_dir = tempfile::tempdir().expect("beacon symlink store probe");
+    let actual_beacon = cli_data_dir.path().join("actual-beacon");
+    fs::create_dir(&actual_beacon).expect("actual beacon store parent");
+    let config = store::StoreConfig::default();
+    for name in ["chain_db", "freezer_db", "blobs_db"] {
+        drop(
+            store::database::interface::BeaconNodeBackend::open(&config, &actual_beacon.join(name))
+                .expect("closed substituted chain store"),
+        );
+    }
+    std::os::unix::fs::symlink(&actual_beacon, pq_node_data_dir(cli_data_dir.path()))
+        .expect("substitute effective beacon directory symlink");
+
+    assert!(probe_chain_store_released(cli_data_dir.path()).is_err());
+}
+
+#[test]
+fn chain_store_probe_opens_validated_directory_after_path_replacement() {
+    let cli_data_dir = tempfile::tempdir().expect("interposed store resource probe");
+    fs::create_dir(pq_node_data_dir(cli_data_dir.path())).expect("effective beacon data directory");
+    let config = store::StoreConfig::default();
+    let paths = pq_store_paths(cli_data_dir.path());
+    for path in &paths {
+        drop(
+            store::database::interface::BeaconNodeBackend::open(&config, path)
+                .expect("closed validated store"),
+        );
+    }
+    let replacement = pq_node_data_dir(cli_data_dir.path()).join("replacement-chain");
+    drop(
+        store::database::interface::BeaconNodeBackend::open(&config, &replacement)
+            .expect("closed replacement store"),
+    );
+    fs::write(replacement.join("CURRENT"), b"MALFORMED\n")
+        .expect("corrupt replacement store identity");
+    let original = paths[0].with_extension("original");
+    let displaced_replacement = replacement.with_extension("displaced");
+    let before_path = paths[0].clone();
+    let before_original = original.clone();
+    let before_replacement = replacement.clone();
+    let after_path = paths[0].clone();
+    let after_original = original.clone();
+    let after_displaced = displaced_replacement.clone();
+
+    probe_chain_store_released_with_hooks(
+        cli_data_dir.path(),
+        move || {
+            fs::rename(&before_path, &before_original).expect("retain validated store inode");
+            fs::rename(&before_replacement, &before_path)
+                .expect("interpose held replacement store");
+        },
+        move || {
+            fs::rename(&after_path, &after_displaced).expect("displace replacement store");
+            fs::rename(&after_original, &after_path).expect("restore validated store binding");
+        },
+    )
+    .expect("backend opens the held validated directory rather than its replaced pathname");
+}
+
+#[test]
+fn chain_store_probe_rejects_malformed_leveldb_identity() {
+    let create = || {
+        let root = tempfile::tempdir().expect("malformed LevelDB identity root");
+        fs::create_dir(pq_node_data_dir(root.path())).expect("effective beacon data directory");
+        let paths = pq_store_paths(root.path());
+        let config = store::StoreConfig::default();
+        for path in &paths {
+            drop(
+                store::database::interface::BeaconNodeBackend::open(&config, path)
+                    .expect("closed real chain store"),
+            );
+        }
+        (root, paths)
+    };
+
+    let (root, paths) = create();
+    File::create(paths[0].join("CURRENT")).expect("truncate CURRENT");
+    assert!(probe_chain_store_released(root.path()).is_err());
+
+    let (root, paths) = create();
+    fs::write(paths[1].join("CURRENT"), b"../MANIFEST-000001\n").expect("write unsafe CURRENT");
+    assert!(probe_chain_store_released(root.path()).is_err());
+
+    let (root, paths) = create();
+    let manifest = fs::read_to_string(paths[2].join("CURRENT"))
+        .expect("read current manifest")
+        .trim_end_matches('\n')
+        .to_owned();
+    File::create(paths[2].join(manifest)).expect("truncate manifest");
+    assert!(probe_chain_store_released(root.path()).is_err());
+
+    let (root, paths) = create();
+    fs::hard_link(paths[0].join("LOCK"), paths[0].join("LOCK.extra"))
+        .expect("add LevelDB LOCK hard link");
+    assert!(probe_chain_store_released(root.path()).is_err());
+
+    let (root, paths) = create();
+    fs::set_permissions(paths[1].join("LOCK"), fs::Permissions::from_mode(0o666))
+        .expect("weaken LevelDB LOCK mode");
+    assert!(probe_chain_store_released(root.path()).is_err());
+}
+
+#[test]
+fn chain_store_probe_rejects_unsafe_type_mode_and_symlink() {
+    let create = || {
+        let root = tempfile::tempdir().expect("mutated store resource probe");
+        fs::create_dir(pq_node_data_dir(root.path())).expect("effective beacon data directory");
+        let paths = pq_store_paths(root.path());
+        let config = store::StoreConfig::default();
+        for path in &paths {
+            drop(
+                store::database::interface::BeaconNodeBackend::open(&config, path)
+                    .expect("closed real chain store"),
+            );
+        }
+        (root, paths)
+    };
+
+    let (root, paths) = create();
+    fs::set_permissions(&paths[0], fs::Permissions::from_mode(0o777))
+        .expect("weaken chain store mode");
+    assert!(probe_chain_store_released(root.path()).is_err());
+
+    let (root, paths) = create();
+    let original = paths[1].with_extension("original");
+    fs::rename(&paths[1], &original).expect("retain freezer store");
+    std::os::unix::fs::symlink(&original, &paths[1]).expect("substitute freezer symlink");
+    assert!(probe_chain_store_released(root.path()).is_err());
+
+    let (root, paths) = create();
+    fs::remove_dir_all(&paths[2]).expect("remove blobs store directory");
+    File::create(&paths[2]).expect("substitute blobs store file");
+    assert!(probe_chain_store_released(root.path()).is_err());
+    assert!(
+        paths[2].is_file(),
+        "release inspection must never replace an invalid store path",
+    );
+}
+
+const PROBE_SLASHING_SCHEMA: &str = "CREATE TABLE validators (
+        id INTEGER PRIMARY KEY,
+        public_key BLOB NOT NULL UNIQUE,
+        enabled BOOL NOT NULL DEFAULT TRUE
+    );
+    CREATE TABLE signed_blocks (
+        validator_id INTEGER NOT NULL,
+        slot INTEGER NOT NULL,
+        signing_root BLOB NOT NULL,
+        FOREIGN KEY(validator_id) REFERENCES validators(id),
+        UNIQUE (validator_id, slot)
+    );
+    CREATE TABLE signed_attestations (
+        validator_id INTEGER,
+        source_epoch INTEGER NOT NULL,
+        target_epoch INTEGER NOT NULL,
+        signing_root BLOB NOT NULL,
+        FOREIGN KEY(validator_id) REFERENCES validators(id),
+        UNIQUE (validator_id, target_epoch)
+    );";
+
+fn create_probe_slashing_database_with_schema(path: &Path, schema: &str) -> Connection {
+    fs::create_dir_all(path.parent().expect("slashing DB parent"))
+        .expect("create slashing DB parent");
+    let connection = Connection::open(path).expect("create probe slashing DB");
+    connection
+        .execute_batch(schema)
+        .expect("create exact slashing schema");
+    for index in 0_u8..16 {
+        connection
+            .execute(
+                "INSERT INTO validators (public_key, enabled) VALUES (?1, TRUE)",
+                params![vec![index; 32]],
+            )
+            .expect("register probe validator");
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("private slashing DB mode");
+    connection
+}
+
+fn create_probe_slashing_database(path: &Path) -> Connection {
+    create_probe_slashing_database_with_schema(path, PROBE_SLASHING_SCHEMA)
+}
+
+#[test]
+fn proposer_slashing_probe_uses_real_cli_path_and_never_creates() {
+    let cli_data_dir = tempfile::tempdir().expect("slashing resource probe");
+    let direct_decoy = cli_data_dir
+        .path()
+        .join("pq-proposer/slashing_protection.sqlite");
+    drop(create_probe_slashing_database(&direct_decoy));
+    let decoy_inventory = || {
+        let mut entries = fs::read_dir(direct_decoy.parent().expect("direct decoy parent"))
+            .expect("read direct decoy directory")
+            .map(|entry| {
+                let entry = entry.expect("read direct decoy entry");
+                (
+                    entry.file_name(),
+                    entry.metadata().expect("inspect direct decoy entry").len(),
+                )
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
+    };
+    let decoy_before = decoy_inventory();
+    let real_path =
+        pq_node_data_dir(cli_data_dir.path()).join("pq-proposer/slashing_protection.sqlite");
+    drop(create_probe_slashing_database(&real_path));
+    let ready = cli_data_dir.path().join("sqlite-lock-ready");
+    let held = HeldSqliteProcess::spawn(&real_path, &ready)
+        .expect("hold real proposer DB in an independent process");
+
+    let blocked_probe_started = Instant::now();
+    assert!(probe_slashing_db_released(cli_data_dir.path()).is_err());
+    assert!(
+        blocked_probe_started.elapsed() < Duration::from_secs(2),
+        "cross-process SQLite lock detection must honor its bounded busy timeout",
+    );
+    held.stop().expect("stop SQLite lock holder");
+    probe_slashing_db_released(cli_data_dir.path())
+        .expect("stopped runtime releases exact proposer SQLite ownership");
+    assert_eq!(
+        decoy_inventory(),
+        decoy_before,
+        "release inspection must not create or mutate direct-root decoy files",
+    );
+
+    let absent = tempfile::tempdir().expect("absent slashing DB root");
+    assert!(probe_slashing_db_released(absent.path()).is_err());
+    assert!(
+        !pq_node_data_dir(absent.path())
+            .join("pq-proposer/slashing_protection.sqlite")
+            .exists(),
+        "release inspection must never create an absent database",
+    );
+}
+
+#[test]
+fn proposer_slashing_probe_rejects_inode_schema_and_registration_mutations() {
+    let create = || {
+        let root = tempfile::tempdir().expect("mutated proposer DB root");
+        let path = pq_node_data_dir(root.path()).join("pq-proposer/slashing_protection.sqlite");
+        let connection = create_probe_slashing_database(&path);
+        (root, path, connection)
+    };
+
+    let (_root, _path, connection) = create();
+    connection
+        .execute("DELETE FROM validators WHERE id = 16", [])
+        .expect("remove one validator registration");
+    drop(connection);
+    assert!(probe_slashing_db_released(_root.path()).is_err());
+
+    let (_root, _path, connection) = create();
+    connection
+        .execute("CREATE TABLE unexpected_state (id INTEGER)", [])
+        .expect("add unexpected schema");
+    drop(connection);
+    assert!(probe_slashing_db_released(_root.path()).is_err());
+
+    let (_root, _path, connection) = create();
+    connection
+        .execute("ALTER TABLE validators ADD COLUMN unexpected INTEGER", [])
+        .expect("mutate validator schema");
+    drop(connection);
+    assert!(probe_slashing_db_released(_root.path()).is_err());
+
+    let (_root, path, connection) = create();
+    drop(connection);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("weaken proposer DB mode");
+    assert!(probe_slashing_db_released(_root.path()).is_err());
+
+    let (_root, path, connection) = create();
+    drop(connection);
+    fs::hard_link(&path, path.with_extension("hardlink")).expect("add proposer DB hard link");
+    assert!(probe_slashing_db_released(_root.path()).is_err());
+
+    let root = tempfile::tempdir().expect("empty proposer DB root");
+    let path = pq_node_data_dir(root.path()).join("pq-proposer/slashing_protection.sqlite");
+    fs::create_dir_all(path.parent().expect("empty proposer DB parent"))
+        .expect("create empty proposer DB parent");
+    File::create(&path).expect("create empty proposer DB");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("empty proposer DB mode");
+    assert!(probe_slashing_db_released(root.path()).is_err());
+
+    let root = tempfile::tempdir().expect("symlink proposer DB root");
+    let proposer_dir = pq_node_data_dir(root.path()).join("pq-proposer");
+    fs::create_dir_all(&proposer_dir).expect("symlink proposer DB parent");
+    let target = proposer_dir.join("target.sqlite");
+    drop(create_probe_slashing_database(&target));
+    std::os::unix::fs::symlink(&target, proposer_dir.join("slashing_protection.sqlite"))
+        .expect("symlink proposer DB");
+    assert!(probe_slashing_db_released(root.path()).is_err());
+}
+
+#[test]
+fn proposer_slashing_probe_rejects_parent_directory_symlink_substitution() {
+    let root = tempfile::tempdir().expect("symlink beacon directory root");
+    let actual_beacon = root.path().join("actual-beacon");
+    let actual_db = actual_beacon.join("pq-proposer/slashing_protection.sqlite");
+    drop(create_probe_slashing_database(&actual_db));
+    std::os::unix::fs::symlink(&actual_beacon, pq_node_data_dir(root.path()))
+        .expect("substitute beacon directory symlink");
+    assert!(probe_slashing_db_released(root.path()).is_err());
+
+    let root = tempfile::tempdir().expect("symlink proposer directory root");
+    let beacon = pq_node_data_dir(root.path());
+    fs::create_dir(&beacon).expect("real beacon directory");
+    let actual_proposer = root.path().join("actual-proposer");
+    let actual_db = actual_proposer.join("slashing_protection.sqlite");
+    drop(create_probe_slashing_database(&actual_db));
+    std::os::unix::fs::symlink(&actual_proposer, beacon.join("pq-proposer"))
+        .expect("substitute proposer directory symlink");
+    assert!(probe_slashing_db_released(root.path()).is_err());
+
+    let root = tempfile::tempdir().expect("unsafe beacon directory root");
+    let path = pq_node_data_dir(root.path()).join("pq-proposer/slashing_protection.sqlite");
+    drop(create_probe_slashing_database(&path));
+    fs::set_permissions(
+        pq_node_data_dir(root.path()),
+        fs::Permissions::from_mode(0o777),
+    )
+    .expect("weaken beacon directory mode");
+    assert!(probe_slashing_db_released(root.path()).is_err());
+
+    let root = tempfile::tempdir().expect("unsafe proposer directory root");
+    let path = pq_node_data_dir(root.path()).join("pq-proposer/slashing_protection.sqlite");
+    drop(create_probe_slashing_database(&path));
+    fs::set_permissions(
+        path.parent().expect("proposer directory"),
+        fs::Permissions::from_mode(0o777),
+    )
+    .expect("weaken proposer directory mode");
+    assert!(probe_slashing_db_released(root.path()).is_err());
+}
+
+#[test]
+fn proposer_slashing_probe_opens_validated_parent_after_path_replacement() {
+    let root = tempfile::tempdir().expect("interposed proposer parent root");
+    let proposer = pq_node_data_dir(root.path()).join("pq-proposer");
+    let path = proposer.join("slashing_protection.sqlite");
+    drop(create_probe_slashing_database(&path));
+    let original = proposer.with_extension("original");
+    let replacement = proposer.with_extension("replacement");
+    fs::create_dir(&replacement).expect("replacement proposer directory");
+    let replacement_db = replacement.join("slashing_protection.sqlite");
+    File::create(&replacement_db).expect("empty replacement proposer DB");
+    fs::set_permissions(&replacement_db, fs::Permissions::from_mode(0o600))
+        .expect("private replacement proposer DB");
+    let displaced_replacement = replacement.with_extension("displaced");
+    let proposer_before = proposer.clone();
+    let original_before = original.clone();
+    let replacement_before = replacement.clone();
+    let proposer_after = proposer.clone();
+    let original_after = original.clone();
+    let displaced_after = displaced_replacement.clone();
+
+    probe_slashing_db_released_with_parent_hooks(
+        root.path(),
+        move || {
+            fs::rename(&proposer_before, &original_before)
+                .expect("retain validated proposer directory");
+            fs::rename(&replacement_before, &proposer_before)
+                .expect("interpose replacement proposer directory");
+        },
+        move || {
+            fs::rename(&proposer_after, &displaced_after)
+                .expect("displace replacement proposer directory");
+            fs::rename(&original_after, &proposer_after)
+                .expect("restore validated proposer directory");
+        },
+    )
+    .expect("SQLite inspection remains anchored to the held proposer directory");
+}
+
+#[test]
+fn proposer_slashing_probe_retains_validated_inode_after_interposed_symlink() {
+    let root = tempfile::tempdir().expect("SQLite symlink-swap root");
+    let path = pq_node_data_dir(root.path()).join("pq-proposer/slashing_protection.sqlite");
+    drop(create_probe_slashing_database(&path));
+    let backup = path.with_extension("original");
+    let replacement = path.with_extension("replacement");
+    File::create(&replacement).expect("empty replacement proposer DB");
+    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600))
+        .expect("private replacement proposer DB");
+
+    let path_before_open = path.clone();
+    let backup_before_open = backup.clone();
+    let replacement_before_open = replacement.clone();
+    let path_after_open = path.clone();
+    let backup_after_open = backup.clone();
+    probe_slashing_db_released_with_hooks(
+        root.path(),
+        move || {
+            fs::rename(&path_before_open, &backup_before_open)
+                .expect("retain validated original proposer DB");
+            std::os::unix::fs::symlink(&replacement_before_open, &path_before_open)
+                .expect("interpose proposer DB symlink");
+        },
+        move || {
+            fs::remove_file(&path_after_open).expect("remove interposed proposer DB symlink");
+            fs::rename(&backup_after_open, &path_after_open)
+                .expect("restore validated original proposer DB");
+        },
+    )
+    .expect("SQLite must retain the validated file inode across final-name replacement");
+}
+
+#[test]
+fn proposer_slashing_probe_rejects_missing_unique_and_foreign_key_constraints() {
+    let mutations = [
+        PROBE_SLASHING_SCHEMA.replace(
+            "public_key BLOB NOT NULL UNIQUE",
+            "public_key BLOB NOT NULL",
+        ),
+        PROBE_SLASHING_SCHEMA.replace("UNIQUE (validator_id, slot)", "CHECK (validator_id >= 0)"),
+        PROBE_SLASHING_SCHEMA.replace(
+            "UNIQUE (validator_id, target_epoch)",
+            "CHECK (validator_id >= 0)",
+        ),
+        PROBE_SLASHING_SCHEMA.replacen(
+            "FOREIGN KEY(validator_id) REFERENCES validators(id),",
+            "",
+            1,
+        ),
+        PROBE_SLASHING_SCHEMA
+            .rsplit_once("FOREIGN KEY(validator_id) REFERENCES validators(id),")
+            .map(|(prefix, suffix)| format!("{prefix}{suffix}"))
+            .expect("attestation foreign-key schema mutation"),
+    ];
+    for schema in mutations {
+        let root = tempfile::tempdir().expect("constraint mutation root");
+        let path = pq_node_data_dir(root.path()).join("pq-proposer/slashing_protection.sqlite");
+        drop(create_probe_slashing_database_with_schema(&path, &schema));
+        probe_slashing_db_released(root.path())
+            .expect_err("slashing-critical schema constraint mutation must be rejected");
+    }
 }
 
 #[tokio::test]
@@ -2484,6 +5288,7 @@ async fn two_real_processes_emit_compatible_status_before_any_proposal() {
     );
     assert_ne!(proposer_engine.url(), verifier_engine.url());
     for engine in [&proposer_engine, &verifier_engine] {
+        engine.enable_engine_audit();
         engine.full_payload_verification();
         engine
             .execution_block_generator()
@@ -2524,18 +5329,45 @@ async fn two_real_processes_emit_compatible_status_before_any_proposal() {
     assert_eq!(parsed_proposer_enr.ip4(), Some(Ipv4Addr::LOCALHOST));
     assert_eq!(parsed_proposer_enr.tcp4(), Some(proposer_tcp));
     assert_eq!(parsed_proposer_enr.udp4(), Some(proposer_udp));
-    assert_eq!(
-        proposer.wait_for_event_count(1, STATUS_EVENT_TIMEOUT).await,
-        vec![PqProcessEvent {
+    let proposer_role = if verifier_only_diagnostic {
+        PqProcessRole::Verifier
+    } else {
+        PqProcessRole::Proposer
+    };
+    let proposer_ready = proposer
+        .wait_for_event_kind_count(1, PROCESS_START_TIMEOUT, |event| {
+            matches!(event, PqProcessEventKind::RuntimeReady { .. })
+        })
+        .await;
+    assert!(matches!(
+        proposer_ready.first(),
+        Some(PqProcessEvent {
             sequence: 1,
-            role: if verifier_only_diagnostic {
-                PqProcessRole::Verifier
-            } else {
-                PqProcessRole::Proposer
-            },
+            role,
             kind: PqProcessEventKind::EventWriterReady,
-        }]
-    );
+        }) if *role == proposer_role
+    ));
+    let ready = proposer_ready
+        .iter()
+        .filter(|event| matches!(event.kind, PqProcessEventKind::RuntimeReady { .. }))
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        ready.as_slice(),
+        [PqProcessEvent {
+            role,
+            kind: PqProcessEventKind::RuntimeReady {
+                startup: PqProcessStartup::Fresh,
+                slot: 0,
+                execution_hash,
+                finalized_epoch: 0,
+                finalized_root,
+                ..
+            },
+            ..
+        }] if *role == proposer_role
+            && *execution_hash == ExecutionBlockHash::zero()
+            && *finalized_root == Hash256::ZERO
+    ));
 
     let verifier_args = node_args(
         &fixture.verifier_data,
@@ -2560,15 +5392,11 @@ async fn two_real_processes_emit_compatible_status_before_any_proposal() {
     assert_eq!(parsed_verifier_enr.tcp4(), Some(verifier_tcp));
     assert_eq!(parsed_verifier_enr.udp4(), Some(verifier_udp));
 
-    let proposer_events = proposer.wait_for_event_count(5, STATUS_EVENT_TIMEOUT).await;
-    let verifier_events = verifier.wait_for_event_count(5, STATUS_EVENT_TIMEOUT).await;
+    let proposer_events = proposer.wait_for_event_count(6, STATUS_EVENT_TIMEOUT).await;
+    let verifier_events = verifier.wait_for_event_count(6, STATUS_EVENT_TIMEOUT).await;
     validate_compatible_event_trace(
         &proposer_events,
-        if verifier_only_diagnostic {
-            PqProcessRole::Verifier
-        } else {
-            PqProcessRole::Proposer
-        },
+        proposer_role,
         PqProcessConnectionDirection::Incoming,
         peer_digest_from_enr(&parsed_verifier_enr),
     )
@@ -2581,6 +5409,129 @@ async fn two_real_processes_emit_compatible_status_before_any_proposal() {
     )
     .expect("exact verifier-compatible event topology");
 
-    verifier.stop().await;
-    proposer.stop().await;
+    if !verifier_only_diagnostic {
+        let proposer_timeout = three_slot_wait_remaining(
+            fixture.genesis_time,
+            unix_time_now().expect("three-slot proposer wait clock"),
+        )
+        .expect("third proposal remains inside its absolute completion deadline");
+        let proposer_events = proposer
+            .wait_for_event_kind_count(3, proposer_timeout, |event| {
+                matches!(event, PqProcessEventKind::ProposalPublished { .. })
+            })
+            .await;
+        let verifier_timeout = three_slot_wait_remaining(
+            fixture.genesis_time,
+            unix_time_now().expect("three-slot verifier wait clock"),
+        )
+        .expect("third gossip import remains inside the shared absolute completion deadline");
+        let verifier_events = verifier
+            .wait_for_event_kind_count(3, verifier_timeout, |event| {
+                matches!(event, PqProcessEventKind::GossipImported { .. })
+            })
+            .await;
+        let proposer_engine_history = proposer_engine
+            .engine_audit_history()
+            .expect("bounded proposer Engine audit");
+        let verifier_engine_history = verifier_engine
+            .engine_audit_history()
+            .expect("bounded verifier Engine audit");
+        validate_three_slot_process_convergence(
+            &proposer_events,
+            &verifier_events,
+            &proposer_engine_history,
+            &verifier_engine_history,
+        )
+        .expect("exact three-slot process convergence and Engine histories");
+        let persisted = proposer_events
+            .iter()
+            .filter_map(|event| {
+                persisted_identity(
+                    event,
+                    PqProcessRole::Proposer,
+                    PqProcessBlockSource::Publish,
+                )
+            })
+            .last()
+            .expect("slot-3 persisted identity");
+        assert_eq!(persisted.slot, THREE_SLOT_TARGET);
+
+        let (_, _) = tokio::join!(verifier.stop(), proposer.stop());
+        probe_network_ports_released(&[proposer_tcp, verifier_tcp], &[proposer_udp, verifier_udp])
+            .expect("first shutdown releases exact network listeners before restart");
+
+        let mut proposer = ChildNode::spawn("restarted-proposer", &proposer_args);
+        let mut verifier = ChildNode::spawn("restarted-verifier", &verifier_args);
+        let restart_timeout = restart_ready_remaining_precise(
+            fixture.genesis_time,
+            unix_time_now_precise().expect("restart-ready deadline clock"),
+        )
+        .expect("restart retains a checked pre-slot-5 stop margin");
+        let restart_deadline = Instant::now()
+            .checked_add(restart_timeout)
+            .expect("bounded monotonic restart-ready deadline");
+        let (proposer_ready_snapshot, verifier_ready_snapshot) = tokio::join!(
+            proposer.wait_for_event_kind_count_until(1, restart_deadline, |event| {
+                matches!(event, PqProcessEventKind::RuntimeReady { .. })
+            }),
+            verifier.wait_for_event_kind_count_until(1, restart_deadline, |event| {
+                matches!(event, PqProcessEventKind::RuntimeReady { .. })
+            }),
+        );
+        proposer.signal_interrupt();
+        verifier.signal_interrupt();
+        let proposer_restart_log = Arc::clone(&proposer.log);
+        let verifier_restart_log = Arc::clone(&verifier.log);
+        let (_, _) = tokio::join!(
+            verifier.finish_stop_after_signal(),
+            proposer.finish_stop_after_signal()
+        );
+        let restarted_proposer_enr = String::from_utf8(
+            open_bounded_regular_nofollow(&fixture.proposer_network.join("enr.dat"), MAX_ENR_BYTES)
+                .expect("bounded restarted proposer ENR"),
+        )
+        .expect("UTF-8 restarted proposer ENR");
+        let restarted_verifier_enr = String::from_utf8(
+            open_bounded_regular_nofollow(&fixture.verifier_network.join("enr.dat"), MAX_ENR_BYTES)
+                .expect("bounded restarted verifier ENR"),
+        )
+        .expect("UTF-8 restarted verifier ENR");
+        assert_eq!(restarted_proposer_enr.trim(), proposer_enr);
+        assert_eq!(restarted_verifier_enr.trim(), verifier_enr);
+
+        let proposer_restart_events = proposer_restart_log
+            .events()
+            .expect("exact restarted proposer event stream");
+        let verifier_restart_events = verifier_restart_log
+            .events()
+            .expect("exact restarted verifier event stream");
+        assert!(proposer_restart_events.starts_with(&proposer_ready_snapshot));
+        assert!(verifier_restart_events.starts_with(&verifier_ready_snapshot));
+        let proposer_engine_after_restart = proposer_engine
+            .engine_audit_history()
+            .expect("bounded proposer Engine audit after restart");
+        let verifier_engine_after_restart = verifier_engine
+            .engine_audit_history()
+            .expect("bounded verifier Engine audit after restart");
+        validate_restart_idempotence(
+            &proposer_restart_events,
+            &verifier_restart_events,
+            persisted,
+            &proposer_engine_history,
+            &proposer_engine_after_restart,
+            &verifier_engine_history,
+            &verifier_engine_after_restart,
+        )
+        .expect("restart replays exactly the persisted slot-3 execution view");
+        probe_network_ports_released(&[proposer_tcp, verifier_tcp], &[proposer_udp, verifier_udp])
+            .expect("second shutdown releases exact network listeners");
+        probe_slashing_db_released(&fixture.proposer_data)
+            .expect("second shutdown releases exact proposer SQLite ownership");
+        probe_chain_store_released(&fixture.proposer_data)
+            .expect("second shutdown releases proposer chain databases");
+        probe_chain_store_released(&fixture.verifier_data)
+            .expect("second shutdown releases verifier chain databases");
+    } else {
+        let (_, _) = tokio::join!(verifier.stop(), proposer.stop());
+    }
 }

@@ -351,6 +351,7 @@ pub enum PqBlockProductionLocalError {
     LocalBlock(PqLocalBlockError),
     Transition(PqTransitionError),
     Execution(execution_layer::Error),
+    OperationalEvent(crate::PqOperationalEventError),
     Invariant(&'static str),
 }
 
@@ -421,6 +422,7 @@ impl Error for PqBlockProductionError {
             Self::Local(PqBlockProductionLocalError::Consensus(error)) => Some(error),
             Self::Local(PqBlockProductionLocalError::LocalBlock(error)) => Some(error),
             Self::Local(PqBlockProductionLocalError::Transition(error)) => Some(error),
+            Self::Local(PqBlockProductionLocalError::OperationalEvent(error)) => Some(error),
             Self::InitialFutureSlot { .. }
             | Self::InitialPastSlot { .. }
             | Self::AtOrBehindHead { .. }
@@ -631,6 +633,17 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         };
 
         self.validate_late_production_context(slot, verified.parent_root)?;
+        let event_result =
+            self.emit_pq_operational_event(crate::PqOperationalEvent::ProposalStarted {
+                slot,
+                parent_root: verified.parent_root,
+            });
+        if let Err(error) = event_result {
+            self.fail_pq_operational_events("PQ proposal-started operational event failed");
+            return Err(PqBlockProductionError::Local(
+                PqBlockProductionLocalError::OperationalEvent(error),
+            ));
+        }
         let spec = Arc::clone(&self.spec);
         let parent_root = verified.parent_root;
         #[cfg(feature = "pq-startup-testing")]

@@ -1047,6 +1047,84 @@ async fn valid_genesis_disk_configuration_constructs_an_owned_runtime() {
 
 #[cfg(target_feature = "avx2")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_ready_event_failure_drains_bound_network_before_returning() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time after epoch")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "lighthouse-pq-runtime-ready-failure-{}-{unique}",
+        std::process::id()
+    ));
+    let testnet = root.join("testnet");
+    let spec = Arc::new(
+        ForkName::Electra
+            .make_genesis_spec(MinimalEthSpec::default_spec())
+            .set_slot_duration_ms::<MinimalEthSpec>(300_000),
+    );
+    write_exact_public_testnet(&testnet, &spec);
+    let jwt = root.join("jwt.hex");
+    std::fs::write(&jwt, "11".repeat(32)).expect("JWT fixture");
+    let reserved = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .expect("reserve network port");
+    let network_port = reserved.local_addr().expect("reserved address").port();
+    drop(reserved);
+
+    let mut client = valid_client_config(root.join("node"));
+    client.network.network_dir = root.join("network");
+    client
+        .network
+        .set_ipv4_listening_address(std::net::Ipv4Addr::LOCALHOST, network_port, 0, 0);
+    client
+        .execution_layer
+        .as_mut()
+        .expect("execution config")
+        .secret_file = Some(jwt);
+    let runtime = task_executor::test_utils::TestRuntime::default();
+    let context = || environment::RuntimeContext {
+        executor: runtime.task_executor.clone(),
+        eth_spec_instance: MinimalEthSpec,
+        eth2_config: eth2_config::Eth2Config {
+            eth_spec_id: types::EthSpecId::Minimal,
+            spec: Arc::clone(&spec),
+        },
+        eth2_network_config: None,
+        sse_logging_components: None,
+    };
+
+    let error = match PqClient::start_pq_runtime(
+        context(),
+        testing_runtime_config(client.clone(), testnet.clone())
+            .testing_only_fail_runtime_ready_event(),
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(runtime) => {
+            runtime
+                .shutdown()
+                .await
+                .expect("unexpected runtime shutdown");
+            panic!("injected RuntimeReady event failure unexpectedly started")
+        }
+    };
+    assert!(matches!(
+        error,
+        PqRuntimeError::OperationalEvent(beacon_chain::PqOperationalEventError::Closed)
+    ));
+    let rebound = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, network_port))
+        .expect("RuntimeReady failure awaits bound network shutdown");
+    drop(rebound);
+
+    let recovered = PqClient::start_pq_runtime(context(), testing_runtime_config(client, testnet))
+        .await
+        .expect("RuntimeReady cleanup releases all owners");
+    recovered.shutdown().await.expect("recovered shutdown");
+    std::fs::remove_dir_all(root).expect("remove fixture");
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn verifier_http_binds_after_network_and_normalizes_wildcard_port_zero() {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2061,16 +2139,28 @@ async fn proposer_manifest_identity_mismatch_releases_the_prepared_store_without
 }
 
 #[cfg(all(target_feature = "avx2", feature = "pq-proposer"))]
+#[derive(Clone, Copy)]
+enum PostBindProposerFailure {
+    Construction,
+    LoopStart,
+}
+
+#[cfg(all(target_feature = "avx2", feature = "pq-proposer"))]
 async fn assert_post_bind_proposer_failure_cleans_all_owners(
     executor: task_executor::TaskExecutor,
     spec: Arc<types::ChainSpec>,
-    client: ClientConfig,
-    testnet: std::path::PathBuf,
-    bundle_dir: std::path::PathBuf,
-    root: std::path::PathBuf,
+    client: &ClientConfig,
+    testnet: &std::path::Path,
+    bundle_dir: &std::path::Path,
+    root: &std::path::Path,
+    failure: PostBindProposerFailure,
 ) {
-    let failure_data_dir = root.join("constructor-failure-node");
-    let failure_network_dir = root.join("constructor-failure-network");
+    let failure_name = match failure {
+        PostBindProposerFailure::Construction => "constructor",
+        PostBindProposerFailure::LoopStart => "loop-start",
+    };
+    let failure_data_dir = root.join(format!("{failure_name}-failure-node"));
+    let failure_network_dir = root.join(format!("{failure_name}-failure-network"));
     let failure_slashing_db = failure_data_dir
         .join("pq-proposer")
         .join(slashing_protection::SLASHING_PROTECTION_FILENAME);
@@ -2081,7 +2171,7 @@ async fn assert_post_bind_proposer_failure_cleans_all_owners(
         .expect("reserved HTTP address")
         .port();
     drop(reserved_http);
-    let mut failure_client = client;
+    let mut failure_client = client.clone();
     failure_client.set_data_dir(failure_data_dir);
     failure_client
         .network
@@ -2098,14 +2188,13 @@ async fn assert_post_bind_proposer_failure_cleans_all_owners(
         eth2_network_config: None,
         sse_logging_components: None,
     };
-    let failure = match PqClient::start_pq_runtime(
-        context(),
-        testing_runtime_config(failure_client.clone(), testnet.clone())
-            .with_validator_bundle(bundle_dir)
-            .testing_only_fail_proposer_construction(),
-    )
-    .await
-    {
+    let config = testing_runtime_config(failure_client.clone(), testnet.to_path_buf())
+        .with_validator_bundle(bundle_dir.to_path_buf());
+    let config = match failure {
+        PostBindProposerFailure::Construction => config.testing_only_fail_proposer_construction(),
+        PostBindProposerFailure::LoopStart => config.testing_only_fail_proposer_loop_start(),
+    };
+    let observed_failure = match PqClient::start_pq_runtime(context(), config).await {
         Err(error) => error,
         Ok(handle) => {
             handle.shutdown().await.expect("unexpected shutdown");
@@ -2113,14 +2202,23 @@ async fn assert_post_bind_proposer_failure_cleans_all_owners(
         }
     };
     assert!(
-        matches!(failure, PqRuntimeError::ProposerPreflightInvariant),
-        "the original constructor error must survive staged cleanup: {failure:?}",
+        matches!(
+            (&failure, &observed_failure),
+            (
+                PostBindProposerFailure::Construction,
+                PqRuntimeError::ProposerPreflightInvariant
+            ) | (
+                PostBindProposerFailure::LoopStart,
+                PqRuntimeError::TaskUnavailable
+            )
+        ),
+        "the original {failure_name} error must survive staged cleanup: {observed_failure:?}",
     );
     let rebound = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, failure_http_port))
-        .expect("constructor failure must stop and await HTTP");
+        .unwrap_or_else(|error| panic!("{failure_name} failure must stop and await HTTP: {error}"));
     drop(rebound);
     let failure_slashing = slashing_protection::SlashingDatabase::open(&failure_slashing_db)
-        .expect("constructor failure leaves a resumable slashing database");
+        .unwrap_or_else(|error| panic!("{failure_name} failure leaves resumable SQLite: {error}"));
     assert_eq!(
         failure_slashing
             .num_validator_rows()
@@ -2128,10 +2226,12 @@ async fn assert_post_bind_proposer_failure_cleans_all_owners(
         1,
     );
     drop(failure_slashing);
-    let recovered =
-        PqClient::start_pq_runtime(context(), testing_runtime_config(failure_client, testnet))
-            .await
-            .expect("constructor cleanup releases network, DB, and aggregation owners");
+    let recovered = PqClient::start_pq_runtime(
+        context(),
+        testing_runtime_config(failure_client, testnet.to_path_buf()),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{failure_name} cleanup restart: {error:?}"));
     assert_eq!(
         recovered
             .http_api_listen_addr()
@@ -2247,15 +2347,21 @@ async fn proposer_configuration_constructs_a_sealed_validator_store_owner() {
         .expect("execution config")
         .secret_file = Some(jwt);
     let runtime = task_executor::test_utils::TestRuntime::default();
-    Box::pin(assert_post_bind_proposer_failure_cleans_all_owners(
-        runtime.task_executor.clone(),
-        Arc::clone(&spec),
-        client.clone(),
-        testnet.clone(),
-        bundle_dir.clone(),
-        root.clone(),
-    ))
-    .await;
+    for failure in [
+        PostBindProposerFailure::Construction,
+        PostBindProposerFailure::LoopStart,
+    ] {
+        Box::pin(assert_post_bind_proposer_failure_cleans_all_owners(
+            runtime.task_executor.clone(),
+            Arc::clone(&spec),
+            &client,
+            &testnet,
+            &bundle_dir,
+            &root,
+            failure,
+        ))
+        .await;
+    }
     let context = environment::RuntimeContext {
         executor: runtime.task_executor.clone(),
         eth_spec_instance: MinimalEthSpec,

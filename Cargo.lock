@@ -1312,6 +1312,7 @@ dependencies = [
  "sensitive_url",
  "serde",
  "serde_json",
+ "sha2",
  "slasher",
  "slot_clock",
  "smallvec",

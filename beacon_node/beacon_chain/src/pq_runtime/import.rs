@@ -1,6 +1,8 @@
 use crate::{BeaconChain, BeaconChainTypes, PqRuntimeError};
 use execution_layer::{ExecutionLayer, NewPayloadRequest, PayloadStatus};
+use sha2::{Digest, Sha256};
 use slot_clock::SlotClock;
+use ssz::Encode;
 use state_processing::{
     BlockProcessingError, PqConsensusError, PqConsensusLocalError, PqTransitionError,
     per_slot_processing_pq, prepare_pq_block, transition_pq_imported_block,
@@ -120,6 +122,16 @@ impl PqBlockImportSource {
         Self::Lookup,
         Self::ForwardRange,
     ];
+}
+
+fn operational_block_source(source: PqBlockImportSource) -> Option<crate::PqBlockEventSource> {
+    match source {
+        PqBlockImportSource::Publish => Some(crate::PqBlockEventSource::Publish),
+        PqBlockImportSource::Gossip => Some(crate::PqBlockEventSource::Gossip),
+        PqBlockImportSource::Rpc
+        | PqBlockImportSource::Lookup
+        | PqBlockImportSource::ForwardRange => None,
+    }
 }
 
 /// Raw wire ownership at an explicit ingress boundary. Only this type can enter verification;
@@ -623,6 +635,7 @@ pub enum PqImportError {
     /// this is terminal but does not incur a peer penalty.
     ExecutionRejected(PayloadStatus),
     ExecutionReconciliation(PqExecutionReconciliationError),
+    OperationalEvent(crate::PqOperationalEventError),
     /// A detached continuation was lost after durable persistence may have begun. The live
     /// process must stop and recover the authoritative head from disk before accepting retries.
     DurableStateUnknown {
@@ -663,6 +676,7 @@ impl std::fmt::Display for PqImportError {
                     "PQ committed-head reconciliation failed: {error:?}"
                 )
             }
+            Self::OperationalEvent(error) => error.fmt(formatter),
             Self::DurableStateUnknown { phase } => {
                 write!(formatter, "PQ durable state is unknown after {phase}")
             }
@@ -722,6 +736,7 @@ impl Error for PqImportError {
             Self::Local(PqImportLocalError::Consensus(error)) => Some(error),
             Self::Local(PqImportLocalError::Transition(error)) => Some(error),
             Self::Local(PqImportLocalError::Persistence(error)) => Some(error),
+            Self::OperationalEvent(error) => Some(error),
             Self::PeerInvalid(
                 PqImportPeerInvalid::NonLinearRange { .. }
                 | PqImportPeerInvalid::Equivocation { .. }
@@ -758,6 +773,7 @@ pub struct PqVerifiedBlockImport<E: EthSpec> {
     observation_key: PqGossipObservationKey,
     block_root: Hash256,
     output: state_processing::PqImportedTransitionOutput<E>,
+    signed_ssz_digest: [u8; 32],
     _admission: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     _activity: Option<Arc<crate::beacon_chain::PqImportActivity>>,
 }
@@ -778,6 +794,16 @@ pub struct PqBlockImportOutcome {
     pub block_root: Hash256,
     pub state_root: Hash256,
     pub payload_status: PqEnginePayloadStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PqOperationalHeadIdentity {
+    pub slot: Slot,
+    pub block_root: Hash256,
+    pub execution_hash: ExecutionBlockHash,
+    pub finalized_epoch: types::Epoch,
+    pub finalized_root: Hash256,
+    pub signed_ssz_digest: [u8; 32],
 }
 
 enum PqVerifiedCommitOutcome {
@@ -918,6 +944,7 @@ struct PqPostPayloadCommit<E: EthSpec> {
     observation_key: PqGossipObservationKey,
     committed_slot: Slot,
     execution_block_hash: ExecutionBlockHash,
+    signed_ssz_digest: [u8; 32],
     gossip_binding: Option<PqGossipClaimBinding>,
     external_reservation: Option<PqExternalObservationReservation>,
     _commit_permit: tokio::sync::OwnedSemaphorePermit,
@@ -992,6 +1019,20 @@ pub struct PqGossipCommitToken<T: BeaconChainTypes> {
 }
 
 impl<T: BeaconChainTypes> PqGossipCommitToken<T> {
+    pub fn operational_identity(&self) -> Result<(Slot, Hash256, [u8; 32]), PqImportError> {
+        let verified =
+            self.verified
+                .as_ref()
+                .ok_or(PqImportError::Local(PqImportLocalError::Invariant(
+                    "PQ gossip commit capability was consumed",
+                )))?;
+        Ok((
+            verified.output.block().slot(),
+            verified.block_root,
+            verified.signed_ssz_digest,
+        ))
+    }
+
     pub async fn commit(mut self) -> Result<PqBlockImportOutcome, PqImportError> {
         let verified =
             self.verified
@@ -1023,6 +1064,7 @@ impl<T: BeaconChainTypes> PqGossipCommitToken<T> {
                 PqImportError::PeerInvalid(_)
                 | PqImportError::ExecutionRejected(_)
                 | PqImportError::ExecutionReconciliation(_)
+                | PqImportError::OperationalEvent(_)
                 | PqImportError::DurableStateUnknown { .. }
                 | PqImportError::TerminalObservation { .. }
                 | PqImportError::StaleHeadAfterVerification { .. }
@@ -1059,6 +1101,20 @@ pub struct PqPublishPropagationToken<T: BeaconChainTypes> {
 }
 
 impl<T: BeaconChainTypes> PqPublishPropagationToken<T> {
+    pub fn operational_identity(&self) -> Result<(Slot, Hash256, [u8; 32]), PqImportError> {
+        let verified =
+            self.verified
+                .as_ref()
+                .ok_or(PqImportError::Local(PqImportLocalError::Invariant(
+                    "PQ publication propagation capability was consumed",
+                )))?;
+        Ok((
+            verified.output.block().slot(),
+            verified.block_root,
+            verified.signed_ssz_digest,
+        ))
+    }
+
     pub fn block(&self) -> Result<&Arc<SignedBeaconBlock<T::EthSpec>>, PqImportError> {
         self.verified
             .as_ref()
@@ -1192,6 +1248,7 @@ impl<T: BeaconChainTypes> PqPublishCommitToken<T> {
                 PqImportError::PeerInvalid(_)
                 | PqImportError::ExecutionRejected(_)
                 | PqImportError::ExecutionReconciliation(_)
+                | PqImportError::OperationalEvent(_)
                 | PqImportError::DurableStateUnknown { .. }
                 | PqImportError::TerminalObservation { .. }
                 | PqImportError::StaleHeadAfterVerification { .. }
@@ -1853,6 +1910,26 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         .await
     }
 
+    pub async fn pq_operational_head_identity(
+        &self,
+    ) -> Result<PqOperationalHeadIdentity, PqImportError> {
+        let snapshot = self.head_snapshot();
+        let genesis_slot = self.slot_clock.genesis_slot();
+        self.run_pq_blocking("pq-operational-head-identity", move || {
+            let execution_hash = persisted_pq_execution_head(&snapshot, genesis_slot)?;
+            let finalized = snapshot.beacon_state.finalized_checkpoint();
+            Ok::<_, PqImportError>(PqOperationalHeadIdentity {
+                slot: snapshot.beacon_state.slot(),
+                block_root: snapshot.beacon_block_root,
+                execution_hash,
+                finalized_epoch: finalized.epoch,
+                finalized_root: finalized.root,
+                signed_ssz_digest: Sha256::digest(snapshot.beacon_block.as_ssz_bytes()).into(),
+            })
+        })
+        .await?
+    }
+
     async fn run_pq_blocking<F, R>(&self, phase: &'static str, task: F) -> Result<R, PqImportError>
     where
         F: FnOnce() -> R + Send + 'static,
@@ -1978,7 +2055,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             .map_err(classify_consensus_error)?;
         let transition_admission = admission.clone();
         let transition_activity = activity.clone();
-        let (output, observation_key, block_root) = self
+        let (output, observation_key, block_root, signed_ssz_digest) = self
             .run_pq_blocking("pq-import-transition", move || {
                 let _admission = transition_admission;
                 let _activity = transition_activity;
@@ -1988,7 +2065,8 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 let observation_key =
                     PqGossipObservationKey::new(block.slot(), block.message().proposer_index());
                 let block_root = block.canonical_root();
-                Ok::<_, PqImportError>((output, observation_key, block_root))
+                let signed_ssz_digest = Sha256::digest(block.as_ssz_bytes()).into();
+                Ok::<_, PqImportError>((output, observation_key, block_root, signed_ssz_digest))
             })
             .await??;
         Ok(PqVerifiedBlockImport {
@@ -1996,6 +2074,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             expected_parent_root,
             observation_key,
             block_root,
+            signed_ssz_digest,
             output,
             _admission: admission,
             _activity: activity,
@@ -2420,6 +2499,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         let PqVerifiedBlockImport {
             source,
             output,
+            signed_ssz_digest,
             _admission,
             _activity,
             ..
@@ -2431,6 +2511,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             observation_key,
             committed_slot,
             execution_block_hash,
+            signed_ssz_digest,
             gossip_binding,
             external_reservation,
             _commit_permit: commit_permit,
@@ -2450,6 +2531,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             observation_key,
             committed_slot,
             execution_block_hash,
+            signed_ssz_digest,
             gossip_binding,
             mut external_reservation,
             _commit_permit,
@@ -2462,6 +2544,9 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         let observations = Arc::clone(&self.observed_pq_blocks);
         let persistence_observations = Arc::clone(&observations);
         let reconciliation = Arc::clone(&self.pq_execution_reconciliation);
+        let operational_events = self.pq_operational_events.clone();
+        let operational_failure_coordinator = Arc::clone(&self.pq_import_coordinator);
+        let mut operational_failure_shutdown = self.task_executor.shutdown_sender();
         #[cfg(feature = "pq-startup-testing")]
         let persistence_test_hook = self.pq_persistence_test_hook.clone();
         #[cfg(feature = "pq-startup-testing")]
@@ -2499,6 +2584,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                     state_root: snapshot.beacon_block.message().state_root(),
                     payload_status: PqEnginePayloadStatus::Valid,
                 };
+                let finalized = snapshot.beacon_state.finalized_checkpoint();
                 *canonical_head.write() = Arc::new(snapshot);
                 reconciliation.set(
                     crate::beacon_chain::PqExecutionReconciliationState::Pending {
@@ -2515,7 +2601,37 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 if let Some(reservation) = &mut external_reservation {
                     reservation.disarm();
                 }
-                Ok(outcome)
+                let operational_event_error = operational_block_source(source).and_then(|source| {
+                    let event = crate::PqOperationalEvent::BlockPersisted {
+                        source,
+                        slot: committed_slot,
+                        block_root: outcome.block_root,
+                        execution_hash: execution_block_hash,
+                        finalized_epoch: finalized.epoch,
+                        finalized_root: finalized.root,
+                        signed_ssz_digest,
+                    };
+                    let result = match operational_events
+                        .as_ref()
+                        .and_then(std::sync::Weak::upgrade)
+                    {
+                        Some(events) => events.try_emit(event),
+                        #[cfg(feature = "pq-startup-testing")]
+                        None => Ok(()),
+                        #[cfg(not(feature = "pq-startup-testing"))]
+                        None => Err(crate::PqOperationalEventError::Closed),
+                    };
+                    result.err()
+                });
+                if operational_event_error.is_some() {
+                    operational_failure_coordinator.close();
+                    let _ = operational_failure_shutdown.try_send(
+                        task_executor::ShutdownReason::Failure(
+                            "PQ block-persisted operational event failed",
+                        ),
+                    );
+                }
+                Ok((outcome, operational_event_error, finalized))
             },
             "pq-import-persist-and-publish",
         );
@@ -2524,7 +2640,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 "pq-import-persist-and-publish",
             )));
         };
-        let outcome = match persistence.await {
+        let (outcome, persisted_event_error, finalized) = match persistence.await {
             Ok(outcome) => outcome?,
             Err(_) => {
                 self.pq_import_coordinator.close();
@@ -2542,7 +2658,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 });
             }
         };
-        let result = reconcile_pq_execution(
+        let reconciliation_result = reconcile_pq_execution(
             &self.pq_execution_notifier,
             &forkchoice_guard,
             &self.pq_execution_reconciliation,
@@ -2551,10 +2667,9 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             committed_slot,
             outcome.block_root,
         )
-        .await
-        .map(|()| PqVerifiedCommitOutcome::Imported(outcome.clone()));
-        match &result {
-            Ok(_) => observations.lock().record_commit(
+        .await;
+        match &reconciliation_result {
+            Ok(()) => observations.lock().record_commit(
                 observation_key,
                 outcome.block_root,
                 committed_slot,
@@ -2563,11 +2678,34 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 .lock()
                 .record_terminal(observation_key, outcome.block_root),
         }
+        let reconciled_event_error = if reconciliation_result.is_ok() {
+            operational_block_source(source).and_then(|source| {
+                self.emit_pq_operational_event(crate::PqOperationalEvent::ExecutionReconciled {
+                    source,
+                    slot: committed_slot,
+                    block_root: outcome.block_root,
+                    execution_hash: execution_block_hash,
+                    finalized_epoch: finalized.epoch,
+                    finalized_root: finalized.root,
+                    signed_ssz_digest,
+                })
+                .err()
+            })
+        } else {
+            None
+        };
+        if reconciled_event_error.is_some() {
+            self.fail_pq_operational_events("PQ execution-reconciled operational event failed");
+        }
         drop(forkchoice_guard);
         drop(_commit_permit);
         drop(_admission);
         drop(_activity);
-        result
+        reconciliation_result?;
+        if let Some(error) = persisted_event_error.or(reconciled_event_error) {
+            return Err(PqImportError::OperationalEvent(error));
+        }
+        Ok(PqVerifiedCommitOutcome::Imported(outcome))
     }
 
     /// Imports an RPC or lookup block through the full sealed boundary. Gossip requires the

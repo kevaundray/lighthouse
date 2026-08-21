@@ -940,6 +940,7 @@ fn production_error_response(error: PqBlockProductionError) -> Response {
             | PqBlockProductionLocalError::LocalBlock(_)
             | PqBlockProductionLocalError::Transition(_)
             | PqBlockProductionLocalError::Execution(_)
+            | PqBlockProductionLocalError::OperationalEvent(_)
             | PqBlockProductionLocalError::Invariant(_),
         ) => (
             warp::http::StatusCode::SERVICE_UNAVAILABLE,

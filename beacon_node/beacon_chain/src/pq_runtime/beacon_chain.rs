@@ -292,6 +292,7 @@ pub struct BeaconChain<T: BeaconChainTypes> {
     pub(crate) pq_attestation_gossip_observations:
         Arc<Mutex<crate::pq_attestation_gossip::PqAttestationGossipObservationCache<T::EthSpec>>>,
     pub(crate) pq_execution_notifier: crate::pq_import::PqExecutionNotifier<T::EthSpec>,
+    pub(crate) pq_operational_events: Option<std::sync::Weak<crate::PqOperationalEventSink>>,
     pub(crate) pq_execution_reconciliation: Arc<PqExecutionReconciliation>,
     pub(crate) task_executor: TaskExecutor,
     #[cfg(feature = "pq-startup-testing")]
@@ -309,6 +310,69 @@ pub struct BeaconChain<T: BeaconChainTypes> {
 }
 
 impl<T: BeaconChainTypes> BeaconChain<T> {
+    pub(crate) fn emit_pq_operational_event(
+        &self,
+        event: crate::PqOperationalEvent,
+    ) -> Result<(), crate::PqOperationalEventError> {
+        match self
+            .pq_operational_events
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        {
+            Some(events) => events.try_emit(event),
+            #[cfg(feature = "pq-startup-testing")]
+            None => Ok(()),
+            #[cfg(not(feature = "pq-startup-testing"))]
+            None => Err(crate::PqOperationalEventError::Closed),
+        }
+    }
+
+    pub(crate) fn fail_pq_operational_events(&self, reason: &'static str) {
+        self.pq_import_coordinator.close();
+        let _ = self
+            .task_executor
+            .shutdown_sender()
+            .try_send(task_executor::ShutdownReason::Failure(reason));
+    }
+
+    /// Records only a freshly imported local publication after its result-bearing broadcaster and
+    /// commit path have both completed. Exact committed duplicates never call this method.
+    pub fn emit_pq_proposal_published(
+        &self,
+        slot: types::Slot,
+        block_root: types::Hash256,
+        signed_ssz_digest: [u8; 32],
+    ) -> Result<(), crate::PqOperationalEventError> {
+        let result = self.emit_pq_operational_event(crate::PqOperationalEvent::ProposalPublished {
+            slot,
+            block_root,
+            signed_ssz_digest,
+        });
+        if result.is_err() {
+            self.fail_pq_operational_events("PQ proposal-published operational event failed");
+        }
+        result
+    }
+
+    /// Records a freshly committed gossip import only after the admitted gossipsub message has
+    /// been resolved terminally. Event failure closes import ingress before signalling shutdown.
+    pub fn emit_pq_gossip_imported(
+        &self,
+        slot: types::Slot,
+        block_root: types::Hash256,
+        signed_ssz_digest: [u8; 32],
+    ) -> Result<(), crate::PqOperationalEventError> {
+        let result = self.emit_pq_operational_event(crate::PqOperationalEvent::GossipImported {
+            slot,
+            block_root,
+            signed_ssz_digest,
+        });
+        if result.is_err() {
+            self.fail_pq_operational_events("PQ gossip-imported operational event failed");
+        }
+        result
+    }
+
     pub(crate) fn new(
         spec: Arc<ChainSpec>,
         store: BeaconStore<T>,
@@ -316,6 +380,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         pq_validator_key_cache: Arc<PqValidatorKeyCache>,
         pq_aggregation_service: Arc<AggregationService>,
         pq_execution_notifier: crate::pq_import::PqExecutionNotifier<T::EthSpec>,
+        pq_operational_events: Option<std::sync::Weak<crate::PqOperationalEventSink>>,
         task_executor: TaskExecutor,
         #[cfg(feature = "pq-startup-testing")] pq_blocking_test_hook: Option<
             Arc<crate::TestingPqBlockingHook>,
@@ -354,6 +419,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 crate::pq_attestation_gossip::PqAttestationGossipObservationCache::default(),
             )),
             pq_execution_notifier,
+            pq_operational_events,
             pq_execution_reconciliation: Arc::new(PqExecutionReconciliation::new(
                 PqExecutionReconciliationState::Pending {
                     block_root: initial_block_root,

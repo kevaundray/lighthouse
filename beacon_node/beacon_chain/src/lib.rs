@@ -206,9 +206,9 @@ pub use self::pq_import::{
     PqBlockImportSource, PqEnginePayloadDisposition, PqEnginePayloadStatus,
     PqExecutionReconciliationError, PqForwardRangeError, PqGossipCommitToken, PqGossipObservation,
     PqGossipPropagationToken, PqImportError, PqImportLocalError, PqImportPeerInvalid,
-    PqKnownPublishObservation, PqPublishCommitOutcome, PqPublishCommitToken, PqPublishObservation,
-    PqPublishPromotion, PqPublishPropagationToken, PqVerifiedBlockImport,
-    classify_pq_engine_payload_status,
+    PqKnownPublishObservation, PqOperationalHeadIdentity, PqPublishCommitOutcome,
+    PqPublishCommitToken, PqPublishObservation, PqPublishPromotion, PqPublishPropagationToken,
+    PqVerifiedBlockImport, classify_pq_engine_payload_status,
 };
 #[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
 pub use self::pq_import::{
@@ -219,9 +219,17 @@ pub use self::pq_import::{
 };
 #[cfg(feature = "pq-devnet")]
 pub use self::pq_operational_events::{
-    PqOperationalEvent, PqOperationalEventError, PqOperationalEventRole, PqOperationalEventSink,
-    PqOperationalEventWriter, PqPeerConnectionDirection, PqStatusMessageDirection,
-    PqStatusRejectionCode,
+    PqBlockEventSource, PqOperationalEvent, PqOperationalEventError, PqOperationalEventRole,
+    PqOperationalEventSink, PqOperationalEventWriter, PqPeerConnectionDirection, PqRuntimeStartup,
+    PqStatusMessageDirection, PqStatusRejectionCode,
+};
+#[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
+#[doc(hidden)]
+pub use self::pq_operational_events::{
+    PqOperationalEventAcknowledgementTrace, PqOperationalEventTestTrace,
+    testing_only_pq_extended_operational_event_contract,
+    testing_only_pq_operational_event_acknowledgement, testing_only_pq_operational_event_sink,
+    testing_only_running_pq_operational_event_sink,
 };
 #[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing", unix))]
 #[doc(hidden)]
@@ -229,12 +237,6 @@ pub use self::pq_operational_events::{
     PqOperationalEventNonblockingWriterTrace, PqOperationalEventStdoutKindsTrace,
     testing_only_pq_operational_event_nonblocking_writer,
     testing_only_pq_operational_event_stdout_kinds,
-};
-#[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
-#[doc(hidden)]
-pub use self::pq_operational_events::{
-    PqOperationalEventTestTrace, testing_only_pq_operational_event_sink,
-    testing_only_running_pq_operational_event_sink,
 };
 #[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
 #[doc(hidden)]
