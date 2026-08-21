@@ -173,6 +173,11 @@ path = "tests/pq_beacon_import.rs"
 required-features = ["pq-beacon-import-testing"]
 
 [[test]]
+name = "pq_attestation_fork_choice"
+path = "tests/pq_attestation_fork_choice.rs"
+required-features = ["pq-beacon-import-testing"]
+
+[[test]]
 name = "pq_block_production"
 path = "tests/pq_block_production.rs"
 required-features = ["pq-beacon-import-testing"]

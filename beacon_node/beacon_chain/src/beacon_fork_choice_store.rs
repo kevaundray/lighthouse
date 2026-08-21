@@ -4,7 +4,9 @@
 //! Additionally, the `BalancesCache` struct is defined; a cache designed to avoid database
 //! reads when fork choice requires the validator balances of the justified state.
 
-use crate::{BeaconSnapshot, metrics};
+use crate::BeaconSnapshot;
+#[cfg(not(feature = "pq-devnet"))]
+use crate::metrics;
 use educe::Educe;
 use fixed_bytes::FixedBytesExtended;
 use fork_choice::ForkChoiceStore;
@@ -217,6 +219,7 @@ where
 
     /// Save the current state of `Self` to a `PersistedForkChoiceStore` which can be stored to the
     /// on-disk database.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn to_persisted(&self) -> PersistedForkChoiceStore {
         PersistedForkChoiceStore {
             time: self.time,
@@ -232,6 +235,7 @@ where
     }
 
     /// Restore `Self` from a previously-generated `PersistedForkChoiceStore`.
+    #[cfg(not(feature = "pq-devnet"))]
     pub fn from_persisted(
         persisted: PersistedForkChoiceStore,
         store: Arc<HotColdDB<E, Hot, Cold>>,
@@ -338,9 +342,11 @@ where
             self.justified_checkpoint.epoch,
         ) {
             // NOTE: could avoid this re-calculation by introducing a `PersistedCacheItem`.
+            #[cfg(not(feature = "pq-devnet"))]
             metrics::inc_counter(&metrics::BALANCES_CACHE_HITS);
             self.justified_balances = JustifiedBalances::from_effective_balances(balances)?;
         } else {
+            #[cfg(not(feature = "pq-devnet"))]
             metrics::inc_counter(&metrics::BALANCES_CACHE_MISSES);
 
             // Justified state is reasonably useful to cache, it might be finalized soon.
@@ -379,9 +385,11 @@ where
     }
 }
 
+#[cfg(not(feature = "pq-devnet"))]
 pub type PersistedForkChoiceStore = PersistedForkChoiceStoreV28;
 
 /// A container which allows persisting the `BeaconForkChoiceStore` to the on-disk database.
+#[cfg(not(feature = "pq-devnet"))]
 #[superstruct(variants(V28), variant_attributes(derive(Encode, Decode)), no_enum)]
 pub struct PersistedForkChoiceStore {
     pub time: Slot,

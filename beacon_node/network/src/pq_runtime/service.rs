@@ -384,6 +384,7 @@ fn commit_error_resolution(error: Option<&PqImportError>) -> AdmittedMessageComm
             PqImportError::PeerInvalid(_)
             | PqImportError::ExecutionRejected(_)
             | PqImportError::ExecutionReconciliation(_)
+            | PqImportError::ForkChoice(_)
             | PqImportError::OperationalEvent(_)
             | PqImportError::DurableStateUnknown { .. }
             | PqImportError::TerminalObservation { .. }

@@ -43,6 +43,7 @@ pub enum PqAttestationGossipPeerInvalid {
 
 #[derive(Debug)]
 pub enum PqAttestationGossipLocalError {
+    ShuttingDown,
     IngressCapacity,
     ClockUnavailable,
     ReceiptBeforeWindow {
@@ -97,6 +98,7 @@ impl PqAttestationGossipError {
                 | PqAttestationGossipLocalError::BoundHeadNoLongerCanonical { .. }
                 | PqAttestationGossipLocalError::StateAdvanceTooLarge { .. }
                 | PqAttestationGossipLocalError::ObservationGenerationExhausted
+                | PqAttestationGossipLocalError::ShuttingDown
                 | PqAttestationGossipLocalError::ReceiptAfterWindow { .. }
         ))
     }
@@ -132,7 +134,8 @@ impl std::error::Error for PqAttestationGossipError {
             Self::PeerInvalid(_)
             | Self::Duplicate(_)
             | Self::Local(
-                PqAttestationGossipLocalError::IngressCapacity
+                PqAttestationGossipLocalError::ShuttingDown
+                | PqAttestationGossipLocalError::IngressCapacity
                 | PqAttestationGossipLocalError::ClockUnavailable
                 | PqAttestationGossipLocalError::ReceiptBeforeWindow { .. }
                 | PqAttestationGossipLocalError::ReceiptAfterWindow { .. }
@@ -170,8 +173,27 @@ impl std::error::Error for PqAttestationGossipError {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ObservationState {
-    Pending { identity: Hash256, generation: u64 },
-    Observed { identity: Hash256 },
+    Pending {
+        identity: Hash256,
+        generation: u64,
+    },
+    ConsumptionPending {
+        identity: Hash256,
+        generation: u64,
+    },
+    Observed {
+        identity: Hash256,
+    },
+    Consumed {
+        identity: Hash256,
+        result: PqSingleConsumptionResult,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PqSingleConsumptionResult {
+    Applied,
+    Terminal,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -221,8 +243,9 @@ impl<E: EthSpec> PqAttestationGossipObservationCache<E> {
 
     fn prune(&mut self, earliest_slot: Slot) {
         let earliest_epoch = earliest_slot.epoch(E::slots_per_epoch());
-        self.singles
-            .retain(|(epoch, _), _| *epoch >= earliest_epoch);
+        self.singles.retain(|(epoch, _), state| {
+            *epoch >= earliest_epoch || matches!(state, ObservationState::ConsumptionPending { .. })
+        });
         self.aggregators
             .retain(|(epoch, _), _| *epoch >= earliest_epoch);
         self.aggregate_candidates
@@ -236,7 +259,11 @@ impl<E: EthSpec> PqAttestationGossipObservationCache<E> {
     ) -> PqAttestationGossipObservation {
         match self.singles.get(&key) {
             Some(ObservationState::Pending { .. }) => PqAttestationGossipObservation::Pending,
+            Some(ObservationState::ConsumptionPending { .. }) => {
+                PqAttestationGossipObservation::Observed
+            }
             Some(ObservationState::Observed { .. }) => PqAttestationGossipObservation::Observed,
+            Some(ObservationState::Consumed { .. }) => PqAttestationGossipObservation::Observed,
             None if self.singles.len() >= PQ_ATTESTATION_OBSERVATION_CAPACITY => {
                 PqAttestationGossipObservation::Capacity
             }
@@ -276,17 +303,68 @@ impl<E: EthSpec> PqAttestationGossipObservationCache<E> {
         }
     }
 
-    fn finalize_single(&mut self, key: (Epoch, u64), identity: Hash256, generation: u64) -> bool {
+    fn finalize_single(
+        &mut self,
+        key: (Epoch, u64),
+        identity: Hash256,
+        generation: u64,
+        result: PqSingleConsumptionResult,
+    ) -> bool {
         let authorized = matches!(
+            self.singles.get(&key),
+            Some(
+                ObservationState::Pending {
+                    identity: known,
+                    generation: known_generation,
+                } | ObservationState::ConsumptionPending {
+                    identity: known,
+                    generation: known_generation,
+                }
+            ) if *known == identity && *known_generation == generation
+        );
+        if authorized {
+            self.singles
+                .insert(key, ObservationState::Consumed { identity, result });
+        }
+        authorized
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    pub(crate) fn single_consumption_result(
+        &self,
+        key: (Epoch, u64),
+    ) -> Option<PqSingleConsumptionResult> {
+        match self.singles.get(&key) {
+            Some(ObservationState::Consumed { result, .. }) => Some(*result),
+            _ => None,
+        }
+    }
+
+    fn retains_single(&self, key: (Epoch, u64), identity: Hash256, generation: u64) -> bool {
+        matches!(
             self.singles.get(&key),
             Some(ObservationState::Pending {
                 identity: known,
                 generation: known_generation,
             }) if *known == identity && *known_generation == generation
-        );
+        )
+    }
+
+    fn mark_single_propagated(
+        &mut self,
+        key: (Epoch, u64),
+        identity: Hash256,
+        generation: u64,
+    ) -> bool {
+        let authorized = self.retains_single(key, identity, generation);
         if authorized {
-            self.singles
-                .insert(key, ObservationState::Observed { identity });
+            self.singles.insert(
+                key,
+                ObservationState::ConsumptionPending {
+                    identity,
+                    generation,
+                },
+            );
         }
         authorized
     }
@@ -499,7 +577,12 @@ impl TestingPqAttestationObservationCache {
     ) -> Result<(), PqAttestationGossipObservation> {
         let key = (epoch, validator_index);
         let generation = self.inner.claim_single(key, identity, earliest_slot)?;
-        if self.inner.finalize_single(key, identity, generation) {
+        if self.inner.finalize_single(
+            key,
+            identity,
+            generation,
+            PqSingleConsumptionResult::Applied,
+        ) {
             Ok(())
         } else {
             Err(PqAttestationGossipObservation::Conflict)
@@ -533,8 +616,47 @@ impl TestingPqAttestationObservationCache {
         identity: Hash256,
         generation: u64,
     ) -> bool {
+        self.inner.finalize_single(
+            (epoch, validator_index),
+            identity,
+            generation,
+            PqSingleConsumptionResult::Applied,
+        )
+    }
+
+    pub fn mark_single_propagated(
+        &mut self,
+        epoch: Epoch,
+        validator_index: u64,
+        identity: Hash256,
+        generation: u64,
+    ) -> bool {
         self.inner
-            .finalize_single((epoch, validator_index), identity, generation)
+            .mark_single_propagated((epoch, validator_index), identity, generation)
+    }
+
+    pub fn finalize_single_terminal(
+        &mut self,
+        epoch: Epoch,
+        validator_index: u64,
+        identity: Hash256,
+        generation: u64,
+    ) -> bool {
+        self.inner.finalize_single(
+            (epoch, validator_index),
+            identity,
+            generation,
+            PqSingleConsumptionResult::Terminal,
+        )
+    }
+
+    pub fn single_consumption_result(
+        &self,
+        epoch: Epoch,
+        validator_index: u64,
+    ) -> Option<PqSingleConsumptionResult> {
+        self.inner
+            .single_consumption_result((epoch, validator_index))
     }
 
     pub fn rollback_single(
@@ -674,14 +796,18 @@ struct SingleObservationBinding {
 
 /// BeaconChain-contextual sealed provenance for a propagated single attestation.
 pub struct PqVerifiedGossipSingle<E: EthSpec> {
-    verified: VerifiedPqSingleAttestation<E>,
+    verified: Option<VerifiedPqSingleAttestation<E>>,
+    observations: Arc<Mutex<PqAttestationGossipObservationCache<E>>>,
+    binding: Option<SingleObservationBinding>,
+    admission: Option<OwnedSemaphorePermit>,
+    activity: Option<Arc<crate::beacon_chain::PqImportActivity>>,
     subnet: SubnetId,
     bound_head_root: Hash256,
 }
 
 impl<E: EthSpec> PqVerifiedGossipSingle<E> {
-    pub const fn verified(&self) -> &VerifiedPqSingleAttestation<E> {
-        &self.verified
+    pub const fn verified(&self) -> Option<&VerifiedPqSingleAttestation<E>> {
+        self.verified.as_ref()
     }
 
     pub const fn subnet(&self) -> SubnetId {
@@ -692,8 +818,116 @@ impl<E: EthSpec> PqVerifiedGossipSingle<E> {
         self.bound_head_root
     }
 
-    pub fn into_parts(self) -> (VerifiedPqSingleAttestation<E>, SubnetId, Hash256) {
-        (self.verified, self.subnet, self.bound_head_root)
+    pub(crate) fn into_consumption_parts(
+        mut self,
+    ) -> Result<
+        (
+            VerifiedPqSingleAttestation<E>,
+            SubnetId,
+            Hash256,
+            PqSingleGossipConsumption<E>,
+        ),
+        PqAttestationGossipError,
+    > {
+        if self.verified.is_none()
+            || self.binding.is_none()
+            || self.admission.is_none()
+            || self.activity.is_none()
+        {
+            return Err(PqAttestationGossipError::Local(
+                PqAttestationGossipLocalError::ObservationLost,
+            ));
+        }
+        let verified = self.verified.take().ok_or(PqAttestationGossipError::Local(
+            PqAttestationGossipLocalError::ObservationLost,
+        ))?;
+        let binding = self.binding.take().ok_or(PqAttestationGossipError::Local(
+            PqAttestationGossipLocalError::ObservationLost,
+        ))?;
+        let admission = self
+            .admission
+            .take()
+            .ok_or(PqAttestationGossipError::Local(
+                PqAttestationGossipLocalError::ObservationLost,
+            ))?;
+        let activity = self.activity.take().ok_or(PqAttestationGossipError::Local(
+            PqAttestationGossipLocalError::ObservationLost,
+        ))?;
+        Ok((
+            verified,
+            self.subnet,
+            self.bound_head_root,
+            PqSingleGossipConsumption {
+                observations: Arc::clone(&self.observations),
+                binding: Some(binding),
+                _admission: admission,
+                _activity: activity,
+            },
+        ))
+    }
+}
+
+impl<E: EthSpec> Drop for PqVerifiedGossipSingle<E> {
+    fn drop(&mut self) {
+        if let Some(binding) = self.binding.take() {
+            self.observations.lock().finalize_single(
+                binding.key,
+                binding.identity,
+                binding.generation,
+                PqSingleConsumptionResult::Terminal,
+            );
+        }
+    }
+}
+
+pub(crate) struct PqSingleGossipConsumption<E: EthSpec> {
+    observations: Arc<Mutex<PqAttestationGossipObservationCache<E>>>,
+    binding: Option<SingleObservationBinding>,
+    _admission: OwnedSemaphorePermit,
+    _activity: Arc<crate::beacon_chain::PqImportActivity>,
+}
+
+impl<E: EthSpec> PqSingleGossipConsumption<E> {
+    pub(crate) fn finalize_applied(mut self) -> Result<(), PqAttestationGossipError> {
+        self.finalize(PqSingleConsumptionResult::Applied)
+    }
+
+    pub(crate) fn finalize_terminal(mut self) -> Result<(), PqAttestationGossipError> {
+        self.finalize(PqSingleConsumptionResult::Terminal)
+    }
+
+    fn finalize(
+        &mut self,
+        result: PqSingleConsumptionResult,
+    ) -> Result<(), PqAttestationGossipError> {
+        let binding = self.binding.take().ok_or(PqAttestationGossipError::Local(
+            PqAttestationGossipLocalError::ObservationLost,
+        ))?;
+        if self.observations.lock().finalize_single(
+            binding.key,
+            binding.identity,
+            binding.generation,
+            result,
+        ) {
+            Ok(())
+        } else {
+            Err(PqAttestationGossipError::Local(
+                PqAttestationGossipLocalError::ObservationLost,
+            ))
+        }
+    }
+}
+
+impl<E: EthSpec> Drop for PqSingleGossipConsumption<E> {
+    fn drop(&mut self) {
+        if let Some(binding) = self.binding.take() {
+            self.observations.lock().finalize_single(
+                binding.key,
+                binding.identity,
+                binding.generation,
+                PqSingleConsumptionResult::Terminal,
+            );
+        }
     }
 }
 
@@ -703,6 +937,7 @@ pub struct PqSingleGossipPropagationToken<E: EthSpec> {
     observations: Arc<Mutex<PqAttestationGossipObservationCache<E>>>,
     binding: Option<SingleObservationBinding>,
     _admission: Option<OwnedSemaphorePermit>,
+    _activity: Option<Arc<crate::beacon_chain::PqImportActivity>>,
     subnet: SubnetId,
     bound_head_root: Hash256,
 }
@@ -716,10 +951,34 @@ impl<E: EthSpec> PqSingleGossipPropagationToken<E> {
     pub fn mark_propagated(
         mut self,
     ) -> Result<PqVerifiedGossipSingle<E>, PqAttestationGossipError> {
+        if self.verified.is_none()
+            || self.binding.is_none()
+            || self._admission.is_none()
+            || self._activity.is_none()
+        {
+            return Err(PqAttestationGossipError::Local(
+                PqAttestationGossipLocalError::ObservationLost,
+            ));
+        }
         let binding = self.binding.take().ok_or(PqAttestationGossipError::Local(
             PqAttestationGossipLocalError::ObservationLost,
         ))?;
-        if !self.observations.lock().finalize_single(
+        let verified = self.verified.take().ok_or(PqAttestationGossipError::Local(
+            PqAttestationGossipLocalError::ObservationLost,
+        ))?;
+        let admission = self
+            ._admission
+            .take()
+            .ok_or(PqAttestationGossipError::Local(
+                PqAttestationGossipLocalError::ObservationLost,
+            ))?;
+        let activity = self
+            ._activity
+            .take()
+            .ok_or(PqAttestationGossipError::Local(
+                PqAttestationGossipLocalError::ObservationLost,
+            ))?;
+        if !self.observations.lock().mark_single_propagated(
             binding.key,
             binding.identity,
             binding.generation,
@@ -728,11 +987,12 @@ impl<E: EthSpec> PqSingleGossipPropagationToken<E> {
                 PqAttestationGossipLocalError::ObservationLost,
             ));
         }
-        let verified = self.verified.take().ok_or(PqAttestationGossipError::Local(
-            PqAttestationGossipLocalError::ObservationLost,
-        ))?;
         Ok(PqVerifiedGossipSingle {
-            verified,
+            verified: Some(verified),
+            observations: Arc::clone(&self.observations),
+            binding: Some(binding),
+            admission: Some(admission),
+            activity: Some(activity),
             subnet: self.subnet,
             bound_head_root: self.bound_head_root,
         })
@@ -828,6 +1088,7 @@ struct PreparedSingle<E: EthSpec> {
     key: (Epoch, u64),
     bound_head_root: Hash256,
     admission: OwnedSemaphorePermit,
+    activity: Arc<crate::beacon_chain::PqImportActivity>,
 }
 
 struct PreparedAggregate<E: EthSpec> {
@@ -913,6 +1174,12 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         attestation: SingleAttestation,
         subnet: SubnetId,
     ) -> Result<PqSingleGossipPropagationToken<T::EthSpec>, PqAttestationGossipError> {
+        let activity =
+            self.pq_import_coordinator
+                .try_start()
+                .ok_or(PqAttestationGossipError::Local(
+                    PqAttestationGossipLocalError::ShuttingDown,
+                ))?;
         let admission = Arc::clone(&self.pq_attestation_gossip_admission)
             .try_acquire_owned()
             .map_err(|_| {
@@ -944,6 +1211,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                         latest_slot,
                         earliest_slot,
                         admission,
+                        activity,
                     )
                 },
                 "pq-attestation-gossip-prepare",
@@ -969,6 +1237,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                         key,
                         bound_head_root,
                         admission,
+                        activity,
                     } = preparation;
                     (
                         prepared.verify(&service).await,
@@ -976,6 +1245,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                         key,
                         bound_head_root,
                         admission,
+                        activity,
                     )
                 },
                 "pq-attestation-gossip-proof",
@@ -983,7 +1253,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             .ok_or(PqAttestationGossipError::Local(
                 PqAttestationGossipLocalError::AsyncTask("pq-attestation-gossip-proof"),
             ))?;
-        let Some((verified, identity, key, bound_head_root, admission)) =
+        let Some((verified, identity, key, bound_head_root, admission, activity)) =
             proof_task.await.map_err(|_| {
                 PqAttestationGossipError::Local(PqAttestationGossipLocalError::AsyncTask(
                     "pq-attestation-gossip-proof",
@@ -1028,6 +1298,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 generation,
             }),
             _admission: Some(admission),
+            _activity: Some(activity),
             subnet,
             bound_head_root,
         })
@@ -1295,6 +1566,7 @@ fn prepare_single_context<T: BeaconChainTypes>(
     latest_slot: Slot,
     earliest_slot: Slot,
     admission: OwnedSemaphorePermit,
+    activity: Arc<crate::beacon_chain::PqImportActivity>,
 ) -> Result<PreparedSingle<T::EthSpec>, PqAttestationGossipError> {
     if attestation.data.slot > latest_slot {
         return Err(PqAttestationGossipError::Local(
@@ -1402,6 +1674,7 @@ fn prepare_single_context<T: BeaconChainTypes>(
         key,
         bound_head_root,
         admission,
+        activity,
     })
 }
 

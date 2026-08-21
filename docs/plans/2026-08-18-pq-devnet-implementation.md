@@ -2561,6 +2561,26 @@ subnet and aggregate-and-proof wiring described at the start of this task remain
 **Prerequisites:** Tasks 5.2a and 5.3e, including the compiling top-level PQ feature spine for the
 affected beacon-node packages.
 
+**Cycle 1 checkpoint (implemented, fresh-only):** `BeaconChain` now owns the minimal
+scheme-neutral fork choice initialized from exact genesis. The sealed single-attestation gossip
+capability transfers its original nonwaiting admission and shutdown activity across propagation
+into a monitored, cancellation-safe consumer. That consumer coalesces on Pending execution
+reconciliation, applies `on_attestation` exactly once on the blocking executor, and resolves the
+observation as Applied or Terminal. The chain-owned tick path uses the same bounded ownership,
+requires exact clock agreement, rejects rollback, and caps one request at eight forward slots.
+
+The block continuation keeps reconciliation Pending across DB publication, no-attributes FCU, and
+blocking fork-choice `on_block`. Only successful insertion atomically promotes Reconciled and
+Committed; panic, join loss, or post-FCU clock loss fails terminally and closes ingress before
+releasing ownership. Pre-propagation cancellation alone may reopen an observation. Once propagation
+is marked, the exact identity is ConsumptionPending, survives bounded pruning, suppresses duplicate
+or conflicting propagation, and resolves only Applied or Terminal.
+
+This checkpoint is not completion of Task 5.2b. It is in-memory Fresh evidence only: no live
+attestation network topic/routing, no operation-pool or naive-aggregation-pool insertion, no
+fork-choice/vote persistence or Resume recovery, and no justification/finalization claim. Those
+remain the subsequent vertical slices described below.
+
 **Files:**
 
 - Modify: `beacon_node/operation_pool/src/attestation_storage.rs`
@@ -2728,6 +2748,12 @@ git commit -m "feat: add reproducible PQ devnet"
 ```
 
 ### Task 7.2: Run a two-node PQ devnet to finality
+
+The completed Task 5.2b cycle-1 checkpoint supplies only a fresh in-memory receiver/fork-choice
+foundation. It does not satisfy this task: real attestation gossip and aggregation routing, pool
+selection, persisted restart behavior, two-thirds epoch participation, justification, and a
+finalized checkpoint beyond genesis remain required. Until those slices are complete, the existing
+two-process evidence must continue to assert finalized checkpoint exactly equal to genesis.
 
 **Files:**
 

@@ -363,6 +363,7 @@ fn classify_import_error(error: PqImportError) -> PqBlockPublicationDisposition 
         PqImportError::PeerInvalid(_) => PqBlockPublicationDisposition::Invalid(error),
         PqImportError::ExecutionRejected(_)
         | PqImportError::ExecutionReconciliation(_)
+        | PqImportError::ForkChoice(_)
         | PqImportError::DurableStateUnknown { .. }
         | PqImportError::TerminalObservation { .. } => {
             PqBlockPublicationDisposition::Terminal(PqBlockPublicationTerminal::Rejected)

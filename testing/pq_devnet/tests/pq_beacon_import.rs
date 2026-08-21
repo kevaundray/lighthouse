@@ -309,6 +309,49 @@ fn pq_single_observation_cancellation_reopens_and_conflicts_ignore() {
 }
 
 #[test]
+fn pq_single_observation_is_sealed_after_propagation_until_consumed() {
+    let mut cache = TestingPqAttestationObservationCache::default();
+    let epoch = types::Epoch::new(0);
+    let identity = Hash256::repeat_byte(0x31);
+    let conflicting = Hash256::repeat_byte(0x32);
+    let generation = cache
+        .claim_single(epoch, 4, identity, Slot::new(0))
+        .expect("claim pending single");
+
+    assert!(cache.mark_single_propagated(epoch, 4, identity, generation));
+    assert_eq!(
+        cache.status_single(epoch, 4, identity),
+        beacon_chain::PqAttestationGossipObservation::Observed
+    );
+    assert!(
+        !cache.rollback_single(epoch, 4, identity, generation),
+        "dropping a propagated capability must not reopen the observation"
+    );
+    assert_eq!(
+        cache.status_single(epoch, 4, conflicting),
+        beacon_chain::PqAttestationGossipObservation::Observed,
+        "a conflicting identity must remain suppressed after propagation"
+    );
+
+    let next_epoch = types::Epoch::new(1);
+    let next_epoch_start = next_epoch.start_slot(types::MinimalEthSpec::slots_per_epoch());
+    assert_eq!(
+        cache.precheck_single(next_epoch, 9, next_epoch_start),
+        beacon_chain::PqAttestationGossipObservation::Unseen
+    );
+    assert_eq!(
+        cache.status_single(epoch, 4, identity),
+        beacon_chain::PqAttestationGossipObservation::Observed,
+        "pruning must retain a propagated observation while consumption is pending"
+    );
+    assert!(cache.finalize_single_terminal(epoch, 4, identity, generation));
+    assert_eq!(
+        cache.single_consumption_result(epoch, 4),
+        Some(beacon_chain::PqSingleConsumptionResult::Terminal)
+    );
+}
+
+#[test]
 fn pq_aggregate_observation_updates_both_indexes_atomically() {
     let mut cache = TestingPqAttestationObservationCache::default();
     let epoch = types::Epoch::new(0);
@@ -1478,10 +1521,22 @@ async fn full_gossip_verification_precedes_observation_engine_commit_and_restart
     let verified_single = (*retry_single_token)
         .mark_propagated()
         .expect("finalize single propagation");
-    let (verified_single, verified_subnet, verified_single_head) = verified_single.into_parts();
-    assert_eq!(verified_single.single_attestation(), &valid_attestation);
-    assert_eq!(verified_subnet, gossip_subnet);
-    assert_eq!(verified_single_head, genesis_root);
+    assert_eq!(
+        verified_single
+            .verified()
+            .expect("sealed verified single")
+            .single_attestation(),
+        &valid_attestation
+    );
+    assert_eq!(verified_single.subnet(), gossip_subnet);
+    assert_eq!(verified_single.bound_head_root(), genesis_root);
+    drop(verified_single);
+    assert!(matches!(
+        processor
+            .verify_gossip_attestation(valid_attestation.clone(), gossip_subnet)
+            .await,
+        PqGossipAttestationDisposition::Ignore(_)
+    ));
 
     let mut aggregate_bits =
         BitList::<<MinimalEthSpec as EthSpec>::MaxValidatorsPerSlot>::with_capacity(
@@ -2215,25 +2270,18 @@ async fn full_gossip_verification_precedes_observation_engine_commit_and_restart
     .await;
     admission_transport.release.add_permits(1);
     let rpc_result = retry_after_engine_cancellation.await.expect("retry task");
-    let lookup_result = stale_after_verification.await.expect("stale import task");
-    let (admission_outcome, stale_error) = match (rpc_result, lookup_result) {
-        (Ok(outcome), Err(stale)) | (Err(stale), Ok(outcome)) => (outcome, stale),
-        (rpc, lookup) => panic!(
-            "one queued import must commit and one must become stale: rpc={rpc:?}, lookup={lookup:?}"
-        ),
-    };
-    assert_eq!(admission_outcome.block_root, signed.canonical_root());
-    assert!(matches!(
-        stale_error,
-        PqImportError::StaleHeadAfterVerification {
-            expected_parent,
-            actual_head,
-        } if expected_parent == genesis_root && actual_head == admission_outcome.block_root
-    ));
+    let lookup_result = stale_after_verification.await.expect("coalesced task");
+    let rpc_outcome = rpc_result.expect("RPC exact duplicate coalesces through reconciliation");
+    let lookup_outcome =
+        lookup_result.expect("lookup exact duplicate coalesces through reconciliation");
+    assert_eq!(rpc_outcome.source, PqBlockImportSource::Rpc);
+    assert_eq!(lookup_outcome.source, PqBlockImportSource::Lookup);
+    assert_eq!(rpc_outcome.block_root, signed.canonical_root());
+    assert_eq!(lookup_outcome.block_root, signed.canonical_root());
     assert_eq!(
         admission_transport.calls.load(Ordering::SeqCst),
         2,
-        "a stale post-verification import must not call Engine"
+        "coalesced exact imports must not call Engine twice"
     );
 
     for expected_source in [PqBlockImportSource::Rpc, PqBlockImportSource::Lookup] {
@@ -2347,12 +2395,12 @@ async fn full_gossip_verification_precedes_observation_engine_commit_and_restart
         "cancellation-independent canonical publication",
     )
     .await;
-    assert!(matches!(
-        blocked_behind_publication
-            .await
-            .expect("blocked publication task"),
-        Err(PqImportError::StaleHeadAfterVerification { .. })
-    ));
+    let coalesced = blocked_behind_publication
+        .await
+        .expect("blocked publication task")
+        .expect("exact lookup coalesces after detached publication");
+    assert_eq!(coalesced.source, PqBlockImportSource::Lookup);
+    assert_eq!(coalesced.block_root, signed.canonical_root());
     assert!(persistence_chain.testing_only_pq_observation_is_committed(
         signed.slot(),
         signed.message().proposer_index(),

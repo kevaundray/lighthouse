@@ -1734,3 +1734,42 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   attestations, and it does not advance justification or finality. The full finalized checkpoint
   remained byte-equal to the genesis checkpoint throughout. Attestation gossip, late join, range
   sync, and non-genesis finalization remain explicit future work.
+
+### 2026-08-21: Fresh-only PQ fork-choice receiver foundation (Task 5.2b cycle 1)
+
+- A fresh in-memory PQ chain now owns a scheme-neutral `ForkChoice` backed by
+  `BeaconForkChoiceStore`, initialized from the exact genesis state and block. After the existing
+  sealed block path has persisted a block and obtained Engine `VALID`, the same detached import
+  continuation inserts that exact block into fork choice on the owned blocking executor. Execution
+  reconciliation remains Pending through this insertion; only successful `on_block` atomically
+  promotes the block observation to Committed and reconciliation to Reconciled. A blocked insertion
+  therefore keeps exact block duplicates and votes pending without a second `newPayload`, database
+  write, FCU, or fork-choice call.
+- A verified single-attestation propagation capability now transfers its original nonwaiting
+  two-item admission and shutdown activity into sealed consumption. Marking propagation atomically
+  changes the exact observation from pre-propagation Pending to ConsumptionPending. Dropping the
+  pre-propagation token alone rolls back to Unseen; after propagation, duplicate or conflicting
+  identities remain ignored, pruning retains the bounded active observation, and every drop or
+  local terminal path resolves the observation as Terminal rather than reopening gossip.
+- The chain-owned, monitored, non-cancellable consumer waits for its bound execution reconciliation
+  before running `ForkChoice::on_attestation` on the blocking executor. Caller cancellation and
+  executor exit do not release the transferred admission/activity or bypass shutdown drain. A
+  successful vote resolves Applied exactly once; reconciliation failure resolves Terminal without
+  a retry or a second propagation. The explicit fork-choice tick entry point uses the same activity
+  and admission boundary, requires the requested slot to equal the process clock, treats equal as a
+  no-op, rejects rollback, and permits at most eight checked forward ticks in one owned blocking
+  continuation.
+- Post-database FCU success is not itself a public commit boundary. A fork-choice insertion panic,
+  join loss, or post-FCU clock loss returns nonretryable `DurableStateUnknown`, changes
+  reconciliation to Failed, retains exact block history as terminal, closes ingress, and signals
+  process failure before releasing the import gates. Waiting propagated votes receive
+  `ReconciliationFailed`; exact RPC/lookup duplicates cannot report Committed during this window.
+- Warning-denied focused evidence passed all four fresh fork-choice tests serially in 344.74 seconds,
+  including real PQ block/attestation verification, blocked reconciliation, cancellation/drain,
+  panic, duplicate, and bounded-tick mutations. The production-shared full-gossip/import regression
+  passed in 185.31 seconds and pins post-propagation drop retention plus exact RPC/lookup
+  coalescing.
+- This is deliberately a fresh-only receiver/fork-choice foundation. It adds no attestation gossip
+  topic or live two-node route, no operation-pool or aggregation-pool insertion, no persisted
+  fork-choice/vote recovery, and no justification or finalization advancement. The finalized
+  checkpoint remains genesis; Task 7.2 finality evidence is not claimed.

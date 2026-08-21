@@ -13,7 +13,6 @@ mod beacon_chain;
 #[cfg(feature = "pq-devnet")]
 #[path = "pq_runtime/beacon_chain.rs"]
 mod beacon_chain;
-#[cfg(not(feature = "pq-devnet"))]
 mod beacon_fork_choice_store;
 #[cfg(not(feature = "pq-devnet"))]
 pub mod beacon_proposer_cache;
@@ -176,7 +175,8 @@ pub use self::beacon_chain::{
 };
 #[cfg(feature = "pq-devnet")]
 pub use self::beacon_chain::{
-    BeaconChain, BeaconChainTypes, BeaconSnapshot, BeaconStore, PqRuntimeError,
+    BeaconChain, BeaconChainTypes, BeaconSnapshot, BeaconStore, PQ_FORK_CHOICE_TICK_MAX_ADVANCE,
+    PqForkChoiceAttestationError, PqForkChoiceAttestationOutcome, PqRuntimeError,
 };
 #[cfg(not(feature = "pq-devnet"))]
 pub use self::beacon_snapshot::BeaconSnapshot;
@@ -191,8 +191,8 @@ pub use self::historical_blocks::HistoricalBlockError;
 pub use self::pq_attestation_gossip::{
     PQ_ATTESTATION_GOSSIP_ADMISSION_CAPACITY, PqAggregateGossipPropagationToken,
     PqAttestationGossipError, PqAttestationGossipLocalError, PqAttestationGossipObservation,
-    PqAttestationGossipPeerInvalid, PqSingleGossipPropagationToken, PqVerifiedGossipAggregate,
-    PqVerifiedGossipSingle,
+    PqAttestationGossipPeerInvalid, PqSingleConsumptionResult, PqSingleGossipPropagationToken,
+    PqVerifiedGossipAggregate, PqVerifiedGossipSingle,
 };
 #[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
 pub use self::pq_attestation_gossip::{

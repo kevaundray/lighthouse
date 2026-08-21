@@ -504,7 +504,7 @@ where
         if self.execution_notifier.is_deferred() {
             return Err(PqRuntimeError::MissingExecutionNotifier);
         }
-        Ok(BeaconChain::new(
+        BeaconChain::new(
             self.spec,
             self.store.ok_or(PqRuntimeError::MissingHeadState)?,
             self.snapshot.ok_or(PqRuntimeError::MissingHeadState)?,
@@ -523,6 +523,6 @@ where
             #[cfg(feature = "pq-startup-testing")]
             self.pq_proposer_duties_test_hook,
             self.slot_clock.ok_or(PqRuntimeError::MissingHeadState)?,
-        ))
+        )
     }
 }
