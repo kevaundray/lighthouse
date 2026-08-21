@@ -204,6 +204,8 @@ pub struct BeaconChainBuilder<T: BeaconChainTypes> {
     pq_persistence_test_hook: Option<Arc<crate::TestingPqBlockingHook>>,
     #[cfg(feature = "pq-startup-testing")]
     pq_proposer_duties_test_hook: Option<Arc<crate::TestingPqBlockingHook>>,
+    #[cfg(feature = "pq-startup-testing")]
+    pq_local_attester_context_test_hook: Option<Arc<crate::TestingPqBlockingHook>>,
     slot_clock: Option<T::SlotClock>,
     marker: PhantomData<T>,
 }
@@ -232,6 +234,8 @@ where
             pq_persistence_test_hook: None,
             #[cfg(feature = "pq-startup-testing")]
             pq_proposer_duties_test_hook: None,
+            #[cfg(feature = "pq-startup-testing")]
+            pq_local_attester_context_test_hook: None,
             slot_clock: None,
             marker: PhantomData,
         }
@@ -467,6 +471,16 @@ where
         self
     }
 
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_pq_local_attester_context_hook(
+        mut self,
+        hook: Arc<crate::TestingPqBlockingHook>,
+    ) -> Self {
+        self.pq_local_attester_context_test_hook = Some(hook);
+        self
+    }
+
     /// Installs the process-owned execution layer once during runtime construction.
     pub fn pq_execution_layer(
         mut self,
@@ -522,6 +536,8 @@ where
             self.pq_persistence_test_hook,
             #[cfg(feature = "pq-startup-testing")]
             self.pq_proposer_duties_test_hook,
+            #[cfg(feature = "pq-startup-testing")]
+            self.pq_local_attester_context_test_hook,
             self.slot_clock.ok_or(PqRuntimeError::MissingHeadState)?,
         )
     }

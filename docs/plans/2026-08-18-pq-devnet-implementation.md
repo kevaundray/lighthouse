@@ -2591,11 +2591,30 @@ tick, kept the receiver network loop responsive during proof work, and applied n
 vote twice on exact redelivery. The outbound attestation injection seam is bounded and entirely
 `pq-startup-testing`-only.
 
-This checkpoint is not completion of Task 5.2b. It is in-memory Fresh evidence only: no live
-aggregate-and-proof routing, no operation-pool or naive-aggregation-pool insertion, no local
-attester/signer, no fork-choice/vote persistence or Resume recovery, and no
-justification/finalization claim. The finalized checkpoint remains genesis. Those remain the
-subsequent vertical slices described below.
+**Cycle 3 Slice A checkpoint (implemented, local context only):** the private native
+`BeaconChain` path derives current-slot contexts only for Minimal/Electra with exact 300-second
+slots. It accepts an immutable, sorted, unique validator identity snapshot capped at 16 and binds
+every public key to its exact canonical registry index; callers cannot supply a slot, committee,
+subnet, or attestation data. The owned blocking derivation clones the canonical state and rebuilds
+the Current committee cache, so a cache-empty Resume snapshot produces the same exact duties
+without mutating persisted state.
+
+Real execution-VALID slot-1 import evidence binds the resulting data and duties to the imported
+canonical root. Independent frozen committee membership, position, and subnet vectors cover the
+full 16-validator profile, while an epoch-2 fixture pins distinct non-default justified source,
+target, and Current-dependent roots. The context path has a nonwaiting cap of two and retains its
+shutdown activity across blocking work, cancellation, late validation, and returned ownership.
+Initial, late, and consume-time clock/head/reconciliation samples use short nonwaiting acquisitions
+of the canonical PQ import gate and release it before exposing the coherent candidate snapshot.
+That snapshot is explicitly not signing authorization; a later signer and pre-publication/local
+application path must revalidate under their own safety boundary.
+
+This checkpoint is not completion of Task 5.2b. The fork-choice receiver remains in-memory Fresh
+evidence, and the local-context Resume evidence is limited to rebuilding ephemeral committee caches
+from the selected canonical snapshot. There is no live aggregate-and-proof routing, operation-pool
+or naive-aggregation-pool insertion, local signing, publication, scheduler, HTTP route,
+fork-choice/vote or local-context persistence, justification, or finalization claim. The finalized
+checkpoint remains genesis. Those remain the subsequent vertical slices described below.
 
 **Files:**
 

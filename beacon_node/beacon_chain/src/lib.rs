@@ -121,6 +121,9 @@ mod pq_attestation_gossip;
 #[path = "pq_runtime/import.rs"]
 mod pq_import;
 #[cfg(feature = "pq-devnet")]
+#[path = "pq_runtime/local_attester_context.rs"]
+mod pq_local_attester_context;
+#[cfg(feature = "pq-devnet")]
 #[path = "pq_runtime/operational_events.rs"]
 mod pq_operational_events;
 #[cfg(feature = "pq-devnet")]
@@ -217,6 +220,14 @@ pub use self::pq_import::{
     TestingPqGossipClaim, TestingPqGossipFinish, TestingPqGossipObservationCache,
     TestingPqPublishPromotionResolution, testing_only_persisted_pq_execution_head,
     testing_only_reconcile_pq_execution,
+};
+#[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
+pub use self::pq_local_attester_context::testing_only_validate_pq_local_attester_profile;
+#[cfg(feature = "pq-devnet")]
+pub use self::pq_local_attester_context::{
+    PQ_LOCAL_ATTESTATION_CONTEXT_ADMISSION_CAPACITY, PQ_LOCAL_ATTESTER_IDENTITY_CAPACITY,
+    PqCoherentLocalAttestationSnapshot, PqLocalAttestationCandidate, PqLocalAttestationContext,
+    PqLocalAttestationContextError, PqLocalAttesterIdentity,
 };
 #[cfg(feature = "pq-devnet")]
 pub use self::pq_operational_events::{

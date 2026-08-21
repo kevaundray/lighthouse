@@ -407,6 +407,7 @@ pub struct BeaconChain<T: BeaconChainTypes> {
     pub(crate) pq_import_coordinator: Arc<PqImportCoordinator>,
     pub(crate) pq_block_production_admission: Arc<tokio::sync::Semaphore>,
     pub(crate) pq_proposer_duty_admission: Arc<tokio::sync::Semaphore>,
+    pub(crate) pq_local_attester_context_admission: Arc<tokio::sync::Semaphore>,
     pub(crate) pq_attestation_gossip_admission: Arc<tokio::sync::Semaphore>,
     pub(crate) pq_attestation_gossip_observations:
         Arc<Mutex<crate::pq_attestation_gossip::PqAttestationGossipObservationCache<T::EthSpec>>>,
@@ -428,6 +429,8 @@ pub struct BeaconChain<T: BeaconChainTypes> {
     pub(crate) pq_post_persist_test_hook: Mutex<Option<Arc<crate::TestingPqBlockingHook>>>,
     #[cfg(feature = "pq-startup-testing")]
     pub(crate) pq_proposer_duties_test_hook: Option<Arc<crate::TestingPqBlockingHook>>,
+    #[cfg(feature = "pq-startup-testing")]
+    pub(crate) pq_local_attester_context_test_hook: Option<Arc<crate::TestingPqBlockingHook>>,
     #[cfg(feature = "pq-startup-testing")]
     pq_fork_choice_attestation_calls: std::sync::atomic::AtomicUsize,
     pub pq_validator_key_cache: Arc<PqValidatorKeyCache>,
@@ -518,6 +521,9 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         #[cfg(feature = "pq-startup-testing")] pq_proposer_duties_test_hook: Option<
             Arc<crate::TestingPqBlockingHook>,
         >,
+        #[cfg(feature = "pq-startup-testing")] pq_local_attester_context_test_hook: Option<
+            Arc<crate::TestingPqBlockingHook>,
+        >,
         slot_clock: T::SlotClock,
     ) -> Result<Self, PqRuntimeError> {
         let initial_block_root = canonical_head.beacon_block_root;
@@ -562,6 +568,9 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             pq_proposer_duty_admission: Arc::new(tokio::sync::Semaphore::new(
                 crate::PQ_PROPOSER_DUTY_ADMISSION_CAPACITY,
             )),
+            pq_local_attester_context_admission: Arc::new(tokio::sync::Semaphore::new(
+                crate::PQ_LOCAL_ATTESTATION_CONTEXT_ADMISSION_CAPACITY,
+            )),
             pq_attestation_gossip_admission: Arc::new(tokio::sync::Semaphore::new(
                 crate::PQ_ATTESTATION_GOSSIP_ADMISSION_CAPACITY,
             )),
@@ -591,6 +600,8 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             #[cfg(feature = "pq-startup-testing")]
             pq_proposer_duties_test_hook,
             #[cfg(feature = "pq-startup-testing")]
+            pq_local_attester_context_test_hook,
+            #[cfg(feature = "pq-startup-testing")]
             pq_fork_choice_attestation_calls: std::sync::atomic::AtomicUsize::new(0),
             pq_validator_key_cache,
             pq_aggregation_service,
@@ -602,6 +613,14 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
     /// Returns the exact snapshot which was strictly validated before worker construction.
     pub fn head_snapshot(&self) -> Arc<BeaconSnapshot<T::EthSpec>> {
         self.canonical_head.read().clone()
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_replace_pq_canonical_head_root(&self, block_root: Hash256) {
+        let mut snapshot = (*self.head_snapshot()).clone();
+        snapshot.beacon_block_root = block_root;
+        *self.canonical_head.write() = Arc::new(snapshot);
     }
 
     pub(crate) async fn on_reconciled_pq_block(
@@ -1003,5 +1022,31 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
     pub fn testing_only_set_pq_execution_reconciliation_failed(&self, block_root: Hash256) {
         self.pq_execution_reconciliation
             .set(PqExecutionReconciliationState::Failed { block_root });
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_pq_execution_reconciled(&self, block_root: Hash256) -> bool {
+        matches!(
+            self.pq_execution_reconciliation.current(),
+            PqExecutionReconciliationState::Reconciled {
+                block_root: reconciled,
+            } if reconciled == block_root
+        )
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_pq_import_gate_available_permits(&self) -> usize {
+        self.pq_import_gate.available_permits()
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub async fn testing_only_hold_pq_import_gate(&self) -> tokio::sync::OwnedSemaphorePermit {
+        Arc::clone(&self.pq_import_gate)
+            .acquire_owned()
+            .await
+            .expect("PQ import gate remains open for the chain lifetime")
     }
 }

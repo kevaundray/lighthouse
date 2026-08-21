@@ -178,6 +178,11 @@ path = "tests/pq_attestation_fork_choice.rs"
 required-features = ["pq-beacon-import-testing"]
 
 [[test]]
+name = "pq_local_attester_context"
+path = "tests/pq_local_attester_context.rs"
+required-features = ["pq-beacon-import-testing"]
+
+[[test]]
 name = "pq_block_production"
 path = "tests/pq_block_production.rs"
 required-features = ["pq-beacon-import-testing"]

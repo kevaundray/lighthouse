@@ -1,7 +1,7 @@
 #[cfg(target_feature = "avx2")]
 mod avx2 {
     use beacon_chain::{
-        BeaconChain, PqNewPayloadTransport,
+        BeaconChain, PqLocalAttesterIdentity, PqNewPayloadTransport,
         builder::{BeaconChainBuilder, Witness},
     };
     use consensus_signature::{AggregationService, OneTimeUseId, PqPublicKey, SigningDuty};
@@ -15,9 +15,9 @@ mod avx2 {
     };
     use store::{HotColdDB, MemoryStore, StoreConfig};
     use types::{
-        AttestationData, BeaconBlock, ChainSpec, Checkpoint, Domain, EthSpec, ExecutionPayloadRef,
-        ForkName, Hash256, MinimalEthSpec, SignedBeaconBlock, SignedRoot, SingleAttestation, Slot,
-        SubnetId,
+        Attestation, AttestationData, BeaconBlock, ChainSpec, Checkpoint, Domain, EthSpec,
+        ExecutionPayloadRef, ForkName, Hash256, MinimalEthSpec, RelativeEpoch, SignedBeaconBlock,
+        SignedRoot, SingleAttestation, Slot, SubnetId,
     };
 
     const PASSWORD: &[u8] = b"correct horse battery staple";
@@ -369,6 +369,113 @@ mod avx2 {
         )
         .expect("slot-one subnet");
         (single, subnet)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_imported_current_slot_seals_exact_local_attester_context() {
+        let FreshSlotOneFixture {
+            executor_exit_sender,
+            _temporary_directory,
+            chain,
+            processor,
+            signed,
+            block_root,
+            genesis_root,
+            post_state,
+            spec,
+            transport,
+            ..
+        } = fresh_slot_one_fixture().await;
+        let _executor_exit_sender = executor_exit_sender;
+        chain.slot_clock.set_slot(1);
+        transport.forkchoice_release.add_permits(1);
+        let import = processor
+            .import_rpc_block(Arc::clone(&signed))
+            .await
+            .expect("real slot-one execution-VALID import");
+        assert_eq!(import.block_root, block_root);
+        assert_ne!(
+            block_root, genesis_root,
+            "slot-one root must not substitute genesis"
+        );
+        assert!(chain.testing_only_pq_execution_reconciled(block_root));
+
+        let head = chain.head_snapshot();
+        assert_eq!(head.beacon_block_root, block_root);
+        assert_eq!(head.beacon_state, post_state);
+        let identities: Arc<[PqLocalAttesterIdentity]> = head
+            .beacon_state
+            .validators()
+            .iter()
+            .enumerate()
+            .map(|(index, validator)| PqLocalAttesterIdentity::new(validator.pubkey, index as u64))
+            .collect::<Vec<_>>()
+            .into();
+        let expected = head
+            .beacon_state
+            .validators()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, validator)| {
+                head.beacon_state
+                    .get_attestation_duties(index, RelativeEpoch::Current)
+                    .expect("cached imported-head attester duty")
+                    .filter(|duty| duty.slot == Slot::new(1))
+                    .map(|duty| (index, validator.pubkey, duty))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(expected.len(), 2, "full-16 profile has two slot-one duties");
+
+        let context = chain
+            .pq_local_attestation_context(identities)
+            .await
+            .expect("imported current-slot local context");
+        let context = chain
+            .consume_pq_local_attestation_context(context)
+            .expect("coherent imported current-slot context");
+        assert_eq!(context.slot(), Slot::new(1));
+        assert_eq!(context.bound_head_root(), block_root);
+        assert_ne!(context.bound_head_root(), genesis_root);
+        assert_eq!(
+            context.dependent_root(),
+            head.beacon_state
+                .attester_shuffling_decision_root(block_root, RelativeEpoch::Current)
+                .expect("imported-head dependent root")
+        );
+        assert_eq!(context.candidates().len(), expected.len());
+        for (candidate, (index, pubkey, duty)) in context.candidates().iter().zip(expected) {
+            assert_eq!(candidate.validator_index(), index as u64);
+            assert_eq!(candidate.pubkey(), pubkey);
+            assert_eq!(candidate.committee_index(), duty.index);
+            assert_eq!(candidate.committee_position(), duty.committee_position);
+            assert_eq!(candidate.committee_length(), duty.committee_len);
+            assert_eq!(candidate.committee_count_at_slot(), duty.committees_at_slot);
+            let expected_subnet = SubnetId::compute_subnet::<MinimalEthSpec>(
+                Slot::new(1),
+                duty.index,
+                duty.committees_at_slot,
+                &spec,
+            )
+            .expect("slot-one subnet");
+            assert_eq!(candidate.subnet(), expected_subnet);
+            let Attestation::Electra(attestation) = candidate.attestation() else {
+                panic!("frozen imported PQ context must be Electra")
+            };
+            assert_eq!(attestation.data.slot, Slot::new(1));
+            assert_eq!(attestation.data.index, 0);
+            assert_eq!(attestation.data.beacon_block_root, block_root);
+            assert_eq!(
+                attestation.data.source,
+                head.beacon_state.current_justified_checkpoint()
+            );
+            assert_eq!(
+                attestation.data.target,
+                Checkpoint {
+                    epoch: types::Epoch::new(0),
+                    root: genesis_root,
+                }
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

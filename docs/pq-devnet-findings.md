@@ -1805,3 +1805,31 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   production `pq-devnet` graph. This checkpoint adds no aggregate-and-proof routing, operation or
   aggregation pool, local attester/signer, persisted vote/fork-choice recovery, justification, or
   finalization. The finalized checkpoint remains genesis and Task 7.2 finality is still unclaimed.
+
+### 2026-08-21: Native PQ local-attester context foundation completed (Task 5.2b cycle 3, Slice A)
+
+- `BeaconChain` now privately derives bounded current-slot local-attestation contexts for the exact
+  Minimal/Electra/300-second profile. The immutable identity input is capped at 16, must be sorted
+  and unique by validator index and public key, and is bound exactly to the canonical registry.
+  Callers provide neither slot, committee, subnet, nor attestation data.
+- Derivation clones the canonical head state and rebuilds its Current committee cache on the owned
+  blocking executor. This preserves Resume when ephemeral committee caches are absent without
+  mutating the persisted canonical snapshot. An execution-VALID real slot-1 import produced the
+  exact imported block root, current justified source, epoch target, dependent root, duties,
+  committee positions, and subnets rather than substituting genesis or stale state.
+- Independent frozen vectors pin the two local duties in the 16-validator profile. A separate
+  epoch-2 fixture pins a non-default justified source and distinct target and Current-dependent
+  roots; changing Current to Previous fails the exact-root assertion.
+- At most two context derivations are admitted without waiting. Admission and shutdown activity are
+  retained through blocking derivation, caller cancellation, late validation, the returned private
+  context, and the coherent candidate snapshot. Chain drain therefore waits until the last such
+  owner is dropped, while post-close and cap-plus-one ingress fail immediately.
+- Initial sampling, late validation, and context consumption each take the canonical PQ import gate
+  only for a short nonwaiting clock/head/reconciliation check. Contention is retryable, and each
+  gate is released before a candidate snapshot is returned. The snapshot is explicitly a coherent
+  derivation result, not signing authorization; signing and pre-publication/local-apply validation
+  must establish their own later safety boundary.
+- This slice adds no signing, publication, scheduler, HTTP route, aggregate routing, operation or
+  aggregation pool insertion, local-attester persistence, vote/fork-choice recovery, justification,
+  or finalization. The finalized checkpoint remains genesis and Task 7.2 finality is still
+  unclaimed.
