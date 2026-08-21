@@ -893,6 +893,64 @@ fn local_publish_of_exact_pending_message_is_negative_not_duplicate() {
 }
 
 #[test]
+fn published_local_and_retained_remote_duplicates_report_their_source() {
+    let (mut gs, peers, queues, topics) = DefaultBehaviourTestBuilder::default()
+        .peer_no(2)
+        .topics(vec!["blocks".into()])
+        .to_subscribe(true)
+        .gs_config(bounded_config(Arc::new(Mutex::new(vec![]))))
+        .create_network();
+    let _queues = flush_events(&mut gs, queues);
+
+    let local_data = vec![0xa1];
+    assert!(gs.publish(topics[0].clone(), local_data.clone()).is_ok());
+    assert!(matches!(
+        gs.publish(topics[0].clone(), local_data),
+        Err(PublishError::DuplicateLocal)
+    ));
+
+    let remote_message = random_message(&mut 1, &topics);
+    let remote_data = remote_message.data.clone();
+    gs.handle_received_message(remote_message, &peers[0]);
+    let remote_id = match gs.events.pop_front().expect("remote admission") {
+        ToSwarm::GenerateEvent(Event::AdmittedMessage { admission_id, .. }) => admission_id,
+        other => panic!("unexpected event: {other:?}"),
+    };
+    assert!(matches!(
+        gs.report_admitted_message_outcome(
+            &remote_id,
+            AdmittedMessageValidationOutcome::TerminalIgnore,
+        ),
+        AdmittedMessageReport::Complete,
+    ));
+    assert!(matches!(
+        gs.publish(topics[0].clone(), remote_data),
+        Err(PublishError::DuplicateRemote)
+    ));
+}
+
+#[test]
+fn precomputed_message_id_is_exact_only_for_anonymous_publication() {
+    let config = ConfigBuilder::default()
+        .validation_mode(ValidationMode::Permissive)
+        .message_id_fn(|message| MessageId(message.data.clone()))
+        .build()
+        .expect("message-id config");
+    let topic = Topic::new("attestation").hash();
+    let data = vec![0x4a, 0x51];
+    let anonymous: Behaviour = Behaviour::new(MessageAuthenticity::Anonymous, config.clone())
+        .expect("anonymous behaviour");
+    let authored: Behaviour =
+        Behaviour::new(MessageAuthenticity::RandomAuthor, config).expect("authored behaviour");
+
+    assert_eq!(
+        anonymous.anonymous_message_id(topic.clone(), &data),
+        Some(MessageId(data)),
+    );
+    assert_eq!(authored.anonymous_message_id(topic, &[0x4a, 0x51]), None);
+}
+
+#[test]
 fn remote_window_exhaustion_cannot_consume_six_local_publication_allowances() {
     let (mut gs, peers, queues, topics) = DefaultBehaviourTestBuilder::default()
         .peer_no(16)

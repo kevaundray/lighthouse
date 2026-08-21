@@ -134,6 +134,99 @@ pub enum NetworkEvent<E: EthSpec> {
     PeerUpdatedCustodyGroupCount(PeerId),
 }
 
+#[cfg(all(test, feature = "pq-proposer"))]
+mod pq_single_publish_outcome_tests {
+    use super::*;
+
+    #[test]
+    fn every_lower_publish_result_has_an_exact_typed_outcome() {
+        let id = MessageId(vec![0x5a; 20]);
+
+        assert_eq!(
+            classify_pq_single_publish_result(id.clone(), Ok(id.clone())),
+            PqSingleAttestationPublishOutcome::Published {
+                message_id: id.clone(),
+            },
+        );
+        let actual_published_id = MessageId(vec![0x6b; 20]);
+        assert_eq!(
+            classify_pq_single_publish_result(id.clone(), Ok(actual_published_id.clone())),
+            PqSingleAttestationPublishOutcome::MessageIdMismatch {
+                expected: id.clone(),
+                actual: actual_published_id,
+            },
+        );
+        assert_eq!(
+            classify_pq_single_publish_result(id.clone(), Err(PublishError::PendingValidation),),
+            PqSingleAttestationPublishOutcome::PendingRemote {
+                message_id: id.clone(),
+            },
+        );
+        assert_eq!(
+            classify_pq_single_publish_result(
+                id.clone(),
+                Err(PublishError::ValidationAdmissionFull),
+            ),
+            PqSingleAttestationPublishOutcome::ValidationAdmissionFull {
+                message_id: id.clone(),
+            },
+        );
+        assert_eq!(
+            classify_pq_single_publish_result(id.clone(), Err(PublishError::Duplicate)),
+            PqSingleAttestationPublishOutcome::DuplicateUnknown {
+                message_id: id.clone(),
+            },
+        );
+        assert_eq!(
+            classify_pq_single_publish_result(id.clone(), Err(PublishError::DuplicateLocal),),
+            PqSingleAttestationPublishOutcome::DuplicateLocal {
+                message_id: id.clone(),
+            },
+        );
+        assert_eq!(
+            classify_pq_single_publish_result(id.clone(), Err(PublishError::DuplicateRemote),),
+            PqSingleAttestationPublishOutcome::DuplicateRemote {
+                message_id: id.clone(),
+            },
+        );
+        assert_eq!(
+            classify_pq_single_publish_result(
+                id.clone(),
+                Err(PublishError::NoPeersSubscribedToTopic),
+            ),
+            PqSingleAttestationPublishOutcome::NoPeers {
+                message_id: id.clone(),
+            },
+        );
+        assert_eq!(
+            classify_pq_single_publish_result(id.clone(), Err(PublishError::AllQueuesFull(4))),
+            PqSingleAttestationPublishOutcome::AllQueuesFull {
+                message_id: id.clone(),
+                attempted_peers: 4,
+            },
+        );
+        assert_eq!(
+            classify_pq_single_publish_result(id.clone(), Err(PublishError::MessageTooLarge),),
+            PqSingleAttestationPublishOutcome::MessageTooLarge {
+                message_id: id.clone(),
+            },
+        );
+        assert_eq!(
+            classify_pq_single_publish_result(
+                id.clone(),
+                Err(PublishError::TransformFailed(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "test transform failure",
+                ))),
+            ),
+            PqSingleAttestationPublishOutcome::Transform {
+                message_id: id,
+                error_kind: std::io::ErrorKind::InvalidData,
+            },
+        );
+    }
+}
+
 pub type Gossipsub = gossipsub::Behaviour<SnappyTransform, SubscriptionFilter>;
 pub type SubscriptionFilter =
     gossipsub::MaxCountSubscriptionFilter<gossipsub::WhitelistSubscriptionFilter>;
@@ -161,6 +254,151 @@ pub enum PqTestingAttestationLowerPublishError {
     Duplicate,
     NoPeersSubscribed,
     Rejected,
+}
+
+/// Result of one exact, anonymous PQ single-attestation gossipsub publication.
+#[cfg(feature = "pq-proposer")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PqSingleAttestationPublishOutcome {
+    Published {
+        message_id: MessageId,
+    },
+    DuplicateLocal {
+        message_id: MessageId,
+    },
+    PendingRemote {
+        message_id: MessageId,
+    },
+    DuplicateRemote {
+        message_id: MessageId,
+    },
+    DuplicateUnknown {
+        message_id: MessageId,
+    },
+    NoPeers {
+        message_id: MessageId,
+    },
+    AllQueuesFull {
+        message_id: MessageId,
+        attempted_peers: usize,
+    },
+    ValidationAdmissionFull {
+        message_id: MessageId,
+    },
+    MessageTooLarge {
+        message_id: MessageId,
+    },
+    Transform {
+        message_id: MessageId,
+        error_kind: std::io::ErrorKind,
+    },
+    MessageIdMismatch {
+        expected: MessageId,
+        actual: MessageId,
+    },
+    NonAnonymousPublisher,
+}
+
+#[cfg(feature = "pq-proposer")]
+fn classify_pq_single_publish_result(
+    message_id: MessageId,
+    result: Result<MessageId, PublishError>,
+) -> PqSingleAttestationPublishOutcome {
+    match result {
+        Ok(actual) if actual == message_id => {
+            PqSingleAttestationPublishOutcome::Published { message_id }
+        }
+        Ok(actual) => PqSingleAttestationPublishOutcome::MessageIdMismatch {
+            expected: message_id,
+            actual,
+        },
+        Err(PublishError::PendingValidation) => {
+            PqSingleAttestationPublishOutcome::PendingRemote { message_id }
+        }
+        Err(PublishError::ValidationAdmissionFull) => {
+            PqSingleAttestationPublishOutcome::ValidationAdmissionFull { message_id }
+        }
+        Err(PublishError::Duplicate) => {
+            PqSingleAttestationPublishOutcome::DuplicateUnknown { message_id }
+        }
+        Err(PublishError::DuplicateLocal) => {
+            PqSingleAttestationPublishOutcome::DuplicateLocal { message_id }
+        }
+        Err(PublishError::DuplicateRemote) => {
+            PqSingleAttestationPublishOutcome::DuplicateRemote { message_id }
+        }
+        Err(PublishError::SigningError(_)) => {
+            PqSingleAttestationPublishOutcome::NonAnonymousPublisher
+        }
+        Err(PublishError::NoPeersSubscribedToTopic) => {
+            PqSingleAttestationPublishOutcome::NoPeers { message_id }
+        }
+        Err(PublishError::MessageTooLarge) => {
+            PqSingleAttestationPublishOutcome::MessageTooLarge { message_id }
+        }
+        Err(PublishError::TransformFailed(error)) => PqSingleAttestationPublishOutcome::Transform {
+            message_id,
+            error_kind: error.kind(),
+        },
+        Err(PublishError::AllQueuesFull(attempted_peers)) => {
+            PqSingleAttestationPublishOutcome::AllQueuesFull {
+                message_id,
+                attempted_peers,
+            }
+        }
+        Err(PublishError::Partial(_)) => PqSingleAttestationPublishOutcome::Transform {
+            message_id,
+            error_kind: std::io::ErrorKind::InvalidData,
+        },
+    }
+}
+
+/// Exact topic and SSZ bytes authorized for one PQ single-attestation publication.
+///
+/// The private fields make this a lower-layer capability. The future attester-to-network handoff
+/// will construct it from a consumed verified batch; callers cannot supply validator semantics.
+#[cfg(feature = "pq-proposer")]
+pub struct PqEncodedSingleAttestation {
+    topic: Topic,
+    data: Vec<u8>,
+    fork_digest: [u8; 4],
+}
+
+#[cfg(feature = "pq-proposer")]
+impl PqEncodedSingleAttestation {
+    pub fn as_ssz_bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    pub fn topic_hash(&self) -> TopicHash {
+        self.topic.hash()
+    }
+
+    pub fn fork_digest(&self) -> [u8; 4] {
+        self.fork_digest
+    }
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+impl PqEncodedSingleAttestation {
+    #[doc(hidden)]
+    pub fn testing_only_encode<E: EthSpec>(
+        attestation: types::SingleAttestation,
+        subnet: SubnetId,
+        fork_digest: [u8; 4],
+    ) -> Self {
+        let message: PubsubMessage<E> = PubsubMessage::Attestation(Box::new((subnet, attestation)));
+        let topic = GossipTopic::new(
+            GossipKind::Attestation(subnet),
+            GossipEncoding::default(),
+            fork_digest,
+        );
+        Self {
+            topic: Topic::from(topic),
+            data: message.encode(GossipEncoding::default()),
+            fork_digest,
+        }
+    }
 }
 
 /// Exact topic and SSZ bytes prepared for a PQ beacon-block publication.
@@ -996,7 +1234,9 @@ impl<E: EthSpec> Network<E> {
                     .publish(Topic::from(topic.clone()), message_data.clone())
                 {
                     match e {
-                        PublishError::Duplicate => {
+                        PublishError::Duplicate
+                        | PublishError::DuplicateLocal
+                        | PublishError::DuplicateRemote => {
                             debug!(
                                 kind = %topic.kind(),
                                 "Attempted to publish duplicate message"
@@ -1070,12 +1310,34 @@ impl<E: EthSpec> Network<E> {
     ) -> Result<PqBeaconBlockPublishOutcome, PqBeaconBlockPublishError> {
         match self.gossipsub_mut().publish(encoded.topic, encoded.data) {
             Ok(_) => Ok(PqBeaconBlockPublishOutcome::Published),
-            Err(PublishError::Duplicate) => Ok(PqBeaconBlockPublishOutcome::Duplicate),
+            Err(
+                PublishError::Duplicate
+                | PublishError::DuplicateLocal
+                | PublishError::DuplicateRemote,
+            ) => Ok(PqBeaconBlockPublishOutcome::Duplicate),
             Err(PublishError::NoPeersSubscribedToTopic) => {
                 Err(PqBeaconBlockPublishError::NoPeersSubscribed)
             }
             Err(_) => Err(PqBeaconBlockPublishError::Rejected),
         }
+    }
+
+    /// Publish exact, pre-encoded PQ single-attestation bytes through anonymous gossipsub.
+    #[cfg(feature = "pq-proposer")]
+    pub fn publish_pq_encoded_single_attestation(
+        &mut self,
+        encoded: &mut PqEncodedSingleAttestation,
+    ) -> PqSingleAttestationPublishOutcome {
+        let Some(message_id) = self
+            .gossipsub()
+            .anonymous_message_id(encoded.topic.hash(), &encoded.data)
+        else {
+            return PqSingleAttestationPublishOutcome::NonAnonymousPublisher;
+        };
+        let result = self
+            .gossipsub_mut()
+            .publish(encoded.topic.clone(), encoded.data.clone());
+        classify_pq_single_publish_result(message_id, result)
     }
 
     #[cfg(feature = "pq-startup-testing")]
@@ -1096,7 +1358,11 @@ impl<E: EthSpec> Network<E> {
             message.encode(GossipEncoding::default()),
         ) {
             Ok(_) => Ok(()),
-            Err(PublishError::Duplicate) => Err(PqTestingAttestationLowerPublishError::Duplicate),
+            Err(
+                PublishError::Duplicate
+                | PublishError::DuplicateLocal
+                | PublishError::DuplicateRemote,
+            ) => Err(PqTestingAttestationLowerPublishError::Duplicate),
             Err(PublishError::NoPeersSubscribedToTopic) => {
                 Err(PqTestingAttestationLowerPublishError::NoPeersSubscribed)
             }
@@ -1753,7 +2019,11 @@ impl<E: EthSpec> Network<E> {
                                         &[topic_str],
                                     );
                                 }
-                                Err(PublishError::Duplicate) => {
+                                Err(
+                                    PublishError::Duplicate
+                                    | PublishError::DuplicateLocal
+                                    | PublishError::DuplicateRemote,
+                                ) => {
                                     debug!(
                                         reason = "duplicate",
                                         topic = topic_str,

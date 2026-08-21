@@ -1977,3 +1977,41 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
 - This is only the bounded lower admission prerequisite. It adds no production attestation
   publisher, does not transfer or consume the service-owned verified batch, and makes no new local
   fork-choice application, scheduling, pool, persistence, justification, or finalization claim.
+
+### 2026-08-21: Source-aware lower PQ single publisher completed (Task 5.2b prerequisite)
+
+- The signer-only `lighthouse_network/pq-proposer` feature exposes one sealed, private-field
+  `PqEncodedSingleAttestation` request and one exact lower publication method. The method requires a
+  unique mutable borrow of the non-`Clone` request, so safe code cannot publish the same authorized
+  capability concurrently through distinct `Network` owners. Retryable `NoPeers`, `AllQueuesFull`,
+  `ValidationAdmissionFull`, and `PendingRemote` results leave the same request with its caller;
+  the real retry test constructs it once and observes `NoPeers -> Published -> DuplicateLocal`
+  without re-encoding.
+- The request binds exact precomputed single-attestation SSZ bytes, attestation-subnet topic, and
+  fork digest before it enters the mutable network loop. Gossipsub still performs its existing
+  bounded Snappy transform synchronously; this slice moves no compression work and makes no
+  off-loop-compression claim. Production has no raw semantic constructor. The only constructor in
+  this checkpoint is hidden behind the additional `pq-startup-testing` feature.
+- Anonymous publication returns the exact `MessageId` on every path where it is computable:
+  `Published`, `DuplicateLocal`, `PendingRemote`, `DuplicateRemote`, `DuplicateUnknown`, `NoPeers`,
+  `AllQueuesFull`, `ValidationAdmissionFull`, `MessageTooLarge`, and `Transform`. A successful
+  lower return whose ID differs from the precomputed capability ID is terminal
+  `MessageIdMismatch`, never `Published`. A generic admission-less duplicate is terminal
+  `DuplicateUnknown`, never guessed local. A non-anonymous publisher returns
+  `NonAnonymousPublisher` without fabricating an ID.
+- Source provenance uses the existing bounded validation-history windows rather than another map.
+  A first local publish is retained as local; remote pending remains distinct; accepted or terminal
+  remote history remains remote; retryable remote resolution releases the exact ID. Failed local
+  `NoPeers` and `AllQueuesFull` attempts roll back reservation, duplicate cache, and mcache state so
+  byte-identical retry can publish. Published history remains irreversible.
+- TDD sensitivity included the missing-API compile RED; missing local/remote duplicate variants;
+  removed `NoPeers` release; collapsed remote/local classification; changed admission-full and
+  transform mappings; fabricated non-anonymous IDs; accepted mismatched success IDs; generic
+  duplicate mapped local; and shared/by-value request signatures. The warning-denied lower suite
+  passes one outcome-table unit test and six real integration tests, including a compatible
+  two-worker remote pending/terminal/retryable trace. Vendored admission and queue tests retain the
+  ordinary no-admission path and exact rollback behavior.
+- This is only the source-aware lower gossipsub publisher. It adds no network-service command,
+  transfer from `PqAttesterService`, consumption of the service-owned verified batch, local
+  fork-choice application, scheduler, HTTP route, pool insertion, aggregation, persistence,
+  justification, or finalization claim.

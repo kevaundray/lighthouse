@@ -2708,6 +2708,29 @@ history release fails. The ordinary no-admission path is unchanged. This checkpo
 or implement a production publisher, consume the service-owned verified batch, apply local fork
 choice, or add scheduler, pool, persistence, justification, or finalization behavior.
 
+**Source-aware lower publication checkpoint (implemented, upper handoff still absent):** the
+signer-only `lighthouse_network/pq-proposer` graph now owns a sealed, private-field, non-`Clone`
+preencoded single-attestation request. Its synchronous lower publish method requires a unique
+mutable borrow, preserving the same capability across retryable `NoPeers`, `AllQueuesFull`,
+`ValidationAdmissionFull`, and `PendingRemote` outcomes while preventing safe concurrent reuse
+through distinct networks. The request binds exact SSZ bytes, subnet topic, and fork digest before
+lower entry. Existing bounded Snappy compression still runs synchronously in gossipsub.
+
+The result-bearing contract preserves exact anonymous `MessageId` identity and distinguishes
+Published, local duplicate, remote pending, remote retained duplicate, unknown duplicate, no peers,
+all queues full, validation admission full, message too large, and transform failure. A mismatched
+success ID and a provenance-less generic duplicate are terminal rather than reported as published
+or guessed local. The bounded vendor history derives provenance from its existing local and remote
+sets; no unbounded side map was added. Failed local queue/peer attempts release reservation,
+duplicate-cache, and mcache state, retryable remote resolution releases the exact remote identity,
+and successful publication remains retained.
+
+Compile and behavioral mutations pin the unique-borrow API, same-object retry, ID mismatch,
+unknown duplicate, source collapse, admission and transform mapping, anonymous-ID eligibility, and
+reservation rollback. This checkpoint adds no upper network command, attester-service batch
+handoff, local consume/apply coalescer, scheduler, HTTP route, pools, aggregation, persistence,
+justification, or finalization behavior.
+
 This checkpoint is not completion of Task 5.2b. The fork-choice receiver remains in-memory Fresh
 evidence, and the local-context Resume evidence is limited to rebuilding ephemeral committee caches
 from the selected canonical snapshot. There is no live aggregate-and-proof routing, operation-pool

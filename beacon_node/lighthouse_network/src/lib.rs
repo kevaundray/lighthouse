@@ -130,3 +130,5 @@ pub use service::utils::*;
 pub use service::{Gossipsub, NetworkEvent};
 #[cfg(feature = "pq-devnet")]
 pub use service::{PqBeaconBlockPublishError, PqBeaconBlockPublishOutcome, PqEncodedBeaconBlock};
+#[cfg(feature = "pq-proposer")]
+pub use service::{PqEncodedSingleAttestation, PqSingleAttestationPublishOutcome};

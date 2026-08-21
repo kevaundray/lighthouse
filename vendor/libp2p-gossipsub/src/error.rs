@@ -31,6 +31,10 @@ pub enum PublishError {
     ValidationAdmissionFull,
     /// This message has already been published.
     Duplicate,
+    /// This message was previously published by this node through source-aware admission.
+    DuplicateLocal,
+    /// This message was previously admitted from a remote peer through source-aware admission.
+    DuplicateRemote,
     /// An error occurred whilst signing the message.
     SigningError(SigningError),
     /// No peers are currently subscribed to receive messages on this topic.

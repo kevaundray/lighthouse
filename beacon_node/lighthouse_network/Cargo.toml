@@ -12,6 +12,7 @@ pq-devnet = [
     "eth2/pq-devnet",
     "types/pq-devnet",
 ]
+pq-proposer = ["pq-devnet"]
 pq-startup-testing = ["pq-devnet"]
 
 [dependencies]

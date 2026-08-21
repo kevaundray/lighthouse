@@ -471,6 +471,12 @@ struct ValidationAdmissionHistory {
     windows: VecDeque<ValidationAdmissionWindow>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ValidationAdmissionSource {
+    Local,
+    Remote,
+}
+
 impl ValidationAdmissionHistory {
     fn new(
         config: crate::ValidationAdmissionConfig,
@@ -541,6 +547,26 @@ impl ValidationAdmissionHistory {
         self.windows
             .iter()
             .any(|window| window.remote_ids.contains_key(id) || window.local_ids.contains(id))
+    }
+
+    fn source(&self, id: &MessageId) -> Option<ValidationAdmissionSource> {
+        self.windows.iter().find_map(|window| {
+            if window.local_ids.contains(id) {
+                Some(ValidationAdmissionSource::Local)
+            } else if window.remote_ids.contains_key(id) {
+                Some(ValidationAdmissionSource::Remote)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn duplicate_publish_error(&self, id: &MessageId) -> PublishError {
+        match self.source(id) {
+            Some(ValidationAdmissionSource::Local) => PublishError::DuplicateLocal,
+            Some(ValidationAdmissionSource::Remote) => PublishError::DuplicateRemote,
+            None => PublishError::Duplicate,
+        }
     }
 
     fn reserve_remote(
@@ -907,13 +933,24 @@ where
                 message_id=%msg_id,
                 "Not publishing a message that has already been published"
             );
-            return Err(PublishError::Duplicate);
+            return Err(self
+                .validation_admission_history
+                .as_ref()
+                .map_or(PublishError::Duplicate, |history| {
+                    history.duplicate_publish_error(&msg_id)
+                }));
         }
 
         if let Some(history) = &mut self.validation_admission_history {
             match history.reserve_local(&msg_id, Instant::now()) {
                 ValidationReservation::New => {}
-                ValidationReservation::Duplicate => return Err(PublishError::Duplicate),
+                ValidationReservation::Duplicate => {
+                    return Err(match history.source(&msg_id) {
+                        Some(ValidationAdmissionSource::Local) => PublishError::DuplicateLocal,
+                        Some(ValidationAdmissionSource::Remote) => PublishError::DuplicateRemote,
+                        None => PublishError::Duplicate,
+                    });
+                }
                 ValidationReservation::PeerFull | ValidationReservation::Full => {
                     return Err(PublishError::ValidationAdmissionFull);
                 }
@@ -1016,6 +1053,25 @@ where
         }
 
         Ok(msg_id)
+    }
+
+    /// Compute the message ID that [`Self::publish`] will use for an anonymous message.
+    ///
+    /// Returns `None` when this behaviour is configured with a non-anonymous publisher because
+    /// its source and sequence number are not present in the pre-encoded payload.
+    pub fn anonymous_message_id(
+        &self,
+        topic: impl Into<TopicHash>,
+        data: &[u8],
+    ) -> Option<MessageId> {
+        matches!(self.publish_config, PublishConfig::Anonymous).then(|| {
+            self.config.message_id(&Message {
+                source: None,
+                data: data.to_vec(),
+                sequence_number: None,
+                topic: topic.into(),
+            })
+        })
     }
 
     /// Get all peers on the topic that have a sufficiently high score to allow publishing.
