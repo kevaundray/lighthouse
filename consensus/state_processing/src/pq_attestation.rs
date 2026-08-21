@@ -227,6 +227,15 @@ impl<E: EthSpec> VerifiedPqSingleAttestation<E> {
         self.single_attestation.attester_index
     }
 
+    pub const fn claim(&self) -> SameMessageClaim {
+        self.verified_attestation.claim()
+    }
+
+    pub fn signer_public_key(&self) -> Option<consensus_signature::ValidatorPublicKeyBytes> {
+        let signers = self.verified_attestation.signers();
+        (signers.len() == 1).then(|| signers[0].public_key)
+    }
+
     pub fn into_parts(self) -> (SingleAttestation, VerifiedPqAttestation<E>) {
         (self.single_attestation, self.verified_attestation)
     }

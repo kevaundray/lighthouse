@@ -1,5 +1,6 @@
-use crate::{BeaconChain, BeaconChainTypes, BeaconSnapshot};
+use crate::{BeaconChain, BeaconChainTypes, BeaconSnapshot, PqLocallyConstructedSingle};
 use parking_lot::Mutex;
+use sha2::{Digest, Sha256};
 use slot_clock::SlotClock;
 use state_processing::{
     PqAttestationError, PqAttestationInvalid, PqAttestationLocalError, PqConsensusError,
@@ -86,6 +87,37 @@ pub enum PqAttestationGossipError {
     Duplicate(PqAttestationGossipObservation),
 }
 
+#[derive(Debug)]
+pub enum PqLocalAttestationInvariant {
+    Contextual(PqAttestationGossipPeerInvalid),
+    UnexpectedObservation,
+    ProvenanceMismatch(&'static str),
+}
+
+#[derive(Debug)]
+pub enum PqLocalAttestationVerificationError {
+    Invariant(PqLocalAttestationInvariant),
+    Local(PqAttestationGossipLocalError),
+}
+
+impl std::fmt::Display for PqLocalAttestationVerificationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "PQ local attestation verification failed: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for PqLocalAttestationVerificationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Local(error) => pq_attestation_local_error_source(error),
+            Self::Invariant(_) => None,
+        }
+    }
+}
+
 impl PqAttestationGossipError {
     pub const fn should_penalize_peer(&self) -> bool {
         matches!(self, Self::PeerInvalid(_))
@@ -113,61 +145,66 @@ impl std::fmt::Display for PqAttestationGossipError {
 impl std::error::Error for PqAttestationGossipError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Local(PqAttestationGossipLocalError::Attestation(
-                PqAttestationLocalError::SigningId(error),
-            )) => Some(error),
-            Self::Local(PqAttestationGossipLocalError::Attestation(
-                PqAttestationLocalError::Aggregation(error),
-            )) => Some(error),
-            Self::Local(PqAttestationGossipLocalError::Aggregate(
-                PqConsensusLocalError::SigningId(error),
-            )) => Some(error),
-            Self::Local(PqAttestationGossipLocalError::Aggregate(
-                PqConsensusLocalError::Aggregation(error),
-            )) => Some(error),
-            Self::Local(PqAttestationGossipLocalError::Aggregate(
-                PqConsensusLocalError::Attestation(PqAttestationLocalError::SigningId(error)),
-            )) => Some(error),
-            Self::Local(PqAttestationGossipLocalError::Aggregate(
-                PqConsensusLocalError::Attestation(PqAttestationLocalError::Aggregation(error)),
-            )) => Some(error),
-            Self::PeerInvalid(_)
-            | Self::Duplicate(_)
-            | Self::Local(
-                PqAttestationGossipLocalError::ShuttingDown
-                | PqAttestationGossipLocalError::IngressCapacity
-                | PqAttestationGossipLocalError::ClockUnavailable
-                | PqAttestationGossipLocalError::ReceiptBeforeWindow { .. }
-                | PqAttestationGossipLocalError::ReceiptAfterWindow { .. }
-                | PqAttestationGossipLocalError::BlockingTask(_)
-                | PqAttestationGossipLocalError::AsyncTask(_)
-                | PqAttestationGossipLocalError::BoundHeadNoLongerCanonical { .. }
-                | PqAttestationGossipLocalError::ProofOutlivedPropagationWindow { .. }
-                | PqAttestationGossipLocalError::ReferencedBlockUnavailable(_)
-                | PqAttestationGossipLocalError::ReferencedStateUnavailable(_)
-                | PqAttestationGossipLocalError::StateAdvanceTooLarge { .. }
-                | PqAttestationGossipLocalError::StateUnavailable
-                | PqAttestationGossipLocalError::ObservationCapacity
-                | PqAttestationGossipLocalError::ObservationGenerationExhausted
-                | PqAttestationGossipLocalError::ObservationLost
-                | PqAttestationGossipLocalError::Store(_)
-                | PqAttestationGossipLocalError::Attestation(
-                    PqAttestationLocalError::UnsupportedProfile
-                    | PqAttestationLocalError::CommitteeCacheUnavailable
-                    | PqAttestationLocalError::CacheInvariant,
-                )
-                | PqAttestationGossipLocalError::Aggregate(
-                    PqConsensusLocalError::UnsupportedProfile
-                    | PqConsensusLocalError::StateUnavailable
-                    | PqConsensusLocalError::CacheInvariant
-                    | PqConsensusLocalError::Attestation(
-                        PqAttestationLocalError::UnsupportedProfile
-                        | PqAttestationLocalError::CommitteeCacheUnavailable
-                        | PqAttestationLocalError::CacheInvariant,
-                    ),
-                ),
-            ) => None,
+            Self::Local(error) => pq_attestation_local_error_source(error),
+            Self::PeerInvalid(_) | Self::Duplicate(_) => None,
         }
+    }
+}
+
+fn pq_attestation_local_error_source(
+    error: &PqAttestationGossipLocalError,
+) -> Option<&(dyn std::error::Error + 'static)> {
+    match error {
+        PqAttestationGossipLocalError::Attestation(PqAttestationLocalError::SigningId(error)) => {
+            Some(error)
+        }
+        PqAttestationGossipLocalError::Attestation(PqAttestationLocalError::Aggregation(error)) => {
+            Some(error)
+        }
+        PqAttestationGossipLocalError::Aggregate(PqConsensusLocalError::SigningId(error)) => {
+            Some(error)
+        }
+        PqAttestationGossipLocalError::Aggregate(PqConsensusLocalError::Aggregation(error)) => {
+            Some(error)
+        }
+        PqAttestationGossipLocalError::Aggregate(PqConsensusLocalError::Attestation(
+            PqAttestationLocalError::SigningId(error),
+        )) => Some(error),
+        PqAttestationGossipLocalError::Aggregate(PqConsensusLocalError::Attestation(
+            PqAttestationLocalError::Aggregation(error),
+        )) => Some(error),
+        PqAttestationGossipLocalError::ShuttingDown
+        | PqAttestationGossipLocalError::IngressCapacity
+        | PqAttestationGossipLocalError::ClockUnavailable
+        | PqAttestationGossipLocalError::ReceiptBeforeWindow { .. }
+        | PqAttestationGossipLocalError::ReceiptAfterWindow { .. }
+        | PqAttestationGossipLocalError::BlockingTask(_)
+        | PqAttestationGossipLocalError::AsyncTask(_)
+        | PqAttestationGossipLocalError::BoundHeadNoLongerCanonical { .. }
+        | PqAttestationGossipLocalError::ProofOutlivedPropagationWindow { .. }
+        | PqAttestationGossipLocalError::ReferencedBlockUnavailable(_)
+        | PqAttestationGossipLocalError::ReferencedStateUnavailable(_)
+        | PqAttestationGossipLocalError::StateAdvanceTooLarge { .. }
+        | PqAttestationGossipLocalError::StateUnavailable
+        | PqAttestationGossipLocalError::ObservationCapacity
+        | PqAttestationGossipLocalError::ObservationGenerationExhausted
+        | PqAttestationGossipLocalError::ObservationLost
+        | PqAttestationGossipLocalError::Store(_)
+        | PqAttestationGossipLocalError::Attestation(
+            PqAttestationLocalError::UnsupportedProfile
+            | PqAttestationLocalError::CommitteeCacheUnavailable
+            | PqAttestationLocalError::CacheInvariant,
+        )
+        | PqAttestationGossipLocalError::Aggregate(
+            PqConsensusLocalError::UnsupportedProfile
+            | PqConsensusLocalError::StateUnavailable
+            | PqConsensusLocalError::CacheInvariant
+            | PqConsensusLocalError::Attestation(
+                PqAttestationLocalError::UnsupportedProfile
+                | PqAttestationLocalError::CommitteeCacheUnavailable
+                | PqAttestationLocalError::CacheInvariant,
+            ),
+        ) => None,
     }
 }
 
@@ -880,6 +917,87 @@ impl<E: EthSpec> Drop for PqVerifiedGossipSingle<E> {
     }
 }
 
+/// Contextually verified local single, sealed without touching remote gossip observations.
+///
+/// The exact signed wire object, signing root, complete signed-SSZ digest and immutable local duty
+/// metadata remain bound together. This type is deliberately non-`Clone` and has no fork-choice
+/// application or gossip-propagation method in Slice B1.
+pub struct PqVerifiedLocalSingle<E: EthSpec> {
+    verified: VerifiedPqSingleAttestation<E>,
+    pubkey: consensus_signature::ValidatorPublicKeyBytes,
+    validator_index: u64,
+    committee_index: u64,
+    committee_position: usize,
+    committee_length: usize,
+    committee_count_at_slot: u64,
+    subnet: SubnetId,
+    slot: Slot,
+    bound_head_root: Hash256,
+    dependent_root: Hash256,
+    signing_root: Hash256,
+    signed_ssz_digest: [u8; 32],
+    _admission: OwnedSemaphorePermit,
+    _activity: Arc<crate::beacon_chain::PqImportActivity>,
+}
+
+impl<E: EthSpec> PqVerifiedLocalSingle<E> {
+    pub const fn verified(&self) -> &VerifiedPqSingleAttestation<E> {
+        &self.verified
+    }
+
+    pub const fn single(&self) -> &SingleAttestation {
+        self.verified.single_attestation()
+    }
+
+    pub const fn pubkey(&self) -> consensus_signature::ValidatorPublicKeyBytes {
+        self.pubkey
+    }
+
+    pub const fn validator_index(&self) -> u64 {
+        self.validator_index
+    }
+
+    pub const fn committee_index(&self) -> u64 {
+        self.committee_index
+    }
+
+    pub const fn committee_position(&self) -> usize {
+        self.committee_position
+    }
+
+    pub const fn committee_length(&self) -> usize {
+        self.committee_length
+    }
+
+    pub const fn committee_count_at_slot(&self) -> u64 {
+        self.committee_count_at_slot
+    }
+
+    pub const fn subnet(&self) -> SubnetId {
+        self.subnet
+    }
+
+    pub const fn slot(&self) -> Slot {
+        self.slot
+    }
+
+    pub const fn bound_head_root(&self) -> Hash256 {
+        self.bound_head_root
+    }
+
+    pub const fn dependent_root(&self) -> Hash256 {
+        self.dependent_root
+    }
+
+    pub const fn signing_root(&self) -> Hash256 {
+        self.signing_root
+    }
+
+    pub const fn signed_ssz_digest(&self) -> [u8; 32] {
+        self.signed_ssz_digest
+    }
+}
+
 pub(crate) struct PqSingleGossipConsumption<E: EthSpec> {
     observations: Arc<Mutex<PqAttestationGossipObservationCache<E>>>,
     binding: Option<SingleObservationBinding>,
@@ -1129,6 +1247,15 @@ struct PreparedSingle<E: EthSpec> {
     activity: Arc<crate::beacon_chain::PqImportActivity>,
 }
 
+struct VerifiedSingle<E: EthSpec> {
+    verified: VerifiedPqSingleAttestation<E>,
+    identity: Hash256,
+    key: (Epoch, u64),
+    bound_head_root: Hash256,
+    admission: OwnedSemaphorePermit,
+    activity: Arc<crate::beacon_chain::PqImportActivity>,
+}
+
 struct PreparedAggregate<E: EthSpec> {
     prepared: PreparedPqAggregateAndProof<E>,
     identity: Hash256,
@@ -1165,14 +1292,20 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         &self,
         bound_root: Hash256,
     ) -> Result<bool, PqAttestationGossipError> {
+        let activity =
+            self.pq_import_coordinator
+                .try_start()
+                .ok_or(PqAttestationGossipError::Local(
+                    PqAttestationGossipLocalError::ShuttingDown,
+                ))?;
         let admission = Arc::clone(&self.pq_attestation_gossip_admission)
             .try_acquire_owned()
             .map_err(|_| {
                 PqAttestationGossipError::Local(PqAttestationGossipLocalError::IngressCapacity)
             })?;
-        self.pq_attestation_bound_is_canonical(bound_root, admission)
+        self.pq_attestation_bound_is_canonical_owned(bound_root, admission, activity)
             .await
-            .map(|(is_canonical, _admission)| is_canonical)
+            .map(|(is_canonical, _admission, _activity)| is_canonical)
     }
 
     async fn pq_attestation_bound_is_canonical(
@@ -1180,10 +1313,25 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         bound_root: Hash256,
         admission: OwnedSemaphorePermit,
     ) -> Result<(bool, OwnedSemaphorePermit), PqAttestationGossipError> {
+        self.pq_attestation_bound_is_canonical_owned(bound_root, admission, ())
+            .await
+            .map(|(is_canonical, admission, ())| (is_canonical, admission))
+    }
+
+    async fn pq_attestation_bound_is_canonical_owned<O: Send + 'static>(
+        &self,
+        bound_root: Hash256,
+        admission: OwnedSemaphorePermit,
+        ownership: O,
+    ) -> Result<(bool, OwnedSemaphorePermit, O), PqAttestationGossipError> {
         let snapshot = self.head_snapshot();
         let store = Arc::clone(&self.store);
         #[cfg(feature = "pq-startup-testing")]
-        let blocking_test_hook = self.pq_blocking_test_hook.clone();
+        let blocking_test_hook = self
+            .pq_attestation_lineage_test_hook
+            .lock()
+            .clone()
+            .or_else(|| self.pq_blocking_test_hook.clone());
         self.task_executor
             .spawn_blocking_handle(
                 move || {
@@ -1192,7 +1340,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                         hook.run();
                     }
                     canonical_lineage_contains::<T>(&store, &snapshot, bound_root)
-                        .map(|is_canonical| (is_canonical, admission))
+                        .map(|is_canonical| (is_canonical, admission, ownership))
                 },
                 "pq-attestation-gossip-late-lineage",
             )
@@ -1205,6 +1353,144 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                     "pq-attestation-gossip-late-lineage",
                 ))
             })?
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_pq_single_verification(
+        &self,
+        snapshot: Arc<BeaconSnapshot<T::EthSpec>>,
+        attestation: SingleAttestation,
+        subnet: SubnetId,
+        latest_slot: Slot,
+        earliest_slot: Slot,
+        bound_head_root: Hash256,
+        admission: OwnedSemaphorePermit,
+        activity: Arc<crate::beacon_chain::PqImportActivity>,
+    ) -> Result<PreparedSingle<T::EthSpec>, PqAttestationGossipError> {
+        let store = Arc::clone(&self.store);
+        let spec = Arc::clone(&self.spec);
+        let key_cache = Arc::clone(&self.pq_validator_key_cache);
+        Ok(self
+            .task_executor
+            .spawn_blocking_handle(
+                move || {
+                    prepare_single_context::<T>(
+                        store,
+                        snapshot,
+                        spec,
+                        key_cache,
+                        attestation,
+                        subnet,
+                        latest_slot,
+                        earliest_slot,
+                        bound_head_root,
+                        admission,
+                        activity,
+                    )
+                },
+                "pq-attestation-gossip-prepare",
+            )
+            .ok_or(PqAttestationGossipError::Local(
+                PqAttestationGossipLocalError::BlockingTask("pq-attestation-gossip-prepare"),
+            ))?
+            .await
+            .map_err(|_| {
+                PqAttestationGossipError::Local(PqAttestationGossipLocalError::BlockingTask(
+                    "pq-attestation-gossip-prepare",
+                ))
+            })??)
+    }
+
+    async fn prove_pq_single_verification(
+        &self,
+        preparation: PreparedSingle<T::EthSpec>,
+    ) -> Result<VerifiedSingle<T::EthSpec>, PqAttestationGossipError> {
+        let service = Arc::clone(&self.pq_aggregation_service);
+        let proof_task = self
+            .task_executor
+            .spawn_handle(
+                async move {
+                    let PreparedSingle {
+                        prepared,
+                        identity,
+                        key,
+                        bound_head_root,
+                        admission,
+                        activity,
+                    } = preparation;
+                    let verified = prepared.verify(&service).await;
+                    (
+                        verified,
+                        identity,
+                        key,
+                        bound_head_root,
+                        admission,
+                        activity,
+                    )
+                },
+                "pq-attestation-gossip-proof",
+            )
+            .ok_or(PqAttestationGossipError::Local(
+                PqAttestationGossipLocalError::AsyncTask("pq-attestation-gossip-proof"),
+            ))?;
+        let Some((verified, identity, key, bound_head_root, admission, activity)) =
+            proof_task.await.map_err(|_| {
+                PqAttestationGossipError::Local(PqAttestationGossipLocalError::AsyncTask(
+                    "pq-attestation-gossip-proof",
+                ))
+            })?
+        else {
+            return Err(PqAttestationGossipError::Local(
+                PqAttestationGossipLocalError::AsyncTask("pq-attestation-gossip-proof"),
+            ));
+        };
+        Ok(VerifiedSingle {
+            verified: verified.map_err(map_attestation_error)?,
+            identity,
+            key,
+            bound_head_root,
+            admission,
+            activity,
+        })
+    }
+
+    async fn finish_pq_single_verification(
+        &self,
+        verified: VerifiedSingle<T::EthSpec>,
+    ) -> Result<(VerifiedSingle<T::EthSpec>, Slot), PqAttestationGossipError> {
+        let verified_slot = verified.verified.single_attestation().data.slot;
+        let (late_latest_slot, late_earliest_slot) =
+            propagation_bounds::<T::EthSpec, _>(&self.slot_clock, &self.spec).map_err(|_| {
+                PqAttestationGossipError::Local(PqAttestationGossipLocalError::ClockUnavailable)
+            })?;
+        validate_late_propagation_window(verified_slot, late_earliest_slot, late_latest_slot)?;
+        let actual_head = self.head_snapshot().beacon_block_root;
+        let (bound_is_canonical, admission, activity) = self
+            .pq_attestation_bound_is_canonical_owned(
+                verified.bound_head_root,
+                verified.admission,
+                verified.activity,
+            )
+            .await?;
+        if !bound_is_canonical {
+            return Err(PqAttestationGossipError::Local(
+                PqAttestationGossipLocalError::BoundHeadNoLongerCanonical {
+                    bound: verified.bound_head_root,
+                    current: actual_head,
+                },
+            ));
+        }
+        Ok((
+            VerifiedSingle {
+                verified: verified.verified,
+                identity: verified.identity,
+                key: verified.key,
+                bound_head_root: verified.bound_head_root,
+                admission,
+                activity,
+            },
+            late_earliest_slot,
+        ))
     }
 
     pub async fn verify_pq_single_attestation_for_gossip(
@@ -1232,114 +1518,174 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             .precheck_single(key, earliest_slot);
         classify_observation(early_status)?;
         let snapshot = self.head_snapshot();
-        let store = Arc::clone(&self.store);
-        let spec = Arc::clone(&self.spec);
-        let key_cache = Arc::clone(&self.pq_validator_key_cache);
-        let preparation = self
-            .task_executor
-            .spawn_blocking_handle(
-                move || {
-                    prepare_single_context::<T>(
-                        store,
-                        snapshot,
-                        spec,
-                        key_cache,
-                        attestation,
-                        subnet,
-                        latest_slot,
-                        earliest_slot,
-                        admission,
-                        activity,
-                    )
-                },
-                "pq-attestation-gossip-prepare",
-            )
-            .ok_or(PqAttestationGossipError::Local(
-                PqAttestationGossipLocalError::BlockingTask("pq-attestation-gossip-prepare"),
-            ))?
-            .await
-            .map_err(|_| {
-                PqAttestationGossipError::Local(PqAttestationGossipLocalError::BlockingTask(
-                    "pq-attestation-gossip-prepare",
-                ))
-            })??;
-
-        let service = Arc::clone(&self.pq_aggregation_service);
-        let proof_task = self
-            .task_executor
-            .spawn_handle(
-                async move {
-                    let PreparedSingle {
-                        prepared,
-                        identity,
-                        key,
-                        bound_head_root,
-                        admission,
-                        activity,
-                    } = preparation;
-                    (
-                        prepared.verify(&service).await,
-                        identity,
-                        key,
-                        bound_head_root,
-                        admission,
-                        activity,
-                    )
-                },
-                "pq-attestation-gossip-proof",
-            )
-            .ok_or(PqAttestationGossipError::Local(
-                PqAttestationGossipLocalError::AsyncTask("pq-attestation-gossip-proof"),
-            ))?;
-        let Some((verified, identity, key, bound_head_root, admission, activity)) =
-            proof_task.await.map_err(|_| {
-                PqAttestationGossipError::Local(PqAttestationGossipLocalError::AsyncTask(
-                    "pq-attestation-gossip-proof",
-                ))
-            })?
-        else {
-            return Err(PqAttestationGossipError::Local(
-                PqAttestationGossipLocalError::AsyncTask("pq-attestation-gossip-proof"),
-            ));
-        };
-        let verified = verified.map_err(map_attestation_error)?;
-
-        let (late_latest_slot, late_earliest_slot) =
-            propagation_bounds::<T::EthSpec, _>(&self.slot_clock, &self.spec).map_err(|_| {
-                PqAttestationGossipError::Local(PqAttestationGossipLocalError::ClockUnavailable)
-            })?;
-        let verified_slot = verified.single_attestation().data.slot;
-        validate_late_propagation_window(verified_slot, late_earliest_slot, late_latest_slot)?;
-        let actual_head = self.head_snapshot().beacon_block_root;
-        let (bound_is_canonical, admission) = self
-            .pq_attestation_bound_is_canonical(bound_head_root, admission)
-            .await?;
-        if !bound_is_canonical {
-            return Err(PqAttestationGossipError::Local(
-                PqAttestationGossipLocalError::BoundHeadNoLongerCanonical {
-                    bound: bound_head_root,
-                    current: actual_head,
-                },
-            ));
+        let bound_head_root = snapshot.beacon_block_root;
+        #[cfg(feature = "pq-startup-testing")]
+        let remote_snapshot_hook = { self.pq_remote_attestation_snapshot_test_hook.lock().clone() };
+        #[cfg(feature = "pq-startup-testing")]
+        if let Some(hook) = remote_snapshot_hook {
+            self.task_executor
+                .spawn_blocking_handle(move || hook.run(), "pq-remote-attestation-snapshot-hook")
+                .ok_or(PqAttestationGossipError::Local(
+                    PqAttestationGossipLocalError::BlockingTask(
+                        "pq-remote-attestation-snapshot-hook",
+                    ),
+                ))?
+                .await
+                .map_err(|_| {
+                    PqAttestationGossipError::Local(PqAttestationGossipLocalError::BlockingTask(
+                        "pq-remote-attestation-snapshot-hook",
+                    ))
+                })?;
         }
+        let prepared = self
+            .prepare_pq_single_verification(
+                snapshot,
+                attestation,
+                subnet,
+                latest_slot,
+                earliest_slot,
+                bound_head_root,
+                admission,
+                activity,
+            )
+            .await?;
+        let verified = self.prove_pq_single_verification(prepared).await?;
+        let (verified, late_earliest_slot) = self.finish_pq_single_verification(verified).await?;
         let generation = self
             .pq_attestation_gossip_observations
             .lock()
-            .claim_single(key, identity, late_earliest_slot)
+            .claim_single(verified.key, verified.identity, late_earliest_slot)
             .map_err(observation_error)?;
         Ok(PqSingleGossipPropagationToken {
-            verified: Some(verified),
+            verified: Some(verified.verified),
             observations: Arc::clone(&self.pq_attestation_gossip_observations),
             binding: Some(SingleObservationBinding {
-                key,
-                identity,
+                key: verified.key,
+                identity: verified.identity,
                 generation,
             }),
-            _admission: Some(admission),
-            _activity: Some(activity),
+            _admission: Some(verified.admission),
+            _activity: Some(verified.activity),
             subnet,
-            bound_head_root,
+            bound_head_root: verified.bound_head_root,
         })
+    }
+
+    pub async fn verify_pq_single_attestation_for_local(
+        &self,
+        provenance: PqLocallyConstructedSingle<T::EthSpec>,
+    ) -> Result<PqVerifiedLocalSingle<T::EthSpec>, PqLocalAttestationVerificationError> {
+        let activity = self.pq_import_coordinator.try_start().ok_or(
+            PqLocalAttestationVerificationError::Local(PqAttestationGossipLocalError::ShuttingDown),
+        )?;
+        let admission = Arc::clone(&self.pq_attestation_gossip_admission)
+            .try_acquire_owned()
+            .map_err(|_| {
+                PqLocalAttestationVerificationError::Local(
+                    PqAttestationGossipLocalError::IngressCapacity,
+                )
+            })?;
+        let (latest_slot, earliest_slot) =
+            propagation_bounds::<T::EthSpec, _>(&self.slot_clock, &self.spec)
+                .map_err(map_local_attestation_error)?;
+        let PqLocallyConstructedSingle {
+            single,
+            signed_attestation,
+            pubkey,
+            validator_index,
+            committee_index,
+            committee_position,
+            committee_length,
+            committee_count_at_slot,
+            subnet,
+            slot,
+            bound_head_root,
+            dependent_root,
+            signing_root,
+            signed_ssz_digest,
+            _phantom: _,
+        } = provenance;
+        let preparation_snapshot = self.head_snapshot();
+        let prepared = self
+            .prepare_pq_single_verification(
+                preparation_snapshot,
+                single,
+                subnet,
+                latest_slot,
+                earliest_slot,
+                bound_head_root,
+                admission,
+                activity,
+            )
+            .await
+            .map_err(map_local_attestation_error)?;
+        let verified = self
+            .prove_pq_single_verification(prepared)
+            .await
+            .map_err(map_local_attestation_error)?;
+        let (verified, _) = self
+            .finish_pq_single_verification(verified)
+            .await
+            .map_err(map_local_attestation_error)?;
+        if verified.verified.attestation() != &signed_attestation {
+            return Err(PqLocalAttestationVerificationError::Invariant(
+                PqLocalAttestationInvariant::ProvenanceMismatch("signed-attestation"),
+            ));
+        }
+        if verified.verified.signer_index() != validator_index
+            || verified.verified.signer_public_key() != Some(pubkey)
+        {
+            return Err(PqLocalAttestationVerificationError::Invariant(
+                PqLocalAttestationInvariant::ProvenanceMismatch("signer"),
+            ));
+        }
+        if Hash256::from(verified.verified.claim().signing_root) != signing_root {
+            return Err(PqLocalAttestationVerificationError::Invariant(
+                PqLocalAttestationInvariant::ProvenanceMismatch("signing-root"),
+            ));
+        }
+        let verified_single = verified.verified.single_attestation();
+        if verified_single.committee_index != committee_index
+            || verified_single.data.slot != slot
+            || verified_single.data.beacon_block_root != bound_head_root
+        {
+            return Err(PqLocalAttestationVerificationError::Invariant(
+                PqLocalAttestationInvariant::ProvenanceMismatch("duty"),
+            ));
+        }
+        let actual_digest: [u8; 32] =
+            Sha256::digest(ssz::Encode::as_ssz_bytes(verified_single)).into();
+        if actual_digest != signed_ssz_digest {
+            return Err(PqLocalAttestationVerificationError::Invariant(
+                PqLocalAttestationInvariant::ProvenanceMismatch("signed-ssz-digest"),
+            ));
+        }
+        Ok(PqVerifiedLocalSingle {
+            verified: verified.verified,
+            pubkey,
+            validator_index,
+            committee_index,
+            committee_position,
+            committee_length,
+            committee_count_at_slot,
+            subnet,
+            slot,
+            bound_head_root,
+            dependent_root,
+            signing_root,
+            signed_ssz_digest,
+            _admission: verified.admission,
+            _activity: verified.activity,
+        })
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_pq_attestation_gossip_observation_count(&self) -> usize {
+        let observations = self.pq_attestation_gossip_observations.lock();
+        observations.singles.len()
+            + observations.aggregators.len()
+            + observations.aggregate_candidates.len()
     }
 
     pub async fn verify_pq_aggregate_for_gossip(
@@ -1603,6 +1949,7 @@ fn prepare_single_context<T: BeaconChainTypes>(
     subnet: SubnetId,
     latest_slot: Slot,
     earliest_slot: Slot,
+    bound_head_root: Hash256,
     admission: OwnedSemaphorePermit,
     activity: Arc<crate::beacon_chain::PqImportActivity>,
 ) -> Result<PreparedSingle<T::EthSpec>, PqAttestationGossipError> {
@@ -1627,7 +1974,6 @@ fn prepare_single_context<T: BeaconChainTypes>(
             PqAttestationGossipPeerInvalid::InvalidTargetEpoch,
         ));
     }
-    let bound_head_root = snapshot.beacon_block_root;
     let CanonicalReference {
         block: reference_block,
         mut state,
@@ -2008,6 +2354,22 @@ fn map_attestation_error(error: PqAttestationError) -> PqAttestationGossipError 
         PqAttestationError::Local(error) => {
             PqAttestationGossipError::Local(PqAttestationGossipLocalError::Attestation(error))
         }
+    }
+}
+
+fn map_local_attestation_error(
+    error: PqAttestationGossipError,
+) -> PqLocalAttestationVerificationError {
+    match error {
+        PqAttestationGossipError::PeerInvalid(error) => {
+            PqLocalAttestationVerificationError::Invariant(PqLocalAttestationInvariant::Contextual(
+                error,
+            ))
+        }
+        PqAttestationGossipError::Local(error) => PqLocalAttestationVerificationError::Local(error),
+        PqAttestationGossipError::Duplicate(_) => PqLocalAttestationVerificationError::Invariant(
+            PqLocalAttestationInvariant::UnexpectedObservation,
+        ),
     }
 }
 

@@ -4,7 +4,10 @@ mod avx2 {
         BeaconChain, PqLocalAttesterIdentity, PqNewPayloadTransport,
         builder::{BeaconChainBuilder, Witness},
     };
-    use consensus_signature::{AggregationService, OneTimeUseId, PqPublicKey, SigningDuty};
+    use consensus_signature::{
+        AggregationService, OneTimeUseId, PqPublicKey, PqRawSignature, SameMessageEvidence,
+        SigningDuty,
+    };
     use futures::StreamExt;
     use network::{PqGossipAttestationDisposition, PqNetworkBlockProcessor};
     use pq_signing::{PqKeyUnlock, PqKeystore, PqSigningAuthority, provision_usage_journal};
@@ -372,7 +375,153 @@ mod avx2 {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn remote_prepare_uses_the_same_snapshot_as_its_bound_head() {
+        let fixture = fresh_slot_one_fixture().await;
+        let (mut remote_single, subnet) = slot_one_single_attestation(&fixture);
+        remote_single.signature = SameMessageEvidence::empty();
+        let FreshSlotOneFixture {
+            executor_exit_sender,
+            _temporary_directory,
+            chain,
+            processor,
+            signed,
+            block_root,
+            transport,
+            ..
+        } = fixture;
+        let _executor_exit_sender = executor_exit_sender;
+        chain.slot_clock.set_slot(1);
+        let snapshot_hook = beacon_chain::TestingPqBlockingHook::blocking();
+        chain
+            .testing_only_set_pq_remote_attestation_snapshot_hook(Some(Arc::clone(&snapshot_hook)));
+        let remote = {
+            let chain = Arc::clone(&chain);
+            tokio::spawn(async move {
+                chain
+                    .verify_pq_single_attestation_for_gossip(remote_single, subnet)
+                    .await
+            })
+        };
+        wait_for_test_condition(
+            || snapshot_hook.entered() == 1,
+            "remote bound-head snapshot captured",
+        )
+        .await;
+        transport.forkchoice_release.add_permits(1);
+        processor
+            .import_rpc_block(Arc::clone(&signed))
+            .await
+            .expect("advance canonical head while remote prepare is parked");
+        snapshot_hook.release();
+        let error = match remote.await.expect("remote verifier task") {
+            Ok(_) => panic!("snapshot-A remote verification prepared against snapshot B"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            beacon_chain::PqAttestationGossipError::Local(
+                beacon_chain::PqAttestationGossipLocalError::ReferencedBlockUnavailable(root)
+            ) if root == block_root
+        ));
+        chain.testing_only_set_pq_remote_attestation_snapshot_hook(None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn aborted_local_waiter_retains_activity_through_blocked_lineage() {
+        let fixture = fresh_slot_one_fixture().await;
+        let (signed_single, _) = slot_one_single_attestation(&fixture);
+        let FreshSlotOneFixture {
+            executor_exit_sender,
+            _temporary_directory,
+            chain,
+            processor,
+            signed,
+            attester_index,
+            spec,
+            transport,
+            ..
+        } = fixture;
+        let _executor_exit_sender = executor_exit_sender;
+        chain.slot_clock.set_slot(1);
+        transport.forkchoice_release.add_permits(1);
+        processor
+            .import_rpc_block(signed)
+            .await
+            .expect("execution-VALID slot-one import");
+        let head = chain.head_snapshot();
+        let identities: Arc<[PqLocalAttesterIdentity]> = head
+            .beacon_state
+            .validators()
+            .iter()
+            .enumerate()
+            .map(|(index, validator)| PqLocalAttesterIdentity::new(validator.pubkey, index as u64))
+            .collect::<Vec<_>>()
+            .into();
+        let context = chain
+            .pq_local_attestation_context(identities)
+            .await
+            .expect("slot-one local context");
+        let context = chain
+            .consume_pq_local_attestation_context(context)
+            .expect("coherent slot-one local context");
+        let candidate = context
+            .into_candidates()
+            .into_iter()
+            .find(|candidate| candidate.validator_index() == attester_index)
+            .expect("signed validator exact candidate");
+        let mut signed_attestation = candidate.attestation().clone();
+        let raw_signature = PqRawSignature::from_bytes(signed_single.signature.as_bytes())
+            .expect("authentic individual signature envelope");
+        signed_attestation
+            .attach_individual_signature(&raw_signature, candidate.committee_position())
+            .expect("attach authentic signature");
+        let provenance = candidate
+            .into_local_single(attester_index, signed_attestation, &spec)
+            .expect("exact local provenance");
+        let lineage_hook = beacon_chain::TestingPqBlockingHook::blocking();
+        chain.testing_only_set_pq_attestation_lineage_hook(Some(Arc::clone(&lineage_hook)));
+        let verification = {
+            let chain = Arc::clone(&chain);
+            tokio::spawn(async move {
+                chain
+                    .verify_pq_single_attestation_for_local(provenance)
+                    .await
+            })
+        };
+        wait_for_test_condition(
+            || lineage_hook.entered() == 1,
+            "blocked local late-lineage check",
+        )
+        .await;
+        verification.abort();
+        let join_error = match verification.await {
+            Ok(_) => panic!("aborted caller-facing lineage waiter completed"),
+            Err(error) => error,
+        };
+        assert!(join_error.is_cancelled());
+        let drain = {
+            let chain = Arc::clone(&chain);
+            tokio::spawn(async move { chain.close_and_drain_pq_imports().await })
+        };
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        let retained_activity = !drain.is_finished();
+        lineage_hook.release();
+        tokio::time::timeout(std::time::Duration::from_secs(1), drain)
+            .await
+            .expect("drain completes after lineage release")
+            .expect("drain task");
+        assert!(
+            retained_activity,
+            "caller abort must not release activity while lineage DB work is still blocked",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn real_imported_current_slot_seals_exact_local_attester_context() {
+        let fixture = fresh_slot_one_fixture().await;
+        let (signed_single, signed_subnet) = slot_one_single_attestation(&fixture);
         let FreshSlotOneFixture {
             executor_exit_sender,
             _temporary_directory,
@@ -382,10 +531,11 @@ mod avx2 {
             block_root,
             genesis_root,
             post_state,
+            attester_index,
             spec,
             transport,
             ..
-        } = fresh_slot_one_fixture().await;
+        } = fixture;
         let _executor_exit_sender = executor_exit_sender;
         chain.slot_clock.set_slot(1);
         transport.forkchoice_release.add_permits(1);
@@ -476,6 +626,104 @@ mod avx2 {
                 }
             );
         }
+
+        let mut candidates = context.into_candidates();
+        let candidate_position = candidates
+            .iter()
+            .position(|candidate| candidate.validator_index() == attester_index)
+            .expect("signed validator has an exact local candidate");
+        let candidate = candidates.remove(candidate_position);
+        let mut signed_attestation = candidate.attestation().clone();
+        let raw_signature = PqRawSignature::from_bytes(signed_single.signature.as_bytes())
+            .expect("authentic individual signature envelope");
+        signed_attestation
+            .attach_individual_signature(&raw_signature, candidate.committee_position())
+            .expect("attach authentic local signature to exact candidate");
+        let provenance = candidate
+            .into_local_single(attester_index, signed_attestation, &spec)
+            .expect("seal exact locally constructed single");
+        assert_eq!(provenance.single(), &signed_single);
+        assert_eq!(provenance.subnet(), signed_subnet);
+        let observations_before = chain.testing_only_pq_attestation_gossip_observation_count();
+        assert_eq!(
+            observations_before, 0,
+            "local verification starts with no remote observation state",
+        );
+        let verified = chain
+            .verify_pq_single_attestation_for_local(provenance)
+            .await
+            .expect("authentic local single proof");
+        assert_eq!(verified.single(), &signed_single);
+        assert_eq!(verified.validator_index(), attester_index);
+        assert_eq!(verified.subnet(), signed_subnet);
+        assert_eq!(verified.bound_head_root(), block_root);
+        assert_eq!(
+            chain.testing_only_pq_attestation_gossip_observation_count(),
+            observations_before,
+            "local verification must not claim or finalize remote gossip observations",
+        );
+
+        let invalid_candidate = candidates
+            .pop()
+            .expect("full-16 profile retains another exact local candidate");
+        let invalid_index = invalid_candidate.validator_index();
+        let mut invalid_attestation = invalid_candidate.attestation().clone();
+        invalid_attestation
+            .attach_individual_signature(
+                &PqRawSignature::empty(),
+                invalid_candidate.committee_position(),
+            )
+            .expect("empty evidence has the exact individual structural shape");
+        let invalid_provenance = invalid_candidate
+            .into_local_single(invalid_index, invalid_attestation, &spec)
+            .expect("structurally sealed invalid local evidence");
+        let invalid_error = match chain
+            .verify_pq_single_attestation_for_local(invalid_provenance)
+            .await
+        {
+            Ok(_) => panic!("cryptographically invalid local evidence verified"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            invalid_error,
+            beacon_chain::PqLocalAttestationVerificationError::Invariant(
+                beacon_chain::PqLocalAttestationInvariant::Contextual(
+                    beacon_chain::PqAttestationGossipPeerInvalid::InvalidAttestation(
+                        state_processing::PqAttestationInvalid::InvalidEvidence
+                    )
+                )
+            )
+        ));
+        assert_eq!(
+            chain.testing_only_pq_attestation_gossip_observation_count(),
+            0,
+            "invalid local evidence must not enter the remote observation path",
+        );
+        assert_eq!(
+            chain.testing_only_pq_attestation_gossip_available_permits(),
+            beacon_chain::PQ_ATTESTATION_GOSSIP_ADMISSION_CAPACITY - 1,
+            "a retained local pre-propagation token must retain proof admission",
+        );
+        let drain = {
+            let chain = Arc::clone(&chain);
+            tokio::spawn(async move { chain.close_and_drain_pq_imports().await })
+        };
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !drain.is_finished(),
+            "a retained local pre-propagation token must retain chain activity",
+        );
+        drop(verified);
+        tokio::time::timeout(std::time::Duration::from_secs(1), drain)
+            .await
+            .expect("drain completes after local token drop")
+            .expect("drain task");
+        assert_eq!(
+            chain.testing_only_pq_attestation_gossip_available_permits(),
+            beacon_chain::PQ_ATTESTATION_GOSSIP_ADMISSION_CAPACITY,
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -432,6 +432,11 @@ pub struct BeaconChain<T: BeaconChainTypes> {
     #[cfg(feature = "pq-startup-testing")]
     pub(crate) pq_local_attester_context_test_hook: Option<Arc<crate::TestingPqBlockingHook>>,
     #[cfg(feature = "pq-startup-testing")]
+    pub(crate) pq_remote_attestation_snapshot_test_hook:
+        Mutex<Option<Arc<crate::TestingPqBlockingHook>>>,
+    #[cfg(feature = "pq-startup-testing")]
+    pub(crate) pq_attestation_lineage_test_hook: Mutex<Option<Arc<crate::TestingPqBlockingHook>>>,
+    #[cfg(feature = "pq-startup-testing")]
     pq_fork_choice_attestation_calls: std::sync::atomic::AtomicUsize,
     pub pq_validator_key_cache: Arc<PqValidatorKeyCache>,
     pub pq_aggregation_service: Arc<AggregationService>,
@@ -602,12 +607,34 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             #[cfg(feature = "pq-startup-testing")]
             pq_local_attester_context_test_hook,
             #[cfg(feature = "pq-startup-testing")]
+            pq_remote_attestation_snapshot_test_hook: Mutex::new(None),
+            #[cfg(feature = "pq-startup-testing")]
+            pq_attestation_lineage_test_hook: Mutex::new(None),
+            #[cfg(feature = "pq-startup-testing")]
             pq_fork_choice_attestation_calls: std::sync::atomic::AtomicUsize::new(0),
             pq_validator_key_cache,
             pq_aggregation_service,
             slot_clock,
             marker: PhantomData,
         })
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_set_pq_remote_attestation_snapshot_hook(
+        &self,
+        hook: Option<Arc<crate::TestingPqBlockingHook>>,
+    ) {
+        *self.pq_remote_attestation_snapshot_test_hook.lock() = hook;
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_set_pq_attestation_lineage_hook(
+        &self,
+        hook: Option<Arc<crate::TestingPqBlockingHook>>,
+    ) {
+        *self.pq_attestation_lineage_test_hook.lock() = hook;
     }
 
     /// Returns the exact snapshot which was strictly validated before worker construction.

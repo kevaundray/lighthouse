@@ -194,8 +194,9 @@ pub use self::historical_blocks::HistoricalBlockError;
 pub use self::pq_attestation_gossip::{
     PQ_ATTESTATION_GOSSIP_ADMISSION_CAPACITY, PqAggregateGossipPropagationToken,
     PqAttestationGossipError, PqAttestationGossipLocalError, PqAttestationGossipObservation,
-    PqAttestationGossipPeerInvalid, PqSingleConsumptionResult, PqSingleGossipPropagationToken,
-    PqVerifiedGossipAggregate, PqVerifiedGossipSingle,
+    PqAttestationGossipPeerInvalid, PqLocalAttestationInvariant,
+    PqLocalAttestationVerificationError, PqSingleConsumptionResult, PqSingleGossipPropagationToken,
+    PqVerifiedGossipAggregate, PqVerifiedGossipSingle, PqVerifiedLocalSingle,
 };
 #[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
 pub use self::pq_attestation_gossip::{
@@ -221,13 +222,16 @@ pub use self::pq_import::{
     TestingPqPublishPromotionResolution, testing_only_persisted_pq_execution_head,
     testing_only_reconcile_pq_execution,
 };
-#[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
-pub use self::pq_local_attester_context::testing_only_validate_pq_local_attester_profile;
 #[cfg(feature = "pq-devnet")]
 pub use self::pq_local_attester_context::{
     PQ_LOCAL_ATTESTATION_CONTEXT_ADMISSION_CAPACITY, PQ_LOCAL_ATTESTER_IDENTITY_CAPACITY,
     PqCoherentLocalAttestationSnapshot, PqLocalAttestationCandidate, PqLocalAttestationContext,
-    PqLocalAttestationContextError, PqLocalAttesterIdentity,
+    PqLocalAttestationContextError, PqLocalAttesterIdentity, PqLocalSingleConstructionError,
+    PqLocallyConstructedSingle,
+};
+#[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
+pub use self::pq_local_attester_context::{
+    testing_only_pq_local_candidate_fixture, testing_only_validate_pq_local_attester_profile,
 };
 #[cfg(feature = "pq-devnet")]
 pub use self::pq_operational_events::{

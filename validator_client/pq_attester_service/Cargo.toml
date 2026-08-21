@@ -1,0 +1,40 @@
+[package]
+name = "pq_attester_service"
+version = "0.1.0"
+edition = { workspace = true }
+
+[features]
+default = []
+pq-devnet = [
+    "dep:beacon_chain",
+    "dep:consensus_signature",
+    "dep:lighthouse_validator_store",
+    "beacon_chain/pq-devnet",
+    "consensus_signature/pq-wire",
+    "lighthouse_validator_store/pq-devnet",
+    "dep:slot_clock",
+    "dep:store",
+    "store/leveldb",
+    "dep:task_executor",
+    "dep:types",
+    "types/pq-devnet",
+]
+pq-startup-testing = ["pq-devnet", "beacon_chain/pq-startup-testing"]
+
+[dependencies]
+beacon_chain = { path = "../../beacon_node/beacon_chain", default-features = false, optional = true }
+consensus_signature = { workspace = true, optional = true }
+lighthouse_validator_store = { path = "../lighthouse_validator_store", default-features = false, optional = true }
+slot_clock = { workspace = true, optional = true }
+store = { path = "../../beacon_node/store", default-features = false, optional = true }
+task_executor = { workspace = true, optional = true }
+types = { workspace = true, optional = true }
+
+[dev-dependencies]
+consensus_signature = { workspace = true, features = ["pq-devnet"] }
+state_processing = { workspace = true, features = ["pq-attestation"] }
+
+[[test]]
+name = "pq_local_attester"
+path = "tests/pq_local_attester.rs"
+required-features = ["pq-startup-testing"]

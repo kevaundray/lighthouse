@@ -2609,10 +2609,28 @@ of the canonical PQ import gate and release it before exposing the coherent cand
 That snapshot is explicitly not signing authorization; a later signer and pre-publication/local
 application path must revalidate under their own safety boundary.
 
+**Cycle 3 Slice B1 checkpoint (implemented, local proof provenance only):** consuming an exact
+Slice-A candidate now seals a private, non-`Clone` provenance object. It binds the immutable
+validator public key and registry index, committee index/position/length/count, trusted subnet,
+slot, bound and dependent roots, signing root, exact attestation data and bitfields, individual
+signature framing, and SHA-256 of the complete signed single-attestation SSZ bytes. The returned
+locally verified token is likewise private and non-`Clone` and retains the original proof admission
+and PQ import activity through late-lineage blocking work, caller cancellation, and its own
+lifetime.
+
+Preparation, proof, and late-lineage validation are shared production stages for remote and local
+singles without an `is_local` mode. The remote route preserves its original single-snapshot
+semantics: the snapshot that supplies the bound root is the snapshot passed into preparation even
+if the canonical head changes between those operations. Signing-ID and aggregation error sources
+remain delegated identically. The local route does not touch remote observations, mark propagation,
+apply fork choice, or publish; authentic slot-1 evidence pins observations exactly `0 -> 0`, and
+structurally valid but cryptographically invalid evidence becomes a typed local contextual
+invariant.
+
 This checkpoint is not completion of Task 5.2b. The fork-choice receiver remains in-memory Fresh
 evidence, and the local-context Resume evidence is limited to rebuilding ephemeral committee caches
 from the selected canonical snapshot. There is no live aggregate-and-proof routing, operation-pool
-or naive-aggregation-pool insertion, local signing, publication, scheduler, HTTP route,
+or naive-aggregation-pool insertion, service-owned signing, publication, scheduler, HTTP route,
 fork-choice/vote or local-context persistence, justification, or finalization claim. The finalized
 checkpoint remains genesis. Those remain the subsequent vertical slices described below.
 

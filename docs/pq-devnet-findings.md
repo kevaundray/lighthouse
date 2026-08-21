@@ -1833,3 +1833,34 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   aggregation pool insertion, local-attester persistence, vote/fork-choice recovery, justification,
   or finalization. The finalized checkpoint remains genesis and Task 7.2 finality is still
   unclaimed.
+
+### 2026-08-21: Sealed local PQ attestation proof foundation completed (Task 5.2b cycle 3, Slice B1)
+
+- A local context candidate is now consumed into a private-field, non-`Clone` provenance object.
+  Construction checks the immutable validator public key and canonical registry index, committee
+  index, position, length and count, exact subnet, slot and bound/dependent roots, signing root,
+  signed attestation data, one aggregation bit, one Electra committee bit, and individual signature
+  framing. It also seals a SHA-256 digest over the complete signed single-attestation SSZ bytes.
+  Callers cannot reconstruct or alter those bindings after consuming the candidate.
+- Remote and local single-attestation verification share source-neutral preparation, proof, and
+  late canonical-lineage stages rather than selecting behavior with a local/remote boolean. The
+  remote path captures one head snapshot and uses that same snapshot for both its bound root and
+  preparation, preserving the prior rejection semantics across a deterministic concurrent head
+  change. Nested signing-ID and aggregation errors retain the same `Error::source` chain on both
+  paths.
+- Successful local verification returns a second private-field, non-`Clone` token that binds the
+  exact signed object and metadata while retaining the original two-item proof admission and PQ
+  import activity. Late-lineage blocking work owns that activity, so caller cancellation cannot let
+  shutdown drain finish while lineage database work is still running. Holding the returned token
+  continues to hold admission and keeps drain pending; dropping it releases both.
+- Local verification never enters the remote gossip observation cache and does not mark gossip
+  propagation, apply fork choice, or publish. The authentic imported-slot-1 proof originally passed
+  in 131.90 seconds. Repaired warning-denied AVX2 regressions passed the remote one-snapshot race in
+  132.61 seconds, the local-token proof in 132.92 seconds, and caller-aborted late-lineage ownership
+  in 132.63 seconds. The token proof pins remote observations exactly `0 -> 0`; structurally sealed
+  but cryptographically invalid local evidence is a typed contextual invariant and likewise leaves
+  observations at zero.
+- This checkpoint still has no service-owned signing, SQLite/journal signing transaction,
+  scheduler, production publication, HTTP route, local fork-choice application, aggregation pool,
+  persisted vote recovery, justification, or finalization. Slice B2 must build the private signing
+  service on this provenance boundary without enabling the ordinary validator-service graph.

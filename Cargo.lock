@@ -7273,6 +7273,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pq_attester_service"
+version = "0.1.0"
+dependencies = [
+ "beacon_chain",
+ "consensus_signature",
+ "lighthouse_validator_store",
+ "slot_clock",
+ "state_processing",
+ "store",
+ "task_executor",
+ "types",
+]
+
+[[package]]
 name = "pq_devnet"
 version = "0.1.0"
 dependencies = [
