@@ -4,14 +4,22 @@ use beacon_node::beacon_chain::{
     BeaconChain, PqLocalAttesterIdentity, PqNewPayloadTransport, PqOperationalEvent,
     PqOperationalEventRole, PqOperationalEventSink,
     builder::{BeaconChainBuilder, Witness},
+    testing_only_running_pq_operational_event_sink,
 };
 use consensus_signature::{AggregationService, PqValidatorRegistryEntry};
 use execution_layer::auth::JwtKey;
 use execution_layer::test_utils::{DEFAULT_JWT_SECRET, MockEngineAuditEvent, MockServer};
 use fs2::FileExt;
 use initialized_validators::InitializedValidators;
+use lighthouse_network::{
+    Context, GossipTopic, MessageId, NetworkConfig, identity::secp256k1,
+    libp2p::gossipsub::IdentTopic, types::GossipEncoding, types::GossipKind,
+};
 use lighthouse_validator_store::{Config as ValidatorStoreConfig, LighthouseValidatorStore};
-use network::PqNetworkBlockProcessor;
+use network::{
+    PqLocalAttestationMemberPublishProgress, PqNetworkBlockProcessor, PqNetworkService,
+    pq_block_broadcast_channel,
+};
 use network_utils::enr_ext::EnrExt;
 use pq_attester_service::{PqAttestationCompletion, PqAttesterService};
 use pq_devnet::{production_config, provision_devnet};
@@ -37,7 +45,7 @@ use store::{HotColdDB, MemoryStore, StoreConfig};
 use tempfile::TempDir;
 use types::{
     BeaconBlock, BeaconState, ChainSpec, EthSpec, ExecutionBlockHash, ExecutionPayloadRef,
-    ForkName, Hash256, MinimalEthSpec, SignedBeaconBlock, Slot, SubnetId, Uint256,
+    ForkContext, ForkName, Hash256, MinimalEthSpec, SignedBeaconBlock, Slot, SubnetId, Uint256,
 };
 use validator_dir::{PqDevnetBundle, PqDevnetManifest};
 use validator_store::{SignedBlock, UnsignedBlock, ValidatorStore};
@@ -557,6 +565,145 @@ async fn direct_pq_attester_service_authentically_signs_and_proves_slot_once() {
         0,
         "local proof must not enter remote gossip observations",
     );
+
+    let verified_batch = fixture
+        .service
+        .testing_only_take_owned_verified_batch()
+        .expect("take the exact authentic batch once for the network tracer");
+    assert_eq!(verified_batch.len(), fixture.expected.len());
+    assert_eq!(fixture.service.testing_only_owned_verified_count(), None);
+    let expected_encoded = verified_batch
+        .verified()
+        .iter()
+        .map(|verified| {
+            let signed_ssz = verified.single().as_ssz_bytes();
+            assert_eq!(
+                <[u8; 32]>::from(Sha256::digest(&signed_ssz)),
+                verified.signed_ssz_digest(),
+                "the independently encoded signed single binds the verified token digest",
+            );
+            let fork_digest = fixture
+                .chain
+                .spec
+                .enr_fork_id::<MinimalEthSpec>(
+                    verified.slot(),
+                    fixture
+                        .chain
+                        .head_snapshot()
+                        .beacon_state
+                        .genesis_validators_root(),
+                )
+                .fork_digest;
+            let topic = IdentTopic::from(GossipTopic::new(
+                GossipKind::Attestation(verified.subnet()),
+                GossipEncoding::default(),
+                fork_digest,
+            ));
+            let topic_hash = topic.hash();
+            let topic_bytes = topic_hash.as_str().as_bytes();
+            let mut message_id_preimage = Vec::with_capacity(
+                fixture.chain.spec.message_domain_valid_snappy.len()
+                    + std::mem::size_of::<usize>()
+                    + topic_bytes.len()
+                    + signed_ssz.len(),
+            );
+            message_id_preimage.extend_from_slice(&fixture.chain.spec.message_domain_valid_snappy);
+            message_id_preimage.extend_from_slice(&topic_bytes.len().to_le_bytes());
+            message_id_preimage.extend_from_slice(topic_bytes);
+            message_id_preimage.extend_from_slice(&signed_ssz);
+            let message_id_digest = Sha256::digest(message_id_preimage);
+            (
+                topic_hash.to_string(),
+                MessageId::from(&message_id_digest[..20]),
+            )
+        })
+        .collect::<Vec<_>>();
+    let network_dir = tempfile::tempdir().expect("private no-peer network directory");
+    let head = fixture.chain.head_snapshot();
+    let genesis_validators_root = head.beacon_state.genesis_validators_root();
+    let mut network_config = NetworkConfig::default();
+    network_config.set_ipv4_listening_address(Ipv4Addr::LOCALHOST, 0, 0, 0);
+    network_config.enr_address = (Some(Ipv4Addr::LOCALHOST), None);
+    network_config.disable_discovery = true;
+    network_config.network_dir = network_dir.path().to_path_buf();
+    let network_context = Context {
+        config: Arc::new(network_config),
+        enr_fork_id: fixture
+            .chain
+            .spec
+            .enr_fork_id::<MinimalEthSpec>(head.beacon_block.slot(), genesis_validators_root),
+        fork_context: Arc::new(ForkContext::new::<MinimalEthSpec>(
+            head.beacon_block.slot(),
+            genesis_validators_root,
+            &fixture.chain.spec,
+        )),
+        chain_spec: Arc::clone(&fixture.chain.spec),
+        libp2p_registry: None,
+    };
+    let (network_exit_owner, network_exit) = async_channel::bounded(1);
+    let (network_failure_sender, _network_failure_receiver) = futures::channel::mpsc::channel(2);
+    let network_executor = task_executor::TaskExecutor::new(
+        tokio::runtime::Handle::current(),
+        network_exit,
+        network_failure_sender,
+    );
+    let (_block_broadcast_sender, block_broadcast_receiver) = pq_block_broadcast_channel();
+    let operational_events = testing_only_running_pq_operational_event_sink(&network_executor);
+    let network_service = PqNetworkService::new(
+        network_executor,
+        network_context,
+        fixture.chain.spec.custody_requirement,
+        secp256k1::Keypair::generate().into(),
+        Arc::clone(&fixture.chain),
+        block_broadcast_receiver,
+        Arc::clone(&operational_events),
+    )
+    .await
+    .expect("actual no-peer PQ network service");
+    let publisher = network_service.local_attestation_batch_publish_sender();
+    let network_shutdown = network_service
+        .start_with_shutdown_receipt()
+        .await
+        .expect("actual network worker live");
+    let publish_receipt = publisher
+        .try_publish(verified_batch)
+        .expect("whole authentic verified batch admitted");
+    let progress = tokio::time::timeout(Duration::from_secs(10), publish_receipt.wait())
+        .await
+        .expect("bounded actual no-peer publication")
+        .expect("network returns the exact authentic batch owner");
+    assert_eq!(progress.verified_count(), fixture.expected.len());
+    let encoding_trace = progress.testing_only_encoding_trace();
+    assert_eq!(encoding_trace.encoded_member_count, expected_encoded.len());
+    assert_eq!(
+        encoding_trace.attempted_member0_topic.as_deref(),
+        Some(expected_encoded[0].0.as_str()),
+    );
+    assert_eq!(
+        encoding_trace.attempted_member0_message_id.as_ref(),
+        Some(&expected_encoded[0].1),
+    );
+    assert!(progress.is_retryable());
+    assert!(matches!(
+        progress.member_progress(),
+        [PqLocalAttestationMemberPublishProgress::Retryable { message_id },
+         PqLocalAttestationMemberPublishProgress::Verified]
+            if !message_id.0.is_empty(),
+    ));
+    assert_eq!(
+        fixture
+            .chain
+            .testing_only_pq_attestation_gossip_observation_count(),
+        0,
+        "local network publication must not enter remote gossip observations",
+    );
+    drop(progress);
+    network_shutdown
+        .wait()
+        .await
+        .expect("no-peer network service drains cleanly");
+    drop(operational_events);
+    drop(network_exit_owner);
     fixture
         .service
         .close_and_drain()

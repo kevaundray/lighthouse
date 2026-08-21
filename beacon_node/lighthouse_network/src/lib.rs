@@ -131,4 +131,4 @@ pub use service::{Gossipsub, NetworkEvent};
 #[cfg(feature = "pq-devnet")]
 pub use service::{PqBeaconBlockPublishError, PqBeaconBlockPublishOutcome, PqEncodedBeaconBlock};
 #[cfg(feature = "pq-proposer")]
-pub use service::{PqEncodedSingleAttestation, PqSingleAttestationPublishOutcome};
+pub use service::{PqSingleAttestationPublishOutcome, classify_pq_single_publish_result};

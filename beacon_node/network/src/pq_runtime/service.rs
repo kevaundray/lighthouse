@@ -948,6 +948,8 @@ enum PqNetworkServiceEvent<T: BeaconChainTypes> {
     Commit(Option<Box<PqBlockCommitCompletion>>),
     Network(Box<NetworkEvent<T::EthSpec>>),
     TestingDial(Option<lighthouse_network::Multiaddr>),
+    #[cfg(feature = "pq-proposer")]
+    LocalAttestationPublish(Option<super::PqLocalAttestationBatchPublishEvent<T::EthSpec>>),
     #[cfg(feature = "pq-startup-testing")]
     TestingAttestationPublish(Option<PqTestingAttestationPublishCommand<T::EthSpec>>),
 }
@@ -961,6 +963,18 @@ async fn next_testing_attestation_publish_event<T: BeaconChainTypes>(
 
 #[cfg(not(feature = "pq-startup-testing"))]
 async fn next_testing_attestation_publish_event<T: BeaconChainTypes>() -> PqNetworkServiceEvent<T> {
+    std::future::pending().await
+}
+
+#[cfg(feature = "pq-proposer")]
+async fn next_local_attestation_publish_event<T: BeaconChainTypes>(
+    receiver: &mut super::PqLocalAttestationBatchPublishReceiver<T::EthSpec>,
+) -> PqNetworkServiceEvent<T> {
+    PqNetworkServiceEvent::LocalAttestationPublish(receiver.next_event().await)
+}
+
+#[cfg(not(feature = "pq-proposer"))]
+async fn next_local_attestation_publish_event<T: BeaconChainTypes>() -> PqNetworkServiceEvent<T> {
     std::future::pending().await
 }
 
@@ -990,6 +1004,10 @@ pub struct PqNetworkService<T: BeaconChainTypes> {
     fork_digest: [u8; 4],
     _testing_dial_sender: mpsc::Sender<lighthouse_network::Multiaddr>,
     testing_dial_receiver: mpsc::Receiver<lighthouse_network::Multiaddr>,
+    #[cfg(feature = "pq-proposer")]
+    local_attestation_publish_sender: super::PqLocalAttestationBatchPublishSender<T::EthSpec>,
+    #[cfg(feature = "pq-proposer")]
+    local_attestation_publish_receiver: super::PqLocalAttestationBatchPublishReceiver<T::EthSpec>,
     #[cfg(feature = "pq-startup-testing")]
     testing_attestation_publish_sender:
         mpsc::Sender<PqTestingAttestationPublishCommand<T::EthSpec>>,
@@ -1047,6 +1065,15 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
             mpsc::channel(PQ_NETWORK_BLOCK_ENCODING_CAPACITY);
         let (commit_sender, commit_receiver) = mpsc::channel(PQ_NETWORK_BLOCK_COMMIT_CAPACITY);
         let (testing_dial_sender, testing_dial_receiver) = mpsc::channel(1);
+        #[cfg(feature = "pq-proposer")]
+        let (local_attestation_publish_sender, local_attestation_publish_receiver) = {
+            let genesis_validators_root =
+                chain.head_snapshot().beacon_state.genesis_validators_root();
+            super::pq_local_attestation_batch_publish_channel(
+                Arc::clone(&chain.spec),
+                genesis_validators_root,
+            )
+        };
         #[cfg(feature = "pq-startup-testing")]
         let (testing_attestation_publish_sender, testing_attestation_publish_receiver) =
             mpsc::channel(PQ_TESTING_ATTESTATION_PUBLISH_CAPACITY);
@@ -1074,6 +1101,10 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
             fork_digest,
             _testing_dial_sender: testing_dial_sender,
             testing_dial_receiver,
+            #[cfg(feature = "pq-proposer")]
+            local_attestation_publish_sender,
+            #[cfg(feature = "pq-proposer")]
+            local_attestation_publish_receiver,
             #[cfg(feature = "pq-startup-testing")]
             testing_attestation_publish_sender,
             #[cfg(feature = "pq-startup-testing")]
@@ -1092,6 +1123,13 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
 
     pub fn network_globals(&self) -> Arc<NetworkGlobals<T::EthSpec>> {
         Arc::clone(&self.network_globals)
+    }
+
+    #[cfg(feature = "pq-proposer")]
+    pub fn local_attestation_batch_publish_sender(
+        &self,
+    ) -> super::PqLocalAttestationBatchPublishSender<T::EthSpec> {
+        self.local_attestation_publish_sender.clone()
     }
 
     #[cfg(feature = "pq-startup-testing")]
@@ -1204,6 +1242,12 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
             );
             #[cfg(not(feature = "pq-startup-testing"))]
             let testing_attestation_publish_event = next_testing_attestation_publish_event::<T>();
+            #[cfg(feature = "pq-proposer")]
+            let local_attestation_publish_event = next_local_attestation_publish_event::<T>(
+                &mut self.local_attestation_publish_receiver,
+            );
+            #[cfg(not(feature = "pq-proposer"))]
+            let local_attestation_publish_event = next_local_attestation_publish_event::<T>();
             let event = tokio::select! {
                 biased;
                 _ = &mut executor_exit => break,
@@ -1237,6 +1281,7 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
                 address = self.testing_dial_receiver.recv() => {
                     PqNetworkServiceEvent::TestingDial(address)
                 }
+                event = local_attestation_publish_event => event,
                 event = testing_attestation_publish_event => event,
             };
             match event {
@@ -1289,6 +1334,32 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
                     let _ = self.network.testing_dial(address);
                 }
                 PqNetworkServiceEvent::TestingDial(None) => break,
+                #[cfg(feature = "pq-proposer")]
+                PqNetworkServiceEvent::LocalAttestationPublish(Some(
+                    super::PqLocalAttestationBatchPublishEvent::Incoming(command),
+                )) => {
+                    if !command.needs_encoding() {
+                        command.publish(&mut self.network);
+                        self.local_attestation_publish_receiver
+                            .retain_and_complete(command);
+                    } else if !self.local_attestation_publish_receiver.start_encoding(
+                        command,
+                        self.task_executor.clone(),
+                        None,
+                    ) {
+                        warn!("PQ local attestation encoding worker unavailable");
+                    }
+                }
+                #[cfg(feature = "pq-proposer")]
+                PqNetworkServiceEvent::LocalAttestationPublish(Some(
+                    super::PqLocalAttestationBatchPublishEvent::Encoded(command),
+                )) => {
+                    command.publish(&mut self.network);
+                    self.local_attestation_publish_receiver
+                        .retain_and_complete(command);
+                }
+                #[cfg(feature = "pq-proposer")]
+                PqNetworkServiceEvent::LocalAttestationPublish(None) => break,
                 #[cfg(feature = "pq-startup-testing")]
                 PqNetworkServiceEvent::TestingAttestationPublish(Some(command)) => {
                     self.handle_testing_attestation_publish(command);
@@ -1302,6 +1373,10 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
 
     async fn shutdown_and_drain(&mut self) {
         self.broadcast_receiver.close_and_reject_pending();
+        #[cfg(feature = "pq-proposer")]
+        self.local_attestation_publish_receiver
+            .close_and_drain()
+            .await;
         #[cfg(feature = "pq-startup-testing")]
         {
             self.testing_attestation_publish_receiver.close();

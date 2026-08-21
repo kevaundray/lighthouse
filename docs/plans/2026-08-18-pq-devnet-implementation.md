@@ -2731,6 +2731,35 @@ reservation rollback. This checkpoint adds no upper network command, attester-se
 handoff, local consume/apply coalescer, scheduler, HTTP route, pools, aggregation, persistence,
 justification, or finalization behavior.
 
+**Network whole-batch command checkpoint (implemented, service handoff/apply still absent):** the
+signer-only `network/pq-proposer` graph now owns one cap-one, result-bearing command whose only
+production input is the complete non-`Clone` verified local batch. The command and its opaque
+progress owner retain all candidate guards and real proof tokens; no raw single, encoded request,
+or token escapes. Admission/closed errors return exact ownership. A monitored without-exit blocking
+operation encodes every member in deterministic order away from the mutable network loop, hashes
+the one exact signed-SSZ buffer against the sealed digest, derives the attestation topic from the
+trusted subnet and slot-specific fork digest, and moves that same buffer into generic anonymous
+gossipsub publication. The specialized lower encoded-request API is consequently removed; only the
+source-aware classifier and generic lower publish remain.
+
+Progress distinguishes verified, published/local-duplicate, remote pending/retained unresolved,
+retryable, and terminal members with exact `MessageId` identity. Retry consumes the opaque owner,
+skips the irreversible prefix, and reuses the failed member's exact encoded buffer. Encoding
+unavailability/panic is terminal and process-fatal while preserving ownership. One bounded
+service-owned completion slot survives receipt cancellation. Production close wakes live queued,
+blocked-encoding, and completed receipts without taking their shared progress; abandoned receipts
+release naturally when the final service/command owner drops, and shutdown drain remains bounded.
+
+The read-only count/topic/ID trace is available only through additive
+`lighthouse/pq-startup-testing`; `pq-proposer` alone does not enable it. Fast tests pin exact
+two-member encoding, subnet/fork topics, no truncation, cursor retry, remote provenance, task
+failure, receipt cancellation, and all three close races. The final authentic warning-denied AVX2
+run passed in 461.00 seconds through real journal signing, whole-batch local proof, and actual
+no-peer `PqNetworkService`, independently matching both encoded members and member-zero's exact
+topic/anonymous ID. It did not apply a vote. Production attester-service handoff, remote outcome
+coalescing, local apply, a two-node upper wire proof, scheduling, pools, persistence, justification,
+and finalization remain future slices.
+
 This checkpoint is not completion of Task 5.2b. The fork-choice receiver remains in-memory Fresh
 evidence, and the local-context Resume evidence is limited to rebuilding ephemeral committee caches
 from the selected canonical snapshot. There is no live aggregate-and-proof routing, operation-pool

@@ -2015,3 +2015,55 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   transfer from `PqAttesterService`, consumption of the service-owned verified batch, local
   fork-choice application, scheduler, HTTP route, pool insertion, aggregation, persistence,
   justification, or finalization claim.
+
+### 2026-08-21: Network-owned whole-batch PQ attestation publication command completed
+
+- The signer-only `network/pq-proposer` graph now owns one cap-one, result-bearing publication
+  command. Its sole production input is the complete non-`Clone`
+  `PqVerifiedLocalAttestationBatch`; no raw single, subnet, topic, encoded request, or verified token
+  is exposed. Admission failure or a closed command channel returns the exact whole batch, and one
+  opaque progress owner retains the batch, its original candidate guards, and every proof token
+  through publication, retry, receipt cancellation, and shutdown.
+- A monitored `spawn_blocking_handle_without_exit` operation encodes every member off the mutable
+  network loop in deterministic batch order. Each signed single is SSZ-encoded exactly once; the
+  same buffer is SHA-256 checked against its sealed token digest and moved into the lower request.
+  Its topic is derived from the token's trusted subnet and the slot-specific fork digest. The
+  mutable network owner then uses generic anonymous gossipsub publication plus the previously
+  shared source-aware result classifier. The now-redundant lower
+  `PqEncodedSingleAttestation`/specialized publish surface and stale tests were removed.
+- Per-member progress remains exact: `Verified`, irreversible `Published` (including a separately
+  marked exact local duplicate), unresolved remote `WaitingRemote` with pending versus retained
+  provenance, `Retryable`, or `Terminal`. A retry consumes the opaque owner, skips the published
+  prefix, and reuses the exact already-encoded failed member without re-signing, re-proving, or
+  re-encoding. `PendingRemote` and `DuplicateRemote` are deliberately not local-apply success.
+  Message-ID mismatch, unknown duplicate, transform/size, and non-anonymous publication remain
+  terminal.
+- Encoding spawn unavailability and panic are explicit terminal progress; both signal process
+  failure, and neither loses the batch. The service awaits the monitored blocking result before
+  completion. Completed progress is retained in one bounded service-owned slot, so dropping the
+  caller receipt cannot release the only owner. Shutdown closes new admission and drains queued or
+  blocked encoding work. A live receipt still receives exact queued, encoding, or already-completed
+  progress after close; close drops only the service `Arc`, while an abandoned receipt naturally
+  lets the final command/service owner release the cap and chain activity.
+- Startup observability is isolated behind additive `lighthouse/pq-startup-testing`, which alone
+  forwards `network/pq-startup-testing`; the production `pq-proposer` graph contains no trace API.
+  Its read-only trace exposes only encoded member count and the attempted first member's topic and
+  `MessageId`. Fast sensitivity tests rejected a second SSZ reconstruction, forced subnet zero,
+  forced zero fork digest, encoding only the first member, the old close-time shared-owner take,
+  cancellable/lost encoding completion, and dropped-receipt owner loss. The final command suite
+  passed 17/17 warning-denied tests.
+- The warning-denied AVX2 authentic tracer used the real direct attester service, SQLite/journal
+  signing, whole-batch local proof, and an actual no-peer `PqNetworkService`. Its exact command was
+  `RUSTFLAGS='-D warnings -C target-feature=+avx2' cargo +1.88 test -p lighthouse
+  --no-default-features --features pq-proposer,pq-startup-testing --test pq_e4f_launch
+  direct_pq_attester_service_authentically_signs_and_proves_slot_once -- --exact --nocapture`; it
+  passed 1/1 in 461.00 seconds (cache 0.074s, authority 280.912s, RANDAO 308.339s, slot-1 import
+  460.025s, verified/publication trace 460.987s, drained 460.999s). It independently derived both
+  complete signed-single SSZ buffers, token digests, subnet/fork topics, and member-zero anonymous
+  message ID before handing over the still-whole batch. The returned progress proved both members
+  were encoded, member zero reached exact `NoPeers`, member one remained `Verified`, remote
+  observations stayed zero, and no local fork-choice application occurred.
+- This checkpoint does not wire the production `PqAttesterService` handoff, resolve remote pending
+  publication, coalesce wire and local outcomes, apply a local vote, schedule duties, publish to a
+  real second node, insert into either pool, aggregate, persist attester/fork-choice state, justify,
+  or finalize. The finalized checkpoint remains genesis.

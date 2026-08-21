@@ -21,6 +21,7 @@ pq-devnet = [
     "operation_pool/pq-devnet",
     "types/pq-devnet",
 ]
+pq-proposer = ["pq-devnet", "lighthouse_network/pq-proposer"]
 pq-startup-testing = [
     "pq-devnet",
     "beacon_chain/pq-startup-testing",
@@ -68,7 +69,7 @@ types = { workspace = true }
 
 [dev-dependencies]
 arbitrary = { workspace = true }
-beacon_chain = { workspace = true, features = ["arbitrary"] }
+beacon_chain = { path = "../beacon_chain", default-features = false, features = ["arbitrary"] }
 bls = { workspace = true }
 eth2 = { workspace = true }
 eth2_network_config = { workspace = true }

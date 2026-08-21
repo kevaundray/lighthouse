@@ -8,6 +8,8 @@ use std::sync::Arc;
 use types::{SignedAggregateAndProof, SignedBeaconBlock, SingleAttestation, SubnetId};
 
 mod broadcast;
+#[cfg(feature = "pq-proposer")]
+mod local_attestation_publish;
 mod publication;
 mod service;
 
@@ -15,6 +17,27 @@ pub use broadcast::{
     PQ_BLOCK_BROADCAST_QUEUE_CAPACITY, PqBlockBroadcastAcknowledgement, PqBlockBroadcastCommand,
     PqBlockBroadcastError, PqBlockBroadcastReceiver, PqBlockBroadcastSender,
     pq_block_broadcast_channel,
+};
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+pub use local_attestation_publish::{
+    PqLocalAttestationBatchEncoderTestTrace, PqLocalAttestationBatchEncodingTestTrace,
+    PqLocalAttestationExactSszBufferTestTrace, PqLocalAttestationPublishTestOutcome,
+    PqLocalAttestationPublishTestTrace, testing_only_pq_local_attestation_batch_publish_channel,
+    testing_only_pq_local_attestation_encode_batch,
+    testing_only_pq_local_attestation_encode_exact_signed_ssz,
+    testing_only_pq_local_attestation_publish_progress,
+};
+#[cfg(feature = "pq-proposer")]
+pub use local_attestation_publish::{
+    PqLocalAttestationBatchEncodingFailure, PqLocalAttestationBatchPublishProgress,
+    PqLocalAttestationBatchPublishReceipt, PqLocalAttestationBatchPublishRetryError,
+    PqLocalAttestationBatchPublishSendError, PqLocalAttestationBatchPublishSender,
+    PqLocalAttestationMemberPublishProgress,
+};
+#[cfg(feature = "pq-proposer")]
+pub(crate) use local_attestation_publish::{
+    PqLocalAttestationBatchPublishEvent, PqLocalAttestationBatchPublishReceiver,
+    pq_local_attestation_batch_publish_channel,
 };
 pub use publication::{
     PQ_BLOCK_PUBLICATION_ADMISSION_CAPACITY, PQ_BLOCK_PUBLICATION_BODY_CHUNK_CAPACITY,

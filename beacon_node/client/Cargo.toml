@@ -33,6 +33,7 @@ pq-proposer = [
     "dep:slashing_protection",
     "initialized_validators/pq-devnet",
     "lighthouse_validator_store/pq-devnet",
+    "network/pq-proposer",
     "pq_proposer_service/pq-devnet",
     "slashing_protection/pq-devnet",
 ]

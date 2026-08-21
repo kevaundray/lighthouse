@@ -300,7 +300,7 @@ pub enum PqSingleAttestationPublishOutcome {
 }
 
 #[cfg(feature = "pq-proposer")]
-fn classify_pq_single_publish_result(
+pub fn classify_pq_single_publish_result(
     message_id: MessageId,
     result: Result<MessageId, PublishError>,
 ) -> PqSingleAttestationPublishOutcome {
@@ -350,54 +350,6 @@ fn classify_pq_single_publish_result(
             message_id,
             error_kind: std::io::ErrorKind::InvalidData,
         },
-    }
-}
-
-/// Exact topic and SSZ bytes authorized for one PQ single-attestation publication.
-///
-/// The private fields make this a lower-layer capability. The future attester-to-network handoff
-/// will construct it from a consumed verified batch; callers cannot supply validator semantics.
-#[cfg(feature = "pq-proposer")]
-pub struct PqEncodedSingleAttestation {
-    topic: Topic,
-    data: Vec<u8>,
-    fork_digest: [u8; 4],
-}
-
-#[cfg(feature = "pq-proposer")]
-impl PqEncodedSingleAttestation {
-    pub fn as_ssz_bytes(&self) -> &[u8] {
-        &self.data
-    }
-
-    pub fn topic_hash(&self) -> TopicHash {
-        self.topic.hash()
-    }
-
-    pub fn fork_digest(&self) -> [u8; 4] {
-        self.fork_digest
-    }
-}
-
-#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
-impl PqEncodedSingleAttestation {
-    #[doc(hidden)]
-    pub fn testing_only_encode<E: EthSpec>(
-        attestation: types::SingleAttestation,
-        subnet: SubnetId,
-        fork_digest: [u8; 4],
-    ) -> Self {
-        let message: PubsubMessage<E> = PubsubMessage::Attestation(Box::new((subnet, attestation)));
-        let topic = GossipTopic::new(
-            GossipKind::Attestation(subnet),
-            GossipEncoding::default(),
-            fork_digest,
-        );
-        Self {
-            topic: Topic::from(topic),
-            data: message.encode(GossipEncoding::default()),
-            fork_digest,
-        }
     }
 }
 
@@ -1320,24 +1272,6 @@ impl<E: EthSpec> Network<E> {
             }
             Err(_) => Err(PqBeaconBlockPublishError::Rejected),
         }
-    }
-
-    /// Publish exact, pre-encoded PQ single-attestation bytes through anonymous gossipsub.
-    #[cfg(feature = "pq-proposer")]
-    pub fn publish_pq_encoded_single_attestation(
-        &mut self,
-        encoded: &mut PqEncodedSingleAttestation,
-    ) -> PqSingleAttestationPublishOutcome {
-        let Some(message_id) = self
-            .gossipsub()
-            .anonymous_message_id(encoded.topic.hash(), &encoded.data)
-        else {
-            return PqSingleAttestationPublishOutcome::NonAnonymousPublisher;
-        };
-        let result = self
-            .gossipsub_mut()
-            .publish(encoded.topic.clone(), encoded.data.clone());
-        classify_pq_single_publish_result(message_id, result)
     }
 
     #[cfg(feature = "pq-startup-testing")]

@@ -1043,6 +1043,18 @@ where
             _ => None,
         }
     }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_take_owned_verified_batch(
+        &self,
+    ) -> Option<PqVerifiedLocalAttestationBatch<MinimalEthSpec>> {
+        let mut control = self.shared.control.lock().ok()?;
+        match &mut control.state {
+            PqAttesterState::CompletedVerified { owned, .. } => owned.take(),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(feature = "pq-devnet")]

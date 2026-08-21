@@ -62,6 +62,23 @@ pub use pq_runtime::{
     testing_only_pq_encoding_shutdown, testing_only_pq_gossip_imported_event_gate,
     testing_only_pq_proof_admission, testing_only_pq_status_lifecycle,
 };
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+#[doc(hidden)]
+pub use pq_runtime::{
+    PqLocalAttestationBatchEncoderTestTrace, PqLocalAttestationBatchEncodingTestTrace,
+    PqLocalAttestationExactSszBufferTestTrace, PqLocalAttestationPublishTestOutcome,
+    PqLocalAttestationPublishTestTrace, testing_only_pq_local_attestation_batch_publish_channel,
+    testing_only_pq_local_attestation_encode_batch,
+    testing_only_pq_local_attestation_encode_exact_signed_ssz,
+    testing_only_pq_local_attestation_publish_progress,
+};
+#[cfg(feature = "pq-proposer")]
+pub use pq_runtime::{
+    PqLocalAttestationBatchEncodingFailure, PqLocalAttestationBatchPublishProgress,
+    PqLocalAttestationBatchPublishReceipt, PqLocalAttestationBatchPublishRetryError,
+    PqLocalAttestationBatchPublishSendError, PqLocalAttestationBatchPublishSender,
+    PqLocalAttestationMemberPublishProgress,
+};
 #[cfg(not(feature = "pq-devnet"))]
 pub use service::{
     NetworkMessage, NetworkReceivers, NetworkSenders, NetworkService, ValidatorSubscriptionMessage,
