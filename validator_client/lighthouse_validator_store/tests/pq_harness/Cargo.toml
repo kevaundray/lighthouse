@@ -8,11 +8,12 @@ rust-version = "1.88"
 [workspace]
 
 [dependencies]
+async-channel = "1.9"
 context_deserialize = "0.2"
 eth2 = { path = "../../../../common/eth2", default-features = false, features = ["pq-devnet"] }
 futures = "0.3"
 initialized_validators = { path = "../../../initialized_validators", default-features = false, features = ["pq-devnet"] }
-lighthouse_validator_store = { path = "../..", default-features = false, features = ["pq-devnet"] }
+lighthouse_validator_store = { path = "../..", default-features = false, features = ["pq-devnet", "pq-startup-testing"] }
 pq_devnet = { path = "../../../../testing/pq_devnet", default-features = false, features = ["pq-devnet"] }
 pq_proposer_service = { path = "../../../pq_proposer_service", default-features = false, features = ["pq-devnet", "pq-startup-testing"] }
 pq_signing = { path = "../../../../crypto/pq_signing", default-features = false, features = ["pq-devnet"] }

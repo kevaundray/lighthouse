@@ -1864,3 +1864,38 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   scheduler, production publication, HTTP route, local fork-choice application, aggregation pool,
   persisted vote recovery, justification, or finalization. Slice B2 must build the private signing
   service on this provenance boundary without enabling the ordinary validator-service graph.
+
+### 2026-08-21: Guarded local PQ attestation signing batches completed (Task 5.2b Slice B2 A+B)
+
+- A coherent Slice-A snapshot now transfers its private candidates, nonwaiting admission, and PQ
+  import activity into one non-`Clone` owned signing batch. The production transfer was exercised
+  from a real execution-VALID imported slot-1 head: after the authentic verified-local token was
+  dropped, chain drain remained pending solely on the owned batch, and dropping that batch restored
+  both admission and shutdown ownership. Replacing its admission with an unrelated permit failed
+  the mutation test in 132.30 seconds; the restored authentic path passed in 131.19 seconds.
+- `plan_pq_local_attestations` returns `NoDuty` for an empty owned batch and otherwise retains the
+  guards in a signing plan capped at 16. Production exposes neither a reusable request vector nor a
+  raw output-validation escape. Its complete exact-output classification rejects requested or
+  returned cap overflow, empty output for a nonempty request, missing or extra members, duplicate
+  returned indices, order/index mismatch, and any candidate/data/bitfield association mismatch;
+  only one complete ordered batch is atomically sealed.
+- `PqLocalAttestationSigningBatch::sign_once` consumes that plan and builds the exact
+  `AttestationToSign` values only inside one TaskExecutor-monitored `spawn_handle_without_exit`
+  operation. It awaits exactly one real validator-store stream result, validates it, and returns a
+  non-`Clone` result receipt containing only the sealed batch. Dropping the caller receipt cannot
+  cancel the task or release its guards. A two-candidate sensitivity test pins exact request order,
+  distinct validator keys and indices, committee positions 0 and 1, distinct complete attestation
+  data, and one signer invocation; substituting committee index for position or reversing iteration
+  fails.
+- Only the PQ attestation slashing precheck changed blocking ownership. The real
+  `ValidatorStore::sign_attestations` path dispatches SQLite work with
+  `spawn_blocking_handle_without_exit`; ordinary BLS attestation signing and PQ block slashing
+  behavior are unchanged. A real one-validator call-site test proved caller abort plus executor exit
+  cannot orphan the blocked precheck, and that a precheck panic returns typed `ExecutorError` and
+  signals exact process failure. Warning-denied AVX2 GREEN runs passed in 138.88 and 138.82 seconds;
+  mutating the actual call back to the cancellable helper lost the failure signal and failed in
+  141.82 seconds.
+- This checkpoint deliberately stops before the full `PqAttesterService`: it adds no monitored
+  current-slot scheduler, production publication, HTTP route, local fork-choice application,
+  aggregate or pool integration, signing retry state machine, persisted vote recovery,
+  justification, or finalization. The finalized checkpoint remains genesis.

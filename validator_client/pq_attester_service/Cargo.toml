@@ -8,6 +8,7 @@ default = []
 pq-devnet = [
     "dep:beacon_chain",
     "dep:consensus_signature",
+    "dep:futures",
     "dep:lighthouse_validator_store",
     "beacon_chain/pq-devnet",
     "consensus_signature/pq-wire",
@@ -16,19 +17,24 @@ pq-devnet = [
     "dep:store",
     "store/leveldb",
     "dep:task_executor",
+    "dep:tokio",
     "dep:types",
     "types/pq-devnet",
+    "dep:validator_store",
 ]
 pq-startup-testing = ["pq-devnet", "beacon_chain/pq-startup-testing"]
 
 [dependencies]
 beacon_chain = { path = "../../beacon_node/beacon_chain", default-features = false, optional = true }
 consensus_signature = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
 lighthouse_validator_store = { path = "../lighthouse_validator_store", default-features = false, optional = true }
 slot_clock = { workspace = true, optional = true }
 store = { path = "../../beacon_node/store", default-features = false, optional = true }
 task_executor = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
 types = { workspace = true, optional = true }
+validator_store = { path = "../validator_store", default-features = false, optional = true }
 
 [dev-dependencies]
 consensus_signature = { workspace = true, features = ["pq-devnet"] }

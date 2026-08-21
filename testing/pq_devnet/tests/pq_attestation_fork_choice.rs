@@ -458,14 +458,14 @@ mod avx2 {
             .collect::<Vec<_>>()
             .into();
         let context = chain
-            .pq_local_attestation_context(identities)
+            .pq_local_attestation_context(Arc::clone(&identities))
             .await
             .expect("slot-one local context");
         let context = chain
             .consume_pq_local_attestation_context(context)
             .expect("coherent slot-one local context");
         let candidate = context
-            .into_candidates()
+            .testing_only_into_candidates()
             .into_iter()
             .find(|candidate| candidate.validator_index() == attester_index)
             .expect("signed validator exact candidate");
@@ -577,7 +577,7 @@ mod avx2 {
         assert_eq!(expected.len(), 2, "full-16 profile has two slot-one duties");
 
         let context = chain
-            .pq_local_attestation_context(identities)
+            .pq_local_attestation_context(Arc::clone(&identities))
             .await
             .expect("imported current-slot local context");
         let context = chain
@@ -627,7 +627,7 @@ mod avx2 {
             );
         }
 
-        let mut candidates = context.into_candidates();
+        let mut candidates = context.testing_only_into_candidates();
         let candidate_position = candidates
             .iter()
             .position(|candidate| candidate.validator_index() == attester_index)
@@ -704,6 +704,20 @@ mod avx2 {
             beacon_chain::PQ_ATTESTATION_GOSSIP_ADMISSION_CAPACITY - 1,
             "a retained local pre-propagation token must retain proof admission",
         );
+        let transfer_context = chain
+            .pq_local_attestation_context(identities)
+            .await
+            .expect("second production local context");
+        let transfer_context = chain
+            .consume_pq_local_attestation_context(transfer_context)
+            .expect("second coherent production local context");
+        let owned_batch = transfer_context.into_owned_candidate_batch();
+        assert_eq!(owned_batch.candidates().len(), 2);
+        assert_eq!(
+            chain.testing_only_pq_local_attestation_context_available_permits(),
+            beacon_chain::PQ_LOCAL_ATTESTATION_CONTEXT_ADMISSION_CAPACITY - 1,
+            "production context admission must transfer into the owned batch",
+        );
         let drain = {
             let chain = Arc::clone(&chain);
             tokio::spawn(async move { chain.close_and_drain_pq_imports().await })
@@ -716,6 +730,19 @@ mod avx2 {
             "a retained local pre-propagation token must retain chain activity",
         );
         drop(verified);
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !drain.is_finished(),
+            "production owned batch must retain transferred chain activity",
+        );
+        assert_eq!(
+            chain.testing_only_pq_local_attestation_context_available_permits(),
+            1,
+            "only the production owned batch admission remains",
+        );
+        drop(owned_batch);
         tokio::time::timeout(std::time::Duration::from_secs(1), drain)
             .await
             .expect("drain completes after local token drop")
@@ -723,6 +750,10 @@ mod avx2 {
         assert_eq!(
             chain.testing_only_pq_attestation_gossip_available_permits(),
             beacon_chain::PQ_ATTESTATION_GOSSIP_ADMISSION_CAPACITY,
+        );
+        assert_eq!(
+            chain.testing_only_pq_local_attestation_context_available_permits(),
+            beacon_chain::PQ_LOCAL_ATTESTATION_CONTEXT_ADMISSION_CAPACITY,
         );
     }
 

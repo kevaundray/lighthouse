@@ -17,6 +17,7 @@ pq-devnet = [
     "types/pq-devnet",
     "validator_store/pq-devnet",
 ]
+pq-startup-testing = ["pq-devnet"]
 
 [dependencies]
 account_utils = { workspace = true }
@@ -42,5 +43,6 @@ validator_metrics = { workspace = true }
 validator_store = { workspace = true }
 
 [dev-dependencies]
+async-channel = { workspace = true }
 futures = { workspace = true }
 logging = { workspace = true }

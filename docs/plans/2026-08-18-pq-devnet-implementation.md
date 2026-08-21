@@ -2627,12 +2627,36 @@ apply fork choice, or publish; authentic slot-1 evidence pins observations exact
 structurally valid but cryptographically invalid evidence becomes a typed local contextual
 invariant.
 
+**Cycle 3 Slice B2 A+B checkpoint (implemented, guarded batch and precheck ownership only):** a
+coherent Slice-A snapshot transfers its candidates plus original admission and shutdown activity
+into a private, non-`Clone` owned signing batch. The planning boundary returns `NoDuty` without
+store work for an empty batch and caps nonempty batches at 16. It classifies every store-output
+shape before sealing: requested/returned capacity, empty, missing, extra, duplicate index,
+order/index mismatch, and exact candidate/data/bitfield association. Production exposes no
+reusable `AttestationToSign` request vector and no raw validation bypass.
+
+The one-shot `sign_once` operation consumes the guarded batch, creates its exact requests only
+inside a TaskExecutor-monitored without-exit task, awaits exactly one real validator-store stream
+result, and returns only an atomically sealed batch through a non-`Clone` receipt. Dropping that
+receipt cannot cancel signing or release the original guards. A two-candidate test pins request
+order, distinct keys/indices/data, committee positions 0 and 1, exact full attestations, one signer
+invocation, and ordered returned output; committee-index substitution and reversed iteration are
+mutation-sensitive.
+
+The real PQ `ValidatorStore::sign_attestations` call now gives its SQLite slashing precheck
+without-exit blocking ownership. Caller abort and executor exit cannot orphan the operation, and a
+panic returns typed `ExecutorError` while signaling process failure. The actual-call mutation back
+to the cancellable helper loses that signal and fails. Ordinary BLS signing and PQ block slashing
+remain unchanged. A production imported-slot context-transfer proof also pins that batch ownership,
+not a synthetic fixture, retains admission and keeps chain drain pending until batch drop.
+
 This checkpoint is not completion of Task 5.2b. The fork-choice receiver remains in-memory Fresh
 evidence, and the local-context Resume evidence is limited to rebuilding ephemeral committee caches
 from the selected canonical snapshot. There is no live aggregate-and-proof routing, operation-pool
-or naive-aggregation-pool insertion, service-owned signing, publication, scheduler, HTTP route,
-fork-choice/vote or local-context persistence, justification, or finalization claim. The finalized
-checkpoint remains genesis. Those remain the subsequent vertical slices described below.
+or naive-aggregation-pool insertion, full service-owned signing state machine, production
+publication, scheduler, HTTP route, fork-choice/vote or local-context persistence, justification,
+or finalization claim. The finalized checkpoint remains genesis. Those remain the subsequent
+vertical slices described below.
 
 **Files:**
 

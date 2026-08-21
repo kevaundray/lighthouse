@@ -60,6 +60,24 @@ where
         .map_err(|_| Error::ExecutorError)
 }
 
+#[cfg(feature = "pq-devnet")]
+async fn pq_run_attestation_slashing_precheck<R, F>(
+    task_executor: &TaskExecutor,
+    check: F,
+) -> Result<R, Error>
+where
+    R: Send + 'static,
+    F: FnOnce() -> R + Send + 'static,
+{
+    let receipt = task_executor
+        .spawn_blocking_handle_without_exit(check, "pq_slashing_precheck_attestations")
+        .ok_or(Error::ExecutorError)?;
+    receipt
+        .await
+        .map_err(|_| Error::ExecutorError)?
+        .map_err(|_| Error::ExecutorError)
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Fallback fee recipient address.
@@ -101,14 +119,38 @@ pub struct LighthouseValidatorStore<T, E> {
     prefer_builder_proposals: bool,
     builder_boost_factor: Option<u64>,
     task_executor: TaskExecutor,
+    #[cfg(feature = "pq-startup-testing")]
+    pq_attestation_precheck_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     _phantom: PhantomData<E>,
 }
 
 #[cfg(all(test, feature = "pq-devnet"))]
 mod pq_blocking_tests {
     use super::*;
+    use futures::StreamExt;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    struct BlockingRelease(Option<std::sync::mpsc::Sender<()>>);
+
+    impl BlockingRelease {
+        fn channel() -> (Self, std::sync::mpsc::Receiver<()>) {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            (Self(Some(sender)), receiver)
+        }
+
+        fn release(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    impl Drop for BlockingRelease {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn block_slashing_sqlite_work_does_not_block_the_async_worker() {
@@ -154,6 +196,75 @@ mod pq_blocking_tests {
         );
         watchdog.join().expect("watchdog");
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn attestation_slashing_precheck_retains_monitor_after_abort_and_executor_exit() {
+        let (executor_exit_sender, executor_exit_receiver) = async_channel::bounded(1);
+        let (shutdown_sender, mut shutdown_receiver) = futures::channel::mpsc::channel(1);
+        let executor = TaskExecutor::new(
+            tokio::runtime::Handle::current(),
+            executor_exit_receiver,
+            shutdown_sender,
+        );
+        let (entered_sender, entered_receiver) = tokio::sync::oneshot::channel();
+        let (mut release, release_receiver) = BlockingRelease::channel();
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_in_work = Arc::clone(&completed);
+        let caller = tokio::spawn(async move {
+            pq_run_attestation_slashing_precheck(&executor, move || {
+                let _ = entered_sender.send(());
+                release_receiver.recv().expect("release SQLite precheck");
+                completed_in_work.store(true, Ordering::SeqCst);
+                panic!("stateful PQ attestation precheck panic")
+            })
+            .await
+        });
+        entered_receiver.await.expect("SQLite precheck entered");
+        caller.abort();
+        assert!(
+            caller
+                .await
+                .expect_err("caller abort is observed")
+                .is_cancelled(),
+            "test must cancel only the caller-facing waiter",
+        );
+        drop(executor_exit_sender);
+        release.release();
+        let reason = tokio::time::timeout(Duration::from_secs(1), shutdown_receiver.next())
+            .await
+            .expect("retained monitor reports the panic")
+            .expect("shutdown reason");
+        assert_eq!(
+            reason,
+            task_executor::ShutdownReason::Failure("Panic (fatal error)")
+        );
+        assert!(completed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn attestation_slashing_precheck_panic_is_typed_and_fatal() {
+        let (_executor_exit_sender, executor_exit_receiver) = async_channel::bounded(1);
+        let (shutdown_sender, mut shutdown_receiver) = futures::channel::mpsc::channel(1);
+        let executor = TaskExecutor::new(
+            tokio::runtime::Handle::current(),
+            executor_exit_receiver,
+            shutdown_sender,
+        );
+        let error = pq_run_attestation_slashing_precheck(&executor, || -> usize {
+            panic!("stateful PQ attestation precheck panic")
+        })
+        .await
+        .expect_err("blocking panic must be typed");
+        assert!(matches!(error, Error::ExecutorError));
+        let reason = tokio::time::timeout(Duration::from_secs(1), shutdown_receiver.next())
+            .await
+            .expect("panic signals process failure")
+            .expect("shutdown reason");
+        assert_eq!(
+            reason,
+            task_executor::ShutdownReason::Failure("Panic (fatal error)")
+        );
+    }
 }
 
 impl<T: SlotClock + 'static, E: EthSpec> LighthouseValidatorStore<T, E> {
@@ -185,8 +296,19 @@ impl<T: SlotClock + 'static, E: EthSpec> LighthouseValidatorStore<T, E> {
             prefer_builder_proposals: config.prefer_builder_proposals,
             builder_boost_factor: config.builder_boost_factor,
             task_executor,
+            #[cfg(feature = "pq-startup-testing")]
+            pq_attestation_precheck_hook: Mutex::new(None),
             _phantom: PhantomData,
         }
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_set_pq_attestation_precheck_hook(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self.pq_attestation_precheck_hook.lock() = hook;
     }
 
     /// Register all local validators in doppelganger protection to try and prevent instances of
@@ -819,6 +941,10 @@ impl<T: SlotClock + 'static, E: EthSpec> LighthouseValidatorStore<T, E> {
         &self,
         attestations: Vec<AttestationToSign<E>>,
     ) -> Result<Vec<(AttestationToSign<E>, Safe)>, Error> {
+        #[cfg(feature = "pq-startup-testing")]
+        if let Some(hook) = self.pq_attestation_precheck_hook.lock().clone() {
+            hook();
+        }
         let mut attestations_to_check = Vec::with_capacity(attestations.len());
         for attestation in &attestations {
             let signing_method = self.doppelganger_checked_signing_method(attestation.pubkey)?;
@@ -1269,15 +1395,11 @@ impl<T: SlotClock + 'static, E: EthSpec> ValidatorStore for LighthouseValidatorS
         let store = self.clone();
         stream::once(async move {
             let validator_store = store.clone();
-            let safe_attestations = store
-                .task_executor
-                .spawn_blocking_handle(
-                    move || validator_store.pq_slashing_precheck_attestations(attestations),
-                    "pq_slashing_precheck_attestations",
-                )
-                .ok_or(Error::ExecutorError)?
-                .await
-                .map_err(|_| Error::ExecutorError)??;
+            let safe_attestations =
+                pq_run_attestation_slashing_precheck(&store.task_executor, move || {
+                    validator_store.pq_slashing_precheck_attestations(attestations)
+                })
+                .await??;
 
             let signing_futures = safe_attestations
                 .into_iter()

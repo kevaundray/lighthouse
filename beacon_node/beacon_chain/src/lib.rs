@@ -225,12 +225,15 @@ pub use self::pq_import::{
 #[cfg(feature = "pq-devnet")]
 pub use self::pq_local_attester_context::{
     PQ_LOCAL_ATTESTATION_CONTEXT_ADMISSION_CAPACITY, PQ_LOCAL_ATTESTER_IDENTITY_CAPACITY,
-    PqCoherentLocalAttestationSnapshot, PqLocalAttestationCandidate, PqLocalAttestationContext,
-    PqLocalAttestationContextError, PqLocalAttesterIdentity, PqLocalSingleConstructionError,
-    PqLocallyConstructedSingle,
+    PqCoherentLocalAttestationSnapshot, PqLocalAttestationBatchSealError,
+    PqLocalAttestationCandidate, PqLocalAttestationContext, PqLocalAttestationContextError,
+    PqLocalAttesterIdentity, PqLocalSingleConstructionError, PqLocallyConstructedSingle,
+    PqOwnedLocalAttestationCandidateBatch, PqSealedLocalAttestationBatch,
 };
 #[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
 pub use self::pq_local_attester_context::{
+    TestingPqLocalCandidateBatchGuards, testing_only_pq_local_candidate_batch_fixture,
+    testing_only_pq_local_candidate_batch_fixture_with_guards,
     testing_only_pq_local_candidate_fixture, testing_only_validate_pq_local_attester_profile,
 };
 #[cfg(feature = "pq-devnet")]

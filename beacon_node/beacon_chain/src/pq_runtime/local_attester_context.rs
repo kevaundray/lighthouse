@@ -341,6 +341,92 @@ pub struct PqCoherentLocalAttestationSnapshot<E: EthSpec> {
     _activity: Arc<crate::beacon_chain::PqImportActivity>,
 }
 
+/// An owned local-attestation candidate batch which retains its original bounded chain guards.
+///
+/// Candidates are available only by shared reference. The batch must be consumed atomically when
+/// associating validator-store output, so no production candidate can outlive its admission or
+/// shutdown activity.
+pub struct PqOwnedLocalAttestationCandidateBatch<E: EthSpec> {
+    candidates: Vec<PqLocalAttestationCandidate<E>>,
+    _admission: OwnedSemaphorePermit,
+    _activity: Arc<crate::beacon_chain::PqImportActivity>,
+}
+
+impl<E: EthSpec> PqOwnedLocalAttestationCandidateBatch<E> {
+    pub fn candidates(&self) -> &[PqLocalAttestationCandidate<E>] {
+        &self.candidates
+    }
+
+    pub fn seal_exact_ordered(
+        self,
+        returned: Vec<(u64, Attestation<E>)>,
+        spec: &ChainSpec,
+    ) -> Result<PqSealedLocalAttestationBatch<E>, PqLocalAttestationBatchSealError> {
+        if returned.len() != self.candidates.len() {
+            return Err(PqLocalAttestationBatchSealError::CountMismatch {
+                expected: self.candidates.len(),
+                actual: returned.len(),
+            });
+        }
+        let mut provenances = Vec::with_capacity(self.candidates.len());
+        for (candidate, (validator_index, signed_attestation)) in
+            self.candidates.into_iter().zip(returned)
+        {
+            provenances.push(
+                candidate
+                    .into_local_single(validator_index, signed_attestation, spec)
+                    .map_err(PqLocalAttestationBatchSealError::Candidate)?,
+            );
+        }
+        Ok(PqSealedLocalAttestationBatch {
+            provenances,
+            _admission: self._admission,
+            _activity: self._activity,
+        })
+    }
+}
+
+/// Atomically sealed store output which continues to retain the candidate batch guards.
+pub struct PqSealedLocalAttestationBatch<E: EthSpec> {
+    provenances: Vec<PqLocallyConstructedSingle<E>>,
+    _admission: OwnedSemaphorePermit,
+    _activity: Arc<crate::beacon_chain::PqImportActivity>,
+}
+
+impl<E: EthSpec> PqSealedLocalAttestationBatch<E> {
+    pub fn len(&self) -> usize {
+        self.provenances.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.provenances.is_empty()
+    }
+}
+
+#[derive(Debug)]
+pub enum PqLocalAttestationBatchSealError {
+    CountMismatch { expected: usize, actual: usize },
+    Candidate(PqLocalSingleConstructionError),
+}
+
+impl std::fmt::Display for PqLocalAttestationBatchSealError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "PQ local attestation batch sealing failed: {self:?}"
+        )
+    }
+}
+
+impl Error for PqLocalAttestationBatchSealError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Candidate(error) => Some(error),
+            Self::CountMismatch { .. } => None,
+        }
+    }
+}
+
 impl<E: EthSpec> std::fmt::Debug for PqCoherentLocalAttestationSnapshot<E> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -370,12 +456,18 @@ impl<E: EthSpec> PqCoherentLocalAttestationSnapshot<E> {
         &self.candidates
     }
 
-    /// Consumes the coherent snapshot and yields its private-field signing candidates.
-    ///
-    /// The snapshot is a derivation result, not signing authorization. Its short import activity
-    /// and admission ownership are released here; every later contextual verification acquires
-    /// fresh bounded chain ownership.
-    pub fn into_candidates(self) -> Vec<PqLocalAttestationCandidate<E>> {
+    /// Transfers the coherent candidates and their original guards into an owned signing batch.
+    pub fn into_owned_candidate_batch(self) -> PqOwnedLocalAttestationCandidateBatch<E> {
+        PqOwnedLocalAttestationCandidateBatch {
+            candidates: self.candidates,
+            _admission: self._admission,
+            _activity: self._activity,
+        }
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_into_candidates(self) -> Vec<PqLocalAttestationCandidate<E>> {
         self.candidates
     }
 }
@@ -824,6 +916,12 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             _activity,
         })
     }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_pq_local_attestation_context_available_permits(&self) -> usize {
+        self.pq_local_attester_context_admission.available_permits()
+    }
 }
 
 #[cfg(feature = "pq-startup-testing")]
@@ -891,4 +989,137 @@ pub fn testing_only_pq_local_candidate_fixture(
         .attach_individual_signature(&PqRawSignature::empty(), committee_position)
         .expect("fixed testing-only signature attachment");
     (candidate, signed, spec)
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub fn testing_only_pq_local_candidate_batch_fixture(
+    count: usize,
+) -> (
+    PqOwnedLocalAttestationCandidateBatch<MinimalEthSpec>,
+    Vec<Attestation<MinimalEthSpec>>,
+    ChainSpec,
+) {
+    let (batch, signed, spec, _guards) =
+        testing_only_pq_local_candidate_batch_fixture_with_guards(count);
+    (batch, signed, spec)
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub struct TestingPqLocalCandidateBatchGuards {
+    coordinator: Arc<crate::beacon_chain::PqImportCoordinator>,
+    admission: Arc<tokio::sync::Semaphore>,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+impl TestingPqLocalCandidateBatchGuards {
+    pub fn available_permits(&self) -> usize {
+        self.admission.available_permits()
+    }
+
+    pub async fn close_and_drain(&self) {
+        self.coordinator.close_and_drain().await;
+    }
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub fn testing_only_pq_local_candidate_batch_fixture_with_guards(
+    count: usize,
+) -> (
+    PqOwnedLocalAttestationCandidateBatch<MinimalEthSpec>,
+    Vec<Attestation<MinimalEthSpec>>,
+    ChainSpec,
+    TestingPqLocalCandidateBatchGuards,
+) {
+    use consensus_signature::{PqPublicKey, PqRawSignature};
+
+    assert!(
+        count <= 17,
+        "testing candidate batch is intentionally bounded"
+    );
+    let spec = ForkName::Electra
+        .make_genesis_spec(MinimalEthSpec::default_spec())
+        .set_slot_duration_ms::<MinimalEthSpec>(300_000);
+    let slot = Slot::new(0);
+    let dependent_root = Hash256::repeat_byte(0x52);
+    let committee_length = count.max(1);
+    let committee_count_at_slot = 1;
+    let mut candidates = Vec::with_capacity(count);
+    let mut signed = Vec::with_capacity(count);
+    for index in 0..count {
+        let validator_index = u64::try_from(index).expect("bounded testing validator index");
+        let key_byte = u8::try_from(index + 1).expect("bounded testing public key byte");
+        let root_byte = 0x51_u8
+            .checked_add(u8::try_from(index).expect("bounded testing root byte"))
+            .expect("bounded testing root byte addition");
+        let bound_head_root = Hash256::repeat_byte(root_byte);
+        let attestation = Attestation::empty_for_signing(
+            0,
+            committee_length,
+            slot,
+            bound_head_root,
+            types::Checkpoint::default(),
+            types::Checkpoint {
+                epoch: types::Epoch::new(0),
+                root: bound_head_root,
+            },
+            false,
+            &spec,
+        )
+        .expect("fixed testing-only attestation candidate batch");
+        let single = SingleAttestation {
+            committee_index: 0,
+            attester_index: validator_index,
+            data: attestation.data().clone(),
+            signature: consensus_signature::SameMessageEvidence::from(&PqRawSignature::empty()),
+        };
+        let subnet = SubnetId::compute_subnet_for_single_attestation::<MinimalEthSpec>(
+            &single,
+            committee_count_at_slot,
+            &spec,
+        )
+        .expect("fixed testing-only batch subnet");
+        candidates.push(PqLocalAttestationCandidate {
+            pubkey: PqPublicKey::deserialize(&[key_byte; 32])
+                .expect("fixed testing-only public key"),
+            validator_index,
+            committee_index: 0,
+            committee_position: index,
+            committee_length,
+            committee_count_at_slot,
+            subnet,
+            bound_head_root,
+            dependent_root,
+            signing_root: Hash256::repeat_byte(0x53),
+            attestation: attestation.clone(),
+        });
+        let mut signed_attestation = attestation;
+        signed_attestation
+            .attach_individual_signature(&PqRawSignature::empty(), index)
+            .expect("fixed testing-only batch signature attachment");
+        signed.push(signed_attestation);
+    }
+    let coordinator = Arc::new(crate::beacon_chain::PqImportCoordinator::default());
+    let activity = coordinator
+        .try_start()
+        .expect("testing candidate batch activity");
+    let admission = Arc::new(tokio::sync::Semaphore::new(1));
+    let admission_permit = Arc::clone(&admission)
+        .try_acquire_owned()
+        .expect("testing candidate batch admission");
+    (
+        PqOwnedLocalAttestationCandidateBatch {
+            candidates,
+            _admission: admission_permit,
+            _activity: activity,
+        },
+        signed,
+        spec,
+        TestingPqLocalCandidateBatchGuards {
+            coordinator,
+            admission,
+        },
+    )
 }

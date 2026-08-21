@@ -5868,6 +5868,7 @@ name = "lighthouse_validator_store"
 version = "0.1.0"
 dependencies = [
  "account_utils",
+ "async-channel 1.9.0",
  "bls",
  "consensus_signature",
  "doppelganger_service",
@@ -7278,12 +7279,15 @@ version = "0.1.0"
 dependencies = [
  "beacon_chain",
  "consensus_signature",
+ "futures",
  "lighthouse_validator_store",
  "slot_clock",
  "state_processing",
  "store",
  "task_executor",
+ "tokio",
  "types",
+ "validator_store",
 ]
 
 [[package]]

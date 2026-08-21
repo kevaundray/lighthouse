@@ -24,6 +24,131 @@ use types::{
 use validator_store::{AttestationToSign, UnsignedBlock, ValidatorStore};
 use warp::{Filter, Reply};
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_pq_attestation_call_retains_precheck_and_reports_panic() {
+    let root = tempdir().expect("root");
+    let seed_path = root.path().join("seed");
+    let password_path = root.path().join("password");
+    fs::write(&seed_path, [44; 32]).expect("seed");
+    fs::write(&password_path, b"deterministic test password").expect("password");
+    fs::set_permissions(&seed_path, fs::Permissions::from_mode(0o600)).expect("seed mode");
+    fs::set_permissions(&password_path, fs::Permissions::from_mode(0o600))
+        .expect("password mode");
+    let destination = root.path().join("devnet");
+    let provisioned = provision_devnet(
+        ProvisionConfig::for_test(destination.clone(), 1, 0..=125, 44),
+        &seed_path,
+        &password_path,
+    )
+    .expect("devnet");
+    let public_key = provisioned.public_keys()[0];
+    let (exit_sender, exit_receiver) = async_channel::bounded(1);
+    let (shutdown_sender, mut shutdown_receiver) = futures::channel::mpsc::channel(2);
+    let executor = task_executor::TaskExecutor::new(
+        tokio::runtime::Handle::current(),
+        exit_receiver,
+        shutdown_sender,
+    );
+    let initialized = InitializedValidators::from_pq_bundle(
+        provisioned.bundle_dir().to_path_buf(),
+        provisioned.genesis_validators_root(),
+        provisioned.genesis_time(),
+        provisioned.validator_registry().to_vec(),
+        executor.clone(),
+    )
+    .await
+    .expect("initialized validators");
+    let slashing = SlashingDatabase::create(&destination.join("slashing_protection.sqlite"))
+        .expect("fresh slashing DB");
+    slashing
+        .register_validator(public_key)
+        .expect("register validator");
+    let spec = Arc::new(ForkName::Electra.make_genesis_spec(MinimalEthSpec::default_spec()));
+    let clock = TestingSlotClock::new(Slot::new(0), Duration::ZERO, Duration::from_secs(300));
+    let store = Arc::new(LighthouseValidatorStore::new(
+        initialized,
+        slashing,
+        Hash256::from(provisioned.genesis_validators_root()),
+        Arc::clone(&spec),
+        None,
+        clock,
+        &Config::default(),
+        executor,
+    ));
+    let make_request = || AttestationToSign {
+        validator_index: 0,
+        pubkey: public_key,
+        validator_committee_index: 0,
+        attestation: attestation(&spec, Slot::new(0), Hash256::repeat_byte(0x71)),
+    };
+
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let invocations_for_hook = Arc::clone(&invocations);
+    let (entered_sender, entered_receiver) = std::sync::mpsc::sync_channel(0);
+    let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(0);
+    let release_receiver = Arc::new(std::sync::Mutex::new(release_receiver));
+    store.testing_only_set_pq_attestation_precheck_hook(Some(Arc::new(move || {
+        invocations_for_hook.fetch_add(1, Ordering::SeqCst);
+        entered_sender.send(()).expect("report blocked precheck");
+        release_receiver
+            .lock()
+            .expect("release receiver lock")
+            .recv()
+            .expect("release blocked precheck");
+        panic!("actual PQ precheck panic after caller abort")
+    })));
+    let aborted_store = Arc::clone(&store);
+    let aborted_request = make_request();
+    let caller = tokio::spawn(async move {
+        let stream = aborted_store.sign_attestations(vec![aborted_request]);
+        futures::pin_mut!(stream);
+        stream.next().await
+    });
+    tokio::task::spawn_blocking(move || {
+        entered_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("real precheck entered")
+    })
+    .await
+    .expect("entered waiter");
+    caller.abort();
+    assert!(caller.await.expect_err("caller aborted").is_cancelled());
+    drop(exit_sender);
+    release_sender.send(()).expect("release retained precheck");
+    let first_reason = tokio::time::timeout(Duration::from_secs(2), shutdown_receiver.next())
+        .await
+        .expect("retained panic reported")
+        .expect("failure reason");
+    assert_eq!(
+        first_reason,
+        task_executor::ShutdownReason::Failure("Panic (fatal error)")
+    );
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
+
+    let invocations_for_hook = Arc::clone(&invocations);
+    store.testing_only_set_pq_attestation_precheck_hook(Some(Arc::new(move || {
+        invocations_for_hook.fetch_add(1, Ordering::SeqCst);
+        panic!("awaited actual PQ precheck panic")
+    })));
+    let stream = store.sign_attestations(vec![make_request()]);
+    futures::pin_mut!(stream);
+    let error = stream
+        .next()
+        .await
+        .expect("one real store batch")
+        .expect_err("actual precheck panic is typed");
+    assert!(matches!(error, validator_store::Error::ExecutorError));
+    let second_reason = tokio::time::timeout(Duration::from_secs(2), shutdown_receiver.next())
+        .await
+        .expect("awaited panic reported")
+        .expect("failure reason");
+    assert_eq!(
+        second_reason,
+        task_executor::ShutdownReason::Failure("Panic (fatal error)")
+    );
+    assert_eq!(invocations.load(Ordering::SeqCst), 2);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn real_pq_block_signing_offloads_the_locked_sqlite_transaction() {
     let root = tempdir().expect("root");
