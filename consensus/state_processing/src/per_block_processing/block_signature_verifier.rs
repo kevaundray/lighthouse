@@ -468,7 +468,6 @@ impl<'a> ParallelSignatureSets<'a> {
     }
 
     /// Verify all included signatures while preserving invalid-evidence and local failures.
-    #[must_use]
     pub fn verify_result(self) -> std::result::Result<(), VerifyError> {
         verify_batch(self.sets.iter())
     }

@@ -3165,6 +3165,12 @@ git commit -m "feat: aggregate PQ attestations in beacon pools"
 
 ### Task 6.1: Update gossip and RPC codecs for PQ bounds
 
+The V1 devnet is intentionally genesis-started and fresh-only. Its RPC negotiation surface is
+Status v1/v2 plus Goodbye, Ping, and Metadata; block range/root and other data RPC protocols are
+not advertised. Signed blocks and attestations move over bounded gossip, while local validator
+traffic uses the narrow HTTP API. Late join and range synchronization remain unsupported rather
+than inheriting BLS-oriented RPC object codecs accidentally.
+
 **Files:**
 
 - Modify: `beacon_node/lighthouse_network/src/types/pubsub.rs`
@@ -3175,8 +3181,9 @@ git commit -m "feat: aggregate PQ attestations in beacon pools"
 
 **Step 1: Write failing codec/admission tests**
 
-Prove valid PQ objects round-trip and oversized objects are rejected before expensive decoding or
-verification.
+Prove valid PQ gossip objects round-trip and oversized objects are rejected before expensive
+decoding or verification. Pin the exact Status/control protocol list and prove ordinary builds
+retain their full RPC profile.
 
 **Step 2: Verify RED**
 
@@ -3185,11 +3192,23 @@ unbounded input.
 
 **Step 3: Implement PQ-specific bounded limits**
 
-Avoid globally raising limits for ordinary BLS networks.
+Use one checked signed-block size contract for HTTP request admission, proposer HTTP response
+collection, gossipsub uncompressed/compressed/transmit limits, and persisted-block decode
+admission. Avoid globally raising limits for ordinary BLS networks.
 
 **Step 4: Verify GREEN**
 
 Run lighthouse-network and network package tests in both configurations.
+
+Implementation checkpoint (2026-08-22): the PQ protocol profile advertises exactly Status v2/v1,
+Goodbye, Ping, and Metadata v2/v1. The exact negotiation test rejects adding data RPC protocols and
+also proves the ordinary profile still advertises blocks-by-range. `PqSignedBlockSizeLimits`
+provides one checked contract across HTTP, proposer collection, gossipsub, and storage. Minimal
+Electra admits 15,731,070 uncompressed signed-block bytes; exact-cap and cap+1 tests exercise both
+Snappy directions, blinded-block and execution-payload record admission, and the recomposed full
+signed-block boundary. A cache-hit barrier additionally proves full-size validation does not retain
+the block-cache mutex. A controlled mutation back to the ordinary
+10,485,760-byte gossip limit failed with the exact contract mismatch before restoration.
 
 **Step 5: Commit**
 
@@ -3199,6 +3218,13 @@ git commit -m "feat: support bounded PQ network messages"
 ```
 
 ### Task 6.2: Update HTTP APIs and explicitly reject unsupported integrations
+
+The PQ executable is a compile-time beacon-node-only profile. The ordinary validator-client,
+Web3Signer, account-manager/offline-exit, builder, and validator-manager command surfaces are not
+compiled into it; combining `pq-devnet` with `full-cli` or the ordinary runtime is a compile error.
+The positive runtime surface is the narrow full-block V3 production/V2 publication API plus
+proposer duties. This compile-time omission is the authoritative V1 rejection and is preferable to
+shipping dormant BLS-shaped operations that return late runtime errors.
 
 **Files:**
 
@@ -3211,16 +3237,20 @@ git commit -m "feat: support bounded PQ network messages"
 
 **Step 1: Write failing tests**
 
-Cover PQ JSON round trips plus explicit startup/configuration errors for external builder modes and
-an explicit unsupported error from account-manager offline-exit signing in the first PQ devnet.
+Cover PQ JSON/SSZ round trips, bounded request/response collection, the compile-time CLI split, and
+explicit startup/configuration errors for every unsupported beacon-node integration that remains
+syntactically reachable.
 
 **Step 2: Verify RED**
 
-Expected: APIs assume BLS hex lengths or unsupported modes start silently.
+Expected: APIs assume BLS hex lengths, the full CLI leaks into the PQ feature graph, or unsupported
+beacon-node modes start silently.
 
 **Step 3: Implement explicit PQ serialization and validation**
 
-Do not silently fall back to BLS.
+Do not silently fall back to BLS. Omit validator-client/Web3Signer/account-manager/builder command
+ownership from the PQ graph, and reject unsupported beacon-node options before filesystem or
+network side effects.
 
 **Step 4: Verify GREEN**
 

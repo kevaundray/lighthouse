@@ -27,7 +27,9 @@ pq-startup-testing = [
     "pq-devnet",
     "beacon_chain/pq-startup-testing",
     "dep:ethereum_ssz",
+    "dep:state_processing",
     "network?/pq-startup-testing",
+    "state_processing/pq-attestation",
 ]
 
 [dependencies]
@@ -38,6 +40,7 @@ futures = { workspace = true, optional = true }
 lighthouse_validator_store = { path = "../lighthouse_validator_store", default-features = false, optional = true }
 network = { path = "../../beacon_node/network", default-features = false, optional = true }
 slot_clock = { workspace = true, optional = true }
+state_processing = { workspace = true, optional = true }
 store = { path = "../../beacon_node/store", default-features = false, optional = true }
 task_executor = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
@@ -46,8 +49,6 @@ validator_store = { path = "../validator_store", default-features = false, optio
 
 [dev-dependencies]
 async-channel = { workspace = true }
-consensus_signature = { workspace = true, features = ["pq-devnet"] }
-state_processing = { workspace = true, features = ["pq-attestation"] }
 
 [[test]]
 name = "pq_local_attester"

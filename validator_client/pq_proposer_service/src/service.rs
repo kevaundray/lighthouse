@@ -1,7 +1,4 @@
-use consensus_signature::{
-    PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN, PQ_RAW_SIGNATURE_LEN, ValidatorPublicKeyBytes,
-    serialize_individual_signature,
-};
+use consensus_signature::{ValidatorPublicKeyBytes, serialize_individual_signature};
 use eth2::{
     ForkVersionedResponse, StrictBeaconNodeHttpClient,
     types::{
@@ -19,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use task_executor::TaskExecutor;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
-use types::{EthSpec, Hash256, MinimalEthSpec, Slot};
+use types::{EthSpec, Hash256, MinimalEthSpec, PqSignedBlockSizeLimits, Slot};
 use validator_store::{SignedBlock, UnsignedBlock, ValidatorStore};
 
 const PQ_PROPOSER_SLOT_DURATION: Duration = Duration::from_secs(300);
@@ -31,7 +28,6 @@ const PQ_PUBLISH_BUDGET: Duration = Duration::from_secs(45);
 const PQ_DUTIES_RESPONSE_MAX_BYTES: usize = 64 * 1024;
 const PQ_ERROR_RESPONSE_MAX_BYTES: usize = 64 * 1024;
 const PQ_RESPONSE_CHUNK_CAPACITY: usize = 4096;
-const PQ_RESPONSE_FIXED_BODY_ALLOWANCE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
 enum PqResponseCollectionError {
@@ -92,18 +88,9 @@ struct PqCollectedResponseBody {
 }
 
 fn pq_v3_response_body_limits() -> Option<(usize, usize)> {
-    let payload_bytes = usize::try_from(MinimalEthSpec::default_spec().max_payload_size).ok()?;
-    let attestation_evidence_bytes =
-        MinimalEthSpec::max_attestations_electra().checked_mul(PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN)?;
-    let individual_signature_bytes = 2usize.checked_mul(PQ_RAW_SIGNATURE_LEN)?;
-    let max_ssz_bytes = payload_bytes
-        .checked_add(attestation_evidence_bytes)?
-        .checked_add(individual_signature_bytes)?
-        .checked_add(PQ_RESPONSE_FIXED_BODY_ALLOWANCE_BYTES)?;
-    let max_json_bytes = max_ssz_bytes
-        .checked_mul(2)?
-        .checked_add(PQ_RESPONSE_FIXED_BODY_ALLOWANCE_BYTES)?;
-    Some((max_ssz_bytes, max_json_bytes))
+    let limits =
+        PqSignedBlockSizeLimits::checked::<MinimalEthSpec>(&MinimalEthSpec::default_spec())?;
+    Some((limits.max_ssz_bytes(), limits.max_json_bytes()))
 }
 
 async fn collect_pq_response(
@@ -1789,6 +1776,12 @@ mod tests {
     async fn bounded_response_rejects_declared_actual_and_fragment_excess() {
         let (max_v3_ssz, max_v3_json) =
             pq_v3_response_body_limits().expect("checked V3 response limits");
+        let shared = types::PqSignedBlockSizeLimits::checked::<MinimalEthSpec>(
+            &MinimalEthSpec::default_spec(),
+        )
+        .expect("shared PQ response limits");
+        assert_eq!(max_v3_ssz, shared.max_ssz_bytes());
+        assert_eq!(max_v3_json, shared.max_json_bytes());
         assert!(max_v3_ssz > PQ_DUTIES_RESPONSE_MAX_BYTES);
         assert!(max_v3_json > max_v3_ssz);
         assert_eq!(PQ_ERROR_RESPONSE_MAX_BYTES, PQ_DUTIES_RESPONSE_MAX_BYTES);

@@ -147,7 +147,7 @@ fn semantic_aliases_retain_the_exact_bls_types() {
     let aggregate: AggregateSignature = same_message.clone();
 
     accepts_exact_bls_types(
-        validator_key.clone(),
+        validator_key,
         verification_key.clone(),
         individual.clone(),
         raw.clone(),

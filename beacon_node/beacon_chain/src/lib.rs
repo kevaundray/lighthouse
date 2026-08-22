@@ -281,12 +281,19 @@ pub use self::pq_local_attester_context::{
     PqPublishedLocalAttestationEvidenceBatch, PqPublishedLocalAttestationEvidenceError,
     PqPublishedLocalAttestationMemberEvidence,
 };
-#[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
+#[cfg(all(
+    feature = "pq-devnet",
+    feature = "pq-proposer",
+    feature = "pq-startup-testing"
+))]
 pub use self::pq_local_attester_context::{
     TestingPqLocalAttestationPreflightHarness, TestingPqLocalAttestationPreflightMember,
     TestingPqLocalAttestationPreflightReconciliation,
-    TestingPqLocalAttestationPreflightRootAccessTrace, TestingPqLocalCandidateBatchGuards,
-    testing_only_pq_local_candidate_batch_fixture,
+    TestingPqLocalAttestationPreflightRootAccessTrace,
+};
+#[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
+pub use self::pq_local_attester_context::{
+    TestingPqLocalCandidateBatchGuards, testing_only_pq_local_candidate_batch_fixture,
     testing_only_pq_local_candidate_batch_fixture_with_guards,
     testing_only_pq_local_candidate_fixture, testing_only_validate_pq_local_attester_profile,
 };

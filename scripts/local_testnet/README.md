@@ -76,6 +76,24 @@ cd ./scripts/local_testnet
 
 You will see "Local testnet stopped." at the end. 
 
+## Experimental PQ finality smoke
+
+The repository also contains a separate, compile-time-selected leanMultisig/XMSS devnet smoke. It
+does not use Kurtosis or the ordinary Lighthouse validator-client profile. From the repository
+root, run:
+
+```bash
+scripts/local_testnet/pq/run-finality-smoke.sh
+```
+
+The command provisions a deterministic 16-validator Minimal/Electra genesis, starts two independent
+beacon-node processes and stores, drives the narrow built-in PQ proposer/attester services through
+32 five-minute slots, requires epoch-2 finality, then restarts both stores and checks the exact
+head/safe/finalized execution bindings. It requires x86-64 AVX2 and the journal-backed PQ fixture;
+the accepted runtime is approximately 3 hours 5 minutes. Timestamped logs are written under
+`target/pq-finality-logs/`. The script clears the verifier-only diagnostic environment variable so
+the finality acceptance cannot silently downgrade to a connectivity-only run.
+
 ## CLI options
 
 The script comes with some CLI options, which can be viewed with `./start_local_testnet.sh --help`. One of the CLI options is to avoid rebuilding Lighthouse each time the testnet starts, which can be configured with the command:

@@ -1,4 +1,5 @@
 use crate::{BeaconChain, BeaconChainTypes, BeaconStore, PqRuntimeError};
+use consensus_signature::is_individual_same_message_evidence;
 use execution_layer::{ExecutionLayer, NewPayloadRequest, PayloadStatus};
 use fork_choice::ForkchoiceUpdateParameters;
 use sha2::{Digest, Sha256};
@@ -2760,6 +2761,18 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 };
                 let justified = snapshot.beacon_state.current_justified_checkpoint();
                 let finalized = snapshot.beacon_state.finalized_checkpoint();
+                let attestations = snapshot.beacon_block.message().body().attestations_len();
+                let aggregate_attestations = snapshot
+                    .beacon_block
+                    .message()
+                    .body()
+                    .attestations()
+                    .filter(|attestation| {
+                        let evidence = attestation.signature();
+                        !evidence.is_empty() && !is_individual_same_message_evidence(evidence)
+                    })
+                    .count();
+                let proposal_signature_bytes = snapshot.beacon_block.signature().as_bytes().len();
                 let snapshot = Arc::new(snapshot);
                 *canonical_head.write() = Arc::clone(&snapshot);
                 reconciliation.set(
@@ -2788,6 +2801,9 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                         finalized_epoch: finalized.epoch,
                         finalized_root: finalized.root,
                         signed_ssz_digest,
+                        attestations,
+                        aggregate_attestations,
+                        proposal_signature_bytes,
                     };
                     let result = match operational_events
                         .as_ref()

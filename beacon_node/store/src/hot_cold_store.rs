@@ -1,3 +1,5 @@
+#[cfg(feature = "pq-startup-testing")]
+use crate::KeyValueStore;
 use crate::config::{OnDiskStoreConfig, StoreConfig};
 use crate::database::interface::BeaconNodeBackend;
 use crate::forwards_iter::{HybridForwardsBlockRootsIterator, HybridForwardsStateRootsIterator};
@@ -37,12 +39,62 @@ use std::io::{Read, Write};
 use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(feature = "pq-startup-testing")]
+use std::sync::{
+    Condvar, Mutex as StdMutex,
+    atomic::{AtomicUsize, Ordering as AtomicOrdering},
+};
 use std::time::Duration;
 use tracing::{debug, debug_span, error, info, instrument, warn};
 use typenum::Unsigned;
 use types::data::{ColumnIndex, DataColumnSidecar, DataColumnSidecarList};
 use types::*;
 use zstd::{Decoder, Encoder};
+
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Debug)]
+pub struct TestingPqStoredBlockValidationHook {
+    entered: AtomicUsize,
+    released: StdMutex<bool>,
+    release: Condvar,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+impl TestingPqStoredBlockValidationHook {
+    pub fn blocking() -> Arc<Self> {
+        Arc::new(Self {
+            entered: AtomicUsize::new(0),
+            released: StdMutex::new(false),
+            release: Condvar::new(),
+        })
+    }
+
+    pub fn entered(&self) -> usize {
+        self.entered.load(AtomicOrdering::SeqCst)
+    }
+
+    pub fn release(&self) {
+        *self
+            .released
+            .lock()
+            .expect("PQ stored-block validation hook lock") = true;
+        self.release.notify_all();
+    }
+
+    fn run(&self) {
+        self.entered.fetch_add(1, AtomicOrdering::SeqCst);
+        let mut released = self
+            .released
+            .lock()
+            .expect("PQ stored-block validation hook lock");
+        while !*released {
+            released = self
+                .release
+                .wait(released)
+                .expect("PQ stored-block validation hook wait");
+        }
+    }
+}
 
 /// On-disk database that stores finalized states efficiently.
 ///
@@ -73,6 +125,8 @@ pub struct HotColdDB<E: EthSpec, Hot: ItemStore, Cold: ItemStore> {
     pub hot_db: Hot,
     /// LRU cache of deserialized blocks and blobs. Updated whenever a block or blob is loaded.
     block_cache: Option<Mutex<BlockCache<E>>>,
+    #[cfg(feature = "pq-startup-testing")]
+    pq_stored_block_validation_test_hook: Mutex<Option<Arc<TestingPqStoredBlockValidationHook>>>,
     /// Cache of beacon states.
     ///
     /// LOCK ORDERING: this lock must always be locked *after* the `split` if both are required.
@@ -242,6 +296,8 @@ impl<E: EthSpec> HotColdDB<E, MemoryStore, MemoryStore> {
             hot_db: MemoryStore::open(),
             block_cache: (config.block_cache_size > 0)
                 .then(|| Mutex::new(BlockCache::new(config.block_cache_size))),
+            #[cfg(feature = "pq-startup-testing")]
+            pq_stored_block_validation_test_hook: Mutex::new(None),
             state_cache: Mutex::new(StateCache::new(
                 config.state_cache_size,
                 config.state_cache_headroom,
@@ -258,6 +314,49 @@ impl<E: EthSpec> HotColdDB<E, MemoryStore, MemoryStore> {
         };
 
         Ok(db)
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_put_raw_pq_block_bytes(
+        &self,
+        block_root: Hash256,
+        bytes: Vec<u8>,
+    ) -> Result<(), Error> {
+        self.hot_db
+            .put_bytes(DBColumn::BeaconBlock, block_root.as_slice(), &bytes)
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_put_raw_pq_execution_payload_bytes(
+        &self,
+        block_root: Hash256,
+        bytes: Vec<u8>,
+    ) -> Result<(), Error> {
+        self.hot_db.put_bytes(
+            ExecutionPayload::<E>::db_column(),
+            block_root.as_slice(),
+            &bytes,
+        )
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_set_pq_stored_block_validation_hook(
+        &self,
+        hook: Arc<TestingPqStoredBlockValidationHook>,
+    ) {
+        *self.pq_stored_block_validation_test_hook.lock() = Some(hook);
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_pq_block_cache_lock_available(&self) -> bool {
+        match &self.block_cache {
+            Some(cache) => cache.try_lock().is_some(),
+            None => true,
+        }
     }
 }
 
@@ -295,6 +394,8 @@ impl<E: EthSpec> HotColdDB<E, BeaconNodeBackend, BeaconNodeBackend> {
             hot_db,
             block_cache: (config.block_cache_size > 0)
                 .then(|| Mutex::new(BlockCache::new(config.block_cache_size))),
+            #[cfg(feature = "pq-startup-testing")]
+            pq_stored_block_validation_test_hook: Mutex::new(None),
             state_cache: Mutex::new(StateCache::new(
                 config.state_cache_size,
                 config.state_cache_headroom,
@@ -454,6 +555,24 @@ impl<E: EthSpec> HotColdDB<E, BeaconNodeBackend, BeaconNodeBackend> {
 }
 
 impl<E: EthSpec, Hot: ItemStore, Cold: ItemStore> HotColdDB<E, Hot, Cold> {
+    #[cfg(feature = "pq-devnet")]
+    fn validate_pq_stored_block_size(&self, actual: usize) -> Result<(), Error> {
+        #[cfg(feature = "pq-startup-testing")]
+        {
+            let hook = self.pq_stored_block_validation_test_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook.run();
+            }
+        }
+        let max = PqSignedBlockSizeLimits::checked::<E>(&self.spec)
+            .ok_or(Error::PqBlockSizeLimitOverflow)?
+            .max_ssz_bytes();
+        if actual > max {
+            return Err(Error::PqBlockSizeExceeded { actual, max });
+        }
+        Ok(())
+    }
+
     fn cold_storage_strategy(&self, slot: Slot) -> Result<StorageStrategy, Error> {
         // The start slot for the freezer HDiff is always 0
         Ok(self.hierarchy.storage_strategy(slot, Slot::new(0))?)
@@ -585,6 +704,8 @@ impl<E: EthSpec, Hot: ItemStore, Cold: ItemStore> HotColdDB<E, Hot, Cold> {
         block: SignedBeaconBlock<E>,
         ops: &mut Vec<KeyValueStoreOp>,
     ) -> Result<SignedBeaconBlock<E>, Error> {
+        #[cfg(feature = "pq-devnet")]
+        self.validate_pq_stored_block_size(block.ssz_bytes_len())?;
         // Split block into blinded block and execution payload.
         let (blinded_block, payload) = block.into();
 
@@ -623,11 +744,15 @@ impl<E: EthSpec, Hot: ItemStore, Cold: ItemStore> HotColdDB<E, Hot, Cold> {
         metrics::inc_counter(&metrics::BEACON_BLOCK_GET_COUNT);
 
         // Check the cache.
-        if let Some(cache) = &self.block_cache
-            && let Some(block) = cache.lock().get_block(block_root)
-        {
+        let cached_block = self
+            .block_cache
+            .as_ref()
+            .and_then(|cache| cache.lock().get_block(block_root).cloned());
+        if let Some(block) = cached_block {
             metrics::inc_counter(&metrics::BEACON_BLOCK_CACHE_HIT_COUNT);
-            return Ok(Some(DatabaseBlock::Full(block.clone())));
+            #[cfg(feature = "pq-devnet")]
+            self.validate_pq_stored_block_size(block.ssz_bytes_len())?;
+            return Ok(Some(DatabaseBlock::Full(block)));
         }
 
         // Load the blinded block.
@@ -676,6 +801,10 @@ impl<E: EthSpec, Hot: ItemStore, Cold: ItemStore> HotColdDB<E, Hot, Cold> {
         } else {
             DatabaseBlock::Blinded(blinded_block)
         };
+        #[cfg(feature = "pq-devnet")]
+        if let DatabaseBlock::Full(full_block) = &block {
+            self.validate_pq_stored_block_size(full_block.ssz_bytes_len())?;
+        }
         drop(split);
 
         Ok(Some(block))
@@ -703,7 +832,7 @@ impl<E: EthSpec, Hot: ItemStore, Cold: ItemStore> HotColdDB<E, Hot, Cold> {
         block_root: &Hash256,
         blinded_block: SignedBeaconBlock<E, BlindedPayload<E>>,
     ) -> Result<SignedBeaconBlock<E>, Error> {
-        if blinded_block.message().execution_payload().is_ok() {
+        let full_block = if blinded_block.message().execution_payload().is_ok() {
             let fork_name = blinded_block.fork_name(&self.spec)?;
             let execution_payload = self
                 .get_execution_payload(block_root, fork_name)?
@@ -712,7 +841,10 @@ impl<E: EthSpec, Hot: ItemStore, Cold: ItemStore> HotColdDB<E, Hot, Cold> {
         } else {
             blinded_block.try_into_full_block(None)
         }
-        .ok_or(Error::AddPayloadLogicError)
+        .ok_or(Error::AddPayloadLogicError)?;
+        #[cfg(feature = "pq-devnet")]
+        self.validate_pq_stored_block_size(full_block.ssz_bytes_len())?;
+        Ok(full_block)
     }
 
     pub fn get_blinded_block(
@@ -735,9 +867,12 @@ impl<E: EthSpec, Hot: ItemStore, Cold: ItemStore> HotColdDB<E, Hot, Cold> {
     ) -> Result<Option<SignedBeaconBlock<E, Payload>>, Error> {
         self.hot_db
             .get_bytes(DBColumn::BeaconBlock, block_root.as_slice())?
-            .map(|block_bytes| decoder(&block_bytes))
+            .map(|block_bytes| {
+                #[cfg(feature = "pq-devnet")]
+                self.validate_pq_stored_block_size(block_bytes.len())?;
+                decoder(&block_bytes).map_err(Into::into)
+            })
             .transpose()
-            .map_err(|e| e.into())
     }
 
     pub fn get_payload_envelope(
@@ -779,9 +914,13 @@ impl<E: EthSpec, Hot: ItemStore, Cold: ItemStore> HotColdDB<E, Hot, Cold> {
             .hot_db
             .get_bytes(ExecutionPayload::<E>::db_column(), key)?
         {
-            Some(bytes) => Ok(Some(ExecutionPayload::from_ssz_bytes_by_fork(
-                &bytes, fork_name,
-            )?)),
+            Some(bytes) => {
+                #[cfg(feature = "pq-devnet")]
+                self.validate_pq_stored_block_size(bytes.len())?;
+                Ok(Some(ExecutionPayload::from_ssz_bytes_by_fork(
+                    &bytes, fork_name,
+                )?))
+            }
             None => Ok(None),
         }
     }
@@ -792,11 +931,22 @@ impl<E: EthSpec, Hot: ItemStore, Cold: ItemStore> HotColdDB<E, Hot, Cold> {
         &self,
         block_root: &Hash256,
     ) -> Result<Option<ExecutionPayload<E>>, Error> {
-        self.get_item(block_root)
+        self.hot_db
+            .get_bytes(ExecutionPayload::<E>::db_column(), block_root.as_slice())?
+            .map(|bytes| {
+                #[cfg(feature = "pq-devnet")]
+                self.validate_pq_stored_block_size(bytes.len())?;
+                ExecutionPayload::<E>::from_store_bytes(&bytes)
+            })
+            .transpose()
     }
 
     /// Check if the execution payload for a block exists on disk.
     pub fn execution_payload_exists(&self, block_root: &Hash256) -> Result<bool, Error> {
+        #[cfg(feature = "pq-devnet")]
+        return self.item_exists::<ExecutionPayload<E>>(block_root);
+
+        #[cfg(not(feature = "pq-devnet"))]
         self.get_item::<ExecutionPayload<E>>(block_root)
             .map(|payload| payload.is_some())
     }

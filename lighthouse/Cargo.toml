@@ -47,13 +47,33 @@ pq-proposer = [
     "pq-devnet",
     "beacon_node/pq-proposer",
     "dep:lighthouse_network",
+    "dep:pq_attester_service",
     "pq_attester_service/pq-proposer",
 ]
 pq-startup-testing = [
     "pq-proposer",
     "beacon_node/pq-startup-testing",
+    "dep:eth2",
+    "dep:execution_layer",
+    "dep:initialized_validators",
+    "dep:lighthouse_validator_store",
+    "dep:network",
+    "dep:pq_devnet",
+    "dep:slashing_protection",
+    "dep:validator_dir",
+    "dep:validator_store",
+    "eth2/pq-devnet",
+    "execution_layer/pq-devnet",
+    "initialized_validators/pq-devnet",
+    "lighthouse_validator_store/pq-devnet",
+    "lighthouse_validator_store/pq-startup-testing",
+    "network/pq-devnet",
     "network/pq-startup-testing",
     "pq_attester_service/pq-startup-testing",
+    "pq_devnet/pq-devnet",
+    "slashing_protection/pq-devnet",
+    "validator_dir/pq-devnet",
+    "validator_store/pq-devnet",
 ]
 # Writes debugging .ssz files to /tmp during block processing.
 write_ssz_files = ["beacon_node/write_ssz_files"]
@@ -99,16 +119,21 @@ environment = { workspace = true }
 eth2 = { workspace = true, optional = true }
 eth2_network_config = { workspace = true }
 ethereum_hashing = { workspace = true }
+execution_layer = { workspace = true, optional = true }
 futures = { workspace = true }
 initialized_validators = { workspace = true, optional = true }
 lighthouse_network = { workspace = true, optional = true }
+lighthouse_validator_store = { workspace = true, optional = true }
 lighthouse_version = { workspace = true }
 logging = { workspace = true }
 metrics = { workspace = true }
+network = { path = "../beacon_node/network", optional = true, default-features = false }
 network_utils = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry_sdk = { workspace = true }
+pq_attester_service = { workspace = true, optional = true }
+pq_devnet = { workspace = true, optional = true }
 sensitive_url = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -126,6 +151,7 @@ types = { workspace = true }
 validator_client = { workspace = true, optional = true }
 validator_dir = { workspace = true, optional = true }
 validator_manager = { path = "../validator_manager", optional = true }
+validator_store = { workspace = true, optional = true }
 yaml_serde = { workspace = true }
 zeroize = { workspace = true, optional = true }
 
@@ -139,25 +165,15 @@ malloc_utils = { workspace = true, features = [] }
 async-channel = { workspace = true }
 consensus_signature = { workspace = true }
 discv5 = { workspace = true }
-eth2 = { workspace = true, features = ["pq-devnet"] }
 ethereum_ssz = { workspace = true }
-execution_layer = { workspace = true, features = ["pq-devnet"] }
 fs2 = { workspace = true }
 hex = { workspace = true }
-initialized_validators = { workspace = true, features = ["pq-devnet"] }
 libc = "0.2"
-lighthouse_validator_store = { workspace = true, features = ["pq-devnet", "pq-startup-testing"] }
-network = { path = "../beacon_node/network", default-features = false, features = ["pq-devnet"] }
-pq_attester_service = { workspace = true, features = ["pq-startup-testing"] }
-pq_devnet = { workspace = true, features = ["pq-devnet"] }
 rusqlite = { workspace = true }
 sha2 = { workspace = true }
-slashing_protection = { workspace = true, features = ["pq-devnet"] }
 slot_clock = { workspace = true }
 state_processing = { workspace = true }
 tempfile = { workspace = true }
-validator_dir = { workspace = true }
-validator_store = { workspace = true, features = ["pq-devnet"] }
 
 [[test]]
 name = "lighthouse_tests"

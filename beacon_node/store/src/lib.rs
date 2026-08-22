@@ -28,6 +28,8 @@ pub mod iter;
 
 pub use self::blob_sidecar_list_from_root::BlobSidecarListFromRoot;
 pub use self::config::StoreConfig;
+#[cfg(feature = "pq-startup-testing")]
+pub use self::hot_cold_store::TestingPqStoredBlockValidationHook;
 pub use self::hot_cold_store::{HotColdDB, HotStateSummary, Split};
 pub use self::memory_store::MemoryStore;
 pub use crate::metadata::BlobInfo;
@@ -545,6 +547,27 @@ mod tests {
         store.delete::<StorableThing>(&key).unwrap();
 
         assert!(!store.exists::<StorableThing>(&key).unwrap());
+    }
+
+    #[test]
+    fn execution_payload_exists_rejects_corrupt_default_payload() {
+        let store = HotColdDB::<MinimalEthSpec, MemoryStore, MemoryStore>::open_ephemeral(
+            StoreConfig::default(),
+            Arc::new(MinimalEthSpec::default_spec()),
+        )
+        .unwrap();
+        let block_root = Hash256::random();
+
+        store
+            .hot_db
+            .put_bytes(
+                ExecutionPayload::<MinimalEthSpec>::db_column(),
+                block_root.as_slice(),
+                &[0xff],
+            )
+            .unwrap();
+
+        assert!(store.execution_payload_exists(&block_root).is_err());
     }
 
     #[test]

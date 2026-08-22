@@ -1691,6 +1691,9 @@ enum PqProcessEventKind {
         finalized_epoch: u64,
         finalized_root: Hash256,
         signed_ssz_digest: [u8; 32],
+        attestations: u64,
+        aggregate_attestations: u64,
+        proposal_signature_bytes: u64,
     },
     ExecutionReconciled {
         source: PqProcessBlockSource,
@@ -1863,7 +1866,7 @@ fn parse_pq_process_event(line: &str) -> Result<PqProcessEvent, PqProcessEventFa
             slot: parse_canonical_u64(fields[4], "slot=")?,
             parent_root: parse_hash256(fields[5], "parent_root=")?,
         },
-        "BlockPersisted" if fields.len() == 13 => PqProcessEventKind::BlockPersisted {
+        "BlockPersisted" if fields.len() == 16 => PqProcessEventKind::BlockPersisted {
             source: parse_block_source(fields[4])?,
             slot: parse_canonical_u64(fields[5], "slot=")?,
             block_root: parse_hash256(fields[6], "block_root=")?,
@@ -1876,6 +1879,9 @@ fn parse_pq_process_event(line: &str) -> Result<PqProcessEvent, PqProcessEventFa
             finalized_epoch: parse_canonical_u64(fields[10], "finalized_epoch=")?,
             finalized_root: parse_hash256(fields[11], "finalized_root=")?,
             signed_ssz_digest: parse_signed_ssz_digest(fields[12])?,
+            attestations: parse_canonical_u64(fields[13], "attestations=")?,
+            aggregate_attestations: parse_canonical_u64(fields[14], "aggregate_attestations=")?,
+            proposal_signature_bytes: parse_canonical_u64(fields[15], "proposal_signature_bytes=")?,
         },
         "ExecutionReconciled" if fields.len() == 13 => PqProcessEventKind::ExecutionReconciled {
             source: parse_block_source(fields[4])?,
@@ -2059,6 +2065,16 @@ struct PqProcessBlockIdentity {
     signed_ssz_digest: [u8; 32],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PqProcessBlockEvidence {
+    slot: u64,
+    block_root: Hash256,
+    signed_ssz_digest: [u8; 32],
+    attestations: u64,
+    aggregate_attestations: u64,
+    proposal_signature_bytes: u64,
+}
+
 fn persisted_identity(
     event: &PqProcessEvent,
     expected_role: PqProcessRole,
@@ -2078,6 +2094,7 @@ fn persisted_identity(
                     finalized_epoch,
                     finalized_root,
                     signed_ssz_digest,
+                    ..
                 },
             ..
         } if *role == expected_role && *source == expected_source => Some(PqProcessBlockIdentity {
@@ -2089,6 +2106,38 @@ fn persisted_identity(
             finalized_epoch: *finalized_epoch,
             finalized_root: *finalized_root,
             signed_ssz_digest: *signed_ssz_digest,
+        }),
+        _ => None,
+    }
+}
+
+fn persisted_evidence(
+    event: &PqProcessEvent,
+    expected_role: PqProcessRole,
+    expected_source: PqProcessBlockSource,
+) -> Option<PqProcessBlockEvidence> {
+    match event {
+        PqProcessEvent {
+            role,
+            kind:
+                PqProcessEventKind::BlockPersisted {
+                    source,
+                    slot,
+                    block_root,
+                    signed_ssz_digest,
+                    attestations,
+                    aggregate_attestations,
+                    proposal_signature_bytes,
+                    ..
+                },
+            ..
+        } if *role == expected_role && *source == expected_source => Some(PqProcessBlockEvidence {
+            slot: *slot,
+            block_root: *block_root,
+            signed_ssz_digest: *signed_ssz_digest,
+            attestations: *attestations,
+            aggregate_attestations: *aggregate_attestations,
+            proposal_signature_bytes: *proposal_signature_bytes,
         }),
         _ => None,
     }
@@ -2440,11 +2489,28 @@ fn validate_process_convergence_through_slot(
             reconciled_identity(event, PqProcessRole::Verifier, PqProcessBlockSource::Gossip)
         })
         .collect::<Vec<_>>();
+    let proposer_evidence = proposer
+        .iter()
+        .filter_map(|event| {
+            persisted_evidence(
+                event,
+                PqProcessRole::Proposer,
+                PqProcessBlockSource::Publish,
+            )
+        })
+        .collect::<Vec<_>>();
+    let verifier_evidence = verifier
+        .iter()
+        .filter_map(|event| {
+            persisted_evidence(event, PqProcessRole::Verifier, PqProcessBlockSource::Gossip)
+        })
+        .collect::<Vec<_>>();
     if proposer_persisted.len()
         != usize::try_from(target_slot).map_err(|_| "target slot exceeds usize")?
         || proposer_persisted != proposer_reconciled
         || proposer_persisted != verifier_persisted
         || proposer_persisted != verifier_reconciled
+        || proposer_evidence != verifier_evidence
     {
         return Err("persisted/reconciled identities do not converge exactly".into());
     }
@@ -2651,6 +2717,48 @@ fn validate_slot_32_finality(identities: &[PqProcessBlockIdentity]) -> Result<()
         return Err("slot 32 does not justify epoch 3 and finalize exact epoch 2".into());
     }
     Ok(())
+}
+
+fn validate_slot_32_pq_evidence(
+    identities: &[PqProcessBlockIdentity],
+    evidence: &[PqProcessBlockEvidence],
+) -> Result<(), String> {
+    let pq_raw_signature_bytes = u64::try_from(consensus_signature::PQ_RAW_SIGNATURE_LEN)
+        .map_err(|_| "PQ raw signature length exceeds u64")?;
+    if identities.len() != FINALITY_TARGET_SLOT || evidence.len() != identities.len() {
+        return Err("PQ evidence does not cover the exact slot-1..32 lineage".into());
+    }
+    for (identity, observed) in identities.iter().zip(evidence) {
+        if observed.slot != identity.slot
+            || observed.block_root != identity.block_root
+            || observed.signed_ssz_digest != identity.signed_ssz_digest
+        {
+            return Err("PQ evidence is not bound to the exact persisted block identity".into());
+        }
+        if observed.aggregate_attestations > observed.attestations {
+            return Err("aggregate attestation count exceeds the persisted body count".into());
+        }
+        if observed.proposal_signature_bytes != pq_raw_signature_bytes {
+            return Err(
+                "persisted proposal does not use the exact PQ raw signature wire size".into(),
+            );
+        }
+    }
+    if !evidence
+        .iter()
+        .any(|observed| observed.aggregate_attestations > 0)
+    {
+        return Err("slot-32 lineage contains no recursive PQ aggregate evidence".into());
+    }
+    Ok(())
+}
+
+fn validate_slot_32_acceptance(
+    identities: &[PqProcessBlockIdentity],
+    evidence: &[PqProcessBlockEvidence],
+) -> Result<(), String> {
+    validate_slot_32_finality(identities)?;
+    validate_slot_32_pq_evidence(identities, evidence)
 }
 
 impl BoundedProcessLog {
@@ -5448,7 +5556,8 @@ block_root=0x0505050505050505050505050505050505050505050505050505050505050505 \
 execution_hash=0x0606060606060606060606060606060606060606060606060606060606060606 \
 justified_epoch=2 justified_root=0x0808080808080808080808080808080808080808080808080808080808080808 \
 finalized_epoch=0 finalized_root=0x0303030303030303030303030303030303030303030303030303030303030303 \
-signed_ssz_digest=0707070707070707070707070707070707070707070707070707070707070707",
+signed_ssz_digest=0707070707070707070707070707070707070707070707070707070707070707 \
+attestations=2 aggregate_attestations=1 proposal_signature_bytes=1215",
     )
     .expect("exact persisted event");
     assert!(matches!(
@@ -5457,6 +5566,9 @@ signed_ssz_digest=07070707070707070707070707070707070707070707070707070707070707
             source: PqProcessBlockSource::Gossip,
             slot: 4,
             signed_ssz_digest,
+            attestations: 2,
+            aggregate_attestations: 1,
+            proposal_signature_bytes: 1215,
             ..
         } if signed_ssz_digest == [7; 32]
     ));
@@ -5573,6 +5685,9 @@ fn three_slot_convergence_contract_is_exact_and_mutation_sensitive() {
                     finalized_epoch: 0,
                     finalized_root: Hash256::ZERO,
                     signed_ssz_digest: digest,
+                    attestations: 1,
+                    aggregate_attestations: 1,
+                    proposal_signature_bytes: 1215,
                 },
             },
             PqProcessEvent {
@@ -5615,6 +5730,9 @@ fn three_slot_convergence_contract_is_exact_and_mutation_sensitive() {
                     finalized_epoch: 0,
                     finalized_root: Hash256::ZERO,
                     signed_ssz_digest: digest,
+                    attestations: 1,
+                    aggregate_attestations: 1,
+                    proposal_signature_bytes: 1215,
                 },
             },
             PqProcessEvent {
@@ -5830,6 +5948,66 @@ fn slot_32_finality_contract_is_exact_and_mutation_sensitive() {
     identities[31].finalized_root = Hash256::repeat_byte(16);
     identities[30].finalized_epoch = 1;
     assert!(validate_slot_32_finality(&identities).is_err());
+}
+
+#[test]
+fn slot_32_finality_requires_persisted_recursive_pq_evidence() {
+    let identities = (1_u64..=FINALITY_TARGET_SLOT as u64)
+        .map(|slot| {
+            let (justified_epoch, justified_root) = if slot >= 32 {
+                (3, Hash256::repeat_byte(24))
+            } else if slot >= 24 {
+                (2, Hash256::repeat_byte(16))
+            } else if slot >= 16 {
+                (1, Hash256::repeat_byte(8))
+            } else {
+                (0, Hash256::ZERO)
+            };
+            let (finalized_epoch, finalized_root) = if slot >= 32 {
+                (2, Hash256::repeat_byte(16))
+            } else {
+                (0, Hash256::ZERO)
+            };
+            PqProcessBlockIdentity {
+                slot,
+                block_root: Hash256::repeat_byte(u8::try_from(slot).expect("slot byte")),
+                execution_hash: ExecutionBlockHash::repeat_byte(
+                    u8::try_from(slot + 64).expect("execution byte"),
+                ),
+                justified_epoch,
+                justified_root,
+                finalized_epoch,
+                finalized_root,
+                signed_ssz_digest: [u8::try_from(slot + 128).expect("digest byte"); 32],
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut evidence = identities
+        .iter()
+        .map(|identity| PqProcessBlockEvidence {
+            slot: identity.slot,
+            block_root: identity.block_root,
+            signed_ssz_digest: identity.signed_ssz_digest,
+            attestations: u64::from(identity.slot > 1),
+            aggregate_attestations: u64::from(identity.slot == 16),
+            proposal_signature_bytes: 1215,
+        })
+        .collect::<Vec<_>>();
+
+    validate_slot_32_acceptance(&identities, &evidence)
+        .expect("exact lineage observes one recursive aggregate and only PQ proposals");
+
+    evidence[15].aggregate_attestations = 0;
+    assert!(validate_slot_32_acceptance(&identities, &evidence).is_err());
+    evidence[15].aggregate_attestations = 1;
+    evidence[31].proposal_signature_bytes = 96;
+    assert!(validate_slot_32_acceptance(&identities, &evidence).is_err());
+    evidence[31].proposal_signature_bytes = 1215;
+    evidence[15].aggregate_attestations = 2;
+    assert!(validate_slot_32_acceptance(&identities, &evidence).is_err());
+    evidence[15].aggregate_attestations = 1;
+    evidence[15].signed_ssz_digest = [0xff; 32];
+    assert!(validate_slot_32_acceptance(&identities, &evidence).is_err());
 }
 
 #[test]
@@ -7251,8 +7429,19 @@ async fn run_two_real_processes_through_slot(target_slot: u64) {
             })
             .collect::<Vec<_>>();
         if target_slot == FINALITY_TARGET_SLOT as u64 {
-            validate_slot_32_finality(&proposer_lineage)
-                .expect("the real two-process lineage finalizes epoch two at slot 32");
+            let proposer_evidence = proposer_events
+                .iter()
+                .filter_map(|event| {
+                    persisted_evidence(
+                        event,
+                        PqProcessRole::Proposer,
+                        PqProcessBlockSource::Publish,
+                    )
+                })
+                .collect::<Vec<_>>();
+            validate_slot_32_acceptance(&proposer_lineage, &proposer_evidence).expect(
+                "the real slot-32 lineage persists recursive PQ evidence without BLS fallback",
+            );
         }
         let persisted = proposer_events
             .iter()

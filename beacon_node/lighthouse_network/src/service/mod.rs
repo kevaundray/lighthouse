@@ -70,6 +70,48 @@ pub const TARGET_SUBNET_PEERS: usize = 3;
 
 const MAX_IDENTIFY_ADDRESSES: usize = 10;
 
+#[derive(Clone, Copy)]
+struct GossipSizeLimits {
+    max_uncompressed_len: usize,
+    max_compressed_len: usize,
+    max_transmit_size: usize,
+}
+
+fn full_gossip_size_limits(spec: &ChainSpec) -> Result<GossipSizeLimits, String> {
+    Ok(GossipSizeLimits {
+        max_uncompressed_len: usize::try_from(spec.max_payload_size)
+            .map_err(|_| "gossipsub payload size does not fit usize".to_owned())?,
+        max_compressed_len: spec.max_compressed_len(),
+        max_transmit_size: spec.max_message_size(),
+    })
+}
+
+#[cfg(feature = "pq-devnet")]
+fn gossip_size_limits<E: EthSpec>(
+    profile: RpcProfile,
+    spec: &ChainSpec,
+) -> Result<GossipSizeLimits, String> {
+    match profile {
+        RpcProfile::Full => full_gossip_size_limits(spec),
+        RpcProfile::StatusAndControlOnly => {
+            let limits = types::PqSignedBlockSizeLimits::checked::<E>(spec)
+                .ok_or_else(|| "PQ signed-block size limits overflow".to_owned())?;
+            Ok(GossipSizeLimits {
+                max_uncompressed_len: limits.max_ssz_bytes(),
+                max_compressed_len: limits.max_compressed_bytes(),
+                max_transmit_size: limits.max_transmit_bytes(),
+            })
+        }
+    }
+}
+
+#[cfg(not(feature = "pq-devnet"))]
+fn gossip_size_limits(profile: RpcProfile, spec: &ChainSpec) -> Result<GossipSizeLimits, String> {
+    match profile {
+        RpcProfile::Full => full_gossip_size_limits(spec),
+    }
+}
+
 /// The types of events than can be obtained from polling the behaviour.
 #[derive(Debug)]
 pub enum NetworkEvent<E: EthSpec> {
@@ -753,9 +795,13 @@ impl<E: EthSpec> Network<E> {
             .eth2()
             .expect("Local ENR must have a fork id");
 
+        #[cfg(feature = "pq-devnet")]
+        let gossip_size_limits = gossip_size_limits::<E>(rpc_profile, &ctx.chain_spec)?;
+        #[cfg(not(feature = "pq-devnet"))]
+        let gossip_size_limits = gossip_size_limits(rpc_profile, &ctx.chain_spec)?;
         let gossipsub_config_params = GossipsubConfigParams {
             message_domain_valid_snappy: ctx.chain_spec.message_domain_valid_snappy,
-            gossipsub_max_transmit_size: ctx.chain_spec.max_message_size(),
+            gossipsub_max_transmit_size: gossip_size_limits.max_transmit_size,
         };
         let gs_config = gossipsub_config(
             config.network_load,
@@ -862,9 +908,10 @@ impl<E: EthSpec> Network<E> {
                 max_subscriptions_per_request: max_topics_at_any_fork * 2,
             };
 
-            let spec = &ctx.chain_spec;
-            let snappy_transform =
-                SnappyTransform::new(spec.max_payload_size as usize, spec.max_compressed_len());
+            let snappy_transform = SnappyTransform::new(
+                gossip_size_limits.max_uncompressed_len,
+                gossip_size_limits.max_compressed_len,
+            );
             let mut gossipsub = Gossipsub::new_with_subscription_filter_and_transform(
                 MessageAuthenticity::Anonymous,
                 gs_config.clone(),
@@ -2863,6 +2910,67 @@ impl<E: EthSpec> Network<E> {
                 // release notes more than compiler feedback
                 None
             }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "pq-devnet"))]
+mod pq_size_limit_tests {
+    use super::*;
+    use libp2p::gossipsub::{DataTransform, RawMessage};
+    use snap::raw::Encoder;
+    use types::{MinimalEthSpec, PqSignedBlockSizeLimits};
+
+    #[test]
+    fn pq_gossip_and_http_share_the_exact_signed_block_size_contract() {
+        let spec = ForkName::Electra.make_genesis_spec(MinimalEthSpec::default_spec());
+        let shared = PqSignedBlockSizeLimits::checked::<MinimalEthSpec>(&spec)
+            .expect("frozen PQ signed-block limits");
+        let gossip = gossip_size_limits::<MinimalEthSpec>(RpcProfile::StatusAndControlOnly, &spec)
+            .expect("PQ gossip limits");
+
+        assert!(shared.max_ssz_bytes() > spec.max_payload_size as usize);
+        assert_eq!(gossip.max_uncompressed_len, shared.max_ssz_bytes());
+        assert_eq!(gossip.max_compressed_len, shared.max_compressed_bytes());
+        assert_eq!(gossip.max_transmit_size, shared.max_transmit_bytes());
+
+        let transform =
+            SnappyTransform::new(gossip.max_uncompressed_len, gossip.max_compressed_len);
+        let topic = TopicHash::from_raw("pq-size-contract");
+        let exact = vec![0x5a; shared.max_ssz_bytes()];
+        let exact_compressed = transform
+            .outbound_transform(&topic, exact)
+            .expect("the exact shared cap is publishable");
+        let exact_message = transform
+            .inbound_transform(raw_message(topic.clone(), exact_compressed))
+            .expect("the exact shared cap is admissible inbound");
+        assert_eq!(exact_message.data.len(), shared.max_ssz_bytes());
+
+        let over_limit = vec![0x5a; shared.max_ssz_bytes().saturating_add(1)];
+        assert!(
+            transform
+                .outbound_transform(&topic, over_limit.clone())
+                .is_err()
+        );
+        let over_limit_compressed = Encoder::new()
+            .compress_vec(&over_limit)
+            .expect("test compression");
+        assert!(
+            transform
+                .inbound_transform(raw_message(topic, over_limit_compressed))
+                .is_err()
+        );
+    }
+
+    fn raw_message(topic: TopicHash, data: Vec<u8>) -> RawMessage {
+        RawMessage {
+            source: None,
+            data,
+            sequence_number: None,
+            topic,
+            signature: None,
+            key: None,
+            validated: false,
         }
     }
 }

@@ -429,7 +429,7 @@ fn prepare_pq_local_attestation_late_apply_context(
 #[doc(hidden)]
 pub struct TestingPqLocalAttestationPreflightMember(PqLocalAttestationPreflightMember);
 
-#[cfg(feature = "pq-startup-testing")]
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
 impl TestingPqLocalAttestationPreflightMember {
     pub const fn new(slot: Slot, bound_head_root: Hash256) -> Self {
         Self(PqLocalAttestationPreflightMember {
@@ -439,7 +439,7 @@ impl TestingPqLocalAttestationPreflightMember {
     }
 }
 
-#[cfg(feature = "pq-startup-testing")]
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[doc(hidden)]
 pub enum TestingPqLocalAttestationPreflightReconciliation {
@@ -448,7 +448,7 @@ pub enum TestingPqLocalAttestationPreflightReconciliation {
     Failed(Hash256),
 }
 
-#[cfg(feature = "pq-startup-testing")]
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[doc(hidden)]
 pub struct TestingPqLocalAttestationPreflightRootAccessTrace {
@@ -458,7 +458,7 @@ pub struct TestingPqLocalAttestationPreflightRootAccessTrace {
     pub state_tree_hash_cache_updates: usize,
 }
 
-#[cfg(feature = "pq-startup-testing")]
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
 #[doc(hidden)]
 pub struct TestingPqLocalAttestationPreflightHarness {
     import_gate: Arc<tokio::sync::Semaphore>,
@@ -475,7 +475,7 @@ pub struct TestingPqLocalAttestationPreflightHarness {
     root_access_trace: parking_lot::Mutex<TestingPqLocalAttestationPreflightRootAccessTrace>,
 }
 
-#[cfg(feature = "pq-startup-testing")]
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
 impl TestingPqLocalAttestationPreflightHarness {
     pub fn reconciled(current_slot: Slot, current_head_root: Hash256) -> Self {
         let state_root = Hash256::repeat_byte(0x61);

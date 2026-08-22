@@ -24,6 +24,8 @@ pub mod exit;
 pub mod fork;
 pub mod kzg_ext;
 pub mod light_client;
+#[cfg(feature = "pq-devnet")]
+mod pq_size_limits;
 pub mod slashing;
 pub mod state;
 pub mod sync_committee;
@@ -43,6 +45,8 @@ pub use exit::*;
 pub use fork::*;
 pub use kzg_ext::*;
 pub use light_client::*;
+#[cfg(feature = "pq-devnet")]
+pub use pq_size_limits::*;
 pub use slashing::*;
 pub use state::*;
 pub use sync_committee::*;

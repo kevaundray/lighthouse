@@ -2457,3 +2457,35 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   the proof-size, latency, and peak-RSS evidence for the frozen prover profile. The 11,099-second
   finality run recorded exact protocol and Engine histories but was not wrapped in a new
   `/usr/bin/time -v` measurement, so it adds no new peak-RSS claim.
+
+### 2026-08-22: Completion audit unified transport/storage limits and narrowed RPC scope
+
+- The audit found a real cross-layer mismatch: the narrow HTTP publisher admitted a checked PQ
+  signed-block body up to 15,731,070 SSZ bytes, while the live gossipsub Snappy transform still
+  rejected decompressed data above the ordinary 10,485,760-byte payload limit. A block valid at the
+  HTTP boundary could therefore fail local publication or remote gossip decode.
+- `types::PqSignedBlockSizeLimits` is now the single checked contract for HTTP publication,
+  proposer-response collection, gossipsub uncompressed/compressed/transmit configuration, and
+  persisted-block decode admission. For Minimal/Electra it yields 15,731,070 SSZ bytes, 32,510,716
+  JSON bytes, 18,352,947 compressed bytes, and 18,353,971 transmit bytes. Exact-cap data passes both
+  Snappy directions and reaches the storage decoder; cap+1 blinded-block or execution-payload
+  records fail before decode, and individually bounded records that recompose above the full
+  signed-block cap fail after reconstruction. Cache-hit validation clones under the cache mutex and
+  performs the bounded size traversal only after releasing it. A controlled
+  mutation restoring the ordinary gossip limit failed with actual 10,485,760 versus expected
+  15,731,070 before the production helper was restored.
+- PQ V1 deliberately has no block/attestation data RPC. Negotiation advertises exactly Status
+  v2/v1, Goodbye, Ping, and Metadata v2/v1; block and attestation data use the bounded gossip paths,
+  and the narrow validator path uses HTTP. The exact protocol-vector regression is
+  mutation-sensitive and separately proves the ordinary profile retains blocks-by-range. This
+  fresh-only choice means late join/range synchronization is unsupported rather than silently
+  routed through BLS-shaped codecs.
+- The PQ binary is likewise beacon-node-only at compile time. Validator-client, Web3Signer,
+  account-manager/offline-exit, builder, validator-manager, and ordinary full-runtime ownership are
+  absent, and incompatible feature combinations fail compilation. Reachable beacon-node options
+  outside the sealed execution/network/HTTP/PQ-bundle allowlist fail before side effects.
+- The authentic `pq_dependency_smoke` now times verification independently of proving. On this
+  host, a 106,895-byte two-signer recursive aggregate verified in **1.559338080 seconds**. The same
+  warning-denied AVX2 run measured raw-plus-raw aggregation at 7.403579676 seconds, raw-plus-child at
+  81.374353111 seconds, and child-plus-child at 72.617374039 seconds; the full test passed 1/1 in
+  209.82 seconds.

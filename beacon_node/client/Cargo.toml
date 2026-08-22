@@ -42,9 +42,13 @@ pq-proposer = [
 pq-startup-testing = [
     "pq-devnet",
     "beacon_chain/pq-startup-testing",
+    "dep:pq_signing",
+    "dep:validator_dir",
     "network/pq-startup-testing",
     "pq_attester_service?/pq-startup-testing",
     "pq_http_api/pq-startup-testing",
+    "pq_signing/pq-devnet",
+    "validator_dir/pq-devnet",
 ]
 
 [dependencies]
@@ -74,6 +78,7 @@ network = { path = "../network", default-features = false }
 pq_attester_service = { path = "../../validator_client/pq_attester_service", optional = true, default-features = false }
 pq_http_api = { workspace = true, optional = true }
 pq_proposer_service = { workspace = true, optional = true }
+pq_signing = { workspace = true, optional = true }
 rand = { workspace = true }
 reqwest = { workspace = true, optional = true }
 rustix = { workspace = true }
@@ -94,6 +99,7 @@ tokio-util = { workspace = true, optional = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 types = { workspace = true }
+validator_dir = { workspace = true, optional = true }
 warp = { workspace = true, optional = true }
 yaml_serde = { workspace = true }
 
@@ -101,12 +107,9 @@ yaml_serde = { workspace = true }
 async-channel = { workspace = true }
 hex = { workspace = true }
 operation_pool = { workspace = true }
-pq_devnet = { path = "../../testing/pq_devnet", default-features = false, features = ["pq-devnet"] }
-pq_signing = { workspace = true, features = ["pq-devnet"] }
 rusqlite = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
-validator_dir = { workspace = true, features = ["pq-devnet"] }
 
 [[test]]
 name = "pq_runtime"

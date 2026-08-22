@@ -2511,6 +2511,30 @@ mod tests {
         assert_eq!(&evidence.as_bytes()[..7], b"LHPQ\x01\x01\x01");
         assert_eq!(&evidence.as_bytes()[7..13], b"LMSI\x01\x01");
 
+        let verification_started = Instant::now();
+        let verified_evidence = futures::executor::block_on(service.verify(
+            VerificationClass::Block,
+            AggregationJob {
+                claim: common_claim,
+                expected_signers: pair_signers.clone(),
+                contributions: vec![AggregationContribution {
+                    signers: pair_signers.clone(),
+                    evidence: evidence.clone(),
+                }],
+            },
+        ))
+        .expect("authentic two-signer aggregate verifies");
+        let verification_elapsed = verification_started.elapsed();
+        eprintln!(
+            "PQ two-signer aggregate verification: elapsed={verification_elapsed:?}, evidence_bytes={}",
+            verified_evidence.as_bytes().len(),
+        );
+        assert_eq!(verified_evidence, evidence);
+        assert!(
+            verification_elapsed <= std::time::Duration::from_secs(60),
+            "authentic aggregate verification exceeds the frozen devnet budget",
+        );
+
         let aggregate_executions_before = super::testing_only_aggregate_executions_started();
         let concurrent_service = Arc::clone(&service);
         let concurrent_signers = pair_signers.clone();

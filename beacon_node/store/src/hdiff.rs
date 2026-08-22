@@ -933,7 +933,7 @@ mod tests {
         let withdrawal_credentials: [u8; 32] = rng.random();
 
         Validator {
-            pubkey: PublicKeyBytes::from_ssz_bytes(&pubkey).unwrap(),
+            pubkey: ValidatorPublicKeyBytes::from_ssz_bytes(&pubkey).unwrap(),
             withdrawal_credentials: withdrawal_credentials.into(),
             slashed: false,
             effective_balance: 32_000_000_000,

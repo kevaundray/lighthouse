@@ -133,6 +133,9 @@ pub enum PqOperationalEvent {
         finalized_epoch: Epoch,
         finalized_root: Hash256,
         signed_ssz_digest: [u8; 32],
+        attestations: usize,
+        aggregate_attestations: usize,
+        proposal_signature_bytes: usize,
     },
     ExecutionReconciled {
         source: PqBlockEventSource,
@@ -457,8 +460,11 @@ impl PqOperationalEventWriter {
                 finalized_epoch,
                 finalized_root,
                 signed_ssz_digest,
+                attestations,
+                aggregate_attestations,
+                proposal_signature_bytes,
             } => format!(
-                "PQ_EVENT_V1 event=BlockPersisted sequence={} role={} source={} slot={} block_root={block_root:?} execution_hash={execution_hash:?} justified_epoch={} justified_root={justified_root:?} finalized_epoch={} finalized_root={finalized_root:?} signed_ssz_digest={}",
+                "PQ_EVENT_V1 event=BlockPersisted sequence={} role={} source={} slot={} block_root={block_root:?} execution_hash={execution_hash:?} justified_epoch={} justified_root={justified_root:?} finalized_epoch={} finalized_root={finalized_root:?} signed_ssz_digest={} attestations={attestations} aggregate_attestations={aggregate_attestations} proposal_signature_bytes={proposal_signature_bytes}",
                 record.sequence,
                 record.role.as_str(),
                 source.as_str(),
@@ -1011,6 +1017,9 @@ pub fn testing_only_pq_extended_operational_event_contract() -> Vec<u8> {
             finalized_epoch: Epoch::new(0),
             finalized_root,
             signed_ssz_digest,
+            attestations: 2,
+            aggregate_attestations: 1,
+            proposal_signature_bytes: 1215,
         },
         PqOperationalEvent::ExecutionReconciled {
             source: PqBlockEventSource::Publish,

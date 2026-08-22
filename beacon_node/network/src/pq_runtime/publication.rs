@@ -4,14 +4,16 @@ use beacon_chain::{
     PqImportLocalError, PqKnownPublishObservation, PqPublishCommitOutcome, PqPublishObservation,
     PqPublishPromotion,
 };
-use consensus_signature::{PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN, PQ_RAW_SIGNATURE_LEN};
 use std::sync::Arc;
 use task_executor::TaskExecutor;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use types::{ChainSpec, EthSpec, Hash256, SignedBeaconBlock};
+use types::{
+    ChainSpec, EthSpec, Hash256, PQ_SIGNED_BLOCK_FIXED_ALLOWANCE_BYTES, PqSignedBlockSizeLimits,
+    SignedBeaconBlock,
+};
 
 pub const PQ_BLOCK_PUBLICATION_ADMISSION_CAPACITY: usize = 2;
-pub const PQ_PUBLICATION_FIXED_BODY_ALLOWANCE_BYTES: usize = 1024 * 1024;
+pub const PQ_PUBLICATION_FIXED_BODY_ALLOWANCE_BYTES: usize = PQ_SIGNED_BLOCK_FIXED_ALLOWANCE_BYTES;
 /// A publication body may be split into at most this many transport chunks before it is rejected
 /// as a local resource failure. The limit bounds retained chunk objects independently of bytes.
 pub const PQ_BLOCK_PUBLICATION_BODY_CHUNK_CAPACITY: usize = 4096;
@@ -35,17 +37,9 @@ impl PqPublicationBodyLimits {
     }
 
     pub fn checked<E: EthSpec>(spec: &ChainSpec) -> Option<Self> {
-        let payload_bytes = usize::try_from(spec.max_payload_size).ok()?;
-        let attestation_evidence_bytes =
-            E::max_attestations_electra().checked_mul(PQ_MAX_SAME_MESSAGE_EVIDENCE_LEN)?;
-        let individual_signature_bytes = 2usize.checked_mul(PQ_RAW_SIGNATURE_LEN)?;
-        let max_ssz_bytes = payload_bytes
-            .checked_add(attestation_evidence_bytes)?
-            .checked_add(individual_signature_bytes)?
-            .checked_add(PQ_PUBLICATION_FIXED_BODY_ALLOWANCE_BYTES)?;
-        let max_json_bytes = max_ssz_bytes
-            .checked_mul(2)?
-            .checked_add(PQ_PUBLICATION_FIXED_BODY_ALLOWANCE_BYTES)?;
+        let shared = PqSignedBlockSizeLimits::checked::<E>(spec)?;
+        let max_ssz_bytes = shared.max_ssz_bytes();
+        let max_json_bytes = shared.max_json_bytes();
         let raw_chunks_and_decode_copy = max_json_bytes.checked_mul(2)?;
         let chunk_metadata = PQ_BLOCK_PUBLICATION_BODY_CHUNK_CAPACITY
             .checked_mul(PQ_BLOCK_PUBLICATION_BODY_CHUNK_METADATA_BYTES)?;

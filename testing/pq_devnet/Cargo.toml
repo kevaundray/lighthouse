@@ -39,7 +39,7 @@ pq-beacon-startup-testing = [
     "dep:store",
     "dep:task_executor",
     "beacon_chain/pq-startup-testing",
-    "store/pq-devnet",
+    "store/pq-startup-testing",
 ]
 pq-proposer = ["pq-beacon-startup-testing", "beacon_node/pq-proposer"]
 pq-beacon-import-testing = [
@@ -221,6 +221,11 @@ required-features = ["pq-beacon-import-testing"]
 [[test]]
 name = "pq_network_service"
 path = "tests/pq_network_service.rs"
+required-features = ["pq-beacon-import-testing"]
+
+[[test]]
+name = "pq_storage_bounds"
+path = "tests/pq_storage_bounds.rs"
 required-features = ["pq-beacon-import-testing"]
 
 [[test]]

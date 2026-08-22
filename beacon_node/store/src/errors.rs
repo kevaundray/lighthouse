@@ -60,6 +60,15 @@ pub enum Error {
     /// A corrupt or incompatible PQ database requested a BLS-only state replay path.
     #[cfg(feature = "pq-devnet")]
     PqReplayUnsupported(Slot),
+    /// A corrupt PQ database record exceeds the shared signed-block allocation contract.
+    #[cfg(feature = "pq-devnet")]
+    PqBlockSizeExceeded {
+        actual: usize,
+        max: usize,
+    },
+    /// The shared PQ signed-block allocation contract overflowed for this chain specification.
+    #[cfg(feature = "pq-devnet")]
+    PqBlockSizeLimitOverflow,
     AddPayloadLogicError,
     InvalidKey(String),
     InvalidBytes,
