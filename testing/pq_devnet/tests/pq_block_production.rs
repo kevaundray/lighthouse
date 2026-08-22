@@ -1954,6 +1954,9 @@ async fn actual_block_production_selects_one_retained_authentic_pq_attestation_b
         OneTimeUseId::for_lean_pq_devnet_v1(2, SigningDuty::RandaoReveal)
             .expect("slot-two RANDAO leaf")
             .as_u32(),
+        OneTimeUseId::for_lean_pq_devnet_v1(2, SigningDuty::BeaconBlockProposal)
+            .expect("slot-two block-proposal leaf")
+            .as_u32(),
     ]
     .into_iter()
     .max()
@@ -2071,7 +2074,9 @@ async fn actual_block_production_selects_one_retained_authentic_pq_attestation_b
             .expect("specialized selection chain"),
     );
     chain.slot_clock.set_slot(2);
-    let genesis_root = chain.head_snapshot().beacon_block_root;
+    let genesis_head = chain.head_snapshot();
+    let genesis_root = genesis_head.beacon_block_root;
+    let genesis_finalized_checkpoint = genesis_head.beacon_state.finalized_checkpoint().clone();
     let mut advanced_state = chain.head_snapshot().beacon_state.clone();
     while advanced_state.slot() < Slot::new(2) {
         state_processing::per_slot_processing_pq(&mut advanced_state, &spec)
@@ -2278,9 +2283,10 @@ async fn actual_block_production_selects_one_retained_authentic_pq_attestation_b
         ))
         .expect("journal-backed slot-two RANDAO");
     let producing_chain = Arc::clone(&chain);
+    let first_randao = randao.clone();
     let production = tokio::spawn(async move {
         producing_chain
-            .produce_pq_block_v3(Slot::new(2), randao, Graffiti::default())
+            .produce_pq_block_v3(Slot::new(2), first_randao, Graffiti::default())
             .await
     });
     let reached_post_selection = tokio::time::timeout(Duration::from_secs(180), async {
@@ -2365,6 +2371,121 @@ async fn actual_block_production_selects_one_retained_authentic_pq_attestation_b
         chain.testing_only_pq_attestation_pool_snapshot(),
         retained_after_late_insert,
         "production consumes its immutable A-only selection while the pool retains A and late B",
+    );
+
+    chain.testing_only_set_pq_attestation_pool_post_selection_hook(None);
+    execution
+        .invalid_payload_block_hash
+        .store(true, Ordering::SeqCst);
+    let error = tokio::time::timeout(
+        Duration::from_secs(180),
+        chain.produce_pq_block_v3(Slot::new(2), randao.clone(), Graffiti::default()),
+    )
+    .await
+    .expect("populated-pool payload-failure production must complete")
+    .expect_err("invalid payload block hash must reject slot-two production");
+    assert!(error.is_retryable());
+    assert!(matches!(
+        error,
+        PqBlockProductionError::Local(PqBlockProductionLocalError::Execution(
+            execution_layer::Error::BlockHashMismatch { .. }
+        ))
+    ));
+    assert_eq!(execution.payload_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        chain.testing_only_pq_attestation_pool_snapshot(),
+        retained_after_late_insert,
+        "payload failure must leave the exact populated pool snapshot retryable",
+    );
+
+    execution
+        .invalid_payload_block_hash
+        .store(false, Ordering::SeqCst);
+    let produced = tokio::time::timeout(
+        Duration::from_secs(180),
+        chain.produce_pq_block_v3(Slot::new(2), randao, Graffiti::default()),
+    )
+    .await
+    .expect("populated-pool payload retry must complete")
+    .expect("slot-two retry with both retained candidates");
+    let (block, sidecars) = produced.into_contents().deconstruct();
+    let (proofs, blobs) = sidecars.expect("Electra V3 has explicit empty sidecars");
+    assert!(proofs.is_empty());
+    assert!(blobs.is_empty());
+    assert_eq!(block.body().attestations_len(), 2);
+    let mut expected_canonical_attestations = vec![
+        (attester_index, expected_attestation.clone()),
+        (late_attester_index, late_expected_attestation.clone()),
+    ];
+    expected_canonical_attestations.sort_unstable_by_key(|(signer_index, _)| *signer_index);
+    let expected_canonical_bytes = expected_canonical_attestations
+        .iter()
+        .map(|(_, attestation)| attestation.as_ssz_bytes())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        block
+            .body()
+            .attestations()
+            .map(|attestation| attestation.clone_as_attestation().as_ssz_bytes())
+            .collect::<Vec<_>>(),
+        expected_canonical_bytes,
+        "the retry must contain both exact authenticated candidates in canonical order",
+    );
+    assert_eq!(execution.payload_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        chain.testing_only_pq_attestation_pool_snapshot(),
+        retained_after_late_insert,
+        "successful retry must leave the exact populated pool snapshot unchanged",
+    );
+
+    let signed = sign_pq_block_for_slot(&authority, &advanced_state, block, &spec);
+    let signed_root = signed.canonical_root();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(180),
+        PqNetworkBlockProcessor::new(Arc::clone(&chain)).import_rpc_block(Arc::clone(&signed)),
+    )
+    .await
+    .expect("sealed RPC import must complete")
+    .expect("sealed RPC import of the exact selected block");
+    assert_eq!(outcome.source, beacon_chain::PqBlockImportSource::Rpc);
+    assert_eq!(outcome.block_root, signed_root);
+    assert_eq!(execution.new_payload_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(execution.forkchoice_calls.load(Ordering::SeqCst), 1);
+
+    let canonical_head = chain.head_snapshot();
+    assert_eq!(canonical_head.beacon_block_root, signed_root);
+    assert_eq!(canonical_head.beacon_state.slot(), Slot::new(2));
+    let mut expected_current_participation =
+        vec![0u8; canonical_head.beacon_state.validators().len()];
+    *expected_current_participation
+        .get_mut(attester_index)
+        .expect("selected attester participation index") = 0b111;
+    *expected_current_participation
+        .get_mut(late_attester_index)
+        .expect("selected late attester participation index") = 0b111;
+    assert_eq!(
+        canonical_head
+            .beacon_state
+            .current_epoch_participation()
+            .expect("Electra current-epoch participation")
+            .iter()
+            .map(|flags| flags.into_u8())
+            .collect::<Vec<_>>(),
+        expected_current_participation,
+    );
+    assert_eq!(
+        canonical_head
+            .beacon_state
+            .previous_epoch_participation()
+            .expect("Electra previous-epoch participation")
+            .iter()
+            .map(|flags| flags.into_u8())
+            .collect::<Vec<_>>(),
+        vec![0u8; canonical_head.beacon_state.validators().len()],
+    );
+    assert_eq!(
+        canonical_head.beacon_state.finalized_checkpoint(),
+        genesis_finalized_checkpoint,
     );
 }
 

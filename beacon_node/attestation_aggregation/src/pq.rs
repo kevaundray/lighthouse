@@ -496,6 +496,15 @@ impl<T> CoordinatorState<T> {
     }
 }
 
+#[cfg(feature = "pq-block-selection")]
+fn prune_for_block_selection<E: EthSpec, V>(
+    state: &BeaconState<E>,
+    coordinator_state: &mut CoordinatorState<V>,
+) -> PruneOutcome {
+    let cutoff = state.previous_epoch().start_slot(E::slots_per_epoch());
+    coordinator_state.prune_before_slot(cutoff)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MachineCommit {
     Committed,
@@ -723,9 +732,8 @@ impl<E: EthSpec> PqAttestationAggregationCoordinator<E> {
         key_cache: &PqValidatorKeyCache,
         spec: &ChainSpec,
     ) -> Result<PqBlockAttestationSelection<E>, PqBlockAttestationSelectionError> {
-        let cutoff = state.previous_epoch().start_slot(E::slots_per_epoch());
         let mut coordinator_state = self.inner.state.lock();
-        coordinator_state.prune_before_slot(cutoff);
+        prune_for_block_selection(state, &mut coordinator_state);
         let mut candidates = coordinator_state
             .buckets
             .iter()
@@ -975,6 +983,8 @@ fn intersects(left: &[u64], right: &[u64]) -> bool {
 mod tests {
     use super::*;
     use types::Hash256;
+    #[cfg(feature = "pq-block-selection")]
+    use types::{Eth1Data, ForkName, MinimalEthSpec};
 
     #[derive(Clone)]
     struct OrderingCandidate {
@@ -1018,6 +1028,95 @@ mod tests {
             },
             committee_index,
         }
+    }
+
+    #[cfg(feature = "pq-block-selection")]
+    fn block_selection_state_at(slot: u64) -> BeaconState<MinimalEthSpec> {
+        let spec = ForkName::Electra.make_genesis_spec(MinimalEthSpec::default_spec());
+        let mut state = BeaconState::new(0, Eth1Data::default(), &spec);
+        *state.slot_mut() = Slot::new(slot);
+        state
+    }
+
+    #[cfg(feature = "pq-block-selection")]
+    #[test]
+    fn block_selection_prunes_exactly_before_previous_epoch_start() {
+        let slot_seven = bucket_at(80, 0, 7);
+        let slot_eight = bucket_at(81, 0, 8);
+        let slot_fifteen = bucket_at(82, 0, 15);
+        let mut coordinator_state = CoordinatorState::<u8>::default();
+        assert!(matches!(
+            coordinator_state.insert_sized(slot_seven.clone(), vec![1], 1, 10),
+            InsertOutcome::Inserted { .. }
+        ));
+        assert!(matches!(
+            coordinator_state.insert_sized(slot_seven.clone(), vec![2], 2, 20),
+            InsertOutcome::Inserted { .. }
+        ));
+        assert!(matches!(
+            coordinator_state.insert_sized(slot_eight.clone(), vec![3], 3, 30),
+            InsertOutcome::Inserted { .. }
+        ));
+        assert!(matches!(
+            coordinator_state.insert_sized(slot_fifteen.clone(), vec![4], 4, 40),
+            InsertOutcome::Inserted { .. }
+        ));
+
+        let outcome =
+            prune_for_block_selection(&block_selection_state_at(16), &mut coordinator_state);
+
+        assert_eq!(
+            outcome,
+            PruneOutcome {
+                buckets_removed: 1,
+                candidates_removed: 2,
+                evidence_bytes_released: 30,
+            }
+        );
+        assert!(!coordinator_state.buckets.contains_key(&slot_seven));
+        assert!(coordinator_state.buckets.contains_key(&slot_eight));
+        assert!(coordinator_state.buckets.contains_key(&slot_fifteen));
+        assert_eq!(coordinator_state.buckets.len(), 2);
+        assert_eq!(
+            coordinator_state
+                .buckets
+                .values()
+                .map(|bucket| bucket.candidates.len())
+                .sum::<usize>(),
+            2
+        );
+        assert_eq!(coordinator_state.retained_evidence_bytes, 70);
+    }
+
+    #[cfg(feature = "pq-block-selection")]
+    #[test]
+    fn block_selection_at_epoch_one_retains_genesis_slot() {
+        let genesis_slot = bucket_at(83, 0, 0);
+        let mut coordinator_state = CoordinatorState::<u8>::default();
+        assert!(matches!(
+            coordinator_state.insert_sized(genesis_slot.clone(), vec![1], 1, 11),
+            InsertOutcome::Inserted { .. }
+        ));
+        assert!(matches!(
+            coordinator_state.insert_sized(genesis_slot.clone(), vec![2], 2, 13),
+            InsertOutcome::Inserted { .. }
+        ));
+
+        let outcome =
+            prune_for_block_selection(&block_selection_state_at(8), &mut coordinator_state);
+
+        assert_eq!(
+            outcome,
+            PruneOutcome {
+                buckets_removed: 0,
+                candidates_removed: 0,
+                evidence_bytes_released: 0,
+            }
+        );
+        assert!(coordinator_state.buckets.contains_key(&genesis_slot));
+        assert_eq!(coordinator_state.buckets.len(), 1);
+        assert_eq!(coordinator_state.buckets[&genesis_slot].candidates.len(), 2);
+        assert_eq!(coordinator_state.retained_evidence_bytes, 24);
     }
 
     #[test]

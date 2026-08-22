@@ -3020,8 +3020,18 @@ block attestations, then the restored path passed. A post-selection clock-advanc
 stale payload call; the GREEN rechecks slot/head before Engine work and returns
 `ExpiredAfterWork` with zero payload calls. State-relative signer/claim drift is covered as a
 skip-and-retain result, while concrete local causes remain available through the production error
-source chain. Authentic participation effects, payload/head failure retry with a populated pool,
-and exact epoch-pruning behavior remain separate RED/GREEN cycles before Step 4 is complete.
+source chain. The populated-pool continuation now also completes an A-only immutable selection,
+injects a retryable Engine block-hash failure with A+B retained, observes an unchanged exact pool
+snapshot, and retries to the same canonical A+B bytes. Epoch pruning is production-shared under the
+selection lock and removes only slots strictly before the previous epoch start: at Minimal slot 16
+it removes slot 7 while retaining slots 8 and 15 with exact evidence accounting, and at slot 8 it
+retains genesis slot 0. Finally, the authentic A+B slot-2 block is journal proposal-signed and
+imported through `PqNetworkBlockProcessor`; both selected validators have exact `0b111`
+current-epoch participation, every other current entry and every previous-epoch entry remains zero,
+the Engine receives one `newPayload` and one fork-choice update, and the finalized checkpoint stays
+at genesis. This completes Step 4's raw-single selection, retry, pruning, inclusion, and participation
+boundary. It does not yet claim aggregate construction/gossip, justification/finality, a second-node
+slot-2 import, or pool recovery across restart.
 
 **Step 5: Add bounded background aggregation**
 

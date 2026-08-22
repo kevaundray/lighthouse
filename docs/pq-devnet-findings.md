@@ -2263,3 +2263,32 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
 - This checkpoint does not yet prove populated-pool retry after payload/head failure, exact pruning
   at the previous-epoch cutoff, participation updates from the produced block, aggregate preference,
   gossip of aggregates, sync-aggregate handling, finality, or restart.
+
+### 2026-08-22: Raw-single block selection reaches authentic participation (Task 5.2b Cycle 4, Step 4 complete)
+
+- Populated-pool production is demonstrably retryable and non-consuming. The authentic continuation
+  first preserves the original immutable A-only selection after candidate B arrives, then selects
+  the retained A+B inventory for a deliberately invalid Engine block hash. That attempt returns the
+  typed retryable `BlockHashMismatch`, leaves the complete pool snapshot unchanged, and a bounded
+  retry emits the same two exact SSZ attestations in canonical signer order while still retaining
+  both candidates. The warning-denied AVX2 tracer passed 1/1 in 182.13 seconds for this boundary.
+- The exact epoch cutoff is now a private production-shared helper called while the coordinator
+  selection lock is held and before snapshot cloning. For Minimal slot 16 it prunes only slot 7,
+  retains slots 8 and 15, and reports one bucket, two candidates, and 30 evidence bytes released;
+  at slot 8 it retains slot 0 and releases nothing. Mutating the strict retained predicate from
+  `>= cutoff` to `> cutoff` was killed by the focused test, which observed two buckets, three
+  candidates, and 60 bytes removed instead of one, two, and 30. The restored warning-denied suite
+  passed 19 unit tests plus one doc test.
+- The final retry block is proposal-signed with the journal-backed slot-2 one-time-use leaf and
+  imported through the actual sealed RPC processor. The block carries the exact two selected raw
+  attestations and empty Electra sidecars. Import reports the exact RPC root; Engine counters are
+  one `newPayload` and one fork-choice update; the canonical head advances to slot 2. Both selected
+  validator indices have exactly `0b111` current-epoch participation, every other current entry and
+  every previous-epoch entry is zero, and the finalized checkpoint remains the captured genesis
+  checkpoint. The combined warning-denied AVX2 selection/retry/import tracer passed 1/1 in 176.79
+  seconds.
+- Step 4 is therefore complete for raw-single deterministic selection, stale-context filtering,
+  immutable capability continuity, Engine failure retry, exact cutoff pruning, block inclusion, and
+  participation mutation on one chain. This is not evidence for background aggregate proof work,
+  aggregate gossip, a second-node slot-2 import, justification/finality, or operation-pool recovery
+  after restart; those remain Steps 5-7.
