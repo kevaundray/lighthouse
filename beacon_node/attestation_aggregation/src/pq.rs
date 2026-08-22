@@ -5,11 +5,19 @@ use consensus_signature::{
     V1_MAX_AGGREGATION_SIGNERS,
 };
 use parking_lot::Mutex;
+use ssz::Encode;
 use state_processing::{
     PqAttestationError, PqAttestationInvalid, PqAttestationLocalError, PqValidatorKeyCache,
     PreparedPqAttestation, VerifiedPqAttestation, prepare_pq_attestation_aggregate,
 };
+#[cfg(feature = "pq-block-selection")]
+use state_processing::{
+    PqBlockAttestationSelectionError, PqLocalBlockError, VerifiedPqLocalBlock, VerifiedPqRandao,
+    prepare_pq_local_block, validate_pq_attestation_for_block_selection,
+};
 use std::{collections::HashMap, future::Future, sync::Arc};
+#[cfg(feature = "pq-block-selection")]
+use types::BeaconBlock;
 use types::{Attestation, AttestationData, BeaconState, ChainSpec, EthSpec, Slot};
 
 /// Coordinator-wide cap on distinct retained V1 attestation buckets.
@@ -18,6 +26,11 @@ use types::{Attestation, AttestationData, BeaconState, ChainSpec, EthSpec, Slot}
 pub const V1_MAX_ATTESTATION_BUCKETS: usize = 64;
 /// Coordinator-wide cap on actual retained same-message evidence bytes.
 pub const V1_MAX_RETAINED_EVIDENCE_BYTES: usize = V1_MAX_AGGREGATION_INPUT_BYTES;
+/// Maximum number of sealed candidates cloned into one non-consuming block-selection snapshot.
+pub const V1_MAX_RETAINED_ATTESTATION_CANDIDATES: usize =
+    V1_MAX_ATTESTATION_BUCKETS * V1_MAX_AGGREGATION_CONTRIBUTIONS;
+#[cfg(feature = "pq-block-selection")]
+const PQ_MAX_ATTESTATIONS_PER_BLOCK: usize = 8;
 
 /// The exact attestation-data and single Electra committee aggregation boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -75,6 +88,69 @@ pub enum AggregateOutcome<E: EthSpec> {
     Failed(AggregateFailure),
 }
 
+/// Non-cloneable authoritative block selection retaining every sealed authentication token.
+#[cfg(feature = "pq-block-selection")]
+pub struct PqBlockAttestationSelection<E: EthSpec> {
+    candidates: Vec<Arc<VerifiedPqAttestation<E>>>,
+}
+
+#[cfg(feature = "pq-block-selection")]
+#[derive(Debug)]
+pub enum PqRetainedAttestationAssemblyError {
+    WrongFork,
+    Capacity,
+    LocalBlock(PqLocalBlockError),
+}
+
+#[cfg(feature = "pq-block-selection")]
+impl std::fmt::Display for PqRetainedAttestationAssemblyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "PQ retained-attestation assembly failed: {self:?}"
+        )
+    }
+}
+
+#[cfg(feature = "pq-block-selection")]
+impl std::error::Error for PqRetainedAttestationAssemblyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::LocalBlock(error) => Some(error),
+            Self::WrongFork | Self::Capacity => None,
+        }
+    }
+}
+
+#[cfg(feature = "pq-block-selection")]
+impl<E: EthSpec> PqBlockAttestationSelection<E> {
+    /// Consumes the only selection authority, installs exact attestation bytes, and seals the
+    /// local block with the identical retained tokens.
+    pub fn into_verified_local_block(
+        self,
+        state: &BeaconState<E>,
+        mut block: BeaconBlock<E>,
+        randao: VerifiedPqRandao<E>,
+    ) -> Result<VerifiedPqLocalBlock<E>, PqRetainedAttestationAssemblyError> {
+        let attestations = self
+            .candidates
+            .iter()
+            .map(|candidate| match candidate.attestation() {
+                Attestation::Electra(attestation) => Ok(attestation.clone()),
+                Attestation::Base(_) => Err(PqRetainedAttestationAssemblyError::WrongFork),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let BeaconBlock::Electra(inner) = &mut block else {
+            return Err(PqRetainedAttestationAssemblyError::WrongFork);
+        };
+        inner.body.attestations = attestations
+            .try_into()
+            .map_err(|_| PqRetainedAttestationAssemblyError::Capacity)?;
+        prepare_pq_local_block(state, block, randao, self.candidates)
+            .map_err(PqRetainedAttestationAssemblyError::LocalBlock)
+    }
+}
+
 struct Candidate<T> {
     id: u64,
     signer_indices: Vec<u64>,
@@ -85,6 +161,45 @@ struct Candidate<T> {
 struct BucketState<T> {
     candidates: Vec<Candidate<T>>,
     in_flight: Option<u64>,
+}
+
+struct PqCandidateOrderingMetadata<'a> {
+    data: &'a AttestationData,
+    committee_index: u64,
+    signer_indices: &'a [u64],
+}
+
+fn compare_pq_candidate_ordering_metadata(
+    left: PqCandidateOrderingMetadata<'_>,
+    right: PqCandidateOrderingMetadata<'_>,
+) -> std::cmp::Ordering {
+    left.data
+        .slot
+        .cmp(&right.data.slot)
+        .then_with(|| left.data.as_ssz_bytes().cmp(&right.data.as_ssz_bytes()))
+        .then_with(|| left.committee_index.cmp(&right.committee_index))
+        .then_with(|| right.signer_indices.len().cmp(&left.signer_indices.len()))
+        .then_with(|| left.signer_indices.cmp(right.signer_indices))
+}
+
+fn try_filter_take_pq_candidates<Candidate, Error>(
+    candidates: impl IntoIterator<Item = Candidate>,
+    maximum: usize,
+    mut retain: impl FnMut(&Candidate) -> Result<bool, Error>,
+) -> Result<Vec<Candidate>, Error> {
+    let mut retained = Vec::with_capacity(maximum);
+    if maximum == 0 {
+        return Ok(retained);
+    }
+    for candidate in candidates {
+        if retain(&candidate)? {
+            retained.push(candidate);
+            if retained.len() == maximum {
+                break;
+            }
+        }
+    }
+    Ok(retained)
 }
 
 impl<T> Default for BucketState<T> {
@@ -597,6 +712,62 @@ impl<E: EthSpec> PqAttestationAggregationCoordinator<E> {
         state.insert_sized(bucket, signer_indices, candidate, evidence_bytes)
     }
 
+    /// Selects one policy-complete, non-consuming candidate set for block production.
+    ///
+    /// Pruning and the bounded metadata snapshot are atomic. Validation and canonical ordering run
+    /// without the coordinator lock, and stop immediately after eight valid candidates.
+    #[cfg(feature = "pq-block-selection")]
+    pub fn select_for_block(
+        &self,
+        state: &BeaconState<E>,
+        key_cache: &PqValidatorKeyCache,
+        spec: &ChainSpec,
+    ) -> Result<PqBlockAttestationSelection<E>, PqBlockAttestationSelectionError> {
+        let cutoff = state.previous_epoch().start_slot(E::slots_per_epoch());
+        let mut coordinator_state = self.inner.state.lock();
+        coordinator_state.prune_before_slot(cutoff);
+        let mut candidates = coordinator_state
+            .buckets
+            .iter()
+            .flat_map(|(bucket, bucket_state)| {
+                bucket_state.candidates.iter().map(|candidate| {
+                    (
+                        Arc::clone(&candidate.value),
+                        bucket.committee_index,
+                        candidate.signer_indices.clone(),
+                    )
+                })
+            })
+            .take(V1_MAX_RETAINED_ATTESTATION_CANDIDATES)
+            .collect::<Vec<_>>();
+        drop(coordinator_state);
+        candidates.sort_unstable_by(|left, right| {
+            compare_pq_candidate_ordering_metadata(
+                PqCandidateOrderingMetadata {
+                    data: left.0.attestation().data(),
+                    committee_index: left.1,
+                    signer_indices: &left.2,
+                },
+                PqCandidateOrderingMetadata {
+                    data: right.0.attestation().data(),
+                    committee_index: right.1,
+                    signer_indices: &right.2,
+                },
+            )
+        });
+        let candidates = try_filter_take_pq_candidates(
+            candidates,
+            PQ_MAX_ATTESTATIONS_PER_BLOCK,
+            |candidate| {
+                validate_pq_attestation_for_block_selection(state, key_cache, &candidate.0, spec)
+            },
+        )?
+        .into_iter()
+        .map(|(candidate, _, _)| candidate)
+        .collect();
+        Ok(PqBlockAttestationSelection { candidates })
+    }
+
     /// Removes every bucket older than `cutoff`, releasing its retained-evidence accounting.
     ///
     /// If a removed bucket has work in flight, that owned execution becomes stale and cannot
@@ -805,6 +976,35 @@ mod tests {
     use super::*;
     use types::Hash256;
 
+    #[derive(Clone)]
+    struct OrderingCandidate {
+        candidate_id: u64,
+        data: AttestationData,
+        committee_index: u64,
+        signer_indices: Vec<u64>,
+    }
+
+    fn canonically_ordered_candidate_ids(mut candidates: Vec<OrderingCandidate>) -> Vec<u64> {
+        candidates.sort_unstable_by(|left, right| {
+            compare_pq_candidate_ordering_metadata(
+                PqCandidateOrderingMetadata {
+                    data: &left.data,
+                    committee_index: left.committee_index,
+                    signer_indices: &left.signer_indices,
+                },
+                PqCandidateOrderingMetadata {
+                    data: &right.data,
+                    committee_index: right.committee_index,
+                    signer_indices: &right.signer_indices,
+                },
+            )
+        });
+        candidates
+            .into_iter()
+            .map(|candidate| candidate.candidate_id)
+            .collect()
+    }
+
     fn bucket(byte: u8, committee_index: u64) -> PqAttestationBucket {
         bucket_at(byte, committee_index, 0)
     }
@@ -818,6 +1018,130 @@ mod tests {
             },
             committee_index,
         }
+    }
+
+    #[test]
+    fn block_candidate_order_is_canonical_content_not_arrival_generation() {
+        let same_committee_data = AttestationData {
+            slot: Slot::new(2),
+            ..AttestationData::default()
+        };
+        let same_signer_bucket_data = AttestationData {
+            slot: Slot::new(3),
+            ..AttestationData::default()
+        };
+        let lexicographic_signer_data = AttestationData {
+            slot: Slot::new(4),
+            ..AttestationData::default()
+        };
+        let candidates = vec![
+            OrderingCandidate {
+                candidate_id: 900,
+                data: AttestationData {
+                    slot: Slot::new(0),
+                    ..AttestationData::default()
+                },
+                committee_index: 99,
+                signer_indices: vec![99],
+            },
+            // SSZ encodes uint64 little-endian, so index 256 (`00 01 ...`) sorts before index 1
+            // (`01 00 ...`) even though its numeric value is larger.
+            OrderingCandidate {
+                candidate_id: 800,
+                data: AttestationData {
+                    slot: Slot::new(1),
+                    index: 256,
+                    ..AttestationData::default()
+                },
+                committee_index: 9,
+                signer_indices: vec![8],
+            },
+            OrderingCandidate {
+                candidate_id: 1,
+                data: AttestationData {
+                    slot: Slot::new(1),
+                    index: 1,
+                    ..AttestationData::default()
+                },
+                committee_index: 0,
+                signer_indices: vec![1],
+            },
+            OrderingCandidate {
+                candidate_id: 700,
+                data: same_committee_data.clone(),
+                committee_index: 0,
+                signer_indices: vec![9],
+            },
+            OrderingCandidate {
+                candidate_id: 0,
+                data: same_committee_data,
+                committee_index: 1,
+                signer_indices: vec![1],
+            },
+            OrderingCandidate {
+                candidate_id: 2,
+                data: same_signer_bucket_data.clone(),
+                committee_index: 0,
+                signer_indices: vec![7, 8],
+            },
+            OrderingCandidate {
+                candidate_id: 999,
+                data: same_signer_bucket_data,
+                committee_index: 0,
+                signer_indices: vec![1],
+            },
+            OrderingCandidate {
+                candidate_id: 600,
+                data: lexicographic_signer_data.clone(),
+                committee_index: 0,
+                signer_indices: vec![2, 9],
+            },
+            OrderingCandidate {
+                candidate_id: 3,
+                data: lexicographic_signer_data,
+                committee_index: 0,
+                signer_indices: vec![3, 4],
+            },
+        ];
+        let expected = vec![900, 800, 1, 700, 0, 2, 999, 600, 3];
+
+        assert_eq!(
+            canonically_ordered_candidate_ids(candidates.clone()),
+            expected,
+        );
+        let mut reversed = candidates.clone();
+        reversed.reverse();
+        assert_eq!(canonically_ordered_candidate_ids(reversed), expected);
+        let mut permuted = candidates;
+        permuted.rotate_left(4);
+        assert_eq!(canonically_ordered_candidate_ids(permuted), expected);
+    }
+
+    #[test]
+    fn block_candidate_cap_applies_after_validation_and_stops_after_eight_valid() {
+        let input = vec![0_u64, 1, 10, 11, 12, 13, 14, 15, 16, 17, 99];
+        let mut visited = Vec::new();
+        let selected = try_filter_take_pq_candidates(input.clone(), 8, |candidate| {
+            visited.push(*candidate);
+            match *candidate {
+                0 | 1 => Ok(false),
+                99 => Err("tail candidate must not be visited"),
+                _ => Ok(true),
+            }
+        })
+        .expect("the invalid prefix is skipped before the eight-valid cap");
+
+        assert_eq!(selected, vec![10, 11, 12, 13, 14, 15, 16, 17]);
+        assert_eq!(visited, vec![0, 1, 10, 11, 12, 13, 14, 15, 16, 17]);
+
+        let mut zero_cap_visits = 0;
+        let selected = try_filter_take_pq_candidates(input, 0, |_| {
+            zero_cap_visits += 1;
+            Ok::<_, &'static str>(true)
+        })
+        .expect("zero capacity is an empty successful selection");
+        assert!(selected.is_empty());
+        assert_eq!(zero_cap_visits, 0);
     }
 
     #[test]

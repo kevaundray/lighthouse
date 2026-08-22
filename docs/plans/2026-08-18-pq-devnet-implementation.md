@@ -2977,6 +2977,52 @@ retry, pruning, and slot-2 raw-single inclusion. Snapshot under pool locks, rele
 the exact sealed values to `prepare_pq_local_block`. Candidate state remains ephemeral; startup does
 not interpret BLS `opo` bytes or re-prove candidates.
 
+Use one opaque, non-cloneable block-selection capability rather than returning a raw candidate
+vector. Before `getPayload`, the private operation pool atomically prunes only permanently expired
+buckets (`attestation.slot < previous_epoch.start_slot`) and clones a bounded snapshot from at most
+64 buckets. It then releases every pool lock and orders candidates by this total content-derived
+key: attestation slot ascending; exact canonical SSZ `AttestationData` bytes; committee index;
+signer count descending within the same data; and signer indices lexicographically. Hash-map
+iteration order, coordinator generations, arrival order, and insertion IDs must never participate.
+It validates the ordered snapshot against the exact advanced pre-block state using one shared
+authoritative inclusion-and-token-binding classifier. Consensus-invalid candidates are skipped and
+retained. Local cache, arithmetic, or state-unavailable errors abort production retryably. Because a
+sealed candidate can outlive the canonical state that authenticated it, signer or claim drift
+against a different current committee/key context is also skipped and retained; it is not an
+invariant unless the token is explicitly bound to that same state context. Once one opaque
+selection is constructed, an impossible byte/token/count/fork mismatch while consuming that exact
+carried selection fails closed. The Electra/V1 limit of eight applies after validation, so an
+invalid early prefix cannot crowd later valid candidates out of the block.
+
+The capability carries the same ordered `Arc<VerifiedPqAttestation>` values across payload work and
+consumes itself when it writes the exact attestation bytes into the block and calls
+`prepare_pq_local_block`. It exposes no raw candidate accessor or reordering/substitution surface.
+Payload, late-head, sealing, and transition failures drop only the owned snapshot; surviving pool
+candidates remain available for an identical retry. A committed maximal aggregate naturally wins
+the existing subset-dominance relation, while otherwise the same selector includes deterministic
+raw singles without starting aggregation on the proposal critical path.
+
+Use vertical RED/GREEN cycles. The first tracer must exercise actual block production and prove one
+retained raw single reaches the block through this opaque selection/assembly seam before
+`getPayload`. Follow with independent cycles for insertion-order permutation, invalid-prefix then
+eight-valid capacity, typed local/invariant outcomes, failed-payload and stale-head retry, exact
+epoch pruning, and finally the authentic slot-2 participation trace.
+
+Implementation checkpoint (2026-08-22): actual `produce_pq_block_v3` first failed with an empty
+attestation body (`0` versus `1`) after the post-selection/pre-payload barrier, then passed with the
+exact journal-authenticated retained attestation. The coordinator now snapshots and epoch-prunes
+under one lock, releases the lock, applies the exact canonical content order, validates and stops
+after eight valid candidates, and returns only an opaque non-cloneable capability. That capability
+crosses `getPayload` unchanged and alone installs the exact bytes and matching sealed tokens at
+`prepare_pq_local_block`. A two-candidate continuation test selected A, inserted B after selection,
+observed A+B still retained, and produced A only; moving the hook before selection failed with two
+block attestations, then the restored path passed. A post-selection clock-advance RED observed one
+stale payload call; the GREEN rechecks slot/head before Engine work and returns
+`ExpiredAfterWork` with zero payload calls. State-relative signer/claim drift is covered as a
+skip-and-retain result, while concrete local causes remain available through the production error
+source chain. Authentic participation effects, payload/head failure retry with a populated pool,
+and exact epoch-pruning behavior remain separate RED/GREEN cycles before Step 4 is complete.
+
 **Step 5: Add bounded background aggregation**
 
 Reuse `PreparedAggregate` and the coordinator's generation-bound in-flight RAII. REDs cover one

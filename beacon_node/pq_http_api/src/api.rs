@@ -924,6 +924,10 @@ fn production_error_response(error: PqBlockProductionError) -> Response {
             warp::http::StatusCode::CONFLICT,
             "proposal slot or parent is stale",
         ),
+        PqBlockProductionError::AttestationSelectionInvariant => (
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "block-attestation selection invariant failed",
+        ),
         PqBlockProductionError::Local(PqBlockProductionLocalError::IngressCapacity) => (
             warp::http::StatusCode::TOO_MANY_REQUESTS,
             "block-production capacity is exhausted",
@@ -941,6 +945,7 @@ fn production_error_response(error: PqBlockProductionError) -> Response {
             | PqBlockProductionLocalError::Transition(_)
             | PqBlockProductionLocalError::Execution(_)
             | PqBlockProductionLocalError::OperationalEvent(_)
+            | PqBlockProductionLocalError::AttestationSelection(_)
             | PqBlockProductionLocalError::Invariant(_),
         ) => (
             warp::http::StatusCode::SERVICE_UNAVAILABLE,

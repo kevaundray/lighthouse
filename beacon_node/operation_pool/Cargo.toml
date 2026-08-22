@@ -9,7 +9,7 @@ default = ["leveldb"]
 leveldb = ["store/leveldb"]
 portable = ["beacon_chain/portable"]
 pq-devnet = [
-    "attestation_aggregation/pq-attestation",
+    "attestation_aggregation/pq-block-selection",
     "dep:attestation_aggregation",
     "dep:consensus_signature",
     "state_processing/pq-transition",

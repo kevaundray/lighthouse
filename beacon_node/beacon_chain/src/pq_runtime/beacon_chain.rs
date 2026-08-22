@@ -661,6 +661,9 @@ pub struct BeaconChain<T: BeaconChainTypes> {
     pq_attestation_pool_local_post_insert_test_hook:
         Mutex<Option<Arc<crate::TestingPqBlockingHook>>>,
     #[cfg(feature = "pq-startup-testing")]
+    pub(crate) pq_attestation_pool_post_selection_test_hook:
+        Mutex<Option<Arc<crate::TestingPqBlockingHook>>>,
+    #[cfg(feature = "pq-startup-testing")]
     pq_attestation_pool_snapshot_guard: Mutex<()>,
     #[cfg(feature = "pq-startup-testing")]
     pq_attestation_pool_source_trace: Mutex<TestingPqAttestationPoolSourceTrace>,
@@ -888,6 +891,8 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             #[cfg(feature = "pq-startup-testing")]
             pq_attestation_pool_local_post_insert_test_hook: Mutex::new(None),
             #[cfg(feature = "pq-startup-testing")]
+            pq_attestation_pool_post_selection_test_hook: Mutex::new(None),
+            #[cfg(feature = "pq-startup-testing")]
             pq_attestation_pool_snapshot_guard: Mutex::new(()),
             #[cfg(feature = "pq-startup-testing")]
             pq_attestation_pool_source_trace: Mutex::new(
@@ -959,6 +964,47 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         hook: Option<Arc<crate::TestingPqBlockingHook>>,
     ) {
         *self.pq_attestation_pool_local_post_insert_test_hook.lock() = hook;
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_insert_pq_attestation_pool_candidate(
+        &self,
+        candidate: state_processing::VerifiedPqAttestation<T::EthSpec>,
+    ) -> Result<(), PqAttestationPoolInsertInvariant> {
+        self.insert_pq_gossip_attestation_pool_candidate(candidate)
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_set_pq_attestation_pool_post_selection_hook(
+        &self,
+        hook: Option<Arc<crate::TestingPqBlockingHook>>,
+    ) {
+        *self.pq_attestation_pool_post_selection_test_hook.lock() = hook;
+    }
+
+    pub(crate) fn select_pq_attestations_for_block(
+        &self,
+        state: &types::BeaconState<T::EthSpec>,
+        key_cache: &PqValidatorKeyCache,
+        spec: &types::ChainSpec,
+    ) -> Result<
+        operation_pool::PqBlockAttestationSelection<T::EthSpec>,
+        state_processing::PqBlockAttestationSelectionError,
+    > {
+        let selection = self
+            ._pq_attestation_pool
+            .select_pq_attestations_for_block(state, key_cache, spec)?;
+        #[cfg(feature = "pq-startup-testing")]
+        if let Some(hook) = self
+            .pq_attestation_pool_post_selection_test_hook
+            .lock()
+            .clone()
+        {
+            hook.run();
+        }
+        Ok(selection)
     }
 
     #[cfg(feature = "pq-startup-testing")]

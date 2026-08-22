@@ -95,7 +95,7 @@ pub use genesis::{
 pub use per_block_processing::deneb::kzg_commitment_to_versioned_hash;
 #[cfg(feature = "pq-transition")]
 pub use per_block_processing::errors::{
-    AttesterSlashingValidationError, BlockProcessingError, HeaderInvalid,
+    AttesterSlashingValidationError, BlockProcessingError, HeaderInvalid, SignatureSetError,
 };
 #[cfg(not(any(feature = "pq-genesis", feature = "pq-attestation")))]
 pub use per_block_processing::{
@@ -132,6 +132,11 @@ pub use pq_transition::{
     PqImportedTransitionOutput, PqLocalTransitionOutput, PqTransitionError,
     per_block_processing_pq, per_block_processing_pq_local, per_slot_processing_pq,
     transition_pq_imported_block,
+};
+#[cfg(feature = "pq-transition")]
+pub use pq_verification::{
+    PqBlockAttestationSelectionError, PqBlockAttestationSelectionLocalError,
+    validate_pq_attestation_for_block_selection,
 };
 #[cfg(feature = "pq-verification")]
 pub use pq_verification::{

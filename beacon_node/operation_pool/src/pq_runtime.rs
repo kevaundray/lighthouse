@@ -1,8 +1,15 @@
-use attestation_aggregation::{InsertOutcome, PqAttestationAggregationCoordinator};
+pub use attestation_aggregation::PqRetainedAttestationAssemblyError;
+use attestation_aggregation::{
+    InsertOutcome, PqAttestationAggregationCoordinator,
+    PqBlockAttestationSelection as AggregationPqBlockAttestationSelection,
+};
 use consensus_signature::AggregationService;
-use state_processing::VerifiedPqAttestation;
+use state_processing::{
+    PqBlockAttestationSelectionError, PqValidatorKeyCache, VerifiedPqAttestation,
+    VerifiedPqLocalBlock, VerifiedPqRandao,
+};
 use std::sync::Arc;
-use types::EthSpec;
+use types::{BeaconBlock, BeaconState, ChainSpec, EthSpec};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PqAttestationPoolResourceLimit {
@@ -89,6 +96,25 @@ pub struct OperationPool<E: EthSpec> {
     _coordinator: PqAttestationAggregationCoordinator<E>,
 }
 
+/// Non-cloneable authoritative block selection retaining every sealed authentication token.
+pub struct PqBlockAttestationSelection<E: EthSpec> {
+    selected: AggregationPqBlockAttestationSelection<E>,
+}
+
+impl<E: EthSpec> PqBlockAttestationSelection<E> {
+    /// Consumes the only selection authority, installs exact attestation bytes, and seals the
+    /// local block with the identical retained tokens.
+    pub fn into_verified_local_block(
+        self,
+        state: &BeaconState<E>,
+        block: BeaconBlock<E>,
+        randao: VerifiedPqRandao<E>,
+    ) -> Result<VerifiedPqLocalBlock<E>, PqRetainedAttestationAssemblyError> {
+        self.selected
+            .into_verified_local_block(state, block, randao)
+    }
+}
+
 impl<E: EthSpec> OperationPool<E> {
     pub fn new(aggregation_service: Arc<AggregationService>) -> Self {
         Self {
@@ -101,6 +127,16 @@ impl<E: EthSpec> OperationPool<E> {
         candidate: VerifiedPqAttestation<E>,
     ) -> Result<PqAttestationPoolInsertDisposition, PqAttestationPoolInsertInvariant> {
         classify_pq_attestation_pool_insert(self._coordinator.insert_verified(candidate))
+    }
+
+    pub fn select_pq_attestations_for_block(
+        &self,
+        state: &BeaconState<E>,
+        key_cache: &PqValidatorKeyCache,
+        spec: &ChainSpec,
+    ) -> Result<PqBlockAttestationSelection<E>, PqBlockAttestationSelectionError> {
+        let selected = self._coordinator.select_for_block(state, key_cache, spec)?;
+        Ok(PqBlockAttestationSelection { selected })
     }
 
     #[cfg(feature = "pq-startup-testing")]

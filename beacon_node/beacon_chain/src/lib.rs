@@ -313,7 +313,8 @@ pub use self::pq_production::{
 #[doc(hidden)]
 pub use self::pq_production::{
     TestingPqPayloadBuildObservation, TestingPqPayloadExpectation,
-    testing_only_validate_pq_full_payload, testing_only_validate_pq_production_advance,
+    testing_only_map_pq_attestation_assembly_error, testing_only_validate_pq_full_payload,
+    testing_only_validate_pq_production_advance,
 };
 #[cfg(feature = "pq-devnet")]
 pub use self::pq_proposer_duties::{

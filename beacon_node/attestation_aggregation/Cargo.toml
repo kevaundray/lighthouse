@@ -7,6 +7,7 @@ edition = { workspace = true }
 default = []
 pq-attestation = [
     "dep:consensus_signature",
+    "dep:ethereum_ssz",
     "dep:parking_lot",
     "dep:state_processing",
     "dep:types",
@@ -14,10 +15,12 @@ pq-attestation = [
     "state_processing/pq-attestation",
     "types/pq-devnet",
 ]
+pq-block-selection = ["pq-attestation", "state_processing/pq-transition"]
 pq-startup-testing = ["pq-attestation"]
 
 [dependencies]
 consensus_signature = { workspace = true, optional = true }
+ethereum_ssz = { workspace = true, optional = true }
 parking_lot = { workspace = true, optional = true }
 state_processing = { workspace = true, optional = true }
 types = { workspace = true, optional = true }

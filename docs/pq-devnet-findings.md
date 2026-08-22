@@ -2207,3 +2207,59 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   remained stored. This completes private ownership, real consumer insertion, and bounded
   classification only. Deterministic selection, background aggregation, block inclusion,
   participation/finality progress, and candidate-pool recovery across restart remain pending.
+
+### 2026-08-22: Deterministic selection boundary chosen (Task 5.2b Cycle 4, Step 4)
+
+- Selection must cap the first eight *valid* candidates, not the first eight entries copied from
+  the pool. Otherwise a stale or state-invalid prefix can suppress later valid attestations even
+  though the pool remains within its memory bounds. The selected design snapshots all candidates
+  from at most 64 buckets under one short coordinator lock, releases the lock, canonically orders
+  the owned `Arc` values, validates against the exact advanced pre-block state, and stops after
+  eight valid entries.
+- Only permanent epoch expiry is safe to prune during selection. Same-slot `IncludedTooEarly`, a
+  temporary local/cache failure, or a branch-specific consensus-invalid result is not proof of
+  permanent expiry. Retention is therefore safe even though future validity is not guaranteed; the
+  cutoff is strictly `attestation.slot < previous_epoch.start_slot`.
+- The selection result is an opaque, non-cloneable capability prepared before `getPayload` and
+  consumed by block assembly. It installs the same ordered bytes and sealed tokens at the existing
+  `prepare_pq_local_block` boundary. Returning a raw vector would permit reordering or token/data
+  substitution, while selecting only after `getPayload` would unnecessarily spend proposal time
+  before detecting local selection failures.
+- Canonical order is a total content-derived tuple: attestation slot ascending, exact canonical SSZ
+  `AttestationData` bytes, committee index, signer count descending for the same data, and signer
+  indices lexicographically. Hash-map iteration, coordinator generations, arrival order, and
+  insertion IDs are explicitly excluded. Validation is typed: consensus-invalid-for-this-state is
+  skipped and retained; local/cache/arithmetic/state failures abort retryably; signer or claim drift
+  against a different current committee/key context is also skipped because the retained token is
+  not bound to its original canonical state. Only an impossible byte/token/count/fork mismatch while
+  consuming one already-built opaque selection fails closed as an invariant violation.
+
+### 2026-08-22: First production selection capability is live (Task 5.2b Cycle 4, Step 4)
+
+- The first actual slot-2 tracer reached the real payload and transition path with a retained,
+  journal-authenticated raw single and failed at the intended old boundary: the produced block had
+  zero attestations instead of one. The GREEN selects before `getPayload`, carries one opaque
+  non-cloneable capability across Engine work, and consumes it to install the exact attestation bytes
+  alongside the identical sealed `Arc` token. The pool remains non-consuming for publication retry.
+- Snapshot continuity is production-sensitive. Two genuine disjoint candidates were verified
+  concurrently; A entered the pool before production and B only after the post-selection barrier.
+  The pool then contained A+B while the block contained A only. Moving the hook before selection
+  failed with two block attestations; restoring the real boundary passed again (183.00 s base,
+  183.13 s mutation RED, 183.06 s restored GREEN).
+- Selection revalidates context before invoking Engine. Advancing the clock while stopped after
+  selection initially returned the right `ExpiredAfterWork` only after one stale payload call. The
+  added pre-Engine check returns the same typed error with zero payload calls (78.86 s RED,
+  78.61 s GREEN).
+- Canonical ordering and the valid-candidate cap are shared production cores with focused mutation
+  evidence. The comparator uses slot, canonical SSZ data bytes, committee, descending signer count,
+  and signer indices, never generation/arrival/signature ordering. Filtering skips an invalid prefix
+  and stops immediately after eight valid entries, so an unused tail failure cannot abort production.
+  Intermediate public snapshot/predicate/truncation methods were removed; the coordinator exposes
+  only the policy-complete opaque final selection.
+- A sealed candidate valid under context A but incompatible with a synthetic context B originally
+  returned terminal `SealedMismatch`. It now returns skip-and-retain and remains valid again under A
+  (131.45 s authentic GREEN). Concrete state, SSZ, bitfield, context, arithmetic, signature-set, and
+  PQ-attestation local causes are preserved through the selection and proposer error source chain.
+- This checkpoint does not yet prove populated-pool retry after payload/head failure, exact pruning
+  at the previous-epoch cutoff, participation updates from the produced block, aggregate preference,
+  gossip of aggregates, sync-aggregate handling, finality, or restart.

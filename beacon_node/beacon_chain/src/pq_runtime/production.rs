@@ -3,12 +3,12 @@ use consensus_signature::IndividualSignature;
 use eth2::types::FullBlockContents;
 use execution_layer::BlockProposalContents;
 use fork_choice::ForkchoiceUpdateParameters;
+use operation_pool::{PqBlockAttestationSelection, PqRetainedAttestationAssemblyError};
 use slot_clock::SlotClock;
 use state_processing::{
     BlockProcessingError, PqConsensusError, PqLocalBlockError, PqTransitionError, PreparedPqRandao,
     VerifiedPqRandao, compute_timestamp_at_slot, get_expected_withdrawals,
-    per_block_processing_pq_local, per_slot_processing_pq, prepare_pq_local_block,
-    prepare_pq_randao,
+    per_block_processing_pq_local, per_slot_processing_pq, prepare_pq_randao,
 };
 use std::{error::Error, sync::Arc};
 use tokio::sync::OwnedSemaphorePermit;
@@ -352,6 +352,7 @@ pub enum PqBlockProductionLocalError {
     Transition(PqTransitionError),
     Execution(execution_layer::Error),
     OperationalEvent(crate::PqOperationalEventError),
+    AttestationSelection(state_processing::PqBlockAttestationSelectionLocalError),
     Invariant(&'static str),
 }
 
@@ -378,6 +379,7 @@ pub enum PqBlockProductionError {
         expected_parent: Hash256,
         actual_head: Hash256,
     },
+    AttestationSelectionInvariant,
     Local(PqBlockProductionLocalError),
 }
 
@@ -410,6 +412,9 @@ impl std::fmt::Display for PqBlockProductionError {
                 formatter,
                 "PQ block-production parent became stale: expected {expected_parent:?}, head {actual_head:?}"
             ),
+            Self::AttestationSelectionInvariant => {
+                write!(formatter, "PQ block-attestation selection invariant failed")
+            }
             Self::Local(error) => write!(formatter, "PQ block production unavailable: {error:?}"),
         }
     }
@@ -423,11 +428,13 @@ impl Error for PqBlockProductionError {
             Self::Local(PqBlockProductionLocalError::LocalBlock(error)) => Some(error),
             Self::Local(PqBlockProductionLocalError::Transition(error)) => Some(error),
             Self::Local(PqBlockProductionLocalError::OperationalEvent(error)) => Some(error),
+            Self::Local(PqBlockProductionLocalError::AttestationSelection(error)) => Some(error),
             Self::InitialFutureSlot { .. }
             | Self::InitialPastSlot { .. }
             | Self::AtOrBehindHead { .. }
             | Self::ExpiredAfterWork { .. }
             | Self::StaleHead { .. }
+            | Self::AttestationSelectionInvariant
             | Self::Local(
                 PqBlockProductionLocalError::IngressCapacity
                 | PqBlockProductionLocalError::ClockUnavailable
@@ -502,6 +509,11 @@ struct VerifiedPqProduction<E: EthSpec> {
     admission: OwnedSemaphorePermit,
 }
 
+struct SelectedPqProduction<E: EthSpec> {
+    verified: VerifiedPqProduction<E>,
+    attestations: PqBlockAttestationSelection<E>,
+}
+
 fn map_consensus_error(error: PqConsensusError) -> PqBlockProductionError {
     match error {
         PqConsensusError::Invalid(_) => PqBlockProductionError::Invalid(error),
@@ -509,6 +521,43 @@ fn map_consensus_error(error: PqConsensusError) -> PqBlockProductionError {
             PqBlockProductionError::Local(PqBlockProductionLocalError::Consensus(error))
         }
     }
+}
+
+fn map_attestation_selection_error(
+    error: state_processing::PqBlockAttestationSelectionError,
+) -> PqBlockProductionError {
+    match error {
+        state_processing::PqBlockAttestationSelectionError::Local(error) => {
+            PqBlockProductionError::Local(PqBlockProductionLocalError::AttestationSelection(error))
+        }
+    }
+}
+
+fn map_attestation_assembly_error(
+    error: PqRetainedAttestationAssemblyError,
+) -> PqBlockProductionError {
+    match error {
+        PqRetainedAttestationAssemblyError::LocalBlock(
+            error @ PqLocalBlockError::Consensus(PqConsensusError::Local(_)),
+        ) => PqBlockProductionError::Local(PqBlockProductionLocalError::LocalBlock(error)),
+        PqRetainedAttestationAssemblyError::LocalBlock(
+            PqLocalBlockError::PreStateMismatch { .. }
+            | PqLocalBlockError::Invalid(_)
+            | PqLocalBlockError::Consensus(PqConsensusError::Invalid(_)),
+        )
+        | PqRetainedAttestationAssemblyError::WrongFork
+        | PqRetainedAttestationAssemblyError::Capacity => {
+            PqBlockProductionError::AttestationSelectionInvariant
+        }
+    }
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub fn testing_only_map_pq_attestation_assembly_error(
+    error: PqRetainedAttestationAssemblyError,
+) -> PqBlockProductionError {
+    map_attestation_assembly_error(error)
 }
 
 impl<T: BeaconChainTypes> BeaconChain<T> {
@@ -648,6 +697,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         let parent_root = verified.parent_root;
         #[cfg(feature = "pq-startup-testing")]
         let blocking_test_hook = self.pq_blocking_test_hook.clone();
+        let selection_chain = Arc::clone(&self);
         let payload_request = self
             .task_executor
             .spawn_blocking_handle(
@@ -656,8 +706,21 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                     if let Some(hook) = blocking_test_hook {
                         hook.run();
                     }
-                    build_payload_request(&verified.state, spec, parent_root)
-                        .map(|request| (request, verified))
+                    let attestations = selection_chain
+                        .select_pq_attestations_for_block(
+                            &verified.state,
+                            &selection_chain.pq_validator_key_cache,
+                            &spec,
+                        )
+                        .map_err(map_attestation_selection_error)?;
+                    let request = build_payload_request(&verified.state, spec, parent_root)?;
+                    Ok((
+                        request,
+                        SelectedPqProduction {
+                            verified,
+                            attestations,
+                        },
+                    ))
                 },
                 "pq-block-production-payload-request",
             )
@@ -670,7 +733,8 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                     "pq-block-production-payload-request",
                 ))
             })??;
-        let (payload_request, verified) = payload_request;
+        let (payload_request, selected) = payload_request;
+        self.validate_late_production_context(slot, selected.verified.parent_root)?;
         let payload = self
             .pq_execution_notifier
             .get_full_payload(payload_request)
@@ -679,12 +743,12 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 PqBlockProductionError::Local(PqBlockProductionLocalError::Execution(error))
             })?;
 
-        self.validate_late_production_context(slot, verified.parent_root)?;
+        self.validate_late_production_context(slot, selected.verified.parent_root)?;
         let spec = Arc::clone(&self.spec);
         let (output, admission) = self
             .task_executor
             .spawn_blocking_handle(
-                move || assemble_and_transition(verified, payload, graffiti, spec),
+                move || assemble_and_transition(selected, payload, graffiti, spec),
                 "pq-block-production-transition",
             )
             .ok_or(PqBlockProductionError::Local(
@@ -801,11 +865,15 @@ fn build_payload_request<E: EthSpec>(
 }
 
 fn assemble_and_transition<E: EthSpec>(
-    verified: VerifiedPqProduction<E>,
+    selected: SelectedPqProduction<E>,
     payload: PqFullPayloadResponse<E>,
     graffiti: Graffiti,
     spec: Arc<ChainSpec>,
 ) -> Result<(PqProducedBlockV3<E>, OwnedSemaphorePermit), PqBlockProductionError> {
+    let SelectedPqProduction {
+        verified,
+        attestations,
+    } = selected;
     let VerifiedPqProduction {
         state,
         parent_root,
@@ -857,10 +925,9 @@ fn assemble_and_transition<E: EthSpec>(
             PqBlockProductionError::Local(PqBlockProductionLocalError::Execution(error))
         })?;
 
-    let sealed =
-        prepare_pq_local_block(&state, block, verified_randao, Vec::new()).map_err(|error| {
-            PqBlockProductionError::Local(PqBlockProductionLocalError::LocalBlock(error))
-        })?;
+    let sealed = attestations
+        .into_verified_local_block(&state, block, verified_randao)
+        .map_err(map_attestation_assembly_error)?;
     let mut post_state = state;
     let local_output = per_block_processing_pq_local(&mut post_state, sealed).map_err(|error| {
         PqBlockProductionError::Local(PqBlockProductionLocalError::Transition(error))

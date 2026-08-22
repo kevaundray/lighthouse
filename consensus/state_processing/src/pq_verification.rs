@@ -55,6 +55,8 @@
 //! }
 //! ```
 
+#[cfg(feature = "pq-transition")]
+use crate::{ConsensusContext, ContextError, SignatureSetError};
 use crate::{
     PqAttestationError, PqAttestationInvalid, PqAttestationLocalError, PqValidatorKeyCache,
     PreparedPqAttestation, VerifiedPqAttestation,
@@ -70,10 +72,59 @@ use consensus_signature::{
     SigningIdError, VerificationClass,
 };
 use std::sync::Arc;
+#[cfg(feature = "pq-transition")]
+use types::{Attestation, AttestationRef};
 use types::{
     BeaconBlock, BeaconBlockRef, BeaconState, BeaconStateError, ChainSpec, Domain, EthSpec,
     ForkName, SignedAggregateAndProof, SignedBeaconBlock, SignedRoot, Slot,
 };
+
+#[cfg(feature = "pq-transition")]
+#[derive(Clone, Debug, PartialEq)]
+pub enum PqBlockAttestationSelectionLocalError {
+    State(BeaconStateError),
+    SignatureSet(SignatureSetError),
+    SszTypes(ssz_types::Error),
+    Bitfield(ssz::BitfieldError),
+    ConsensusContext(ContextError),
+    Arithmetic(safe_arith::ArithError),
+    Attestation(PqAttestationLocalError),
+}
+
+#[cfg(feature = "pq-transition")]
+impl std::fmt::Display for PqBlockAttestationSelectionLocalError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "PQ block-attestation selection local error: {self:?}"
+        )
+    }
+}
+
+#[cfg(feature = "pq-transition")]
+impl std::error::Error for PqBlockAttestationSelectionLocalError {}
+
+#[cfg(feature = "pq-transition")]
+#[derive(Clone, Debug, PartialEq)]
+pub enum PqBlockAttestationSelectionError {
+    Local(PqBlockAttestationSelectionLocalError),
+}
+
+#[cfg(feature = "pq-transition")]
+impl std::fmt::Display for PqBlockAttestationSelectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "PQ block-attestation selection failed: {self:?}")
+    }
+}
+
+#[cfg(feature = "pq-transition")]
+impl std::error::Error for PqBlockAttestationSelectionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Local(error) => Some(error),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PqConsensusComponent {
@@ -489,6 +540,86 @@ fn prepare_pq_randao_inner<E: EthSpec>(
         job,
         _eth_spec: std::marker::PhantomData,
     })
+}
+
+/// Revalidates one sealed, previously authenticated candidate against the exact block pre-state.
+///
+/// Consensus-invalid candidates and candidates sealed against a different state context are
+/// reported as `Ok(false)` so a proposer can skip them. Local state/cache failures abort
+/// selection.
+#[cfg(feature = "pq-transition")]
+pub fn validate_pq_attestation_for_block_selection<E: EthSpec>(
+    state: &BeaconState<E>,
+    key_cache: &PqValidatorKeyCache,
+    candidate: &VerifiedPqAttestation<E>,
+    spec: &ChainSpec,
+) -> Result<bool, PqBlockAttestationSelectionError> {
+    use crate::per_block_processing::{
+        VerifySignatures, errors::BlockOperationError, verify_attestation_for_block_inclusion,
+    };
+
+    let attestation = match candidate.attestation() {
+        Attestation::Base(attestation) => AttestationRef::Base(attestation),
+        Attestation::Electra(attestation) => AttestationRef::Electra(attestation),
+    };
+    let preflight =
+        match preflight_pq_attestation_verification_job(state, key_cache, attestation, spec) {
+            Ok(preflight) => preflight,
+            Err(PqAttestationError::Invalid(_)) => return Ok(false),
+            Err(PqAttestationError::Local(error)) => {
+                return Err(PqBlockAttestationSelectionError::Local(
+                    PqBlockAttestationSelectionLocalError::Attestation(error),
+                ));
+            }
+        };
+    if preflight.signer_indices() != candidate.signer_indices()
+        || preflight.signers() != candidate.signers()
+        || preflight.claim() != candidate.claim()
+    {
+        return Ok(false);
+    }
+    let mut context = ConsensusContext::new(state.slot());
+    match verify_attestation_for_block_inclusion(
+        state,
+        attestation,
+        &mut context,
+        VerifySignatures::False,
+        spec,
+    ) {
+        Ok(_) => {}
+        Err(BlockOperationError::Invalid(_)) => return Ok(false),
+        Err(BlockOperationError::BeaconStateError(error)) => {
+            return Err(PqBlockAttestationSelectionError::Local(
+                PqBlockAttestationSelectionLocalError::State(error),
+            ));
+        }
+        Err(BlockOperationError::SignatureSetError(error)) => {
+            return Err(PqBlockAttestationSelectionError::Local(
+                PqBlockAttestationSelectionLocalError::SignatureSet(error),
+            ));
+        }
+        Err(BlockOperationError::SszTypesError(error)) => {
+            return Err(PqBlockAttestationSelectionError::Local(
+                PqBlockAttestationSelectionLocalError::SszTypes(error),
+            ));
+        }
+        Err(BlockOperationError::BitfieldError(error)) => {
+            return Err(PqBlockAttestationSelectionError::Local(
+                PqBlockAttestationSelectionLocalError::Bitfield(error),
+            ));
+        }
+        Err(BlockOperationError::ConsensusContext(error)) => {
+            return Err(PqBlockAttestationSelectionError::Local(
+                PqBlockAttestationSelectionLocalError::ConsensusContext(error),
+            ));
+        }
+        Err(BlockOperationError::ArithError(error)) => {
+            return Err(PqBlockAttestationSelectionError::Local(
+                PqBlockAttestationSelectionLocalError::Arithmetic(error),
+            ));
+        }
+    }
+    Ok(true)
 }
 
 pub fn prepare_pq_local_block<E: EthSpec>(

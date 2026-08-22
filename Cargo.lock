@@ -1118,6 +1118,7 @@ name = "attestation_aggregation"
 version = "0.1.0"
 dependencies = [
  "consensus_signature",
+ "ethereum_ssz",
  "parking_lot",
  "state_processing",
  "types",

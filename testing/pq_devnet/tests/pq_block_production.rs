@@ -63,11 +63,11 @@ use std::time::Duration;
 use store::{HotColdDB, MemoryStore, StoreConfig};
 #[cfg(target_feature = "avx2")]
 use types::{
-    Address, BeaconBlock, BeaconState, Blob, ConsolidationRequest, DepositRequest, Domain, Epoch,
-    EthSpec, ExecPayload, ExecutionBlockHash, ExecutionPayload, ExecutionPayloadRef,
-    ExecutionRequests, ForkContext, ForkName, FullPayload, Graffiti, Hash256, KzgCommitment,
-    KzgProof, MinimalEthSpec, ProposerPreparationData, SignedBeaconBlock, SignedRoot, Slot,
-    Uint256, Withdrawal, WithdrawalRequest,
+    Address, AttestationData, BeaconBlock, BeaconState, Blob, Checkpoint, ConsolidationRequest,
+    DepositRequest, Domain, Epoch, EthSpec, ExecPayload, ExecutionBlockHash, ExecutionPayload,
+    ExecutionPayloadRef, ExecutionRequests, ForkContext, ForkName, FullPayload, Graffiti, Hash256,
+    KzgCommitment, KzgProof, MinimalEthSpec, ProposerPreparationData, SignedBeaconBlock,
+    SignedRoot, SingleAttestation, Slot, Uint256, Withdrawal, WithdrawalRequest,
 };
 
 #[cfg(target_feature = "avx2")]
@@ -1791,6 +1791,78 @@ async fn initial_slot_outcomes_distinguish_retryable_future_from_terminal_past_a
 
 #[cfg(target_feature = "avx2")]
 #[tokio::test(flavor = "current_thread")]
+async fn slot_expiry_after_attestation_selection_skips_get_payload() {
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    let fixture = valid_production_fixture(false, false);
+    let post_selection = TestingPqBlockingHook::blocking();
+    fixture
+        .chain
+        .testing_only_set_pq_attestation_pool_post_selection_hook(Some(Arc::clone(
+            &post_selection,
+        )));
+
+    struct ReleaseSelectionHook(Option<Arc<TestingPqBlockingHook>>);
+
+    impl ReleaseSelectionHook {
+        fn release(&mut self) {
+            if let Some(hook) = self.0.take() {
+                hook.release();
+            }
+        }
+    }
+
+    impl Drop for ReleaseSelectionHook {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    let mut release_selection = ReleaseSelectionHook(Some(Arc::clone(&post_selection)));
+    let producing_chain = Arc::clone(&fixture.chain);
+    let randao = fixture.randao.clone();
+    let production = tokio::spawn(async move {
+        producing_chain
+            .produce_pq_block_v3(Slot::new(1), randao, Graffiti::default())
+            .await
+    });
+    let reached_post_selection = tokio::time::timeout(Duration::from_secs(180), async {
+        loop {
+            if post_selection.entered() == 1 {
+                break true;
+            }
+            if production.is_finished() {
+                break false;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    match reached_post_selection {
+        Ok(true) => {}
+        Ok(false) => panic!("production completed before the post-selection expiry barrier"),
+        Err(error) => panic!("production did not reach the post-selection expiry barrier: {error}"),
+    }
+
+    fixture.chain.slot_clock.set_slot(2);
+    release_selection.release();
+    let error = production
+        .await
+        .expect("slot-expiry production task")
+        .expect_err("slot-one production must expire after selection");
+    assert!(matches!(
+        error,
+        PqBlockProductionError::ExpiredAfterWork { current, requested }
+            if current == Slot::new(2) && requested == Slot::new(1)
+    ));
+    assert_eq!(
+        fixture.execution.payload_calls.load(Ordering::SeqCst),
+        0,
+        "expired selection must be rejected before getPayload",
+    );
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
 async fn valid_randao_produces_one_full_canonical_empty_block_without_head_mutation() {
     let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
     let fixture = valid_production_fixture(false, false);
@@ -1827,6 +1899,472 @@ async fn valid_randao_produces_one_full_canonical_empty_block_without_head_mutat
             parent_root: genesis_root,
         }],
         "production emits only after RANDAO and the late parent/slot check",
+    );
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn actual_block_production_selects_one_retained_authentic_pq_attestation_before_payload() {
+    const PASSWORD: &[u8] = b"retained PQ block candidate";
+
+    let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
+    let runtime = task_executor::test_utils::TestRuntime::default();
+    let temporary_directory = tempfile::TempDir::new().expect("selection fixture directory");
+    let spec = Arc::new(electra_spec());
+    let provisional_validators = (1..=16)
+        .map(|byte| state_processing::DirectGenesisValidator {
+            public_key: PqPublicKey::deserialize(&[byte; 32])
+                .expect("canonical provisional public key"),
+            withdrawal_credentials: Hash256::ZERO,
+        })
+        .collect::<Vec<_>>();
+    let mut provisional =
+        state_processing::initialize_beacon_state_from_validators::<MinimalEthSpec>(
+            Hash256::ZERO,
+            0,
+            provisional_validators,
+            None,
+            &spec,
+        )
+        .expect("provisional direct PQ genesis");
+    provisional
+        .build_all_committee_caches(&spec)
+        .expect("provisional committee caches");
+    let proposer_index = provisional
+        .get_beacon_proposer_index(Slot::new(2), &spec)
+        .expect("slot-two proposer");
+    let slot_one_committee = provisional
+        .get_beacon_committee(Slot::new(1), 0)
+        .expect("slot-one committee");
+    let attester_index = *slot_one_committee
+        .committee
+        .iter()
+        .find(|index| **index != proposer_index)
+        .expect("slot-one attester distinct from slot-two proposer");
+    let late_attester_index = *slot_one_committee
+        .committee
+        .iter()
+        .find(|index| **index != attester_index)
+        .expect("second disjoint slot-one attester");
+
+    let maximum_leaf = [
+        OneTimeUseId::for_lean_pq_devnet_v1(1, SigningDuty::Attestation)
+            .expect("slot-one attestation leaf")
+            .as_u32(),
+        OneTimeUseId::for_lean_pq_devnet_v1(2, SigningDuty::RandaoReveal)
+            .expect("slot-two RANDAO leaf")
+            .as_u32(),
+    ]
+    .into_iter()
+    .max()
+    .expect("nonempty one-time-use range");
+    let proposer_keystore = PqKeystore::from_seed([0xc1; 32], 0..=maximum_leaf, PASSWORD)
+        .expect("slot-two proposer keystore");
+    let attester_keystore = PqKeystore::from_seed([0xc2; 32], 0..=maximum_leaf, PASSWORD)
+        .expect("slot-one attester keystore");
+    let late_attester_keystore = (late_attester_index != proposer_index)
+        .then(|| PqKeystore::from_seed([0xc3; 32], 0..=maximum_leaf, PASSWORD))
+        .transpose()
+        .expect("late slot-one attester keystore");
+    let proposer_authenticated = proposer_keystore
+        .authenticate(PASSWORD)
+        .expect("authenticated slot-two proposer");
+    let attester_authenticated = attester_keystore
+        .authenticate(PASSWORD)
+        .expect("authenticated slot-one attester");
+    let late_attester_authenticated = late_attester_keystore
+        .as_ref()
+        .map(|keystore| keystore.authenticate(PASSWORD))
+        .transpose()
+        .expect("authenticated late slot-one attester");
+    let mut final_validators = (1..=16)
+        .map(|byte| state_processing::DirectGenesisValidator {
+            public_key: PqPublicKey::deserialize(&[byte; 32]).expect("canonical final public key"),
+            withdrawal_credentials: Hash256::ZERO,
+        })
+        .collect::<Vec<_>>();
+    final_validators[proposer_index].public_key = *proposer_authenticated.public_key();
+    final_validators[attester_index].public_key = *attester_authenticated.public_key();
+    if let Some(authenticated) = &late_attester_authenticated {
+        final_validators[late_attester_index].public_key = *authenticated.public_key();
+    }
+    let mut genesis = state_processing::initialize_beacon_state_from_validators::<MinimalEthSpec>(
+        Hash256::ZERO,
+        0,
+        final_validators,
+        None,
+        &spec,
+    )
+    .expect("final direct PQ genesis");
+    genesis
+        .build_all_committee_caches(&spec)
+        .expect("final committee caches");
+    assert_eq!(
+        genesis
+            .get_beacon_proposer_index(Slot::new(2), &spec)
+            .expect("final slot-two proposer"),
+        proposer_index,
+        "supplying final keys must not change the specialized proposer",
+    );
+    assert!(
+        genesis
+            .get_beacon_committee(Slot::new(1), 0)
+            .expect("final slot-one committee")
+            .committee
+            .contains(&attester_index),
+        "supplying final keys must preserve the specialized attester",
+    );
+    assert!(
+        genesis
+            .get_beacon_committee(Slot::new(1), 0)
+            .expect("final slot-one committee")
+            .committee
+            .contains(&late_attester_index),
+        "supplying final keys must preserve the second specialized attester",
+    );
+    let validators_root = genesis.genesis_validators_root().0;
+    let journal_path = temporary_directory.path().join("xmss_usage.sqlite");
+    let mut authenticated_keys = vec![proposer_authenticated, attester_authenticated];
+    if let Some(authenticated) = late_attester_authenticated {
+        authenticated_keys.push(authenticated);
+    }
+    provision_usage_journal(&journal_path, validators_root, &authenticated_keys)
+        .expect("selection usage journal");
+    let mut key_unlocks = vec![
+        PqKeyUnlock::new(proposer_keystore, PASSWORD).expect("slot-two proposer unlock"),
+        PqKeyUnlock::new(attester_keystore, PASSWORD).expect("slot-one attester unlock"),
+    ];
+    if let Some(keystore) = late_attester_keystore {
+        key_unlocks
+            .push(PqKeyUnlock::new(keystore, PASSWORD).expect("late slot-one attester unlock"));
+    }
+    let authority = PqSigningAuthority::open(&journal_path, validators_root, key_unlocks)
+        .expect("selection signing authority");
+    let execution = Arc::new(RecordingExecution {
+        new_payload_calls: AtomicUsize::new(0),
+        new_payload_responses: Mutex::new(VecDeque::new()),
+        stall_new_payload: AtomicBool::new(false),
+        new_payload_release: tokio::sync::Semaphore::new(0),
+        forkchoice_calls: AtomicUsize::new(0),
+        forkchoice_responses: Mutex::new(VecDeque::new()),
+        stall_forkchoice: AtomicBool::new(false),
+        forkchoice_release: tokio::sync::Semaphore::new(0),
+        payload_calls: AtomicUsize::new(0),
+        stall_payload: AtomicBool::new(false),
+        omit_payload_bundle: AtomicBool::new(false),
+        invalid_payload_block_hash: AtomicBool::new(false),
+        nonzero_blob_gas: AtomicBool::new(false),
+        payload_release: tokio::sync::Semaphore::new(0),
+    });
+    let aggregation_service =
+        Arc::new(AggregationService::new().expect("one process aggregation service"));
+    let chain = Arc::new(
+        BeaconChainBuilder::<TestWitness>::pq_new(MinimalEthSpec)
+            .store(exact_snapshot_store(Arc::clone(&spec)))
+            .custom_spec(Arc::clone(&spec))
+            .genesis_state(genesis)
+            .expect("persist specialized genesis")
+            .pq_aggregation_service(Arc::clone(&aggregation_service))
+            .task_executor(runtime.task_executor.clone())
+            .testing_only_pq_execution_notifier(execution.clone())
+            .build()
+            .expect("specialized selection chain"),
+    );
+    chain.slot_clock.set_slot(2);
+    let genesis_root = chain.head_snapshot().beacon_block_root;
+    let mut advanced_state = chain.head_snapshot().beacon_state.clone();
+    while advanced_state.slot() < Slot::new(2) {
+        state_processing::per_slot_processing_pq(&mut advanced_state, &spec)
+            .expect("advance exact block-production state");
+    }
+    let attestation_data = AttestationData {
+        slot: Slot::new(1),
+        index: 0,
+        beacon_block_root: genesis_root,
+        source: Checkpoint::default(),
+        target: Checkpoint {
+            epoch: Epoch::new(0),
+            root: genesis_root,
+        },
+    };
+    let attestation_domain = spec.get_domain(
+        Epoch::new(0),
+        Domain::BeaconAttester,
+        &advanced_state.fork(),
+        advanced_state.genesis_validators_root(),
+    );
+    let attester_public_key = advanced_state
+        .validators()
+        .get(attester_index)
+        .expect("final attester validator")
+        .pubkey;
+    let attestation_signature = authority
+        .signer(&attester_public_key)
+        .expect("bound attester signer")
+        .sign(consensus_signature::pq::PqSigningClaim::new(
+            attestation_data.signing_root(attestation_domain).0,
+            OneTimeUseId::for_lean_pq_devnet_v1(1, SigningDuty::Attestation)
+                .expect("slot-one attestation leaf"),
+        ))
+        .expect("journal-backed slot-one attestation");
+    let late_attester_public_key = advanced_state
+        .validators()
+        .get(late_attester_index)
+        .expect("final late attester validator")
+        .pubkey;
+    let late_attestation_signature = authority
+        .signer(&late_attester_public_key)
+        .expect("bound late attester signer")
+        .sign(consensus_signature::pq::PqSigningClaim::new(
+            attestation_data.signing_root(attestation_domain).0,
+            OneTimeUseId::for_lean_pq_devnet_v1(1, SigningDuty::Attestation)
+                .expect("late slot-one attestation leaf"),
+        ))
+        .expect("journal-backed late slot-one attestation");
+    let prepared = state_processing::prepare_pq_single_attestation(
+        &advanced_state,
+        &chain.pq_validator_key_cache,
+        SingleAttestation {
+            committee_index: 0,
+            attester_index: u64::try_from(attester_index).expect("bounded attester index"),
+            data: attestation_data.clone(),
+            signature: (&attestation_signature).into(),
+        },
+        &spec,
+    )
+    .expect("prepare exact retained raw single");
+    let late_prepared = state_processing::prepare_pq_single_attestation(
+        &advanced_state,
+        &chain.pq_validator_key_cache,
+        SingleAttestation {
+            committee_index: 0,
+            attester_index: u64::try_from(late_attester_index)
+                .expect("bounded late attester index"),
+            data: attestation_data,
+            signature: (&late_attestation_signature).into(),
+        },
+        &spec,
+    )
+    .expect("prepare exact late retained raw single");
+    let (verified_candidate, late_verified_candidate) = tokio::join!(
+        prepared.verify(&aggregation_service),
+        late_prepared.verify(&aggregation_service),
+    );
+    let (_, verified_candidate) = verified_candidate
+        .expect("authenticate exact retained raw single")
+        .into_parts();
+    let (_, late_verified_candidate) = late_verified_candidate
+        .expect("authenticate exact late retained raw single")
+        .into_parts();
+    assert_eq!(
+        state_processing::validate_pq_attestation_for_block_selection(
+            &advanced_state,
+            &chain.pq_validator_key_cache,
+            &verified_candidate,
+            &spec,
+        ),
+        Ok(true),
+        "the sealed candidate remains authoritative for its original state",
+    );
+    let mut changed_key_state = advanced_state.clone();
+    let changed_key_index = (0..changed_key_state.validators().len())
+        .find(|index| *index != attester_index)
+        .expect("a distinct changed-context validator");
+    let attester_state_b_pubkey = changed_key_state
+        .validators()
+        .get(changed_key_index)
+        .expect("state-B source validator")
+        .pubkey;
+    let changed_state_b_pubkey = changed_key_state
+        .validators()
+        .get(attester_index)
+        .expect("state-B attester validator")
+        .pubkey;
+    changed_key_state
+        .validators_mut()
+        .get_mut(attester_index)
+        .expect("state-B attester validator")
+        .pubkey = attester_state_b_pubkey;
+    changed_key_state
+        .validators_mut()
+        .get_mut(changed_key_index)
+        .expect("state-B changed-context validator")
+        .pubkey = changed_state_b_pubkey;
+    let changed_key_cache = state_processing::PqValidatorKeyCache::from_state(&changed_key_state)
+        .expect("synthetic state-B matching PQ key cache");
+    assert_eq!(
+        state_processing::validate_pq_attestation_for_block_selection(
+            &changed_key_state,
+            &changed_key_cache,
+            &verified_candidate,
+            &spec,
+        ),
+        Ok(false),
+        "a synthetic state-B key context skips a state-A sealed token",
+    );
+    assert_eq!(
+        state_processing::validate_pq_attestation_for_block_selection(
+            &advanced_state,
+            &chain.pq_validator_key_cache,
+            &verified_candidate,
+            &spec,
+        ),
+        Ok(true),
+        "synthetic state-B validation must not consume or corrupt the state-A candidate",
+    );
+    assert_eq!(
+        state_processing::validate_pq_attestation_for_block_selection(
+            &advanced_state,
+            &chain.pq_validator_key_cache,
+            &late_verified_candidate,
+            &spec,
+        ),
+        Ok(true),
+        "the held late candidate is independently authoritative for state A",
+    );
+    let expected_attestation = verified_candidate.attestation().clone();
+    let late_expected_attestation = late_verified_candidate.attestation().clone();
+    chain
+        .testing_only_insert_pq_attestation_pool_candidate(verified_candidate)
+        .expect("move sealed candidate into the chain-owned pool");
+    let retained_snapshot = chain.testing_only_pq_attestation_pool_snapshot();
+    assert_eq!(retained_snapshot.candidate_count, 1);
+    assert_eq!(
+        retained_snapshot.candidate_signer_sets,
+        vec![vec![
+            u64::try_from(attester_index).expect("bounded attester index")
+        ]],
+    );
+
+    let post_selection = TestingPqBlockingHook::blocking();
+    struct ReleasePostSelectionHook(Option<Arc<TestingPqBlockingHook>>);
+
+    impl ReleasePostSelectionHook {
+        fn release(&mut self) {
+            if let Some(hook) = self.0.take() {
+                hook.release();
+            }
+        }
+    }
+
+    impl Drop for ReleasePostSelectionHook {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    let mut release_post_selection = ReleasePostSelectionHook(Some(Arc::clone(&post_selection)));
+    chain.testing_only_set_pq_attestation_pool_post_selection_hook(Some(Arc::clone(
+        &post_selection,
+    )));
+    let randao_domain = spec.get_domain(
+        advanced_state.current_epoch(),
+        Domain::Randao,
+        &advanced_state.fork(),
+        advanced_state.genesis_validators_root(),
+    );
+    let proposer_public_key = advanced_state
+        .validators()
+        .get(proposer_index)
+        .expect("final proposer validator")
+        .pubkey;
+    let randao = authority
+        .signer(&proposer_public_key)
+        .expect("bound proposer signer")
+        .sign(consensus_signature::pq::PqSigningClaim::new(
+            advanced_state.current_epoch().signing_root(randao_domain).0,
+            OneTimeUseId::for_lean_pq_devnet_v1(2, SigningDuty::RandaoReveal)
+                .expect("slot-two RANDAO leaf"),
+        ))
+        .expect("journal-backed slot-two RANDAO");
+    let producing_chain = Arc::clone(&chain);
+    let production = tokio::spawn(async move {
+        producing_chain
+            .produce_pq_block_v3(Slot::new(2), randao, Graffiti::default())
+            .await
+    });
+    let reached_post_selection = tokio::time::timeout(Duration::from_secs(180), async {
+        loop {
+            if post_selection.entered() == 1 {
+                break true;
+            }
+            if production.is_finished() {
+                break false;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    match reached_post_selection {
+        Ok(true) => {}
+        Ok(false) => {
+            panic!("actual production completed before the post-selection barrier");
+        }
+        Err(error) => {
+            panic!("actual production did not reach the post-selection barrier: {error}");
+        }
+    }
+    let payload_calls_before_release = execution.payload_calls.load(Ordering::SeqCst);
+    let late_insertion = {
+        let chain = Arc::clone(&chain);
+        tokio::task::spawn_blocking(move || {
+            chain.testing_only_insert_pq_attestation_pool_candidate(late_verified_candidate)
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), late_insertion)
+        .await
+        .expect("late insertion cannot remain blocked behind the immutable selection")
+        .expect("late insertion blocking task")
+        .expect("insert late sealed candidate after the production snapshot");
+    let blocked_snapshot = {
+        let chain = Arc::clone(&chain);
+        tokio::task::spawn_blocking(move || chain.testing_only_pq_attestation_pool_snapshot())
+    };
+    let snapshot_before_release =
+        tokio::time::timeout(Duration::from_secs(5), blocked_snapshot).await;
+    release_post_selection.release();
+    assert_eq!(
+        payload_calls_before_release, 0,
+        "authoritative attestation selection must finish before getPayload",
+    );
+    let retained_after_late_insert = snapshot_before_release
+        .expect("pool snapshot cannot be locked behind the post-selection hook")
+        .expect("pool snapshot blocking task");
+    assert_eq!(retained_after_late_insert.candidate_count, 2);
+    let mut expected_signer_sets = vec![
+        vec![u64::try_from(attester_index).expect("bounded attester index")],
+        vec![u64::try_from(late_attester_index).expect("bounded late attester index")],
+    ];
+    expected_signer_sets.sort_unstable();
+    assert_eq!(
+        retained_after_late_insert.candidate_signer_sets, expected_signer_sets,
+        "the off-loop pool snapshot must see both retained disjoint candidates",
+    );
+    let produced = production
+        .await
+        .expect("slot-two production task")
+        .expect("slot-two production with one retained candidate");
+    let block = produced.contents().block();
+    assert_eq!(block.body().attestations_len(), 1);
+    assert_eq!(
+        block
+            .body()
+            .attestations()
+            .next()
+            .expect("one selected attestation")
+            .clone_as_attestation(),
+        expected_attestation,
+        "the block must contain the exact authenticated pool bytes",
+    );
+    assert_ne!(
+        expected_attestation, late_expected_attestation,
+        "the late candidate must carry a distinct signer and exact signature bytes",
+    );
+    assert_eq!(execution.payload_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        chain.testing_only_pq_attestation_pool_snapshot(),
+        retained_after_late_insert,
+        "production consumes its immutable A-only selection while the pool retains A and late B",
     );
 }
 
