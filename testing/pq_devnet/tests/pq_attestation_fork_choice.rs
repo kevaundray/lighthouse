@@ -63,6 +63,8 @@ mod avx2 {
         fn notify_forkchoice_updated<'a>(
             &'a self,
             _head_block_hash: types::ExecutionBlockHash,
+            _safe_block_hash: types::ExecutionBlockHash,
+            _finalized_block_hash: types::ExecutionBlockHash,
             _current_slot: Slot,
             _head_block_root: Hash256,
         ) -> std::pin::Pin<
@@ -113,6 +115,9 @@ mod avx2 {
         executor_exit_sender: async_channel::Sender<()>,
         shutdown_receiver: futures::channel::mpsc::Receiver<task_executor::ShutdownReason>,
         _temporary_directory: tempfile::TempDir,
+        store: Arc<HotColdDB<MinimalEthSpec, MemoryStore, MemoryStore>>,
+        service: Arc<AggregationService>,
+        task_executor: task_executor::TaskExecutor,
         chain: Arc<BeaconChain<TestWitness>>,
         processor: Arc<PqNetworkBlockProcessor<TestWitness>>,
         signed: Arc<SignedBeaconBlock<MinimalEthSpec>>,
@@ -211,14 +216,15 @@ mod avx2 {
         .expect("signing authority");
         let service = Arc::new(AggregationService::new().expect("PQ aggregation service"));
         let transport = Arc::new(BlockingForkchoiceTransport::new());
+        let store = exact_snapshot_store(Arc::clone(&spec));
         let chain = Arc::new(
             BeaconChainBuilder::<TestWitness>::pq_new(MinimalEthSpec)
-                .store(exact_snapshot_store(Arc::clone(&spec)))
+                .store(Arc::clone(&store))
                 .custom_spec(Arc::clone(&spec))
                 .genesis_state(genesis.clone())
                 .expect("persist genesis")
                 .pq_aggregation_service(Arc::clone(&service))
-                .task_executor(task_executor)
+                .task_executor(task_executor.clone())
                 .testing_only_pq_execution_notifier(transport.clone())
                 .build()
                 .expect("PQ chain"),
@@ -311,6 +317,9 @@ mod avx2 {
             executor_exit_sender,
             shutdown_receiver,
             _temporary_directory: temporary_directory,
+            store,
+            service,
+            task_executor,
             chain,
             processor,
             signed,
@@ -1220,6 +1229,104 @@ mod avx2 {
                 local_dominated: 0,
                 local_removed_subsets: 0,
             },
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_genesis_restart_reconstructs_fork_choice_and_consumes_an_exact_vote() {
+        let fixture = fresh_slot_one_fixture().await;
+        let (single, subnet) = slot_one_single_attestation(&fixture);
+        let FreshSlotOneFixture {
+            executor_exit_sender,
+            _temporary_directory,
+            store,
+            service,
+            task_executor,
+            chain,
+            processor,
+            signed,
+            block_root,
+            attester_index,
+            spec,
+            transport,
+            ..
+        } = fixture;
+        let _executor_exit_sender = executor_exit_sender;
+        chain.slot_clock.set_slot(1);
+        transport.forkchoice_release.add_permits(1);
+        processor
+            .import_rpc_block(signed)
+            .await
+            .expect("persist and reconcile the authentic slot-one head");
+        assert_eq!(chain.head_snapshot().beacon_block_root, block_root);
+        chain.close_and_drain_pq_imports().await;
+        drop(processor);
+        drop(chain);
+
+        let restarted_transport: Arc<dyn PqNewPayloadTransport<MinimalEthSpec>> = transport.clone();
+        let restarted = Arc::new(
+            BeaconChainBuilder::<TestWitness>::pq_new(MinimalEthSpec)
+                .store(store)
+                .custom_spec(Arc::clone(&spec))
+                .resume_from_db()
+                .expect("resume the authentic post-genesis head")
+                .pq_aggregation_service(service)
+                .task_executor(task_executor)
+                .testing_only_pq_execution_notifier(restarted_transport)
+                .build()
+                .expect("rebuild the post-genesis chain owner"),
+        );
+        assert_eq!(restarted.head_snapshot().beacon_block_root, block_root);
+        assert_eq!(
+            restarted.testing_only_pq_fork_choice_current_slot(),
+            Some(Slot::new(1)),
+            "resume must reconstruct fork choice at the exact durable head",
+        );
+        assert_eq!(
+            restarted.testing_only_pq_fork_choice_proposer_boost_root(),
+            Some(Hash256::default()),
+            "historical replay must not fabricate proposer boost for the durable head",
+        );
+        assert_eq!(
+            restarted.testing_only_pq_fork_choice_cached_head_root(),
+            Some(block_root),
+            "historical replay must refresh the cached fork-choice head",
+        );
+        restarted.slot_clock.set_slot(2);
+        transport.forkchoice_release.add_permits(1);
+        restarted
+            .reconcile_persisted_pq_head()
+            .await
+            .expect("reconcile the resumed execution head");
+        restarted
+            .on_pq_fork_choice_tick(Slot::new(2))
+            .await
+            .expect("continue the checked fork-choice clock after restart");
+
+        let processor = PqNetworkBlockProcessor::new(Arc::clone(&restarted));
+        let token = match processor.verify_gossip_attestation(single, subnet).await {
+            PqGossipAttestationDisposition::Accept(token) => token,
+            PqGossipAttestationDisposition::Reject(error) => {
+                panic!("valid resumed vote was rejected: {error:?}")
+            }
+            PqGossipAttestationDisposition::Ignore(error) => {
+                panic!("valid resumed vote was ignored: {error:?}")
+            }
+        };
+        let verified = (*token)
+            .mark_propagated()
+            .expect("transfer the exact resumed vote authority");
+        assert_eq!(
+            restarted
+                .consume_pq_verified_gossip_single(verified)
+                .await
+                .expect("consume the exact vote after restart"),
+            beacon_chain::PqForkChoiceAttestationOutcome::Applied,
+        );
+        assert_eq!(
+            restarted.testing_only_pq_fork_choice_latest_message(attester_index),
+            Some((Slot::new(1), block_root)),
+            "the resumed fork choice must retain the exact validator vote",
         );
     }
 

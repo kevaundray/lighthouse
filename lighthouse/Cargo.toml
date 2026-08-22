@@ -51,6 +51,7 @@ pq-proposer = [
 ]
 pq-startup-testing = [
     "pq-proposer",
+    "beacon_node/pq-startup-testing",
     "network/pq-startup-testing",
     "pq_attester_service/pq-startup-testing",
 ]

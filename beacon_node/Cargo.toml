@@ -25,6 +25,7 @@ pq-devnet = [
     "types/pq-devnet",
 ]
 pq-proposer = ["pq-devnet", "client/pq-proposer"]
+pq-startup-testing = ["pq-proposer", "client/pq-startup-testing"]
 
 [dependencies]
 account_utils = { workspace = true }

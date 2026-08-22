@@ -32,6 +32,13 @@ pub use pq_runtime::PqPublicTestnetError;
 pub use pq_runtime::{
     PqClient, PqProposerRuntimePaths, PqRuntimeConfig, PqRuntimeConfigError, PqRuntimeError,
 };
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+#[doc(hidden)]
+pub use pq_runtime::{
+    TestingPqAttesterLoop, TestingPqAttesterLoopCompletion, TestingPqAttesterPublicationBarrier,
+    TestingPqParkedAttesterLoop, testing_only_start_pq_attester_loop_parked,
+    testing_only_start_pq_attester_loop_parked_with_publication_barrier,
+};
 
 /// The core "beacon node" client.
 ///

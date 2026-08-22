@@ -18,7 +18,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use store::{HotColdDB, ItemStore};
 use task_executor::TaskExecutor;
-use types::{BeaconState, ChainSpec, EthSpec, Hash256, SignedBeaconBlock, Slot};
+use types::{
+    BeaconState, ChainSpec, EthSpec, ExecutionBlockHash, Hash256, SignedBeaconBlock, Slot,
+};
 
 use crate::pq_background_attestation_aggregation::PqBackgroundAttestationAggregator;
 
@@ -722,6 +724,9 @@ pub enum PqRuntimeError {
     Aggregation(consensus_signature::AggregationError),
     ForkChoiceStore(crate::beacon_fork_choice_store::Error),
     ForkChoice(fork_choice::Error<crate::beacon_fork_choice_store::Error>),
+    MissingForkChoiceHistoryBlock(Hash256),
+    MissingForkChoiceHistoryState(Hash256),
+    ForkChoiceHistoryBinding(&'static str),
     MissingExecutionNotifier,
     MissingTaskExecutor,
     DeferredRuntimeIntegration,
@@ -755,6 +760,15 @@ impl std::fmt::Display for PqRuntimeError {
             Self::ForkChoice(error) => {
                 write!(formatter, "PQ fork-choice initialization failed: {error:?}")
             }
+            Self::MissingForkChoiceHistoryBlock(root) => {
+                write!(formatter, "PQ fork-choice history block {root:?} is missing")
+            }
+            Self::MissingForkChoiceHistoryState(root) => {
+                write!(formatter, "PQ fork-choice history state {root:?} is missing")
+            }
+            Self::ForkChoiceHistoryBinding(reason) => {
+                write!(formatter, "PQ fork-choice history binding rejected: {reason}")
+            }
             Self::MissingExecutionNotifier => {
                 formatter.write_str("PQ execution notifier was not installed")
             }
@@ -780,6 +794,9 @@ impl std::error::Error for PqRuntimeError {
             | Self::Store(_)
             | Self::ForkChoiceStore(_)
             | Self::ForkChoice(_)
+            | Self::MissingForkChoiceHistoryBlock(_)
+            | Self::MissingForkChoiceHistoryState(_)
+            | Self::ForkChoiceHistoryBinding(_)
             | Self::MissingExecutionNotifier
             | Self::MissingTaskExecutor
             | Self::DeferredRuntimeIntegration => None,
@@ -791,6 +808,139 @@ impl From<store::Error> for PqRuntimeError {
     fn from(error: store::Error) -> Self {
         Self::Store(error)
     }
+}
+
+fn reconstruct_pq_fork_choice<T: BeaconChainTypes>(
+    store: &BeaconStore<T>,
+    canonical_head: &BeaconSnapshot<T::EthSpec>,
+    spec: &ChainSpec,
+) -> Result<(PqForkChoice<T>, ExecutionBlockHash), PqRuntimeError> {
+    let head_slot = canonical_head.beacon_state.slot();
+    let genesis_slot = spec.genesis_slot;
+    let (anchor, mut descendants) = if head_slot == genesis_slot {
+        (canonical_head.clone(), Vec::new())
+    } else {
+        let genesis_block_root = *canonical_head
+            .beacon_state
+            .get_block_root(genesis_slot)
+            .map_err(|error| {
+                PqRuntimeError::ForkChoiceStore(
+                    crate::beacon_fork_choice_store::Error::BeaconStateError(error),
+                )
+            })?;
+        let genesis_state_root = *canonical_head
+            .beacon_state
+            .get_state_root(genesis_slot)
+            .map_err(|error| {
+                PqRuntimeError::ForkChoiceStore(
+                    crate::beacon_fork_choice_store::Error::BeaconStateError(error),
+                )
+            })?;
+        let genesis_block = store.get_full_block(&genesis_block_root)?.ok_or(
+            PqRuntimeError::MissingForkChoiceHistoryBlock(genesis_block_root),
+        )?;
+        let mut genesis_state = store
+            .get_state(&genesis_state_root, Some(genesis_slot), true)?
+            .ok_or(PqRuntimeError::MissingForkChoiceHistoryState(
+                genesis_state_root,
+            ))?;
+        if genesis_block.canonical_root() != genesis_block_root
+            || genesis_block.message().state_root() != genesis_state_root
+            || genesis_state
+                .update_tree_hash_cache()
+                .map_err(store::Error::from)?
+                != genesis_state_root
+        {
+            return Err(PqRuntimeError::ForkChoiceHistoryBinding(
+                "genesis block and state do not match the canonical history roots",
+            ));
+        }
+        let anchor = BeaconSnapshot {
+            beacon_block: Arc::new(genesis_block),
+            beacon_block_root: genesis_block_root,
+            beacon_state: genesis_state,
+            validated_state_root: genesis_state_root,
+        };
+
+        let mut descendants = Vec::new();
+        let mut descendant_root = canonical_head.beacon_block_root;
+        while descendant_root != genesis_block_root {
+            if descendants.len() >= T::EthSpec::slots_per_historical_root() {
+                return Err(PqRuntimeError::ForkChoiceHistoryBinding(
+                    "canonical history exceeds the bounded V1 reconstruction window",
+                ));
+            }
+            let block = store.get_full_block(&descendant_root)?.ok_or(
+                PqRuntimeError::MissingForkChoiceHistoryBlock(descendant_root),
+            )?;
+            if block.canonical_root() != descendant_root || block.slot() <= genesis_slot {
+                return Err(PqRuntimeError::ForkChoiceHistoryBinding(
+                    "canonical descendant block root or slot is invalid",
+                ));
+            }
+            let state_root = block.message().state_root();
+            let mut state = store
+                .get_state(&state_root, Some(block.slot()), true)?
+                .ok_or(PqRuntimeError::MissingForkChoiceHistoryState(state_root))?;
+            if state.slot() != block.slot()
+                || state.update_tree_hash_cache().map_err(store::Error::from)? != state_root
+            {
+                return Err(PqRuntimeError::ForkChoiceHistoryBinding(
+                    "canonical descendant state does not match its block",
+                ));
+            }
+            descendant_root = block.parent_root();
+            descendants.push((block, state));
+        }
+        descendants.reverse();
+        (anchor, descendants)
+    };
+
+    let genesis_execution_hash = anchor
+        .beacon_state
+        .latest_execution_payload_header()
+        .map_err(|_| {
+            PqRuntimeError::PersistedHeadBinding("genesis state has no execution payload header")
+        })?
+        .block_hash();
+    let fork_choice_store =
+        crate::beacon_fork_choice_store::BeaconForkChoiceStore::get_forkchoice_store(
+            Arc::clone(store),
+            anchor.clone(),
+        )
+        .map_err(PqRuntimeError::ForkChoiceStore)?;
+    let mut fork_choice = fork_choice::ForkChoice::from_anchor(
+        fork_choice_store,
+        anchor.beacon_block_root,
+        anchor.beacon_block.as_ref(),
+        &anchor.beacon_state,
+        Some(head_slot),
+        spec,
+    )
+    .map_err(PqRuntimeError::ForkChoice)?;
+    for (block, state) in descendants.drain(..) {
+        let block_root = block.canonical_root();
+        fork_choice
+            .on_block(
+                head_slot,
+                block.message(),
+                block_root,
+                spec.get_attestation_due::<T::EthSpec>(block.slot()),
+                &state,
+                fork_choice::PayloadVerificationStatus::Verified,
+                spec,
+            )
+            .map_err(PqRuntimeError::ForkChoice)?;
+    }
+    let (reconstructed_head, _) = fork_choice
+        .get_head(head_slot, spec)
+        .map_err(PqRuntimeError::ForkChoice)?;
+    if reconstructed_head != canonical_head.beacon_block_root {
+        return Err(PqRuntimeError::ForkChoiceHistoryBinding(
+            "reconstructed fork-choice head does not match the durable canonical head",
+        ));
+    }
+    Ok((fork_choice, genesis_execution_hash))
 }
 
 /// Immutable ownership root for the Task 5.3e-b PQ runtime.
@@ -811,6 +961,7 @@ pub struct BeaconChain<T: BeaconChainTypes> {
     pub(crate) pq_attestation_gossip_observations:
         Arc<Mutex<crate::pq_attestation_gossip::PqAttestationGossipObservationCache<T::EthSpec>>>,
     pub(crate) pq_execution_notifier: crate::pq_import::PqExecutionNotifier<T::EthSpec>,
+    pub(crate) pq_genesis_execution_hash: ExecutionBlockHash,
     pub(crate) pq_operational_events: Option<std::sync::Weak<crate::PqOperationalEventSink>>,
     pub(crate) pq_execution_reconciliation: Arc<PqExecutionReconciliation>,
     pub(crate) task_executor: TaskExecutor,
@@ -989,28 +1140,9 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
     ) -> Result<Self, PqRuntimeError> {
         let initial_block_root = canonical_head.beacon_block_root;
         let pq_attestation_pool = Arc::new(OperationPool::new(Arc::clone(&pq_aggregation_service)));
-        // Task 7.2 cycle 1 deliberately establishes only an in-memory Fresh fork choice. Resume
-        // reconstruction/persistence is a later vertical slice and must not be inferred here.
-        let pq_fork_choice = if canonical_head.beacon_state.slot() == spec.genesis_slot {
-            let fork_choice_store =
-                crate::beacon_fork_choice_store::BeaconForkChoiceStore::get_forkchoice_store(
-                    Arc::clone(&store),
-                    canonical_head.clone(),
-                )
-                .map_err(PqRuntimeError::ForkChoiceStore)?;
-            let fork_choice = fork_choice::ForkChoice::from_anchor(
-                fork_choice_store,
-                canonical_head.beacon_block_root,
-                canonical_head.beacon_block.as_ref(),
-                &canonical_head.beacon_state,
-                Some(canonical_head.beacon_state.slot()),
-                &spec,
-            )
-            .map_err(PqRuntimeError::ForkChoice)?;
-            Some(Arc::new(Mutex::new(fork_choice)))
-        } else {
-            None
-        };
+        let (fork_choice, pq_genesis_execution_hash) =
+            reconstruct_pq_fork_choice::<T>(&store, &canonical_head, &spec)?;
+        let pq_fork_choice = Some(Arc::new(Mutex::new(fork_choice)));
         let canonical_head = Arc::new(RwLock::new(Arc::new(canonical_head)));
         let pq_execution_reconciliation = Arc::new(PqExecutionReconciliation::new(
             PqExecutionReconciliationState::Pending {
@@ -1059,6 +1191,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 crate::pq_attestation_gossip::PqAttestationGossipObservationCache::default(),
             )),
             pq_execution_notifier,
+            pq_genesis_execution_hash,
             pq_operational_events,
             pq_execution_reconciliation,
             task_executor,
@@ -1987,6 +2120,22 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         self.pq_fork_choice
             .as_ref()
             .map(|fork_choice| fork_choice.lock().fc_store().get_current_slot())
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_pq_fork_choice_proposer_boost_root(&self) -> Option<Hash256> {
+        self.pq_fork_choice
+            .as_ref()
+            .map(|fork_choice| fork_choice.lock().proposer_boost_root())
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_pq_fork_choice_cached_head_root(&self) -> Option<Hash256> {
+        self.pq_fork_choice
+            .as_ref()
+            .map(|fork_choice| fork_choice.lock().cached_fork_choice_view().head_block_root)
     }
 
     #[cfg(feature = "pq-startup-testing")]

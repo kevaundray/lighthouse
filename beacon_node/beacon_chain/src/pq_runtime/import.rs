@@ -1,5 +1,6 @@
-use crate::{BeaconChain, BeaconChainTypes, PqRuntimeError};
+use crate::{BeaconChain, BeaconChainTypes, BeaconStore, PqRuntimeError};
 use execution_layer::{ExecutionLayer, NewPayloadRequest, PayloadStatus};
+use fork_choice::ForkchoiceUpdateParameters;
 use sha2::{Digest, Sha256};
 use slot_clock::SlotClock;
 use ssz::Encode;
@@ -20,7 +21,9 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
-use types::{EthSpec, ExecPayload, ExecutionBlockHash, Hash256, SignedBeaconBlock, Slot};
+use types::{
+    Checkpoint, EthSpec, ExecPayload, ExecutionBlockHash, Hash256, SignedBeaconBlock, Slot,
+};
 
 pub const PQ_EXECUTION_RECONCILIATION_ATTEMPTS: usize = 3;
 const PQ_EXECUTION_RECONCILIATION_BACKOFF: Duration = Duration::from_millis(25);
@@ -208,6 +211,8 @@ pub trait PqNewPayloadTransport<E: EthSpec>: Send + Sync {
     fn notify_forkchoice_updated<'a>(
         &'a self,
         head_block_hash: ExecutionBlockHash,
+        safe_block_hash: ExecutionBlockHash,
+        finalized_block_hash: ExecutionBlockHash,
         current_slot: Slot,
         head_block_root: Hash256,
     ) -> Pin<Box<dyn Future<Output = Result<PayloadStatus, execution_layer::Error>> + Send + 'a>>;
@@ -295,6 +300,8 @@ impl<E: EthSpec> PqExecutionNotifier<E> {
         &self,
         guard: &PqExecutionForkchoiceGuard,
         head_block_hash: ExecutionBlockHash,
+        safe_block_hash: ExecutionBlockHash,
+        finalized_block_hash: ExecutionBlockHash,
         _current_slot: Slot,
         _head_block_root: Hash256,
     ) -> Result<PayloadStatus, execution_layer::Error> {
@@ -308,15 +315,21 @@ impl<E: EthSpec> PqExecutionNotifier<E> {
                 execution_layer
                     .notify_forkchoice_updated_for_pq(execution_layer::ForkchoiceState {
                         head_block_hash,
-                        safe_block_hash: ExecutionBlockHash::zero(),
-                        finalized_block_hash: ExecutionBlockHash::zero(),
+                        safe_block_hash,
+                        finalized_block_hash,
                     })
                     .await
             }
             #[cfg(feature = "pq-startup-testing")]
             (Self::Testing(notifier), PqExecutionForkchoiceGuard::Testing) => {
                 notifier
-                    .notify_forkchoice_updated(head_block_hash, _current_slot, _head_block_root)
+                    .notify_forkchoice_updated(
+                        head_block_hash,
+                        safe_block_hash,
+                        finalized_block_hash,
+                        _current_slot,
+                        _head_block_root,
+                    )
                     .await
             }
             (Self::Deferred, _) => Err(execution_layer::Error::NoEngine),
@@ -435,6 +448,8 @@ async fn reconcile_pq_execution<E: EthSpec>(
     reconciliation: &Arc<crate::beacon_chain::PqExecutionReconciliation>,
     task_executor: &task_executor::TaskExecutor,
     head_block_hash: ExecutionBlockHash,
+    safe_block_hash: ExecutionBlockHash,
+    finalized_block_hash: ExecutionBlockHash,
     current_slot: Slot,
     head_block_root: Hash256,
 ) -> Result<(), PqImportError> {
@@ -453,7 +468,14 @@ async fn reconcile_pq_execution<E: EthSpec>(
         };
         attempts = next_attempt;
         let response = notifier
-            .notify_forkchoice_updated(guard, head_block_hash, current_slot, head_block_root)
+            .notify_forkchoice_updated(
+                guard,
+                head_block_hash,
+                safe_block_hash,
+                finalized_block_hash,
+                current_slot,
+                head_block_root,
+            )
             .await;
         match response {
             Ok(status)
@@ -508,17 +530,15 @@ async fn reconcile_pq_execution<E: EthSpec>(
     }
 }
 
-fn persisted_pq_execution_head<E: EthSpec>(
+fn persisted_pq_execution_head_binding<E: EthSpec>(
     snapshot: &crate::BeaconSnapshot<E>,
     genesis_slot: Slot,
-) -> Result<ExecutionBlockHash, PqImportError> {
+) -> Result<ExecutionBlockHash, PqRuntimeError> {
     let state_hash = snapshot
         .beacon_state
         .latest_execution_payload_header()
         .map_err(|_| {
-            PqImportError::Local(PqImportLocalError::Persistence(
-                PqRuntimeError::PersistedHeadBinding("post-state has no execution payload header"),
-            ))
+            PqRuntimeError::PersistedHeadBinding("post-state has no execution payload header")
         })?
         .block_hash();
     if snapshot.beacon_state.slot() == genesis_slot {
@@ -530,21 +550,23 @@ fn persisted_pq_execution_head<E: EthSpec>(
         .body()
         .execution_payload()
         .map_err(|_| {
-            PqImportError::Local(PqImportLocalError::Persistence(
-                PqRuntimeError::PersistedHeadBinding(
-                    "non-genesis head has no full execution payload",
-                ),
-            ))
+            PqRuntimeError::PersistedHeadBinding("non-genesis head has no full execution payload")
         })?
         .block_hash();
     if payload_hash != state_hash {
-        return Err(PqImportError::Local(PqImportLocalError::Persistence(
-            PqRuntimeError::PersistedHeadBinding(
-                "block payload hash does not match post-state execution header",
-            ),
-        )));
+        return Err(PqRuntimeError::PersistedHeadBinding(
+            "block payload hash does not match post-state execution header",
+        ));
     }
     Ok(payload_hash)
+}
+
+fn persisted_pq_execution_head<E: EthSpec>(
+    snapshot: &crate::BeaconSnapshot<E>,
+    genesis_slot: Slot,
+) -> Result<ExecutionBlockHash, PqImportError> {
+    persisted_pq_execution_head_binding(snapshot, genesis_slot)
+        .map_err(|error| PqImportError::Local(PqImportLocalError::Persistence(error)))
 }
 
 #[cfg(feature = "pq-startup-testing")]
@@ -581,6 +603,8 @@ pub async fn testing_only_reconcile_pq_execution<E: EthSpec>(
         &reconciliation,
         &task_executor,
         head_block_hash,
+        ExecutionBlockHash::zero(),
+        ExecutionBlockHash::zero(),
         current_slot,
         head_block_root,
     )
@@ -818,6 +842,8 @@ pub struct PqOperationalHeadIdentity {
     pub slot: Slot,
     pub block_root: Hash256,
     pub execution_hash: ExecutionBlockHash,
+    pub justified_epoch: types::Epoch,
+    pub justified_root: Hash256,
     pub finalized_epoch: types::Epoch,
     pub finalized_root: Hash256,
     pub signed_ssz_digest: [u8; 32],
@@ -1884,10 +1910,103 @@ impl Error for PqForwardRangeError {
     }
 }
 
+fn pq_execution_checkpoint_hash<T: BeaconChainTypes>(
+    store: &BeaconStore<T>,
+    genesis_slot: Slot,
+    genesis_execution_hash: ExecutionBlockHash,
+    checkpoint: Checkpoint,
+) -> Result<ExecutionBlockHash, PqRuntimeError> {
+    if checkpoint.root.is_zero() {
+        if checkpoint.epoch == T::EthSpec::genesis_epoch() {
+            return Ok(genesis_execution_hash);
+        }
+        return Err(PqRuntimeError::PersistedHeadBinding(
+            "non-genesis execution checkpoint has a zero beacon root",
+        ));
+    }
+    let block = store
+        .get_full_block(&checkpoint.root)
+        .map_err(PqRuntimeError::Store)?
+        .ok_or(PqRuntimeError::MissingForkChoiceHistoryBlock(
+            checkpoint.root,
+        ))?;
+    if block.canonical_root() != checkpoint.root {
+        return Err(PqRuntimeError::PersistedHeadBinding(
+            "execution checkpoint block root does not match durable history",
+        ));
+    }
+    let state_root = block.message().state_root();
+    let mut state = store
+        .get_state(&state_root, Some(block.slot()), true)
+        .map_err(PqRuntimeError::Store)?
+        .ok_or(PqRuntimeError::MissingForkChoiceHistoryState(state_root))?;
+    if state.slot() != block.slot()
+        || state
+            .update_tree_hash_cache()
+            .map_err(store::Error::from)
+            .map_err(PqRuntimeError::Store)?
+            != state_root
+    {
+        return Err(PqRuntimeError::PersistedHeadBinding(
+            "execution checkpoint post-state does not match its durable block",
+        ));
+    }
+    persisted_pq_execution_head_binding(
+        &crate::BeaconSnapshot {
+            beacon_block: Arc::new(block),
+            beacon_block_root: checkpoint.root,
+            beacon_state: state,
+            validated_state_root: state_root,
+        },
+        genesis_slot,
+    )
+}
+
+fn pq_execution_forkchoice_parameters<T: BeaconChainTypes>(
+    store: &BeaconStore<T>,
+    genesis_slot: Slot,
+    genesis_execution_hash: ExecutionBlockHash,
+    state: &types::BeaconState<T::EthSpec>,
+    head_root: Hash256,
+    head_hash: ExecutionBlockHash,
+) -> Result<ForkchoiceUpdateParameters, PqRuntimeError> {
+    Ok(ForkchoiceUpdateParameters {
+        head_root,
+        head_hash: Some(head_hash),
+        justified_hash: Some(pq_execution_checkpoint_hash::<T>(
+            store,
+            genesis_slot,
+            genesis_execution_hash,
+            state.current_justified_checkpoint(),
+        )?),
+        finalized_hash: Some(pq_execution_checkpoint_hash::<T>(
+            store,
+            genesis_slot,
+            genesis_execution_hash,
+            state.finalized_checkpoint(),
+        )?),
+    })
+}
+
 impl<T: BeaconChainTypes> BeaconChain<T> {
-    /// Replays the exact durable PQ head into the process-owned execution engine before any
-    /// external ingress is exposed. Frozen V1 has no fork-choice finality, so safe and finalized
-    /// remain the exact zero hashes used by [`PqExecutionNotifier`].
+    pub(crate) fn pq_execution_forkchoice_parameters(
+        &self,
+        state: &types::BeaconState<T::EthSpec>,
+        head_root: Hash256,
+        head_hash: ExecutionBlockHash,
+    ) -> Result<ForkchoiceUpdateParameters, PqRuntimeError> {
+        pq_execution_forkchoice_parameters::<T>(
+            &self.store,
+            self.slot_clock.genesis_slot(),
+            self.pq_genesis_execution_hash,
+            state,
+            head_root,
+            head_hash,
+        )
+    }
+
+    /// Replays the exact durable PQ head and its bound justified/finalized execution checkpoints
+    /// into the process-owned execution engine before any external ingress is exposed.
     pub async fn reconcile_persisted_pq_head(&self) -> Result<(), PqImportError> {
         let _commit_permit = Arc::clone(&self.pq_import_gate)
             .acquire_owned()
@@ -1901,11 +2020,34 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         let current_slot = snapshot.beacon_state.slot();
         let head_block_root = snapshot.beacon_block_root;
         let genesis_slot = self.slot_clock.genesis_slot();
-        let head_block_hash = self
+        let genesis_execution_hash = self.pq_genesis_execution_hash;
+        let store = Arc::clone(&self.store);
+        let (head_block_hash, forkchoice_parameters) = self
             .run_pq_blocking("pq-persisted-head-execution-binding", move || {
-                persisted_pq_execution_head(&snapshot, genesis_slot)
+                let head_block_hash = persisted_pq_execution_head(&snapshot, genesis_slot)?;
+                let parameters = pq_execution_forkchoice_parameters::<T>(
+                    &store,
+                    genesis_slot,
+                    genesis_execution_hash,
+                    &snapshot.beacon_state,
+                    snapshot.beacon_block_root,
+                    head_block_hash,
+                )
+                .map_err(|error| PqImportError::Local(PqImportLocalError::Persistence(error)))?;
+                Ok((head_block_hash, parameters))
             })
             .await??;
+        let safe_block_hash = forkchoice_parameters
+            .justified_hash
+            .ok_or(PqImportError::Local(PqImportLocalError::Invariant(
+                "PQ justified execution checkpoint is absent",
+            )))?;
+        let finalized_block_hash =
+            forkchoice_parameters
+                .finalized_hash
+                .ok_or(PqImportError::Local(PqImportLocalError::Invariant(
+                    "PQ finalized execution checkpoint is absent",
+                )))?;
         let guard = self
             .pq_execution_notifier
             .acquire_forkchoice_guard()
@@ -1922,6 +2064,8 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             &self.pq_execution_reconciliation,
             &self.task_executor,
             head_block_hash,
+            safe_block_hash,
+            finalized_block_hash,
             current_slot,
             head_block_root,
         )
@@ -1944,11 +2088,14 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         let genesis_slot = self.slot_clock.genesis_slot();
         self.run_pq_blocking("pq-operational-head-identity", move || {
             let execution_hash = persisted_pq_execution_head(&snapshot, genesis_slot)?;
+            let justified = snapshot.beacon_state.current_justified_checkpoint();
             let finalized = snapshot.beacon_state.finalized_checkpoint();
             Ok::<_, PqImportError>(PqOperationalHeadIdentity {
                 slot: snapshot.beacon_state.slot(),
                 block_root: snapshot.beacon_block_root,
                 execution_hash,
+                justified_epoch: justified.epoch,
+                justified_root: justified.root,
                 finalized_epoch: finalized.epoch,
                 finalized_root: finalized.root,
                 signed_ssz_digest: Sha256::digest(snapshot.beacon_block.as_ssz_bytes()).into(),
@@ -2611,6 +2758,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                     state_root: snapshot.beacon_block.message().state_root(),
                     payload_status: PqEnginePayloadStatus::Valid,
                 };
+                let justified = snapshot.beacon_state.current_justified_checkpoint();
                 let finalized = snapshot.beacon_state.finalized_checkpoint();
                 let snapshot = Arc::new(snapshot);
                 *canonical_head.write() = Arc::clone(&snapshot);
@@ -2635,6 +2783,8 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                         slot: committed_slot,
                         block_root: outcome.block_root,
                         execution_hash: execution_block_hash,
+                        justified_epoch: justified.epoch,
+                        justified_root: justified.root,
                         finalized_epoch: finalized.epoch,
                         finalized_root: finalized.root,
                         signed_ssz_digest,
@@ -2659,7 +2809,13 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                         ),
                     );
                 }
-                Ok((outcome, operational_event_error, finalized, snapshot))
+                Ok((
+                    outcome,
+                    operational_event_error,
+                    justified,
+                    finalized,
+                    snapshot,
+                ))
             },
             "pq-import-persist-and-publish",
         );
@@ -2668,30 +2824,61 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 "pq-import-persist-and-publish",
             )));
         };
-        let (outcome, persisted_event_error, finalized, snapshot) = match persistence.await {
-            Ok(outcome) => outcome?,
-            Err(_) => {
-                self.pq_import_coordinator.close();
-                self.pq_execution_reconciliation.set(
-                    crate::beacon_chain::PqExecutionReconciliationState::Failed {
-                        block_root: durable_block_root,
-                    },
-                );
-                observations
-                    .lock()
-                    .record_durable_state_unknown(observation_key, durable_block_root);
-                signal_pq_execution_reconciliation_failure(&self.task_executor);
-                return Err(PqImportError::DurableStateUnknown {
-                    phase: "pq-import-persist-and-publish",
-                });
-            }
-        };
+        let (outcome, persisted_event_error, justified, finalized, snapshot) =
+            match persistence.await {
+                Ok(outcome) => outcome?,
+                Err(_) => {
+                    self.pq_import_coordinator.close();
+                    self.pq_execution_reconciliation.set(
+                        crate::beacon_chain::PqExecutionReconciliationState::Failed {
+                            block_root: durable_block_root,
+                        },
+                    );
+                    observations
+                        .lock()
+                        .record_durable_state_unknown(observation_key, durable_block_root);
+                    signal_pq_execution_reconciliation_failure(&self.task_executor);
+                    return Err(PqImportError::DurableStateUnknown {
+                        phase: "pq-import-persist-and-publish",
+                    });
+                }
+            };
+        let store = Arc::clone(&self.store);
+        let genesis_slot = self.slot_clock.genesis_slot();
+        let genesis_execution_hash = self.pq_genesis_execution_hash;
+        let snapshot_for_forkchoice = Arc::clone(&snapshot);
+        let forkchoice_parameters = self
+            .run_pq_blocking("pq-import-execution-checkpoint-binding", move || {
+                pq_execution_forkchoice_parameters::<T>(
+                    &store,
+                    genesis_slot,
+                    genesis_execution_hash,
+                    &snapshot_for_forkchoice.beacon_state,
+                    snapshot_for_forkchoice.beacon_block_root,
+                    execution_block_hash,
+                )
+                .map_err(|error| PqImportError::Local(PqImportLocalError::Persistence(error)))
+            })
+            .await??;
+        let safe_block_hash = forkchoice_parameters
+            .justified_hash
+            .ok_or(PqImportError::Local(PqImportLocalError::Invariant(
+                "PQ justified execution checkpoint is absent",
+            )))?;
+        let finalized_block_hash =
+            forkchoice_parameters
+                .finalized_hash
+                .ok_or(PqImportError::Local(PqImportLocalError::Invariant(
+                    "PQ finalized execution checkpoint is absent",
+                )))?;
         let reconciliation_result = reconcile_pq_execution(
             &self.pq_execution_notifier,
             &forkchoice_guard,
             &self.pq_execution_reconciliation,
             &self.task_executor,
             execution_block_hash,
+            safe_block_hash,
+            finalized_block_hash,
             committed_slot,
             outcome.block_root,
         )
@@ -2734,6 +2921,8 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                     slot: committed_slot,
                     block_root: outcome.block_root,
                     execution_hash: execution_block_hash,
+                    justified_epoch: justified.epoch,
+                    justified_root: justified.root,
                     finalized_epoch: finalized.epoch,
                     finalized_root: finalized.root,
                     signed_ssz_digest,

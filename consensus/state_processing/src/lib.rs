@@ -136,7 +136,7 @@ pub use pq_transition::{
 #[cfg(feature = "pq-transition")]
 pub use pq_verification::{
     PqBlockAttestationSelectionError, PqBlockAttestationSelectionLocalError,
-    validate_pq_attestation_for_block_selection,
+    pq_signers_add_marginal_participation, validate_pq_attestation_for_block_selection,
 };
 #[cfg(feature = "pq-verification")]
 pub use pq_verification::{

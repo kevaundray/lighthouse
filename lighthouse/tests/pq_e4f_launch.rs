@@ -2,11 +2,11 @@
 
 use beacon_node::beacon_chain::{
     BeaconChain, PqLocalAttesterIdentity, PqNewPayloadTransport, PqOperationalEvent,
-    PqOperationalEventRole, PqOperationalEventSink, PqSingleConsumptionResult,
-    PqSingleObservationStatus, PqSingleWireMessageId, TestingPqAttestationPoolSnapshot,
-    TestingPqBlockingHook,
+    PqOperationalEventRole, PqOperationalEventSink, PqPayloadBuildRequest, PqRuntimeStartup,
+    PqSingleConsumptionResult, PqSingleObservationStatus, PqSingleWireMessageId,
+    TestingPqAttestationPoolSnapshot, TestingPqBlockingHook,
     builder::{BeaconChainBuilder, Witness},
-    testing_only_pq_local_candidate_batch_fixture, testing_only_running_pq_operational_event_sink,
+    testing_only_running_pq_operational_event_sink,
 };
 use consensus_signature::{AggregationService, PqValidatorRegistryEntry};
 use execution_layer::auth::JwtKey;
@@ -18,12 +18,10 @@ use lighthouse_network::{
     libp2p::gossipsub::IdentTopic, types::GossipEncoding, types::GossipKind,
 };
 use lighthouse_validator_store::{Config as ValidatorStoreConfig, LighthouseValidatorStore};
-use network::{
-    PqLocalAttestationMemberPublishProgress, PqNetworkBlockProcessor, PqNetworkService,
-    pq_block_broadcast_channel, testing_only_pq_local_attestation_batch_publish_channel,
-};
+use network::{PqBlockPublicationDisposition, PqBlockPublicationService};
+use network::{PqNetworkBlockProcessor, PqNetworkService, pq_block_broadcast_channel};
 use network_utils::enr_ext::EnrExt;
-use pq_attester_service::{PqAttestationCompletion, PqAttesterPublicationError, PqAttesterService};
+use pq_attester_service::PqAttesterService;
 use pq_devnet::{production_config, provision_devnet};
 use rusqlite::{Connection, MAIN_DB, params};
 use serde_json::Value;
@@ -46,8 +44,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use store::{HotColdDB, MemoryStore, StoreConfig};
 use tempfile::TempDir;
 use types::{
-    BeaconBlock, BeaconState, ChainSpec, Epoch, EthSpec, ExecutionBlockHash, ExecutionPayloadRef,
-    ForkContext, ForkName, Hash256, MinimalEthSpec, SignedBeaconBlock, Slot, SubnetId, Uint256,
+    BeaconBlock, BeaconState, ChainSpec, Epoch, EthSpec, ExecPayload, ExecutionBlockHash,
+    ExecutionPayloadRef, ForkContext, ForkName, Graffiti, Hash256, MinimalEthSpec,
+    SignedBeaconBlock, Slot, SubnetId, Uint256,
 };
 use validator_dir::{PqDevnetBundle, PqDevnetManifest};
 use validator_store::{SignedBlock, UnsignedBlock, ValidatorStore};
@@ -55,7 +54,20 @@ use validator_store::{SignedBlock, UnsignedBlock, ValidatorStore};
 const PQ_EVENT_PREFIX: &str = "PQ_EVENT_V1";
 const MAX_LOG_FRAME_BYTES: usize = 64 * 1024;
 const MAX_RETAINED_LOG_FRAMES: usize = 512;
-const MAX_RETAINED_PQ_EVENTS: usize = 64;
+const FINALITY_TARGET_SLOT: usize = 32;
+const FINALITY_STARTUP_EVENTS: usize = 6;
+const FINALITY_EVENTS_PER_SLOT: usize = 4;
+const FINALITY_PRE_GENESIS_SECONDS: usize = 900;
+const FINALITY_STATUS_INTERVAL_SECONDS: usize = 300;
+const FINALITY_STATUS_EVENTS_PER_INTERVAL: usize = 2;
+const FINALITY_STATUS_INTERVAL_MARGIN: usize = 1;
+const MAX_RETAINED_PQ_EVENTS: usize = FINALITY_STARTUP_EVENTS
+    + FINALITY_EVENTS_PER_SLOT * FINALITY_TARGET_SLOT
+    + FINALITY_STATUS_EVENTS_PER_INTERVAL
+        * (FINALITY_PRE_GENESIS_SECONDS / FINALITY_STATUS_INTERVAL_SECONDS
+            + FINALITY_TARGET_SLOT
+            + FINALITY_STATUS_INTERVAL_MARGIN);
+const FINALITY_PROPOSER_ENGINE_EVENTS: usize = 2 + 4 * FINALITY_TARGET_SLOT;
 const MAX_ENR_BYTES: u64 = 4096;
 const MAX_TEMPLATE_ENTRIES: usize = 128;
 const MAX_TEMPLATE_BYTES: u64 = 256 * 1024 * 1024;
@@ -71,6 +83,18 @@ const THREE_SLOT_TARGET: u64 = 3;
 const PROPOSAL_COMPLETION_SECONDS: u64 = 285;
 const RESTART_STOP_MARGIN_SECONDS: u64 = 5;
 
+fn verifier_only_diagnostic_for_target(
+    target_slot: u64,
+    diagnostic_requested: bool,
+) -> Result<bool, &'static str> {
+    if diagnostic_requested && target_slot != THREE_SLOT_TARGET {
+        return Err(
+            "verifier-only diagnostic mode is unavailable for the slot-32 finality acceptance",
+        );
+    }
+    Ok(diagnostic_requested)
+}
+
 fn unix_time_now() -> Result<u64, String> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -80,7 +104,20 @@ fn unix_time_now() -> Result<u64, String> {
 
 type DirectAttesterWitness = Witness<SystemTimeSlotClock, MinimalEthSpec, MemoryStore, MemoryStore>;
 
-struct DirectAttesterExecution;
+#[derive(Default)]
+struct DirectAttesterExecution {
+    payload_calls: std::sync::atomic::AtomicUsize,
+    new_payload_calls: std::sync::atomic::AtomicUsize,
+    forkchoice_calls: Mutex<
+        Vec<(
+            ExecutionBlockHash,
+            ExecutionBlockHash,
+            ExecutionBlockHash,
+            Slot,
+            Hash256,
+        )>,
+    >,
+}
 
 impl PqNewPayloadTransport<MinimalEthSpec> for DirectAttesterExecution {
     fn notify_new_payload<'a>(
@@ -94,14 +131,18 @@ impl PqNewPayloadTransport<MinimalEthSpec> for DirectAttesterExecution {
                 + 'a,
         >,
     > {
+        self.new_payload_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Box::pin(async { Ok(execution_layer::PayloadStatus::Valid) })
     }
 
     fn notify_forkchoice_updated<'a>(
         &'a self,
-        _head_block_hash: ExecutionBlockHash,
-        _current_slot: Slot,
-        _head_block_root: Hash256,
+        head_block_hash: ExecutionBlockHash,
+        safe_block_hash: ExecutionBlockHash,
+        finalized_block_hash: ExecutionBlockHash,
+        current_slot: Slot,
+        head_block_root: Hash256,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -110,7 +151,68 @@ impl PqNewPayloadTransport<MinimalEthSpec> for DirectAttesterExecution {
                 + 'a,
         >,
     > {
+        self.forkchoice_calls
+            .lock()
+            .expect("direct-attester FCU audit lock")
+            .push((
+                head_block_hash,
+                safe_block_hash,
+                finalized_block_hash,
+                current_slot,
+                head_block_root,
+            ));
         Box::pin(async { Ok(execution_layer::PayloadStatus::Valid) })
+    }
+
+    fn get_full_payload<'a>(
+        &'a self,
+        request: PqPayloadBuildRequest<MinimalEthSpec>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        execution_layer::BlockProposalContents<
+                            MinimalEthSpec,
+                            types::FullPayload<MinimalEthSpec>,
+                        >,
+                        execution_layer::Error,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        self.payload_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move {
+            let mut empty: BeaconBlock<MinimalEthSpec> = BeaconBlock::empty(request.spec());
+            let BeaconBlock::Electra(inner) = &mut empty else {
+                return Err(execution_layer::Error::InvalidForkForPayload);
+            };
+            inner.body.execution_payload.execution_payload.parent_hash = request.parent_hash();
+            inner.body.execution_payload.execution_payload.timestamp = request.timestamp();
+            inner.body.execution_payload.execution_payload.prev_randao = request.prev_randao();
+            inner.body.execution_payload.execution_payload.withdrawals = request
+                .withdrawals()
+                .clone()
+                .try_into()
+                .map_err(|_| execution_layer::Error::InvalidPayloadConversion)?;
+            inner.body.execution_payload.execution_payload.block_hash =
+                execution_layer::calculate_execution_block_hash(
+                    ExecutionPayloadRef::Electra(&inner.body.execution_payload.execution_payload),
+                    Some(request.parent_beacon_block_root()),
+                    Some(&inner.body.execution_requests),
+                )
+                .0;
+            Ok(execution_layer::BlockProposalContents::PayloadAndBlobs {
+                payload: types::FullPayload::from(types::ExecutionPayload::Electra(
+                    inner.body.execution_payload.execution_payload.clone(),
+                )),
+                block_value: Default::default(),
+                kzg_commitments: Default::default(),
+                blobs_and_proofs: Some((Default::default(), Default::default())),
+                requests: Some(Default::default()),
+            })
+        })
     }
 }
 
@@ -121,6 +223,25 @@ fn direct_attester_store(
     config.hierarchy_config.exponents = vec![0];
     config.block_cache_size = 0;
     Arc::new(HotColdDB::open_ephemeral(config, spec).expect("snapshot-every-slot store"))
+}
+
+fn restart_direct_attester_chain(
+    chain: &Arc<BeaconChain<DirectAttesterWitness>>,
+    execution: Arc<DirectAttesterExecution>,
+    task_executor: task_executor::TaskExecutor,
+) -> Arc<BeaconChain<DirectAttesterWitness>> {
+    Arc::new(
+        BeaconChainBuilder::<DirectAttesterWitness>::pq_new(MinimalEthSpec)
+            .store(Arc::clone(&chain.store))
+            .custom_spec(Arc::clone(&chain.spec))
+            .resume_from_db()
+            .expect("resume the exact persisted direct-attester head")
+            .pq_aggregation_service(Arc::clone(&chain.pq_aggregation_service))
+            .task_executor(task_executor)
+            .testing_only_pq_execution_notifier(execution)
+            .build()
+            .expect("rebuild the exact direct-attester chain"),
+    )
 }
 
 fn direct_attester_network_context(
@@ -217,8 +338,12 @@ impl<T> Deref for RootLastOwner<T> {
 
 struct AuthenticDirectAttesterOwners {
     _executor_exit_sender: async_channel::Sender<()>,
+    task_executor: task_executor::TaskExecutor,
     chain: Arc<BeaconChain<DirectAttesterWitness>>,
     receiver_chain: Arc<BeaconChain<DirectAttesterWitness>>,
+    validator_store: Arc<LighthouseValidatorStore<SystemTimeSlotClock, MinimalEthSpec>>,
+    sender_execution: Arc<DirectAttesterExecution>,
+    receiver_execution: Arc<DirectAttesterExecution>,
     service: Arc<PqAttesterService<DirectAttesterWitness>>,
     prechecks: Arc<std::sync::atomic::AtomicUsize>,
     expected: Vec<ExpectedDirectAttestation>,
@@ -226,21 +351,6 @@ struct AuthenticDirectAttesterOwners {
 }
 
 type AuthenticDirectAttesterFixture = RootLastOwner<AuthenticDirectAttesterOwners>;
-
-fn empty_verified_batch_for_publication_capacity()
--> beacon_node::beacon_chain::PqVerifiedLocalAttestationBatch<MinimalEthSpec> {
-    let (candidates, signed, spec) = testing_only_pq_local_candidate_batch_fixture(0);
-    let returned = candidates
-        .candidates()
-        .iter()
-        .map(|candidate| candidate.validator_index())
-        .zip(signed)
-        .collect();
-    candidates
-        .seal_exact_ordered(returned, &spec)
-        .expect("empty publication-capacity batch seals exactly")
-        .testing_only_into_empty_verified_batch()
-}
 
 struct RootPresenceOnOwnerDrop {
     root: PathBuf,
@@ -386,6 +496,8 @@ async fn authentic_system_slot_one_attester_fixture() -> AuthenticDirectAttester
     })));
     let aggregation_service =
         Arc::new(AggregationService::new().expect("sole PQ aggregation service"));
+    let sender_execution = Arc::new(DirectAttesterExecution::default());
+    let receiver_execution = Arc::new(DirectAttesterExecution::default());
     let chain = Arc::new(
         BeaconChainBuilder::<DirectAttesterWitness>::pq_new(MinimalEthSpec)
             .store(direct_attester_store(Arc::clone(&spec)))
@@ -394,7 +506,7 @@ async fn authentic_system_slot_one_attester_fixture() -> AuthenticDirectAttester
             .expect("persist exact 16-validator genesis")
             .pq_aggregation_service(Arc::clone(&aggregation_service))
             .task_executor(task_executor.clone())
-            .testing_only_pq_execution_notifier(Arc::new(DirectAttesterExecution))
+            .testing_only_pq_execution_notifier(sender_execution.clone())
             .build()
             .expect("SystemTime direct-attester chain"),
     );
@@ -406,7 +518,7 @@ async fn authentic_system_slot_one_attester_fixture() -> AuthenticDirectAttester
             .expect("persist the receiver's independent exact genesis")
             .pq_aggregation_service(aggregation_service)
             .task_executor(task_executor.clone())
-            .testing_only_pq_execution_notifier(Arc::new(DirectAttesterExecution))
+            .testing_only_pq_execution_notifier(receiver_execution.clone())
             .build()
             .expect("independent receiver SystemTime chain"),
     );
@@ -535,15 +647,23 @@ async fn authentic_system_slot_one_attester_fixture() -> AuthenticDirectAttester
     assert_eq!(expected.len(), 2, "frozen full-16 slot-one duty count");
     drop(context);
     let service = Arc::new(
-        PqAttesterService::new(Arc::clone(&chain), validator_store, task_executor)
-            .expect("internally sourced exact 16-key identity snapshot"),
+        PqAttesterService::new(
+            Arc::clone(&chain),
+            Arc::clone(&validator_store),
+            task_executor.clone(),
+        )
+        .expect("internally sourced exact 16-key identity snapshot"),
     );
     RootLastOwner {
         _root: root,
         owner: AuthenticDirectAttesterOwners {
             _executor_exit_sender: executor_exit_sender,
+            task_executor: task_executor.clone(),
             chain,
             receiver_chain,
+            validator_store,
+            sender_execution,
+            receiver_execution,
             service,
             prechecks,
             expected,
@@ -600,16 +720,97 @@ async fn direct_pq_attester_service_converges_two_independent_workers_exactly_on
     let _checked_proof_budget = remaining
         .checked_sub(DIRECT_ATTESTER_MIN_SLOT_ONE_BUDGET)
         .expect("enough slot-one budget remains for both authentic proof paths");
-    let first = fixture
-        .service
-        .try_attest_current_slot()
-        .expect("current slot admitted")
-        .wait()
+    let sender_network_dir = tempfile::tempdir().expect("private sender network directory");
+    let peer_network_dir = tempfile::tempdir().expect("private peer network directory");
+    let (sender_network_exit_owner, sender_network_exit) = async_channel::bounded(1);
+    let (sender_network_failure, mut sender_network_failures) = futures::channel::mpsc::channel(2);
+    let sender_network_executor = task_executor::TaskExecutor::new(
+        tokio::runtime::Handle::current(),
+        sender_network_exit,
+        sender_network_failure,
+    );
+    let (peer_network_exit_owner, peer_network_exit) = async_channel::bounded(1);
+    let (peer_network_failure, mut peer_network_failures) = futures::channel::mpsc::channel(2);
+    let peer_network_executor = task_executor::TaskExecutor::new(
+        tokio::runtime::Handle::current(),
+        peer_network_exit,
+        peer_network_failure,
+    );
+    let (sender_block_sender, sender_block_receiver) = pq_block_broadcast_channel();
+    let (_peer_block_sender, peer_block_receiver) = pq_block_broadcast_channel();
+    let sender_operational_events =
+        testing_only_running_pq_operational_event_sink(&sender_network_executor);
+    let peer_operational_events =
+        testing_only_running_pq_operational_event_sink(&peer_network_executor);
+    let mut sender_network_service = PqNetworkService::new(
+        sender_network_executor,
+        direct_attester_network_context(&fixture.chain, sender_network_dir.path()),
+        fixture.chain.spec.custody_requirement,
+        secp256k1::Keypair::generate().into(),
+        Arc::clone(&fixture.chain),
+        sender_block_receiver,
+        Arc::clone(&sender_operational_events),
+    )
+    .await
+    .expect("actual sender PQ network service");
+    let publisher = sender_network_service.local_attestation_batch_publish_sender();
+    let sender_globals = sender_network_service.network_globals();
+    let sender_dial = sender_network_service.testing_only_dial_sender();
+    let sender_admission = sender_network_service.testing_only_gossip_admission();
+    let mut inbound_barrier = sender_network_service
+        .testing_only_hold_next_attestation_verification()
+        .expect("one exact sender inbound verification barrier");
+    let sender_shutdown = sender_network_service
+        .start_with_shutdown_receipt()
         .await
-        .expect("real direct service completion");
-    let PqAttestationCompletion::Verified(first_metadata) = first else {
-        panic!("two exact current-slot duties must verify")
-    };
+        .expect("actual sender network worker live");
+
+    let peer_network_service = PqNetworkService::new(
+        peer_network_executor,
+        direct_attester_network_context(&fixture.receiver_chain, peer_network_dir.path()),
+        fixture.receiver_chain.spec.custody_requirement,
+        secp256k1::Keypair::generate().into(),
+        Arc::clone(&fixture.receiver_chain),
+        peer_block_receiver,
+        Arc::clone(&peer_operational_events),
+    )
+    .await
+    .expect("actual independent peer PQ network service");
+    let peer_globals = peer_network_service.network_globals();
+    let peer_admission = peer_network_service.testing_only_gossip_admission();
+    let peer_attestation_sender = peer_network_service.testing_only_attestation_publish_sender();
+    let peer_shutdown = peer_network_service
+        .start_with_shutdown_receipt()
+        .await
+        .expect("actual independent peer worker live");
+
+    let publication_barrier = Arc::new(beacon_node::TestingPqAttesterPublicationBarrier::new());
+    let parked_attester =
+        beacon_node::testing_only_start_pq_attester_loop_parked_with_publication_barrier(
+            Arc::clone(&fixture.service),
+            publisher.clone(),
+            fixture.chain.slot_clock.clone(),
+            fixture.task_executor.clone(),
+            PqRuntimeStartup::Fresh,
+            Arc::clone(&publication_barrier),
+        )
+        .await
+        .expect("the production attester scheduler starts parked");
+    let attester_loop = parked_attester
+        .release()
+        .await
+        .expect("RuntimeReady releases the authentic attester scheduler");
+    tokio::time::timeout(
+        Duration::from_secs(300),
+        publication_barrier.wait_until_blocked(),
+    )
+    .await
+    .expect("the production scheduler reaches Verified before publication")
+    .expect("the publication barrier remains live");
+    let first_metadata = fixture
+        .service
+        .testing_only_completed_verified_metadata()
+        .expect("the production scheduler leaves exact verified metadata owned by the service");
     eprintln!(
         "PQ direct attester: service verified after {:?}",
         started.elapsed()
@@ -640,25 +841,17 @@ async fn direct_pq_attester_service_converges_two_independent_workers_exactly_on
         fixture.service.testing_only_completed_verified_metadata(),
         Some(first_metadata.clone()),
     );
-    let cached = fixture
-        .service
-        .try_attest_current_slot()
-        .expect("same-slot result cached")
-        .wait()
-        .await
-        .expect("cached direct completion");
-    assert_eq!(cached, PqAttestationCompletion::Verified(first_metadata));
     assert_eq!(
         fixture.prechecks.load(std::sync::atomic::Ordering::SeqCst),
         1,
-        "same-slot cache must not invoke SQLite/signing twice",
+        "the production scheduler invokes SQLite/signing once",
     );
     assert_eq!(
         fixture
             .chain
             .testing_only_pq_local_attestation_batch_verification_count(),
         1,
-        "same-slot cache must not invoke the real local proof batch twice",
+        "the production scheduler invokes the real local proof batch once",
     );
     assert_eq!(
         fixture
@@ -725,70 +918,6 @@ async fn direct_pq_attester_service_converges_two_independent_workers_exactly_on
             )
         })
         .collect::<Vec<_>>();
-    let sender_network_dir = tempfile::tempdir().expect("private sender network directory");
-    let peer_network_dir = tempfile::tempdir().expect("private peer network directory");
-    let (sender_network_exit_owner, sender_network_exit) = async_channel::bounded(1);
-    let (sender_network_failure, mut sender_network_failures) = futures::channel::mpsc::channel(2);
-    let sender_network_executor = task_executor::TaskExecutor::new(
-        tokio::runtime::Handle::current(),
-        sender_network_exit,
-        sender_network_failure,
-    );
-    let (peer_network_exit_owner, peer_network_exit) = async_channel::bounded(1);
-    let (peer_network_failure, mut peer_network_failures) = futures::channel::mpsc::channel(2);
-    let peer_network_executor = task_executor::TaskExecutor::new(
-        tokio::runtime::Handle::current(),
-        peer_network_exit,
-        peer_network_failure,
-    );
-    let (_sender_block_sender, sender_block_receiver) = pq_block_broadcast_channel();
-    let (_peer_block_sender, peer_block_receiver) = pq_block_broadcast_channel();
-    let sender_operational_events =
-        testing_only_running_pq_operational_event_sink(&sender_network_executor);
-    let peer_operational_events =
-        testing_only_running_pq_operational_event_sink(&peer_network_executor);
-    let mut sender_network_service = PqNetworkService::new(
-        sender_network_executor,
-        direct_attester_network_context(&fixture.chain, sender_network_dir.path()),
-        fixture.chain.spec.custody_requirement,
-        secp256k1::Keypair::generate().into(),
-        Arc::clone(&fixture.chain),
-        sender_block_receiver,
-        Arc::clone(&sender_operational_events),
-    )
-    .await
-    .expect("actual sender PQ network service");
-    let publisher = sender_network_service.local_attestation_batch_publish_sender();
-    let sender_globals = sender_network_service.network_globals();
-    let sender_dial = sender_network_service.testing_only_dial_sender();
-    let sender_admission = sender_network_service.testing_only_gossip_admission();
-    let mut inbound_barrier = sender_network_service
-        .testing_only_hold_next_attestation_verification()
-        .expect("one exact sender inbound verification barrier");
-    let sender_shutdown = sender_network_service
-        .start_with_shutdown_receipt()
-        .await
-        .expect("actual sender network worker live");
-
-    let peer_network_service = PqNetworkService::new(
-        peer_network_executor,
-        direct_attester_network_context(&fixture.receiver_chain, peer_network_dir.path()),
-        fixture.receiver_chain.spec.custody_requirement,
-        secp256k1::Keypair::generate().into(),
-        Arc::clone(&fixture.receiver_chain),
-        peer_block_receiver,
-        Arc::clone(&peer_operational_events),
-    )
-    .await
-    .expect("actual independent peer PQ network service");
-    let peer_globals = peer_network_service.network_globals();
-    let peer_admission = peer_network_service.testing_only_gossip_admission();
-    let peer_attestation_sender = peer_network_service.testing_only_attestation_publish_sender();
-    let peer_shutdown = peer_network_service
-        .start_with_shutdown_receipt()
-        .await
-        .expect("actual independent peer worker live");
-
     let peer_address = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Some(address) = peer_globals
@@ -876,41 +1005,7 @@ async fn direct_pq_attester_service_converges_two_independent_workers_exactly_on
         1,
         "one exact remote member remains pending before local publication",
     );
-    let (full_sender, _full_receiver) = testing_only_pq_local_attestation_batch_publish_channel();
-    let _full_receipt = full_sender
-        .try_publish(empty_verified_batch_for_publication_capacity())
-        .expect("fill the exact bounded publication channel");
-    assert!(matches!(
-        fixture
-            .service
-            .try_publish_owned_verified_batch(&full_sender),
-        Err(PqAttesterPublicationError::Capacity)
-    ));
-    assert_eq!(
-        fixture.service.testing_only_owned_verified_count(),
-        Some(fixture.expected.len()),
-        "capacity rejection restores the exact service-owned batch",
-    );
-
-    let (closed_sender, closed_receiver) =
-        testing_only_pq_local_attestation_batch_publish_channel();
-    drop(closed_receiver);
-    assert!(matches!(
-        fixture
-            .service
-            .try_publish_owned_verified_batch(&closed_sender),
-        Err(PqAttesterPublicationError::Closed)
-    ));
-    assert_eq!(
-        fixture.service.testing_only_owned_verified_count(),
-        Some(fixture.expected.len()),
-        "closed rejection restores the exact service-owned batch",
-    );
-
-    let publish_receipt = fixture
-        .service
-        .try_publish_owned_verified_batch(&publisher)
-        .expect("sealed authentic batch handoff is admitted once");
+    publication_barrier.release();
     tokio::time::timeout(Duration::from_secs(300), async {
         loop {
             if fixture
@@ -954,27 +1049,7 @@ async fn direct_pq_attester_service_converges_two_independent_workers_exactly_on
         },
         "the independent peer stores only the exact sender-published member zero after FC",
     );
-    assert_eq!(
-        publish_receipt
-            .testing_only_shared_member_progress_trace()
-            .expect("the live receipt retains a read-only shared progress trace"),
-        vec![
-            PqLocalAttestationMemberPublishProgress::Published {
-                message_id: expected_encoded[0].1.clone(),
-                duplicate: false,
-            },
-            PqLocalAttestationMemberPublishProgress::WaitingRemote {
-                message_id: expected_encoded[1].1.clone(),
-                retained: false,
-            },
-        ],
-        "PendingValidation is pending-not-yet-retained provenance until the bridge-backed chain claim resolves",
-    );
-    let mut publication = Box::pin(publish_receipt.wait());
-    tokio::select! {
-        _ = &mut publication => panic!("publication completed before remote resolution"),
-        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-    }
+    assert_eq!(attester_loop.completed_slot_count(), 0);
     assert_eq!(
         fixture.service.testing_only_owned_verified_count(),
         None,
@@ -1011,38 +1086,22 @@ async fn direct_pq_attester_service_converges_two_independent_workers_exactly_on
         "the source-specific local hook blocks after insertion and before exact finalization",
     );
     local_post_insert.release();
-    let progress = tokio::time::timeout(Duration::from_secs(300), publication)
+    let completion = tokio::time::timeout(
+        Duration::from_secs(300),
+        attester_loop.wait_for_completion(),
+    )
+    .await
+    .expect("bounded production-scheduler publication and coalescence")
+    .expect("the production scheduler observes exact whole-batch consumption");
+    assert_eq!(
+        completion,
+        beacon_node::TestingPqAttesterLoopCompletion::Consumed { slot: Slot::new(1) },
+    );
+    assert_eq!(attester_loop.completed_slot_count(), 1);
+    attester_loop
+        .stop_and_wait()
         .await
-        .expect("bounded two-worker publication and coalescence")
-        .expect("network returns the exact consumed publication progress");
-    assert_eq!(progress.verified_count(), fixture.expected.len());
-    let encoding_trace = progress.testing_only_encoding_trace();
-    assert_eq!(encoding_trace.encoded_member_count, expected_encoded.len());
-    assert_eq!(
-        encoding_trace.attempted_member0_topic.as_deref(),
-        Some(expected_encoded[0].0.as_str()),
-    );
-    assert_eq!(
-        encoding_trace.attempted_member0_message_id.as_ref(),
-        Some(&expected_encoded[0].1),
-    );
-    assert!(!progress.is_retryable());
-    assert_eq!(
-        progress.member_progress(),
-        [
-            PqLocalAttestationMemberPublishProgress::Consumed {
-                message_id: expected_encoded[0].1.clone(),
-                duplicate: false,
-                result: PqSingleConsumptionResult::Queued,
-            },
-            PqLocalAttestationMemberPublishProgress::Consumed {
-                message_id: expected_encoded[1].1.clone(),
-                duplicate: true,
-                result: PqSingleConsumptionResult::Queued,
-            },
-        ],
-        "both exact wire identities retain source provenance and current-slot queued outcomes",
-    );
+        .expect("the one-duty production attester stops before slot-two block production");
     assert_eq!(
         fixture
             .chain
@@ -1088,7 +1147,7 @@ async fn direct_pq_attester_service_converges_two_independent_workers_exactly_on
     assert_eq!(
         sender_pool,
         TestingPqAttestationPoolSnapshot {
-            candidate_validator_indices: pooled_validator_indices,
+            candidate_validator_indices: pooled_validator_indices.clone(),
             candidate_count: fixture.expected.len(),
             candidate_signer_sets: vec![
                 vec![fixture.expected[0].validator_index],
@@ -1115,7 +1174,189 @@ async fn direct_pq_attester_service_converges_two_independent_workers_exactly_on
         1,
         "publication/coalescence must not repeat SQLite precheck or signing",
     );
-    drop(progress);
+    let aggregate_snapshot = tokio::time::timeout(Duration::from_secs(240), async {
+        loop {
+            let snapshot = fixture.chain.testing_only_pq_attestation_pool_snapshot();
+            if snapshot.candidate_count == 1
+                && snapshot.candidate_signer_sets == vec![pooled_validator_indices.clone()]
+            {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the production background worker commits the exact two-signer aggregate");
+    assert_eq!(aggregate_snapshot.candidate_count, 1);
+    assert_eq!(
+        fixture
+            .chain
+            .testing_only_pq_local_attestation_batch_verification_count(),
+        1,
+        "background aggregation must not repeat local attestation verification",
+    );
+
+    tokio::time::timeout(Duration::from_secs(360), async {
+        loop {
+            match fixture.chain.slot_clock.now() {
+                Some(slot) if slot == Slot::new(2) => break,
+                Some(slot) if slot > Slot::new(2) => {
+                    panic!("authentic aggregate fixture missed slot two: {slot}")
+                }
+                Some(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                None => panic!("authentic aggregate fixture clock unavailable"),
+            }
+        }
+    })
+    .await
+    .expect("bounded wait for authentic slot two");
+    let mut slot_two_state = fixture.chain.head_snapshot().beacon_state.clone();
+    while slot_two_state.slot() < Slot::new(2) {
+        state_processing::per_slot_processing_pq(&mut slot_two_state, &fixture.chain.spec)
+            .expect("advance the exact slot-one head to slot two");
+    }
+    let slot_two_proposer = slot_two_state
+        .get_beacon_proposer_index(Slot::new(2), &fixture.chain.spec)
+        .expect("slot-two proposer");
+    let slot_two_proposer_pubkey = slot_two_state
+        .validators()
+        .get(slot_two_proposer)
+        .expect("slot-two proposer validator")
+        .pubkey;
+    let slot_two_randao = fixture
+        .validator_store
+        .randao_reveal(slot_two_proposer_pubkey, Slot::new(2))
+        .await
+        .expect("journal-backed slot-two RANDAO");
+    assert_eq!(
+        fixture
+            .sender_execution
+            .payload_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+    );
+    assert_eq!(
+        fixture
+            .receiver_execution
+            .payload_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+    );
+    let produced_slot_two = fixture
+        .chain
+        .produce_pq_block_v3(Slot::new(2), slot_two_randao, Graffiti::default())
+        .await
+        .expect("real slot-two production selects the retained aggregate");
+    let (slot_two_block, slot_two_sidecars) = produced_slot_two.into_contents().deconstruct();
+    let (slot_two_proofs, slot_two_blobs) =
+        slot_two_sidecars.expect("Electra slot-two production carries explicit empty sidecars");
+    assert!(slot_two_proofs.is_empty());
+    assert!(slot_two_blobs.is_empty());
+    assert_eq!(slot_two_block.body().attestations_len(), 1);
+    assert_eq!(
+        fixture
+            .sender_execution
+            .payload_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+    );
+    let slot_two_contents = eth2::types::FullBlockContents::new(
+        slot_two_block,
+        Some((slot_two_proofs, slot_two_blobs)),
+    );
+    let SignedBlock::Full(signed_slot_two) = fixture
+        .validator_store
+        .sign_block(
+            slot_two_proposer_pubkey,
+            UnsignedBlock::Full(slot_two_contents),
+            Slot::new(2),
+        )
+        .await
+        .expect("journal-backed slot-two proposal")
+    else {
+        panic!("slot-two full block signing preserves shape")
+    };
+    let signed_slot_two: Arc<SignedBeaconBlock<MinimalEthSpec>> =
+        Arc::clone(signed_slot_two.signed_block());
+    let signed_slot_two_root = signed_slot_two.canonical_root();
+    let publication_service = Arc::new(
+        PqBlockPublicationService::new(
+            Arc::clone(&fixture.chain),
+            fixture.task_executor.clone(),
+            sender_block_sender,
+        )
+        .expect("actual sender block publication service"),
+    );
+    let publication = publication_service
+        .try_admit()
+        .expect("slot-two block publication admission")
+        .publish(Arc::clone(&signed_slot_two));
+    let disposition = tokio::time::timeout(Duration::from_secs(300), publication)
+        .await
+        .expect("slot-two block publication completes");
+    let PqBlockPublicationDisposition::Published(outcome) = disposition else {
+        panic!("the authentic aggregate block must commit on its publisher")
+    };
+    assert_eq!(outcome.block_root, signed_slot_two_root);
+    tokio::time::timeout(Duration::from_secs(300), async {
+        while fixture.receiver_chain.head_snapshot().beacon_block_root != signed_slot_two_root {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the independent peer imports the exact slot-two aggregate block");
+
+    let mut expected_participation = vec![
+        0u8;
+        fixture
+            .chain
+            .head_snapshot()
+            .beacon_state
+            .validators()
+            .len()
+    ];
+    for expected in &fixture.expected {
+        *expected_participation
+            .get_mut(
+                usize::try_from(expected.validator_index)
+                    .expect("minimal validator index fits usize"),
+            )
+            .expect("attesting validator remains in the slot-two registry") = 0b111;
+    }
+    for chain in [&fixture.chain, &fixture.receiver_chain] {
+        let head = chain.head_snapshot();
+        assert_eq!(head.beacon_block_root, signed_slot_two_root);
+        assert_eq!(head.beacon_state.slot(), Slot::new(2));
+        assert_eq!(
+            head.beacon_state
+                .current_epoch_participation()
+                .expect("Electra current participation")
+                .iter()
+                .map(|flags| flags.into_u8())
+                .collect::<Vec<_>>(),
+            expected_participation,
+        );
+        assert_eq!(
+            head.beacon_state.finalized_checkpoint().epoch,
+            Epoch::new(0)
+        );
+        assert_eq!(
+            chain
+                .store
+                .get_full_block(&signed_slot_two_root)
+                .expect("slot-two store lookup")
+                .expect("slot-two exact block persisted"),
+            *signed_slot_two,
+        );
+    }
+    assert_eq!(
+        fixture
+            .receiver_execution
+            .payload_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the receiver validates new payloads but never builds a proposer payload",
+    );
     for (owner, receiver) in [
         (
             "chain task executor",
@@ -1132,6 +1373,11 @@ async fn direct_pq_attester_service_converges_two_independent_workers_exactly_on
             }
         }
     }
+    fixture
+        .service
+        .close_and_drain()
+        .await
+        .expect("drop service-owned real token batch before network drain");
     sender_shutdown
         .wait()
         .await
@@ -1144,17 +1390,155 @@ async fn direct_pq_attester_service_converges_two_independent_workers_exactly_on
     drop(peer_operational_events);
     drop(sender_network_exit_owner);
     drop(peer_network_exit_owner);
-    fixture
-        .service
-        .close_and_drain()
-        .await
-        .expect("drop service-owned real token batch");
     fixture.chain.close_and_drain_pq_imports().await;
     fixture.receiver_chain.close_and_drain_pq_imports().await;
     assert!(matches!(
         fixture.service.try_attest_current_slot(),
         Err(pq_attester_service::PqAttesterServiceError::Closed)
     ));
+    let expected_execution_hash = signed_slot_two
+        .message()
+        .body()
+        .execution_payload()
+        .expect("slot-two execution payload")
+        .block_hash();
+    let signed_slot_one_root = signed_slot_two.parent_root();
+    let expected_genesis_execution_hash = fixture
+        .chain
+        .store
+        .get_full_block(&signed_slot_one_root)
+        .expect("slot-one store lookup for execution ancestry")
+        .expect("slot-one block remains persisted")
+        .message()
+        .body()
+        .execution_payload()
+        .expect("slot-one execution payload")
+        .parent_hash();
+    let expected_state_root = signed_slot_two.message().state_root();
+    let expected_finalized = fixture
+        .chain
+        .head_snapshot()
+        .beacon_state
+        .finalized_checkpoint();
+    let sender_new_payload_before = fixture
+        .sender_execution
+        .new_payload_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let receiver_new_payload_before = fixture
+        .receiver_execution
+        .new_payload_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let sender_forkchoice_before = fixture
+        .sender_execution
+        .forkchoice_calls
+        .lock()
+        .expect("sender FCU audit")
+        .len();
+    let receiver_forkchoice_before = fixture
+        .receiver_execution
+        .forkchoice_calls
+        .lock()
+        .expect("receiver FCU audit")
+        .len();
+    let restarted_sender = restart_direct_attester_chain(
+        &fixture.chain,
+        Arc::clone(&fixture.sender_execution),
+        fixture.task_executor.clone(),
+    );
+    let restarted_receiver = restart_direct_attester_chain(
+        &fixture.receiver_chain,
+        Arc::clone(&fixture.receiver_execution),
+        fixture.task_executor.clone(),
+    );
+    let (sender_reconciled, receiver_reconciled) = tokio::join!(
+        restarted_sender.reconcile_persisted_pq_head(),
+        restarted_receiver.reconcile_persisted_pq_head(),
+    );
+    sender_reconciled.expect("restarted sender reconciles the persisted slot-two head");
+    receiver_reconciled.expect("restarted receiver reconciles the persisted slot-two head");
+    for (chain, execution, new_payload_before, forkchoice_before) in [
+        (
+            &restarted_sender,
+            &fixture.sender_execution,
+            sender_new_payload_before,
+            sender_forkchoice_before,
+        ),
+        (
+            &restarted_receiver,
+            &fixture.receiver_execution,
+            receiver_new_payload_before,
+            receiver_forkchoice_before,
+        ),
+    ] {
+        let head = chain.head_snapshot();
+        assert_eq!(head.beacon_block_root, signed_slot_two_root);
+        assert_eq!(head.beacon_block.as_ref(), signed_slot_two.as_ref());
+        assert_eq!(head.beacon_state.slot(), Slot::new(2));
+        assert_eq!(head.validated_state_root(), expected_state_root);
+        assert_eq!(head.beacon_state.finalized_checkpoint(), expected_finalized);
+        assert_eq!(
+            head.beacon_state
+                .current_epoch_participation()
+                .expect("restarted Electra current participation")
+                .iter()
+                .map(|flags| flags.into_u8())
+                .collect::<Vec<_>>(),
+            expected_participation,
+        );
+        assert_eq!(
+            chain.testing_only_pq_fork_choice_current_slot(),
+            Some(Slot::new(2)),
+            "restart reconstructs fork choice at the exact durable slot",
+        );
+        assert!(
+            chain.testing_only_pq_fork_choice_contains_block(signed_slot_one_root),
+            "restart reconstructs the durable slot-one ancestor",
+        );
+        assert!(
+            chain.testing_only_pq_fork_choice_contains_block(signed_slot_two_root),
+            "restart reconstructs the exact durable slot-two head",
+        );
+        assert_eq!(
+            chain.testing_only_pq_fork_choice_cached_head_root(),
+            Some(signed_slot_two_root),
+            "restart refreshes the cached head after replaying the full lineage",
+        );
+        assert_eq!(
+            chain.testing_only_pq_fork_choice_proposer_boost_root(),
+            Some(Hash256::default()),
+            "historical replay never fabricates proposer boost",
+        );
+        assert_eq!(
+            execution
+                .new_payload_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            new_payload_before,
+            "restart reconciliation does not re-submit the persisted payload",
+        );
+        let forkchoice_calls = execution
+            .forkchoice_calls
+            .lock()
+            .expect("restarted FCU audit");
+        assert_eq!(forkchoice_calls.len(), forkchoice_before + 1);
+        assert_eq!(
+            forkchoice_calls.last().copied(),
+            Some((
+                expected_execution_hash,
+                expected_genesis_execution_hash,
+                expected_genesis_execution_hash,
+                Slot::new(2),
+                signed_slot_two_root,
+            )),
+            "restart emits one exact head/safe/finalized no-attributes FCU",
+        );
+        assert_eq!(
+            chain.testing_only_pq_attestation_pool_snapshot(),
+            TestingPqAttestationPoolSnapshot::default(),
+            "the ephemeral attestation pool is intentionally rebuilt empty after restart",
+        );
+    }
+    restarted_sender.close_and_drain_pq_imports().await;
+    restarted_receiver.close_and_drain_pq_imports().await;
     eprintln!("PQ direct attester: drained after {:?}", started.elapsed());
 }
 
@@ -1165,17 +1549,25 @@ fn unix_time_now_precise() -> Result<Duration, String> {
 }
 
 fn three_slot_wait_remaining(genesis_time: u64, now: u64) -> Result<Duration, String> {
-    let slot_three_boundary = THREE_SLOT_TARGET
+    process_wait_remaining(genesis_time, now, THREE_SLOT_TARGET)
+}
+
+fn process_wait_remaining(
+    genesis_time: u64,
+    now: u64,
+    target_slot: u64,
+) -> Result<Duration, String> {
+    let target_boundary = target_slot
         .checked_mul(PQ_SLOT_SECONDS)
         .and_then(|offset| genesis_time.checked_add(offset))
-        .ok_or("three-slot absolute deadline overflow")?;
-    let deadline = slot_three_boundary
+        .ok_or("process target-slot absolute deadline overflow")?;
+    let deadline = target_boundary
         .checked_add(PROPOSAL_COMPLETION_SECONDS)
-        .ok_or("three-slot completion deadline overflow")?;
+        .ok_or("process target-slot completion deadline overflow")?;
     let remaining = deadline
         .checked_sub(now)
         .filter(|remaining| *remaining > 0)
-        .ok_or("three-slot absolute deadline expired")?;
+        .ok_or("process target-slot absolute deadline expired")?;
     Ok(Duration::from_secs(remaining))
 }
 
@@ -1184,17 +1576,28 @@ fn restart_ready_remaining(genesis_time: u64, now: u64) -> Result<Duration, Stri
 }
 
 fn restart_ready_remaining_precise(genesis_time: u64, now: Duration) -> Result<Duration, String> {
-    let slot_five_boundary = 5_u64
+    restart_ready_remaining_for_target(genesis_time, now, THREE_SLOT_TARGET)
+}
+
+fn restart_ready_remaining_for_target(
+    genesis_time: u64,
+    now: Duration,
+    target_slot: u64,
+) -> Result<Duration, String> {
+    let stop_slot = target_slot
+        .checked_add(2)
+        .ok_or("restart stop slot overflow")?;
+    let stop_boundary = stop_slot
         .checked_mul(PQ_SLOT_SECONDS)
         .and_then(|offset| genesis_time.checked_add(offset))
-        .ok_or("restart slot-5 boundary overflow")?;
-    let ready_deadline = slot_five_boundary
+        .ok_or("restart stop boundary overflow")?;
+    let ready_deadline = stop_boundary
         .checked_sub(RESTART_STOP_MARGIN_SECONDS)
         .ok_or("restart stop margin underflow")?;
     let remaining = Duration::from_secs(ready_deadline)
         .checked_sub(now)
         .filter(|remaining| !remaining.is_zero())
-        .ok_or("restart can no longer stop safely before slot 5")?;
+        .ok_or("restart can no longer stop safely before its checked boundary")?;
     Ok(remaining)
 }
 
@@ -1268,6 +1671,8 @@ enum PqProcessEventKind {
         slot: u64,
         block_root: Hash256,
         execution_hash: ExecutionBlockHash,
+        justified_epoch: u64,
+        justified_root: Hash256,
         finalized_epoch: u64,
         finalized_root: Hash256,
         signed_ssz_digest: [u8; 32],
@@ -1281,6 +1686,8 @@ enum PqProcessEventKind {
         slot: u64,
         block_root: Hash256,
         execution_hash: ExecutionBlockHash,
+        justified_epoch: u64,
+        justified_root: Hash256,
         finalized_epoch: u64,
         finalized_root: Hash256,
         signed_ssz_digest: [u8; 32],
@@ -1290,6 +1697,8 @@ enum PqProcessEventKind {
         slot: u64,
         block_root: Hash256,
         execution_hash: ExecutionBlockHash,
+        justified_epoch: u64,
+        justified_root: Hash256,
         finalized_epoch: u64,
         finalized_root: Hash256,
         signed_ssz_digest: [u8; 32],
@@ -1432,7 +1841,7 @@ fn parse_pq_process_event(line: &str) -> Result<PqProcessEvent, PqProcessEventFa
     };
     let kind = match event {
         "EventWriterReady" if fields.len() == 4 => PqProcessEventKind::EventWriterReady,
-        "RuntimeReady" if fields.len() == 11 => PqProcessEventKind::RuntimeReady {
+        "RuntimeReady" if fields.len() == 13 => PqProcessEventKind::RuntimeReady {
             startup: match exact_field(fields[4], "startup=")? {
                 "fresh" => PqProcessStartup::Fresh,
                 "resume" => PqProcessStartup::Resume,
@@ -1444,15 +1853,17 @@ fn parse_pq_process_event(line: &str) -> Result<PqProcessEvent, PqProcessEventFa
                 fields[7],
                 "execution_hash=",
             )?),
-            finalized_epoch: parse_canonical_u64(fields[8], "finalized_epoch=")?,
-            finalized_root: parse_hash256(fields[9], "finalized_root=")?,
-            signed_ssz_digest: parse_signed_ssz_digest(fields[10])?,
+            justified_epoch: parse_canonical_u64(fields[8], "justified_epoch=")?,
+            justified_root: parse_hash256(fields[9], "justified_root=")?,
+            finalized_epoch: parse_canonical_u64(fields[10], "finalized_epoch=")?,
+            finalized_root: parse_hash256(fields[11], "finalized_root=")?,
+            signed_ssz_digest: parse_signed_ssz_digest(fields[12])?,
         },
         "ProposalStarted" if fields.len() == 6 => PqProcessEventKind::ProposalStarted {
             slot: parse_canonical_u64(fields[4], "slot=")?,
             parent_root: parse_hash256(fields[5], "parent_root=")?,
         },
-        "BlockPersisted" if fields.len() == 11 => PqProcessEventKind::BlockPersisted {
+        "BlockPersisted" if fields.len() == 13 => PqProcessEventKind::BlockPersisted {
             source: parse_block_source(fields[4])?,
             slot: parse_canonical_u64(fields[5], "slot=")?,
             block_root: parse_hash256(fields[6], "block_root=")?,
@@ -1460,11 +1871,13 @@ fn parse_pq_process_event(line: &str) -> Result<PqProcessEvent, PqProcessEventFa
                 fields[7],
                 "execution_hash=",
             )?),
-            finalized_epoch: parse_canonical_u64(fields[8], "finalized_epoch=")?,
-            finalized_root: parse_hash256(fields[9], "finalized_root=")?,
-            signed_ssz_digest: parse_signed_ssz_digest(fields[10])?,
+            justified_epoch: parse_canonical_u64(fields[8], "justified_epoch=")?,
+            justified_root: parse_hash256(fields[9], "justified_root=")?,
+            finalized_epoch: parse_canonical_u64(fields[10], "finalized_epoch=")?,
+            finalized_root: parse_hash256(fields[11], "finalized_root=")?,
+            signed_ssz_digest: parse_signed_ssz_digest(fields[12])?,
         },
-        "ExecutionReconciled" if fields.len() == 11 => PqProcessEventKind::ExecutionReconciled {
+        "ExecutionReconciled" if fields.len() == 13 => PqProcessEventKind::ExecutionReconciled {
             source: parse_block_source(fields[4])?,
             slot: parse_canonical_u64(fields[5], "slot=")?,
             block_root: parse_hash256(fields[6], "block_root=")?,
@@ -1472,9 +1885,11 @@ fn parse_pq_process_event(line: &str) -> Result<PqProcessEvent, PqProcessEventFa
                 fields[7],
                 "execution_hash=",
             )?),
-            finalized_epoch: parse_canonical_u64(fields[8], "finalized_epoch=")?,
-            finalized_root: parse_hash256(fields[9], "finalized_root=")?,
-            signed_ssz_digest: parse_signed_ssz_digest(fields[10])?,
+            justified_epoch: parse_canonical_u64(fields[8], "justified_epoch=")?,
+            justified_root: parse_hash256(fields[9], "justified_root=")?,
+            finalized_epoch: parse_canonical_u64(fields[10], "finalized_epoch=")?,
+            finalized_root: parse_hash256(fields[11], "finalized_root=")?,
+            signed_ssz_digest: parse_signed_ssz_digest(fields[12])?,
         },
         "ProposalPublished" if fields.len() == 7 => PqProcessEventKind::ProposalPublished {
             slot: parse_canonical_u64(fields[4], "slot=")?,
@@ -1565,11 +1980,14 @@ fn validate_compatible_event_trace(
                 slot: 0,
                 block_root,
                 execution_hash,
+                justified_epoch: 0,
+                justified_root,
                 finalized_epoch: 0,
                 finalized_root,
                 signed_ssz_digest,
             } if *block_root != Hash256::ZERO
                 && *execution_hash == ExecutionBlockHash::zero()
+                && *justified_root == Hash256::ZERO
                 && *finalized_root == Hash256::ZERO
                 && *signed_ssz_digest != [0; 32]
         )
@@ -1634,6 +2052,8 @@ struct PqProcessBlockIdentity {
     slot: u64,
     block_root: Hash256,
     execution_hash: ExecutionBlockHash,
+    justified_epoch: u64,
+    justified_root: Hash256,
     finalized_epoch: u64,
     finalized_root: Hash256,
     signed_ssz_digest: [u8; 32],
@@ -1653,6 +2073,8 @@ fn persisted_identity(
                     slot,
                     block_root,
                     execution_hash,
+                    justified_epoch,
+                    justified_root,
                     finalized_epoch,
                     finalized_root,
                     signed_ssz_digest,
@@ -1662,6 +2084,8 @@ fn persisted_identity(
             slot: *slot,
             block_root: *block_root,
             execution_hash: *execution_hash,
+            justified_epoch: *justified_epoch,
+            justified_root: *justified_root,
             finalized_epoch: *finalized_epoch,
             finalized_root: *finalized_root,
             signed_ssz_digest: *signed_ssz_digest,
@@ -1684,6 +2108,8 @@ fn reconciled_identity(
                     slot,
                     block_root,
                     execution_hash,
+                    justified_epoch,
+                    justified_root,
                     finalized_epoch,
                     finalized_root,
                     signed_ssz_digest,
@@ -1693,6 +2119,8 @@ fn reconciled_identity(
             slot: *slot,
             block_root: *block_root,
             execution_hash: *execution_hash,
+            justified_epoch: *justified_epoch,
+            justified_root: *justified_root,
             finalized_epoch: *finalized_epoch,
             finalized_root: *finalized_root,
             signed_ssz_digest: *signed_ssz_digest,
@@ -1706,6 +2134,16 @@ fn validate_engine_history(
     identities: &[PqProcessBlockIdentity],
     expect_get_payload: bool,
 ) -> Result<(), String> {
+    let checkpoint_execution_hash = |root: Hash256| {
+        if root == Hash256::ZERO {
+            return Ok(ExecutionBlockHash::zero());
+        }
+        identities
+            .iter()
+            .find(|identity| identity.block_root == root)
+            .map(|identity| identity.execution_hash)
+            .ok_or_else(|| format!("checkpoint root is absent from the exact lineage: {root:?}"))
+    };
     let mut expected = vec![MockEngineAuditEvent::ForkchoiceUpdated {
         head_block_hash: ExecutionBlockHash::zero(),
         safe_block_hash: ExecutionBlockHash::zero(),
@@ -1714,12 +2152,14 @@ fn validate_engine_history(
     }];
     let mut parent_execution_hash = ExecutionBlockHash::zero();
     for identity in identities {
+        let safe_block_hash = checkpoint_execution_hash(identity.justified_root)?;
+        let finalized_block_hash = checkpoint_execution_hash(identity.finalized_root)?;
         if expect_get_payload {
             expected.extend([
                 MockEngineAuditEvent::ForkchoiceUpdated {
                     head_block_hash: parent_execution_hash,
-                    safe_block_hash: ExecutionBlockHash::zero(),
-                    finalized_block_hash: ExecutionBlockHash::zero(),
+                    safe_block_hash,
+                    finalized_block_hash,
                     has_payload_attributes: true,
                 },
                 MockEngineAuditEvent::GetPayload {
@@ -1735,8 +2175,8 @@ fn validate_engine_history(
             },
             MockEngineAuditEvent::ForkchoiceUpdated {
                 head_block_hash: identity.execution_hash,
-                safe_block_hash: ExecutionBlockHash::zero(),
-                finalized_block_hash: ExecutionBlockHash::zero(),
+                safe_block_hash,
+                finalized_block_hash,
                 has_payload_attributes: false,
             },
         ]);
@@ -1758,6 +2198,30 @@ fn validate_restart_idempotence(
     proposer_engine_after: &[MockEngineAuditEvent],
     verifier_engine_before: &[MockEngineAuditEvent],
     verifier_engine_after: &[MockEngineAuditEvent],
+) -> Result<(), String> {
+    validate_restart_idempotence_with_checkpoints(
+        proposer_events,
+        verifier_events,
+        expected,
+        proposer_engine_before,
+        proposer_engine_after,
+        verifier_engine_before,
+        verifier_engine_after,
+        ExecutionBlockHash::zero(),
+        ExecutionBlockHash::zero(),
+    )
+}
+
+fn validate_restart_idempotence_with_checkpoints(
+    proposer_events: &[PqProcessEvent],
+    verifier_events: &[PqProcessEvent],
+    expected: PqProcessBlockIdentity,
+    proposer_engine_before: &[MockEngineAuditEvent],
+    proposer_engine_after: &[MockEngineAuditEvent],
+    verifier_engine_before: &[MockEngineAuditEvent],
+    verifier_engine_after: &[MockEngineAuditEvent],
+    expected_safe_execution_hash: ExecutionBlockHash,
+    expected_finalized_execution_hash: ExecutionBlockHash,
 ) -> Result<(), String> {
     let validate_events = |events: &[PqProcessEvent], role: PqProcessRole| {
         if events.first()
@@ -1781,6 +2245,8 @@ fn validate_restart_idempotence(
                     slot,
                     block_root,
                     execution_hash,
+                    justified_epoch,
+                    justified_root,
                     finalized_epoch,
                     finalized_root,
                     signed_ssz_digest,
@@ -1790,6 +2256,8 @@ fn validate_restart_idempotence(
                         slot,
                         block_root,
                         execution_hash,
+                        justified_epoch,
+                        justified_root,
                         finalized_epoch,
                         finalized_root,
                         signed_ssz_digest,
@@ -1823,8 +2291,8 @@ fn validate_restart_idempotence(
     let validate_engine = |before: &[MockEngineAuditEvent], after: &[MockEngineAuditEvent]| {
         let expected_replay = MockEngineAuditEvent::ForkchoiceUpdated {
             head_block_hash: expected.execution_hash,
-            safe_block_hash: ExecutionBlockHash::zero(),
-            finalized_block_hash: ExecutionBlockHash::zero(),
+            safe_block_hash: expected_safe_execution_hash,
+            finalized_block_hash: expected_finalized_execution_hash,
             has_payload_attributes: false,
         };
         if after.len()
@@ -1852,6 +2320,25 @@ fn validate_three_slot_process_convergence(
     proposer_engine: &[MockEngineAuditEvent],
     verifier_engine: &[MockEngineAuditEvent],
 ) -> Result<(), String> {
+    validate_process_convergence_through_slot(
+        proposer,
+        verifier,
+        proposer_engine,
+        verifier_engine,
+        THREE_SLOT_TARGET,
+    )
+}
+
+fn validate_process_convergence_through_slot(
+    proposer: &[PqProcessEvent],
+    verifier: &[PqProcessEvent],
+    proposer_engine: &[MockEngineAuditEvent],
+    verifier_engine: &[MockEngineAuditEvent],
+    target_slot: u64,
+) -> Result<(), String> {
+    if target_slot == 0 {
+        return Err("process convergence target slot must be nonzero".into());
+    }
     let proposer_runtime_events = proposer
         .iter()
         .enumerate()
@@ -1910,17 +2397,15 @@ fn validate_three_slot_process_convergence(
             _ => None,
         })
         .collect::<Vec<_>>();
-    if starts.len() != 3
+    if starts.len() != usize::try_from(target_slot).map_err(|_| "target slot exceeds usize")?
         || starts[0].0 <= proposer_compatible
         || starts[0].0 <= proposer_ready_position
     {
         return Err(format!(
-            "expected three post-compatibility proposals: {starts:?}"
+            "unexpected post-compatibility proposal count: {starts:?}"
         ));
     }
-    if starts[1].1 != starts[0].1.checked_add(1).ok_or("slot overflow")?
-        || starts[2].1 != starts[1].1.checked_add(1).ok_or("slot overflow")?
-    {
+    if starts.iter().map(|(_, slot, _)| *slot).ne(1..=target_slot) {
         return Err(format!("proposal slots are not consecutive: {starts:?}"));
     }
     let proposer_persisted = proposer
@@ -1955,7 +2440,8 @@ fn validate_three_slot_process_convergence(
             reconciled_identity(event, PqProcessRole::Verifier, PqProcessBlockSource::Gossip)
         })
         .collect::<Vec<_>>();
-    if proposer_persisted.len() != 3
+    if proposer_persisted.len()
+        != usize::try_from(target_slot).map_err(|_| "target slot exceeds usize")?
         || proposer_persisted != proposer_reconciled
         || proposer_persisted != verifier_persisted
         || proposer_persisted != verifier_reconciled
@@ -2005,12 +2491,8 @@ fn validate_three_slot_process_convergence(
         } else {
             proposer_persisted[index - 1].block_root
         };
-        if *slot != identity.slot
-            || *parent_root != expected_parent
-            || identity.finalized_epoch != 0
-            || identity.finalized_root != Hash256::ZERO
-        {
-            return Err("proposal parent/finalized identity mismatch".into());
+        if *slot != identity.slot || *parent_root != expected_parent {
+            return Err("proposal parent identity mismatch".into());
         }
         let proposer_positions = (
             starts[index].0,
@@ -2127,6 +2609,47 @@ fn validate_three_slot_process_convergence(
     }
     validate_engine_history(proposer_engine, &proposer_persisted, true)?;
     validate_engine_history(verifier_engine, &proposer_persisted, false)?;
+    Ok(())
+}
+
+fn validate_slot_32_finality(identities: &[PqProcessBlockIdentity]) -> Result<(), String> {
+    if identities.len() != FINALITY_TARGET_SLOT
+        || identities
+            .iter()
+            .map(|identity| identity.slot)
+            .ne(1..=FINALITY_TARGET_SLOT as u64)
+    {
+        return Err("finality lineage is not the exact consecutive slot-1..32 history".into());
+    }
+    let slot_16 = identities
+        .get(15)
+        .ok_or("slot-16 finality boundary is absent")?;
+    let slot_24 = identities
+        .get(23)
+        .ok_or("slot-24 justification boundary is absent")?;
+    let slot_32 = identities
+        .get(31)
+        .ok_or("slot-32 finality boundary is absent")?;
+    if identities[..31]
+        .iter()
+        .any(|identity| identity.finalized_epoch != 0 || identity.finalized_root != Hash256::ZERO)
+    {
+        return Err("a non-genesis checkpoint finalized before slot 32".into());
+    }
+    if slot_24.justified_epoch != 2
+        || slot_24.justified_root != slot_16.block_root
+        || slot_24.finalized_epoch != 0
+        || slot_24.finalized_root != Hash256::ZERO
+    {
+        return Err("slot 24 does not justify the exact epoch-2 boundary".into());
+    }
+    if slot_32.justified_epoch != 3
+        || slot_32.justified_root != slot_24.block_root
+        || slot_32.finalized_epoch != 2
+        || slot_32.finalized_root != slot_16.block_root
+    {
+        return Err("slot 32 does not justify epoch 3 and finalize exact epoch 2".into());
+    }
     Ok(())
 }
 
@@ -4751,6 +5274,8 @@ peer_digest=02020202020202020202020202020202",
                 slot: 0,
                 block_root: Hash256::repeat_byte(1),
                 execution_hash: ExecutionBlockHash::zero(),
+                justified_epoch: 0,
+                justified_root: Hash256::ZERO,
                 finalized_epoch: 0,
                 finalized_root: Hash256::ZERO,
                 signed_ssz_digest: [2; 32],
@@ -4846,8 +5371,14 @@ peer_digest=02020202020202020202020202020202",
         .is_err()
     );
 
+    const EXPECTED_FINALITY_EVENT_CAPACITY: usize = 206;
+
     let overflow = BoundedProcessLog::default();
-    for sequence in 1..=65 {
+    assert_eq!(
+        MAX_RETAINED_PQ_EVENTS, EXPECTED_FINALITY_EVENT_CAPACITY,
+        "the bounded event journal must retain slot-32 lifecycle and periodic status events",
+    );
+    for sequence in 1..=EXPECTED_FINALITY_EVENT_CAPACITY {
         overflow.push(
             "stdout",
             format!(
@@ -4857,6 +5388,19 @@ peer_digest=02020202020202020202020202020202"
             .as_bytes(),
         );
     }
+    assert_eq!(overflow.event_failure(), None);
+    assert_eq!(
+        overflow
+            .events()
+            .expect("the exact slot-32 event workload fits")
+            .len(),
+        EXPECTED_FINALITY_EVENT_CAPACITY
+    );
+    overflow.push(
+        "stdout",
+        b"PQ_EVENT_V1 event=PeerCompatible sequence=207 role=verifier \
+peer_digest=02020202020202020202020202020202",
+    );
     overflow.push("stderr", b"ordinary-after-overflow");
     assert_eq!(
         overflow.event_failure(),
@@ -4875,6 +5419,7 @@ fn extended_structured_event_parser_is_exact_and_mutation_sensitive() {
         "PQ_EVENT_V1 event=RuntimeReady sequence=6 role=proposer startup=resume slot=3 \
 block_root=0x0101010101010101010101010101010101010101010101010101010101010101 \
 execution_hash=0x0202020202020202020202020202020202020202020202020202020202020202 \
+justified_epoch=2 justified_root=0x0808080808080808080808080808080808080808080808080808080808080808 \
 finalized_epoch=0 finalized_root=0x0303030303030303030303030303030303030303030303030303030303030303 \
 signed_ssz_digest=0404040404040404040404040404040404040404040404040404040404040404",
     )
@@ -4886,11 +5431,14 @@ signed_ssz_digest=04040404040404040404040404040404040404040404040404040404040404
             slot: 3,
             block_root,
             execution_hash,
+            justified_epoch: 2,
+            justified_root,
             finalized_epoch: 0,
             finalized_root,
             signed_ssz_digest,
         } if block_root == types::Hash256::repeat_byte(1)
             && execution_hash == ExecutionBlockHash::repeat_byte(2)
+            && justified_root == types::Hash256::repeat_byte(8)
             && finalized_root == types::Hash256::repeat_byte(3)
             && signed_ssz_digest == [4; 32]
     ));
@@ -4898,6 +5446,7 @@ signed_ssz_digest=04040404040404040404040404040404040404040404040404040404040404
         "PQ_EVENT_V1 event=BlockPersisted sequence=7 role=verifier source=gossip slot=4 \
 block_root=0x0505050505050505050505050505050505050505050505050505050505050505 \
 execution_hash=0x0606060606060606060606060606060606060606060606060606060606060606 \
+justified_epoch=2 justified_root=0x0808080808080808080808080808080808080808080808080808080808080808 \
 finalized_epoch=0 finalized_root=0x0303030303030303030303030303030303030303030303030303030303030303 \
 signed_ssz_digest=0707070707070707070707070707070707070707070707070707070707070707",
     )
@@ -4942,6 +5491,8 @@ fn three_slot_convergence_contract_is_exact_and_mutation_sensitive() {
                     slot: 0,
                     block_root: Hash256::repeat_byte(1),
                     execution_hash: ExecutionBlockHash::zero(),
+                    justified_epoch: 0,
+                    justified_root: Hash256::ZERO,
                     finalized_epoch: 0,
                     finalized_root: Hash256::ZERO,
                     signed_ssz_digest: [2; 32],
@@ -5017,6 +5568,8 @@ fn three_slot_convergence_contract_is_exact_and_mutation_sensitive() {
                     slot,
                     block_root,
                     execution_hash,
+                    justified_epoch: 0,
+                    justified_root: Hash256::ZERO,
                     finalized_epoch: 0,
                     finalized_root: Hash256::ZERO,
                     signed_ssz_digest: digest,
@@ -5030,6 +5583,8 @@ fn three_slot_convergence_contract_is_exact_and_mutation_sensitive() {
                     slot,
                     block_root,
                     execution_hash,
+                    justified_epoch: 0,
+                    justified_root: Hash256::ZERO,
                     finalized_epoch: 0,
                     finalized_root: Hash256::ZERO,
                     signed_ssz_digest: digest,
@@ -5055,6 +5610,8 @@ fn three_slot_convergence_contract_is_exact_and_mutation_sensitive() {
                     slot,
                     block_root,
                     execution_hash,
+                    justified_epoch: 0,
+                    justified_root: Hash256::ZERO,
                     finalized_epoch: 0,
                     finalized_root: Hash256::ZERO,
                     signed_ssz_digest: digest,
@@ -5068,6 +5625,8 @@ fn three_slot_convergence_contract_is_exact_and_mutation_sensitive() {
                     slot,
                     block_root,
                     execution_hash,
+                    justified_epoch: 0,
+                    justified_root: Hash256::ZERO,
                     finalized_epoch: 0,
                     finalized_root: Hash256::ZERO,
                     signed_ssz_digest: digest,
@@ -5233,6 +5792,47 @@ fn three_slot_convergence_contract_is_exact_and_mutation_sensitive() {
 }
 
 #[test]
+fn slot_32_finality_contract_is_exact_and_mutation_sensitive() {
+    let mut identities = (1_u64..=FINALITY_TARGET_SLOT as u64)
+        .map(|slot| {
+            let (justified_epoch, justified_root) = if slot >= 32 {
+                (3, Hash256::repeat_byte(24))
+            } else if slot >= 24 {
+                (2, Hash256::repeat_byte(16))
+            } else if slot >= 16 {
+                (1, Hash256::repeat_byte(8))
+            } else {
+                (0, Hash256::ZERO)
+            };
+            let (finalized_epoch, finalized_root) = if slot >= 32 {
+                (2, Hash256::repeat_byte(16))
+            } else {
+                (0, Hash256::ZERO)
+            };
+            PqProcessBlockIdentity {
+                slot,
+                block_root: Hash256::repeat_byte(u8::try_from(slot).expect("slot byte")),
+                execution_hash: ExecutionBlockHash::repeat_byte(
+                    u8::try_from(slot + 64).expect("execution byte"),
+                ),
+                justified_epoch,
+                justified_root,
+                finalized_epoch,
+                finalized_root,
+                signed_ssz_digest: [u8::try_from(slot + 128).expect("digest byte"); 32],
+            }
+        })
+        .collect::<Vec<_>>();
+    validate_slot_32_finality(&identities).expect("epoch two finalizes exactly at slot 32");
+
+    identities[31].finalized_root = Hash256::repeat_byte(15);
+    assert!(validate_slot_32_finality(&identities).is_err());
+    identities[31].finalized_root = Hash256::repeat_byte(16);
+    identities[30].finalized_epoch = 1;
+    assert!(validate_slot_32_finality(&identities).is_err());
+}
+
+#[test]
 fn three_slot_wait_uses_a_checked_absolute_genesis_deadline() {
     assert_eq!(
         three_slot_wait_remaining(900, 0).unwrap(),
@@ -5264,6 +5864,8 @@ fn restart_idempotence_contract_is_exact_and_mutation_sensitive() {
         slot: 3,
         block_root: Hash256::repeat_byte(0x33),
         execution_hash: ExecutionBlockHash::from_root(Hash256::repeat_byte(0x44)),
+        justified_epoch: 0,
+        justified_root: Hash256::ZERO,
         finalized_epoch: 0,
         finalized_root: Hash256::ZERO,
         signed_ssz_digest: [0x55; 32],
@@ -5283,6 +5885,8 @@ fn restart_idempotence_contract_is_exact_and_mutation_sensitive() {
                     slot: identity.slot,
                     block_root: identity.block_root,
                     execution_hash: identity.execution_hash,
+                    justified_epoch: identity.justified_epoch,
+                    justified_root: identity.justified_root,
                     finalized_epoch: identity.finalized_epoch,
                     finalized_root: identity.finalized_root,
                     signed_ssz_digest: identity.signed_ssz_digest,
@@ -5317,6 +5921,49 @@ fn restart_idempotence_contract_is_exact_and_mutation_sensitive() {
         &verifier_after,
     )
     .expect("exact resume is idempotent");
+
+    let expected_safe_execution_hash = ExecutionBlockHash::repeat_byte(0x66);
+    let expected_finalized_execution_hash = ExecutionBlockHash::repeat_byte(0x77);
+    let mut checkpointed_after = proposer_before.clone();
+    checkpointed_after.push(MockEngineAuditEvent::ForkchoiceUpdated {
+        head_block_hash: identity.execution_hash,
+        safe_block_hash: expected_safe_execution_hash,
+        finalized_block_hash: expected_finalized_execution_hash,
+        has_payload_attributes: false,
+    });
+    validate_restart_idempotence_with_checkpoints(
+        &proposer,
+        &verifier,
+        identity,
+        &proposer_before,
+        &checkpointed_after,
+        &verifier_before,
+        &checkpointed_after,
+        expected_safe_execution_hash,
+        expected_finalized_execution_hash,
+    )
+    .expect("restart preserves exact non-genesis safe and finalized execution hashes");
+    let mut wrong_safe = checkpointed_after.clone();
+    if let MockEngineAuditEvent::ForkchoiceUpdated {
+        safe_block_hash, ..
+    } = wrong_safe.last_mut().expect("checkpointed restart replay")
+    {
+        *safe_block_hash = ExecutionBlockHash::zero();
+    }
+    assert!(
+        validate_restart_idempotence_with_checkpoints(
+            &proposer,
+            &verifier,
+            identity,
+            &proposer_before,
+            &wrong_safe,
+            &verifier_before,
+            &checkpointed_after,
+            expected_safe_execution_hash,
+            expected_finalized_execution_hash,
+        )
+        .is_err()
+    );
 
     let mut wrong_digest = proposer.clone();
     if let PqProcessEventKind::RuntimeReady {
@@ -5365,6 +6012,8 @@ fn restart_idempotence_contract_is_exact_and_mutation_sensitive() {
             slot: identity.slot,
             block_root: identity.block_root,
             execution_hash: identity.execution_hash,
+            justified_epoch: identity.justified_epoch,
+            justified_root: identity.justified_root,
             finalized_epoch: identity.finalized_epoch,
             finalized_root: identity.finalized_root,
             signed_ssz_digest: identity.signed_ssz_digest,
@@ -5374,6 +6023,8 @@ fn restart_idempotence_contract_is_exact_and_mutation_sensitive() {
             slot: identity.slot + 1,
             block_root: identity.block_root,
             execution_hash: identity.execution_hash,
+            justified_epoch: identity.justified_epoch,
+            justified_root: identity.justified_root,
             finalized_epoch: identity.finalized_epoch,
             finalized_root: identity.finalized_root,
             signed_ssz_digest: identity.signed_ssz_digest,
@@ -5383,6 +6034,8 @@ fn restart_idempotence_contract_is_exact_and_mutation_sensitive() {
             slot: identity.slot,
             block_root: Hash256::repeat_byte(0xee),
             execution_hash: identity.execution_hash,
+            justified_epoch: identity.justified_epoch,
+            justified_root: identity.justified_root,
             finalized_epoch: identity.finalized_epoch,
             finalized_root: identity.finalized_root,
             signed_ssz_digest: identity.signed_ssz_digest,
@@ -5392,6 +6045,8 @@ fn restart_idempotence_contract_is_exact_and_mutation_sensitive() {
             slot: identity.slot,
             block_root: identity.block_root,
             execution_hash: ExecutionBlockHash::from_root(Hash256::repeat_byte(0xee)),
+            justified_epoch: identity.justified_epoch,
+            justified_root: identity.justified_root,
             finalized_epoch: identity.finalized_epoch,
             finalized_root: identity.finalized_root,
             signed_ssz_digest: identity.signed_ssz_digest,
@@ -5401,6 +6056,8 @@ fn restart_idempotence_contract_is_exact_and_mutation_sensitive() {
             slot: identity.slot,
             block_root: identity.block_root,
             execution_hash: identity.execution_hash,
+            justified_epoch: identity.justified_epoch,
+            justified_root: identity.justified_root,
             finalized_epoch: 1,
             finalized_root: Hash256::repeat_byte(0xee),
             signed_ssz_digest: identity.signed_ssz_digest,
@@ -6365,6 +7022,30 @@ async fn child_aware_enr_wait_reports_early_exit_with_bounded_diagnostics() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_real_processes_emit_compatible_status_before_any_proposal() {
+    run_two_real_processes_through_slot(THREE_SLOT_TARGET).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual ~3h05m PQ finality acceptance test; run via scripts/local_testnet/pq"]
+async fn two_real_processes_finalize_epoch_two_at_slot_32() {
+    run_two_real_processes_through_slot(FINALITY_TARGET_SLOT as u64).await;
+}
+
+#[test]
+fn verifier_only_diagnostic_is_rejected_for_finality_target() {
+    assert_eq!(
+        verifier_only_diagnostic_for_target(THREE_SLOT_TARGET, false),
+        Ok(false)
+    );
+    assert_eq!(
+        verifier_only_diagnostic_for_target(THREE_SLOT_TARGET, true),
+        Ok(true)
+    );
+    assert!(verifier_only_diagnostic_for_target(FINALITY_TARGET_SLOT as u64, true).is_err());
+}
+
+async fn run_two_real_processes_through_slot(target_slot: u64) {
+    assert!(matches!(target_slot, THREE_SLOT_TARGET | 32));
     require_pq_avx2_launch_profile();
     let fixture = tokio::task::spawn_blocking(prepare_launch_fixture)
         .await
@@ -6393,7 +7074,7 @@ async fn two_real_processes_emit_compatible_status_before_any_proposal() {
     );
     assert_ne!(proposer_engine.url(), verifier_engine.url());
     for engine in [&proposer_engine, &verifier_engine] {
-        engine.enable_engine_audit();
+        engine.enable_engine_audit_with_capacity(FINALITY_PROPOSER_ENGINE_EVENTS);
         engine.full_payload_verification();
         engine
             .execution_block_generator()
@@ -6411,7 +7092,11 @@ async fn two_real_processes_emit_compatible_status_before_any_proposal() {
     let proposer_udp = reserve_udp_port();
     let verifier_tcp = reserve_tcp_port();
     let verifier_udp = reserve_udp_port();
-    let verifier_only_diagnostic = std::env::var_os("PQ_E4F_VERIFIER_ONLY_DIAGNOSTIC").is_some();
+    let verifier_only_diagnostic = verifier_only_diagnostic_for_target(
+        target_slot,
+        std::env::var_os("PQ_E4F_VERIFIER_ONLY_DIAGNOSTIC").is_some(),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
     let proposer_args = node_args(
         &fixture.proposer_data,
         &fixture.proposer_network,
@@ -6515,25 +7200,31 @@ async fn two_real_processes_emit_compatible_status_before_any_proposal() {
     .expect("exact verifier-compatible event topology");
 
     if !verifier_only_diagnostic {
-        let proposer_timeout = three_slot_wait_remaining(
+        let proposer_timeout = process_wait_remaining(
             fixture.genesis_time,
             unix_time_now().expect("three-slot proposer wait clock"),
+            target_slot,
         )
-        .expect("third proposal remains inside its absolute completion deadline");
+        .expect("target proposal remains inside its absolute completion deadline");
         let proposer_events = proposer
-            .wait_for_event_kind_count(3, proposer_timeout, |event| {
-                matches!(event, PqProcessEventKind::ProposalPublished { .. })
-            })
+            .wait_for_event_kind_count(
+                usize::try_from(target_slot).expect("target slot fits usize"),
+                proposer_timeout,
+                |event| matches!(event, PqProcessEventKind::ProposalPublished { .. }),
+            )
             .await;
-        let verifier_timeout = three_slot_wait_remaining(
+        let verifier_timeout = process_wait_remaining(
             fixture.genesis_time,
             unix_time_now().expect("three-slot verifier wait clock"),
+            target_slot,
         )
-        .expect("third gossip import remains inside the shared absolute completion deadline");
+        .expect("target gossip import remains inside the shared absolute completion deadline");
         let verifier_events = verifier
-            .wait_for_event_kind_count(3, verifier_timeout, |event| {
-                matches!(event, PqProcessEventKind::GossipImported { .. })
-            })
+            .wait_for_event_kind_count(
+                usize::try_from(target_slot).expect("target slot fits usize"),
+                verifier_timeout,
+                |event| matches!(event, PqProcessEventKind::GossipImported { .. }),
+            )
             .await;
         let proposer_engine_history = proposer_engine
             .engine_audit_history()
@@ -6541,13 +7232,28 @@ async fn two_real_processes_emit_compatible_status_before_any_proposal() {
         let verifier_engine_history = verifier_engine
             .engine_audit_history()
             .expect("bounded verifier Engine audit");
-        validate_three_slot_process_convergence(
+        validate_process_convergence_through_slot(
             &proposer_events,
             &verifier_events,
             &proposer_engine_history,
             &verifier_engine_history,
+            target_slot,
         )
-        .expect("exact three-slot process convergence and Engine histories");
+        .expect("exact target-slot process convergence and Engine histories");
+        let proposer_lineage = proposer_events
+            .iter()
+            .filter_map(|event| {
+                persisted_identity(
+                    event,
+                    PqProcessRole::Proposer,
+                    PqProcessBlockSource::Publish,
+                )
+            })
+            .collect::<Vec<_>>();
+        if target_slot == FINALITY_TARGET_SLOT as u64 {
+            validate_slot_32_finality(&proposer_lineage)
+                .expect("the real two-process lineage finalizes epoch two at slot 32");
+        }
         let persisted = proposer_events
             .iter()
             .filter_map(|event| {
@@ -6559,7 +7265,7 @@ async fn two_real_processes_emit_compatible_status_before_any_proposal() {
             })
             .last()
             .expect("slot-3 persisted identity");
-        assert_eq!(persisted.slot, THREE_SLOT_TARGET);
+        assert_eq!(persisted.slot, target_slot);
 
         let (_, _) = tokio::join!(verifier.stop(), proposer.stop());
         probe_network_ports_released(&[proposer_tcp, verifier_tcp], &[proposer_udp, verifier_udp])
@@ -6567,11 +7273,12 @@ async fn two_real_processes_emit_compatible_status_before_any_proposal() {
 
         let mut proposer = ChildNode::spawn("restarted-proposer", &proposer_args);
         let mut verifier = ChildNode::spawn("restarted-verifier", &verifier_args);
-        let restart_timeout = restart_ready_remaining_precise(
+        let restart_timeout = restart_ready_remaining_for_target(
             fixture.genesis_time,
             unix_time_now_precise().expect("restart-ready deadline clock"),
+            target_slot,
         )
-        .expect("restart retains a checked pre-slot-5 stop margin");
+        .expect("restart retains a checked stop margin");
         let restart_deadline = Instant::now()
             .checked_add(restart_timeout)
             .expect("bounded monotonic restart-ready deadline");
@@ -6618,7 +7325,17 @@ async fn two_real_processes_emit_compatible_status_before_any_proposal() {
         let verifier_engine_after_restart = verifier_engine
             .engine_audit_history()
             .expect("bounded verifier Engine audit after restart");
-        validate_restart_idempotence(
+        let checkpoint_execution_hash = |root: Hash256| {
+            if root == Hash256::ZERO {
+                return ExecutionBlockHash::zero();
+            }
+            proposer_lineage
+                .iter()
+                .find(|identity| identity.block_root == root)
+                .map(|identity| identity.execution_hash)
+                .unwrap_or_else(|| panic!("restart checkpoint is absent from lineage: {root:?}"))
+        };
+        validate_restart_idempotence_with_checkpoints(
             &proposer_restart_events,
             &verifier_restart_events,
             persisted,
@@ -6626,8 +7343,10 @@ async fn two_real_processes_emit_compatible_status_before_any_proposal() {
             &proposer_engine_after_restart,
             &verifier_engine_history,
             &verifier_engine_after_restart,
+            checkpoint_execution_hash(persisted.justified_root),
+            checkpoint_execution_hash(persisted.finalized_root),
         )
-        .expect("restart replays exactly the persisted slot-3 execution view");
+        .expect("restart replays exactly the persisted execution checkpoint view");
         probe_network_ports_released(&[proposer_tcp, verifier_tcp], &[proposer_udp, verifier_udp])
             .expect("second shutdown releases exact network listeners");
         probe_slashing_db_released(&fixture.proposer_data)

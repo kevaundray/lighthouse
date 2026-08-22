@@ -163,12 +163,14 @@ struct BucketState<T> {
     in_flight: Option<u64>,
 }
 
+#[cfg(any(test, feature = "pq-block-selection"))]
 struct PqCandidateOrderingMetadata<'a> {
     data: &'a AttestationData,
     committee_index: u64,
     signer_indices: &'a [u64],
 }
 
+#[cfg(any(test, feature = "pq-block-selection"))]
 fn compare_pq_candidate_ordering_metadata(
     left: PqCandidateOrderingMetadata<'_>,
     right: PqCandidateOrderingMetadata<'_>,
@@ -182,6 +184,7 @@ fn compare_pq_candidate_ordering_metadata(
         .then_with(|| left.signer_indices.cmp(right.signer_indices))
 }
 
+#[cfg(any(test, feature = "pq-block-selection"))]
 fn try_filter_take_pq_candidates<Candidate, Error>(
     candidates: impl IntoIterator<Item = Candidate>,
     maximum: usize,
@@ -1313,6 +1316,88 @@ mod tests {
         .expect("zero capacity is an empty successful selection");
         assert!(selected.is_empty());
         assert_eq!(zero_cap_visits, 0);
+    }
+
+    #[cfg(feature = "pq-block-selection")]
+    #[test]
+    fn block_selection_excludes_zero_marginal_candidates_before_the_eight_candidate_cap() {
+        #[derive(Clone)]
+        struct SelectionCandidate {
+            candidate_id: u64,
+            data: AttestationData,
+            committee_index: u64,
+            signer_indices: Vec<u64>,
+            signer_participation: Vec<types::ParticipationFlags>,
+        }
+
+        let mut all_flags = types::ParticipationFlags::default();
+        for flag_index in 0..types::consts::altair::NUM_FLAG_INDICES {
+            all_flags
+                .add_flag(flag_index)
+                .expect("all consensus participation flags fit in a u8");
+        }
+
+        let mut candidates = (0..PQ_MAX_ATTESTATIONS_PER_BLOCK as u64)
+            .map(|candidate_id| SelectionCandidate {
+                candidate_id,
+                data: AttestationData {
+                    slot: Slot::new(candidate_id.saturating_add(1)),
+                    ..AttestationData::default()
+                },
+                committee_index: 0,
+                signer_indices: vec![candidate_id],
+                signer_participation: vec![all_flags],
+            })
+            .chain(std::iter::once(SelectionCandidate {
+                candidate_id: PQ_MAX_ATTESTATIONS_PER_BLOCK as u64,
+                data: AttestationData {
+                    slot: Slot::new(PQ_MAX_ATTESTATIONS_PER_BLOCK as u64 + 1),
+                    ..AttestationData::default()
+                },
+                committee_index: 0,
+                signer_indices: vec![PQ_MAX_ATTESTATIONS_PER_BLOCK as u64],
+                signer_participation: vec![types::ParticipationFlags::default()],
+            }))
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by(|left, right| {
+            compare_pq_candidate_ordering_metadata(
+                PqCandidateOrderingMetadata {
+                    data: &left.data,
+                    committee_index: left.committee_index,
+                    signer_indices: &left.signer_indices,
+                },
+                PqCandidateOrderingMetadata {
+                    data: &right.data,
+                    committee_index: right.committee_index,
+                    signer_indices: &right.signer_indices,
+                },
+            )
+        });
+
+        let awarded_flags = (0..types::consts::altair::NUM_FLAG_INDICES).collect::<Vec<_>>();
+        let selected =
+            try_filter_take_pq_candidates(candidates, PQ_MAX_ATTESTATIONS_PER_BLOCK, |candidate| {
+                state_processing::pq_signers_add_marginal_participation(
+                    &candidate.signer_participation,
+                    &awarded_flags,
+                )
+            })
+            .expect("participation state is internally consistent");
+
+        assert!(
+            selected
+                .iter()
+                .all(|candidate| candidate.signer_participation != vec![all_flags]),
+            "zero-marginal candidates must be excluded from the block"
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .map(|candidate| candidate.candidate_id)
+                .collect::<Vec<_>>(),
+            vec![PQ_MAX_ATTESTATIONS_PER_BLOCK as u64],
+            "the useful fresh candidate must survive the max-eight selection"
+        );
     }
 
     #[test]

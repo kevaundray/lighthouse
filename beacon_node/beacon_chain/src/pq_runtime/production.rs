@@ -353,6 +353,7 @@ pub enum PqBlockProductionLocalError {
     Execution(execution_layer::Error),
     OperationalEvent(crate::PqOperationalEventError),
     AttestationSelection(state_processing::PqBlockAttestationSelectionLocalError),
+    Persistence(crate::PqRuntimeError),
     Invariant(&'static str),
 }
 
@@ -429,6 +430,7 @@ impl Error for PqBlockProductionError {
             Self::Local(PqBlockProductionLocalError::Transition(error)) => Some(error),
             Self::Local(PqBlockProductionLocalError::OperationalEvent(error)) => Some(error),
             Self::Local(PqBlockProductionLocalError::AttestationSelection(error)) => Some(error),
+            Self::Local(PqBlockProductionLocalError::Persistence(error)) => Some(error),
             Self::InitialFutureSlot { .. }
             | Self::InitialPastSlot { .. }
             | Self::AtOrBehindHead { .. }
@@ -713,7 +715,18 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                             &spec,
                         )
                         .map_err(map_attestation_selection_error)?;
-                    let request = build_payload_request(&verified.state, spec, parent_root)?;
+                    let mut request = build_payload_request(&verified.state, spec, parent_root)?;
+                    request.forkchoice_update_parameters = selection_chain
+                        .pq_execution_forkchoice_parameters(
+                            &verified.state,
+                            parent_root,
+                            request.parent_hash,
+                        )
+                        .map_err(|error| {
+                            PqBlockProductionError::Local(PqBlockProductionLocalError::Persistence(
+                                error,
+                            ))
+                        })?;
                     Ok((
                         request,
                         SelectedPqProduction {

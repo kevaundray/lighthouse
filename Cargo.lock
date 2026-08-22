@@ -1984,6 +1984,7 @@ dependencies = [
  "monitoring_api",
  "network",
  "operation_pool",
+ "pq_attester_service",
  "pq_devnet",
  "pq_http_api",
  "pq_proposer_service",

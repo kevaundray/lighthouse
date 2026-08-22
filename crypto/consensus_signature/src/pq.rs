@@ -485,7 +485,7 @@ static PQ_PROVER_LIFECYCLE: ProverLifecycle = ProverLifecycle::idle();
 #[cfg(test)]
 static PQ_AGGREGATE_EXECUTIONS_STARTED: AtomicUsize = AtomicUsize::new(0);
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64", target_feature = "avx2"))]
 fn testing_only_aggregate_executions_started() -> usize {
     PQ_AGGREGATE_EXECUTIONS_STARTED.load(Ordering::SeqCst)
 }
@@ -1053,20 +1053,17 @@ impl<Job, Output> SchedulerState<Job, Output> {
             ));
         }
         let class_max = limits.bytes(class);
-        let class_actual = match self
+        let Some(class_actual) = self
             .class_bytes(class)
             .checked_add(command.queued_evidence_bytes)
-        {
-            Some(actual) => actual,
-            None => {
-                return Err((
-                    SchedulerAdmissionError::ClassBytesFull {
-                        actual: usize::MAX,
-                        max: class_max,
-                    },
-                    command,
-                ));
-            }
+        else {
+            return Err((
+                SchedulerAdmissionError::ClassBytesFull {
+                    actual: usize::MAX,
+                    max: class_max,
+                },
+                command,
+            ));
         };
         if class_actual > class_max {
             return Err((
@@ -1077,17 +1074,14 @@ impl<Job, Output> SchedulerState<Job, Output> {
                 command,
             ));
         }
-        let total_actual = match self.total_bytes.checked_add(command.queued_evidence_bytes) {
-            Some(actual) => actual,
-            None => {
-                return Err((
-                    SchedulerAdmissionError::TotalBytesFull {
-                        actual: usize::MAX,
-                        max: limits.total_bytes,
-                    },
-                    command,
-                ));
-            }
+        let Some(total_actual) = self.total_bytes.checked_add(command.queued_evidence_bytes) else {
+            return Err((
+                SchedulerAdmissionError::TotalBytesFull {
+                    actual: usize::MAX,
+                    max: limits.total_bytes,
+                },
+                command,
+            ));
         };
         if total_actual > limits.total_bytes {
             return Err((

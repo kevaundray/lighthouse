@@ -537,6 +537,7 @@ pub enum PqSingleObservationCompletion {
 #[cfg(feature = "pq-proposer")]
 pub enum PqPublishedLocalMemberResolution {
     Immediate(PqSingleConsumptionResult),
+    TerminalAlreadySignaled,
     Wait(PqSingleObservationWatchReceipt),
 }
 
@@ -571,7 +572,14 @@ pub(crate) fn resolve_pq_published_local_member<E: EthSpec>(
     let wire_id = PqSingleWireMessageId::try_from(actual_message_id.0.as_slice())
         .map_err(|_| PqPublishedLocalMemberResolutionError::MessageId)?;
     let cache = cache.lock();
-    match cache.exact_single_wire_status(&identity, wire_id) {
+    let status = cache.exact_single_wire_status(&identity, wire_id);
+    if status == PqSingleObservationStatus::Consumed(PqSingleConsumptionResult::Terminal)
+        && cache.exact_single_wire_completion(&identity, wire_id)
+            == Some(PqSingleObservationCompletion::ConsumedTerminalAlreadySignaled)
+    {
+        return Ok(PqPublishedLocalMemberResolution::TerminalAlreadySignaled);
+    }
+    match status {
         PqSingleObservationStatus::Consumed(
             result @ (PqSingleConsumptionResult::Applied | PqSingleConsumptionResult::Queued),
         ) => Ok(PqPublishedLocalMemberResolution::Immediate(result)),
@@ -864,6 +872,25 @@ impl<E: EthSpec> PqAttestationGossipObservationCache<E> {
         wire_id: PqSingleWireMessageId,
     ) -> PqSingleObservationStatus {
         Self::exact_single_wire_status_in(&self.singles, identity, wire_id)
+    }
+
+    #[cfg(feature = "pq-proposer")]
+    fn exact_single_wire_completion(
+        &self,
+        identity: &PqSingleObservationIdentity,
+        wire_id: PqSingleWireMessageId,
+    ) -> Option<PqSingleObservationCompletion> {
+        let completion = match self.singles.get(&identity.key()) {
+            Some(SingleObservationState::Consumed {
+                identity: known,
+                wire_id: known_wire_id,
+                completion,
+                ..
+            }) if known == identity && *known_wire_id == wire_id => completion,
+            _ => return None,
+        };
+        let observed = *completion.borrow();
+        observed
     }
 
     #[cfg(feature = "pq-startup-testing")]
@@ -2826,6 +2853,18 @@ impl TestingPqPublishedLocalMemberResolver {
                 result,
             );
         }
+    }
+
+    pub fn finalize_exact_terminal_already_signaled(&self) -> bool {
+        self.generation.is_some_and(|generation| {
+            self.cache.lock().finalize_single_with_authority(
+                self.identity,
+                self.wire_id(),
+                generation,
+                PqSingleConsumptionResult::Terminal,
+                true,
+            )
+        })
     }
 
     pub fn finalize_exact_observation_before_resolution(

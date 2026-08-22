@@ -34,6 +34,8 @@ impl PqNewPayloadTransport<MinimalEthSpec> for ValidExecution {
     fn notify_forkchoice_updated<'a>(
         &'a self,
         _head_block_hash: types::ExecutionBlockHash,
+        _safe_block_hash: types::ExecutionBlockHash,
+        _finalized_block_hash: types::ExecutionBlockHash,
         _current_slot: Slot,
         _head_block_root: Hash256,
     ) -> std::pin::Pin<

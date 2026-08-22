@@ -3087,12 +3087,72 @@ evidence, consuming no XMSS leaf. Verification must accept exactly that pair, re
 with any set bit, and reject raw/aggregate evidence with zero bits. Never emulate BLS infinity or
 silently run the BLS sync path.
 
+Implementation checkpoint (2026-08-22): this boundary was already complete in the dedicated PQ
+runtime and required no new production code. The `pq-devnet` Lighthouse feature is mutually
+exclusive with `full-cli`, so it cannot construct the ordinary validator client or its sync-duty
+service. `PqNetworkService` subscribes to exactly the beacon-block topic plus all eight Minimal
+attestation subnets; it does not subscribe to sync-committee messages or signed contributions.
+Electra block construction retains `SyncAggregate::empty()`, while both chain preflight and the
+proposer response validator independently reject any participant bit or nonempty PQ evidence. The
+warning-denied exact tests passed for consensus shape (1/1), the nine-topic network surface (1/1),
+proposer response validation (1/1), and actual block production (1/1 in 78.41 seconds). No sync
+duty is invoked and therefore the empty aggregate consumes no one-time-use signing leaf.
+
 **Step 7: Verify both profiles, the slot-2 tracer, restart semantics, and commit**
 
 Run the PQ operation-pool, coordinator, beacon-chain, and block-production suites; default BLS
 operation-pool/state-processing suites; warning-denied verifier/proposer feature checks; and the
 authentic two-worker slot-2 production/import/restart tracer. Record proof latency and raw-fallback
 behavior in the findings document.
+
+Before the slot-2 tracer can represent the executable rather than a test-owned attester, complete
+the missing client-runtime composition as a vertical slice:
+
+1. Enable `pq_attester_service` only in the signer-enabled `pq-proposer` graph and construct one
+   private service from the same sealed validator-store `Arc` used by the proposer. Capture the
+   bounded local-publication sender from `PqNetworkService` before the network owner starts.
+2. Start one client-owned attester loop alongside the proposer loop. Both owners must report live
+   while parked; acknowledge `RuntimeReady` durably before releasing either. A resumed runtime
+   observes and skips its first post-release slot so it cannot sign a partly elapsed duty.
+3. Admit at most one current-slot attestation receipt. Await admitted signing/proof work
+   non-cancellably, transfer a verified batch atomically to the bounded network publisher, and
+   retain at most one publication receipt. Capacity restores the exact service-owned batch or
+   opaque publication progress; no retry may sign or prove again.
+4. Complete a slot only after `NoDuty` or exact whole-batch `Consumed(Applied|Queued)` evidence.
+   Pre-sign retryable head/context failures may retry within the same slot while the measured
+   time gate remains open. Stateful failures and network/chain terminalization keep their existing
+   single failure owners; scheduler-only invariants signal once.
+5. On shutdown, signal proposer and attester loops before awaiting either, let admitted work reach
+   an ownership-safe boundary, close and drain the attester service, then stop HTTP, drop the block
+   broadcaster, drain network publication, and finally close chain import admission.
+6. Replace the E4F tracer's manual attester drive with this actual runtime owner. Require the two
+   slot-1 singles to coalesce into the canonical aggregate, produce/sign/publish/import the exact
+   slot-2 block on two independent chains, restart both stores at that head, and prove no current
+   slot is signed or published twice.
+
+Implementation checkpoint (2026-08-22): all six steps are now complete. The E4F tracer releases the
+real client-owned attester scheduler, observes its exact `Verified` publication barrier and typed
+`Consumed { slot: 1 }` completion, and never calls the fixture-owned attestation or publication
+drivers. The two authentic slot-1 singles converge through the actual network/chain consumers into
+one canonical two-signer aggregate. The same run produces, proposal-signs, publishes, and imports
+the exact aggregate-bearing slot-2 block on two independent chains, proves the two validators alone
+receive `0b111` participation flags, then rebuilds both chain owners from their independent stores.
+The final warning-denied AVX2 run passed 1/1 in 764.13 seconds; its major phases were immutable cache
+clone 0.044 seconds, authority open 279.48 seconds, RANDAO 306.73 seconds, slot-1 imports 459.31
+seconds, scheduler `Verified` 460.26 seconds, and clean restart/drain 764.12 seconds.
+
+Restart evidence is source-exact rather than a head-only check: each execution transport records no
+replayed `newPayload`, one exact no-attributes FCU for the persisted slot-2 execution/head binding,
+and the rebuilt state root, participation, finalized checkpoint, block bytes, and empty ephemeral
+pool must all match. A separate authentic restart regression imports slot 1, reconstructs fork
+choice from the bounded persisted canonical lineage, advances its checked clock to slot 2, and
+applies an exact validator vote after restart.
+
+Non-genesis finality remains a separate acceptance boundary, not an inference from slot 2. The
+runtime must schedule enough validator duties for supermajority participation through the epoch-4
+transition and propagate the resulting safe/finalized execution hashes before Task 7.2 can be
+marked complete. Post-genesis fork-choice reconstruction is now implemented and tested, but the
+sustained multi-epoch process trace and non-zero execution finality binding remain outstanding.
 
 ```bash
 git add beacon_node/operation_pool beacon_node/attestation_aggregation beacon_node/beacon_chain \
@@ -3257,6 +3317,33 @@ locations in `docs/pq-devnet-findings.md`.
 git add scripts/local_testnet/pq docs/pq-devnet-findings.md
 git commit -m "test: verify PQ devnet reaches finality"
 ```
+
+Implementation checkpoint (2026-08-22): Task 7.2 is complete for the frozen 16-validator
+Minimal/Electra/300-second V1 profile. The checked-in
+`scripts/local_testnet/pq/run-finality-smoke.sh` launches the exact ignored acceptance and writes a
+timestamped trace under `target/pq-finality-logs/`. The first authentic run reached slot 2 and
+failed at the obsolete proposer-response rule `attestations are nonempty`. A focused RED pinned one
+structurally bound PQ attestation plus the malformed zero-bit, multi-committee, and absent-evidence
+cases; the proposer now accepts only the former while retaining every unrelated unsupported-body
+rejection. The full proposer-service suite passed 40/40.
+
+The final warning-denied AVX2 two-process run passed 1/1 in 11,099.20 seconds. Both independent
+nodes proposed and imported the exact slots 1 through 32, agreed on every execution head, and
+crossed the exact checkpoint sequence: slot 24 justified epoch 2 at the slot-16 root while
+finalized remained genesis; slot 32 justified epoch 3 at the slot-24 root and finalized epoch 2 at
+the non-genesis slot-16 root. The Engine histories carried the corresponding non-zero safe hash
+`0x70c70c5e2d7c8738c6505bcc42ca49ba2f956d1f97a223cacf8c2132f99f7bdf` and finalized hash
+`0x863a3f0b47d66cb2c4dbffff5cc60a914396d410648da43c66b4d11117742dd2` on both nodes. Both
+processes then restarted from their independent stores and replayed the identical head, safe, and
+finalized bindings without replaying `newPayload`. The accepted trace is
+`target/pq-finality-logs/two-process-slot32-20260822T131355Z.log`.
+
+The bounded event journal is source-sized rather than enlarged arbitrarily: six startup events,
+four lifecycle events per target slot, and two status events per 300-second peer-status interval
+across the 900-second pre-genesis window, 32 slots, and one boundary margin, for 206 events. Its
+focused overflow test failed at the former 134-event limit and passed after the exact formula was
+installed. Existing dedicated proof/RSS measurements remain the resource evidence for this frozen
+profile; this final wall-clock run did not take a new `/usr/bin/time -v` sample.
 
 ## Milestone 8: Completion Audit
 

@@ -38,6 +38,8 @@ impl beacon_chain::PqNewPayloadTransport<MinimalEthSpec> for AlwaysValidStartupE
     fn notify_forkchoice_updated<'a>(
         &'a self,
         _head_block_hash: types::ExecutionBlockHash,
+        _safe_block_hash: types::ExecutionBlockHash,
+        _finalized_block_hash: types::ExecutionBlockHash,
         _current_slot: types::Slot,
         _head_block_root: types::Hash256,
     ) -> std::pin::Pin<
@@ -2388,14 +2390,27 @@ async fn proposer_configuration_constructs_a_sealed_validator_store_owner() {
         handle.testing_only_pq_proposer_is_running(),
         "the sealed store must be consumed only after actual HTTP bind",
     );
+    assert!(
+        handle.testing_only_pq_attester_is_running(),
+        "the same sealed store must start the production direct-attester loop",
+    );
     handle
         .testing_only_wait_for_pq_proposer_attempt()
         .await
         .expect("slot loop calls the concrete proposer service");
+    handle
+        .testing_only_wait_for_pq_attester_attempt()
+        .await
+        .expect("slot loop calls the concrete direct-attester service");
     assert_eq!(
         handle.testing_only_pq_proposer_max_retained_receipts(),
         Some(1),
         "the process-owned loop retains at most one cloneable receipt",
+    );
+    assert_eq!(
+        handle.testing_only_pq_attester_max_retained_receipts(),
+        Some(1),
+        "the process-owned attester loop retains at most one signing or publication receipt",
     );
     assert!(bundle_dir.exists());
     assert!(slashing_db.is_file());

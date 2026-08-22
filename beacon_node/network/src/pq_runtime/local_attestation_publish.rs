@@ -48,6 +48,7 @@ pub(crate) enum PqAttestationAdmissionBridgeError {
 
 pub(crate) enum PqLocalAttestationRemoteResolution {
     Immediate(PqSingleConsumptionResult),
+    TerminalAlreadySignaled,
     ChainWait(beacon_chain::PqSingleObservationWatchReceipt),
     BridgeWait(PqAttestationAdmissionBridgeReceipt),
 }
@@ -56,6 +57,9 @@ impl From<PqPublishedLocalMemberResolution> for PqLocalAttestationRemoteResoluti
     fn from(resolution: PqPublishedLocalMemberResolution) -> Self {
         match resolution {
             PqPublishedLocalMemberResolution::Immediate(result) => Self::Immediate(result),
+            PqPublishedLocalMemberResolution::TerminalAlreadySignaled => {
+                Self::TerminalAlreadySignaled
+            }
             PqPublishedLocalMemberResolution::Wait(receipt) => Self::ChainWait(receipt),
         }
     }
@@ -357,6 +361,28 @@ impl<E: EthSpec> PqLocalAttestationBatchPublishProgress<E> {
                 matches!(
                     member,
                     PqLocalAttestationMemberPublishProgress::Terminal { .. }
+                        | PqLocalAttestationMemberPublishProgress::Consumed {
+                            result: PqSingleConsumptionResult::Terminal,
+                            ..
+                        }
+                )
+            })
+    }
+
+    pub fn is_successfully_consumed(&self) -> bool {
+        self.verified_count > 0
+            && self.members.len() == self.verified_count
+            && self.encoding_complete
+            && self.encoding_error.is_none()
+            && self.post_publish_failure.is_none()
+            && self.members.iter().all(|member| {
+                matches!(
+                    member,
+                    PqLocalAttestationMemberPublishProgress::Consumed {
+                        result: PqSingleConsumptionResult::Applied
+                            | PqSingleConsumptionResult::Queued,
+                        ..
+                    }
                 )
             })
     }
@@ -963,6 +989,19 @@ where
                             return false;
                         }
                         command = retained_command;
+                    }
+                    Ok(PqLocalAttestationRemoteResolution::TerminalAlreadySignaled) => {
+                        retained_command.fail_consumption(
+                            PqLocalAttestationPostPublishFailure::RemoteResolution(
+                                PqPublishedLocalMemberResolutionError::Observation(
+                                    beacon_chain::PqSingleObservationStatus::Consumed(
+                                        PqSingleConsumptionResult::Terminal,
+                                    ),
+                                ),
+                            ),
+                        );
+                        receiver.retain_and_complete(retained_command);
+                        return false;
                     }
                     Ok(PqLocalAttestationRemoteResolution::ChainWait(receipt)) => {
                         receiver.start_remote_resolution(retained_command, receipt);
@@ -2550,6 +2589,16 @@ impl TestingPqChainAuthoritativeMixedPublishDriver {
         remote.generation().ok_or("remote claim was not admitted")
     }
 
+    pub fn terminalize_member_one_before_local_resolution_as_already_signaled(
+        &mut self,
+    ) -> Result<(), &'static str> {
+        self.remote
+            .lock()
+            .finalize_exact_terminal_already_signaled()
+            .then_some(())
+            .ok_or("exact terminal observation was not finalized by the chain owner")
+    }
+
     pub fn member_message_id(&self, member: usize) -> MessageId {
         self.message_ids[member].clone()
     }
@@ -2796,6 +2845,9 @@ impl TestingPqChainAuthoritativeMixedPublishDriver {
 
     async fn finish_receiver(&mut self) -> Result<PqMixedRemotePublishTrace, &'static str> {
         loop {
+            if self.receiver.completed.is_some() {
+                break;
+            }
             match self.receiver.next_event().await {
                 Some(PqLocalAttestationBatchPublishEvent::RemoteResolved(completion)) => {
                     let fail_closed_calls = Arc::clone(&self.fail_closed_calls);

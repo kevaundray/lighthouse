@@ -66,10 +66,20 @@ pub enum MockEngineAuditError {
     Overflow,
 }
 
-#[derive(Default)]
 struct MockEngineAuditHistory {
     entries: Vec<MockEngineAuditEvent>,
     overflowed: bool,
+    capacity: usize,
+}
+
+impl Default for MockEngineAuditHistory {
+    fn default() -> Self {
+        Self {
+            entries: vec![],
+            overflowed: false,
+            capacity: MOCK_ENGINE_AUDIT_CAPACITY,
+        }
+    }
 }
 pub const DEFAULT_ENGINE_CAPABILITIES: EngineCapabilities = EngineCapabilities {
     new_payload_v1: true,
@@ -295,7 +305,15 @@ impl<E: EthSpec> MockServer<E> {
     }
 
     pub fn enable_engine_audit(&self) {
-        *self.ctx.audit_history.lock() = MockEngineAuditHistory::default();
+        self.enable_engine_audit_with_capacity(MOCK_ENGINE_AUDIT_CAPACITY);
+    }
+
+    pub fn enable_engine_audit_with_capacity(&self, capacity: usize) {
+        assert!(capacity > 0, "mock Engine audit capacity must be nonzero");
+        *self.ctx.audit_history.lock() = MockEngineAuditHistory {
+            capacity,
+            ..MockEngineAuditHistory::default()
+        };
         self.ctx.audit_enabled.store(true, Ordering::SeqCst);
     }
 
@@ -597,7 +615,7 @@ impl<E: EthSpec> Context<E> {
             return Ok(());
         }
         let mut history = self.audit_history.lock();
-        if history.entries.len() >= MOCK_ENGINE_AUDIT_CAPACITY {
+        if history.entries.len() >= history.capacity {
             history.overflowed = true;
             return Err(MockEngineAuditError::Overflow);
         }

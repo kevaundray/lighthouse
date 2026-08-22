@@ -244,6 +244,40 @@ async fn remote_terminal_or_conflict_fails_closed_once() {
 }
 
 #[tokio::test]
+async fn terminal_before_remote_subscription_preserves_the_chain_failure_owner() {
+    let mut driver = testing_only_pq_chain_authoritative_mixed_publish_driver().await;
+    driver
+        .claim_member_one_remote_pending()
+        .expect("member1 starts with one exact remote observation");
+    driver
+        .terminalize_member_one_before_local_resolution_as_already_signaled()
+        .expect("the inbound chain owner terminalizes and signals before H3 subscribes");
+    driver
+        .start_actual_publish_with_remote_timing(PqMixedRemoteTiming::BeforeFirstPoll)
+        .await
+        .expect("the local owner reaches the already-terminal exact observation");
+
+    let trace = driver
+        .finish_actual_receiver_terminal()
+        .await
+        .expect("the local receipt terminalizes without taking failure authority");
+    assert_eq!(trace.consumer_calls, 0);
+    assert_eq!(
+        trace.fail_closed_calls, 0,
+        "the inbound chain already owns the sole process-failure signal",
+    );
+    assert_eq!(
+        trace.terminal_failure,
+        Some(PqLocalAttestationPostPublishFailure::RemoteResolution(
+            PqPublishedLocalMemberResolutionError::Observation(
+                PqSingleObservationStatus::Consumed(PqSingleConsumptionResult::Terminal),
+            ),
+        )),
+    );
+    assert!(!trace.guards_retained_after_terminal);
+}
+
+#[tokio::test]
 async fn chain_observation_watch_loss_is_typed_end_to_end() {
     let mut driver = testing_only_pq_chain_authoritative_mixed_publish_driver().await;
     driver

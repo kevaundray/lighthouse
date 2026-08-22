@@ -2347,3 +2347,113 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   and drains already-admitted proof ownership. This checkpoint commits only the verified inner
   aggregate to the local pool; it does not claim aggregate gossip, an outer aggregator signature,
   sync-committee support, finality, or restart recovery.
+
+### 2026-08-22: The V1 sync aggregate is explicitly empty
+
+- The PQ executable is a compile-time beacon-node-only profile: `pq-devnet` is mutually exclusive
+  with `full-cli`, and therefore cannot construct the ordinary validator client or its sync-duty
+  service. The custom PQ proposer path performs only RANDAO, block, and attestation duties; producing
+  the canonical empty sync aggregate invokes no signer and consumes no XMSS leaf.
+- The custom network service subscribes to exactly nine gossip topics: the beacon-block topic and
+  all eight Minimal attestation subnets. Its exact startup test passed 1/1 in 26.48 seconds and
+  proves that configured ordinary aggregate/exit topics are ignored; the exact cardinality also
+  excludes sync-message and signed-contribution subscriptions.
+- PQ consensus preflight accepts exactly zero sync participant bits with canonical absent evidence.
+  The mutation-sensitive shape test passed 1/1 and rejects both raw and aggregate evidence when
+  bits are zero, any set bit with absent evidence, and both evidence forms with a set bit. The PQ
+  proposer response validator independently rejects nonzero bits and nonempty evidence (1/1).
+- Actual warning-denied AVX2 block production passed 1/1 in 78.41 seconds and emitted an Electra
+  block whose sync bitvector has zero set bits and whose PQ evidence is empty. No BLS infinity
+  emulation, BLS sync processing, sync-message gossip, contribution aggregation, or sync signing is
+  part of this V1 runtime.
+
+### 2026-08-22: The client-owned attester completes the authentic slot-2/restart path
+
+- The client constructs and schedules one private `PqAttesterService` beside the PQ proposer from
+  the same sealed validator-store authority. Both loops remain parked until the durable
+  `RuntimeReady` acknowledgement. The attester captures one monotonic end-of-slot publication
+  deadline before signing, retains at most one stateful receipt, and reports a typed
+  `Consumed { slot }` completion only after every exact member is `Applied` or `Queued`.
+- The E4F tracer no longer calls `try_attest_current_slot` or a manual publication handoff. It
+  releases the actual scheduler, observes the production-shared post-`Verified` barrier, arranges
+  one exact remote member through the real network verifier, and observes whole-batch
+  `Consumed { slot: 1 }`. Shutdown after an observed stop cannot enqueue one last retry, cannot
+  mark an unconsumed slot complete, and never signs or proves the retained batch again.
+- Once an attestation attempt becomes stateful, shutdown awaits the service-owned operation.
+  A verified batch transfers atomically into the network publisher; handoff capacity restores the
+  exact batch, while retryable publication retains the exact opaque cursor and tokens. The slot is
+  complete only after `NoDuty` or whole-batch `Consumed(Applied|Queued)` evidence. No scheduler retry
+  may re-sign or re-prove.
+- Shutdown must signal both loops before joining either, then close/drain untransferred attester
+  authority while HTTP and network publication remain live. Existing attester, chain, and network
+  terminal paths retain their exact-once process-failure ownership; only scheduler invariants may
+  add a new failure signal.
+- The authentic warning-denied AVX2 run passed 1/1 in 764.13 seconds. It formed one canonical
+  two-signer aggregate from the real slot-1 consumers, produced and signed the exact aggregate-
+  bearing slot-2 block, published it through the running sender network, imported it on two
+  independent chains/stores, and applied `0b111` participation flags to exactly those two
+  validators. Both chains restarted at the identical persisted block/state with empty rebuilt
+  ephemeral pools and clean failure channels. Phase times were cache clone 0.044 seconds,
+  authority open 279.48 seconds, RANDAO 306.73 seconds, slot-1 imports 459.31 seconds, scheduler
+  `Verified` 460.26 seconds, and final restart/drain 764.12 seconds.
+- Restart now rebuilds PQ fork choice from the exact bounded canonical lineage rather than setting
+  it to `None`. A separate authentic regression imports a signed slot-1 head, closes the original
+  owner, resumes, ticks the reconstructed fork choice to slot 2, verifies an exact vote, and records
+  the validator's latest message; it passed 1/1 in 131.88 seconds. The E4F restart additionally
+  binds the state root, participation, finalized checkpoint, and one exact no-attributes FCU while
+  proving `newPayload` is not replayed.
+- Slot-2 convergence is still not finality evidence: the bounded tracer has two participating
+  validators out of sixteen and correctly retains the genesis finalized checkpoint. Sustained
+  supermajority duties through roughly the epoch-4 transition and non-zero safe/finalized execution
+  hash propagation remain required before claiming a finalized checkpoint beyond genesis.
+- Publication status is now source-exact at the client boundary: a chain-owned
+  `Consumed(Terminal)` result is terminal without making the scheduler a second failure owner, and
+  success requires a non-empty batch whose returned member count exactly equals the verified count
+  with every result `Applied` or `Queued`. Completed retryable progress with no published prefix is
+  intentionally droppable during network shutdown; once any member has published, the network
+  retains the command internally and fail-closes it before releasing guards.
+
+### 2026-08-22: Two independent PQ nodes finalize epoch 2 and restart exactly
+
+- The checked-in entry point is `scripts/local_testnet/pq/run-finality-smoke.sh`. It runs the exact
+  ignored warning-denied AVX2 acceptance and writes a timestamped trace under
+  `target/pq-finality-logs/`. The accepted run used sixteen validators and the frozen
+  Minimal/Electra profile with eight 300-second slots per epoch.
+- The first authentic slot-32 attempt was useful RED evidence rather than a harness failure. Slot 1
+  converged, then slot 2 produced its first attestation-bearing body and the external PQ proposer
+  service rejected it with `InvalidProducedBlock("attestations are nonempty")`. That rule predated
+  block selection. Focused tests now require at least one aggregation bit, exactly one committee bit,
+  and non-absent PQ evidence for every returned attestation; zero-bit, multi-committee, and absent-
+  evidence shapes remain rejected, as do every other unsupported V1 body family. The complete
+  proposer-service suite passed 40/40 warning-denied.
+- Periodic status traffic made the original slot-only event bound dishonest. The exact bounded
+  capacity is now 206: six startup events, four proposal/import lifecycle events for each of 32
+  slots, and request/response status pairs for each 300-second interval across the 900-second
+  pre-genesis wait, the target slots, and one boundary margin. The focused test observed the old
+  value 134 versus required 206 before the corrected formula passed; the full run did not overflow.
+- The final command was:
+
+  `scripts/local_testnet/pq/run-finality-smoke.sh`
+
+  It passed 1/1 in 11,099.20 seconds. The retained log is
+  `target/pq-finality-logs/two-process-slot32-20260822T131355Z.log`. Slots 1 through 32 were proposed,
+  signed, published, imported, persisted, and reconciled by two independent Lighthouse processes
+  and stores. The former slot-2 boundary passed, every observed execution head matched, and neither
+  process emitted a failure shutdown reason.
+- The checkpoint transition is exact rather than inferred from a final slot number. At slot 24,
+  justified epoch 2 referenced the slot-16 root while finalized remained genesis; both Engine
+  histories used slot 16's execution hash
+  `0x863a3f0b47d66cb2c4dbffff5cc60a914396d410648da43c66b4d11117742dd2` as safe. At slot 32,
+  justified epoch 3 referenced the slot-24 root and finalized epoch 2 referenced the non-genesis
+  slot-16 root. Both Engines then used slot 24's execution hash
+  `0x70c70c5e2d7c8738c6505bcc42ca49ba2f956d1f97a223cacf8c2132f99f7bdf` as safe and the exact
+  slot-16 execution hash as finalized.
+- Both nodes shut down cleanly, released their listeners, restarted from their separate persisted
+  stores, and emitted one exact no-attributes FCU with the same slot-32 head, non-zero safe, and
+  non-zero finalized hashes. Restart did not replay `newPayload`; persisted block/state roots,
+  participation, justified/finalized checkpoints, and the rebuilt empty ephemeral pool remained
+  bound to the pre-restart trace.
+- Resource claims remain scoped. Dedicated authentic measurements elsewhere in this document retain
+  the proof-size, latency, and peak-RSS evidence for the frozen prover profile. The 11,099-second
+  finality run recorded exact protocol and Engine histories but was not wrapped in a new
+  `/usr/bin/time -v` measurement, so it adds no new peak-RSS claim.

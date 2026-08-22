@@ -813,8 +813,19 @@ fn validate_pq_v3_response(
                     ));
                 }
                 let body = &electra.body;
-                let unsupported = if !body.attestations.is_empty() {
-                    Some("attestations are nonempty")
+                let invalid_attestation = body.attestations.iter().find_map(|attestation| {
+                    if attestation.aggregation_bits.num_set_bits() == 0 {
+                        Some("attestation aggregation bits are empty")
+                    } else if attestation.committee_bits.num_set_bits() != 1 {
+                        Some("attestation committee binding is not singular")
+                    } else if attestation.signature.is_empty() {
+                        Some("attestation evidence is absent")
+                    } else {
+                        None
+                    }
+                });
+                let unsupported = if let Some(reason) = invalid_attestation {
+                    Some(reason)
                 } else if body.sync_aggregate.sync_committee_bits.num_set_bits() != 0 {
                     Some("sync committee participants are nonempty")
                 } else if !body.sync_aggregate.sync_committee_signature.is_empty() {
@@ -2125,6 +2136,47 @@ mod tests {
         )
     }
 
+    fn push_test_pq_attestation(
+        block: &mut types::BeaconBlock<MinimalEthSpec>,
+        aggregation_positions: &[usize],
+        committee_positions: &[usize],
+        signature: consensus_signature::PqSameMessageEvidence,
+    ) {
+        let types::BeaconBlock::Electra(electra) = block else {
+            panic!("fixture block is Electra")
+        };
+        let bit_capacity = aggregation_positions
+            .iter()
+            .copied()
+            .max()
+            .and_then(|position| position.checked_add(1))
+            .unwrap_or(1);
+        let mut aggregation_bits = ssz_types::BitList::<
+            <MinimalEthSpec as EthSpec>::MaxValidatorsPerSlot,
+        >::with_capacity(bit_capacity)
+        .expect("attestation bitlist");
+        for position in aggregation_positions {
+            aggregation_bits
+                .set(*position, true)
+                .expect("attestation bit");
+        }
+        let mut committee_bits =
+            ssz_types::BitVector::<<MinimalEthSpec as EthSpec>::MaxCommitteesPerSlot>::default();
+        for position in committee_positions {
+            committee_bits.set(*position, true).expect("committee bit");
+        }
+        electra
+            .body
+            .attestations
+            .push(types::AttestationElectra {
+                aggregation_bits,
+                data: types::AttestationData::default(),
+                signature,
+                committee_bits,
+            })
+            .expect("attestation capacity");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn same_slot_receipts_are_cloneable_and_observe_the_same_completion() {
         let clock = TestingSlotClock::new(Slot::new(0), Duration::ZERO, Duration::from_secs(300));
@@ -2815,6 +2867,70 @@ mod tests {
     }
 
     #[test]
+    fn produced_block_accepts_one_structurally_bound_pq_attestation() {
+        let (duty, randao, graffiti, response, metadata) = mutate_valid_v3_block(|block| {
+            push_test_pq_attestation(
+                block,
+                &[0],
+                &[0],
+                consensus_signature::PqSameMessageEvidence::from_bytes(
+                    consensus_signature::PqRawSignature::empty().as_bytes(),
+                )
+                .expect("canonical non-absent PQ evidence"),
+            );
+        });
+        validate_pq_v3_response(duty, randao, graffiti, response, metadata)
+            .expect("the proposer accepts the chain-produced PQ attestation body");
+    }
+
+    #[test]
+    fn produced_block_rejects_unbound_pq_attestation_shapes() {
+        for (aggregation, committees, signature, expected) in [
+            (
+                vec![],
+                vec![0],
+                consensus_signature::PqSameMessageEvidence::from_bytes(
+                    consensus_signature::PqRawSignature::empty().as_bytes(),
+                )
+                .expect("canonical raw evidence"),
+                "attestation aggregation bits are empty",
+            ),
+            (
+                vec![0],
+                vec![],
+                consensus_signature::PqSameMessageEvidence::from_bytes(
+                    consensus_signature::PqRawSignature::empty().as_bytes(),
+                )
+                .expect("canonical raw evidence"),
+                "attestation committee binding is not singular",
+            ),
+            (
+                vec![0],
+                vec![0, 1],
+                consensus_signature::PqSameMessageEvidence::from_bytes(
+                    consensus_signature::PqRawSignature::empty().as_bytes(),
+                )
+                .expect("canonical raw evidence"),
+                "attestation committee binding is not singular",
+            ),
+            (
+                vec![0],
+                vec![0],
+                consensus_signature::PqSameMessageEvidence::empty(),
+                "attestation evidence is absent",
+            ),
+        ] {
+            let (duty, randao, graffiti, response, metadata) = mutate_valid_v3_block(|block| {
+                push_test_pq_attestation(block, &aggregation, &committees, signature);
+            });
+            assert!(matches!(
+                validate_pq_v3_response(duty, randao, graffiti, response, metadata),
+                Err(PqProposerServiceError::InvalidProducedBlock(reason)) if reason == expected
+            ));
+        }
+    }
+
+    #[test]
     fn produced_block_rejects_every_unsupported_v1_body_family() {
         fn assert_invalid_profile(
             mutate: impl FnOnce(&mut types::BeaconBlock<MinimalEthSpec>),
@@ -2845,29 +2961,6 @@ mod tests {
                 *block = types::BeaconBlock::empty(&spec);
             },
             "block body is not Electra",
-        );
-        assert_invalid_profile(
-            |block| {
-                let body = &mut electra(block).body;
-                let mut aggregation_bits = ssz_types::BitList::<
-                    <MinimalEthSpec as EthSpec>::MaxValidatorsPerSlot,
-                >::with_capacity(1)
-                .expect("attestation bitlist");
-                aggregation_bits.set(0, true).expect("attestation bit");
-                let mut committee_bits = ssz_types::BitVector::<
-                    <MinimalEthSpec as EthSpec>::MaxCommitteesPerSlot,
-                >::default();
-                committee_bits.set(0, true).expect("committee bit");
-                body.attestations
-                    .push(types::AttestationElectra {
-                        aggregation_bits,
-                        data: types::AttestationData::default(),
-                        signature: consensus_signature::PqSameMessageEvidence::empty(),
-                        committee_bits,
-                    })
-                    .expect("attestation capacity");
-            },
-            "attestations are nonempty",
         );
         assert_invalid_profile(
             |block| {

@@ -2467,6 +2467,8 @@ impl PqNewPayloadTransport<MinimalEthSpec> for RecordingTransport {
     fn notify_forkchoice_updated<'a>(
         &'a self,
         head_block_hash: types::ExecutionBlockHash,
+        _safe_block_hash: types::ExecutionBlockHash,
+        _finalized_block_hash: types::ExecutionBlockHash,
         _current_slot: Slot,
         _head_block_root: Hash256,
     ) -> std::pin::Pin<
@@ -2554,6 +2556,8 @@ impl PqNewPayloadTransport<MinimalEthSpec> for ReconciliationOutcomeTransport {
     fn notify_forkchoice_updated<'a>(
         &'a self,
         _head_block_hash: types::ExecutionBlockHash,
+        _safe_block_hash: types::ExecutionBlockHash,
+        _finalized_block_hash: types::ExecutionBlockHash,
         _current_slot: Slot,
         _head_block_root: Hash256,
     ) -> std::pin::Pin<
@@ -2609,6 +2613,8 @@ impl PqNewPayloadTransport<MinimalEthSpec> for BlockingForkchoiceTransport {
     fn notify_forkchoice_updated<'a>(
         &'a self,
         _head_block_hash: types::ExecutionBlockHash,
+        _safe_block_hash: types::ExecutionBlockHash,
+        _finalized_block_hash: types::ExecutionBlockHash,
         _current_slot: Slot,
         _head_block_root: Hash256,
     ) -> std::pin::Pin<
@@ -2686,6 +2692,8 @@ impl PqNewPayloadTransport<MinimalEthSpec> for StallingTransport {
     fn notify_forkchoice_updated<'a>(
         &'a self,
         _head_block_hash: types::ExecutionBlockHash,
+        _safe_block_hash: types::ExecutionBlockHash,
+        _finalized_block_hash: types::ExecutionBlockHash,
         _current_slot: Slot,
         _head_block_root: Hash256,
     ) -> std::pin::Pin<

@@ -20,6 +20,13 @@ pub use client::PqRuntimeConfig;
 #[cfg(feature = "pq-devnet")]
 pub use client::config::PqDevnetConfigError as PqClientConfigError;
 pub use client::{Client, ClientConfig, ClientGenesis};
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+#[doc(hidden)]
+pub use client::{
+    TestingPqAttesterLoop, TestingPqAttesterLoopCompletion, TestingPqAttesterPublicationBarrier,
+    TestingPqParkedAttesterLoop, testing_only_start_pq_attester_loop_parked,
+    testing_only_start_pq_attester_loop_parked_with_publication_barrier,
+};
 #[cfg(feature = "pq-devnet")]
 pub use config::PqDevnetConfigError as PqCliConfigError;
 #[cfg(feature = "pq-devnet")]

@@ -19,6 +19,15 @@ use network::{
     PqBlockBroadcastSender, PqNetworkService, PqNetworkServiceError, PqNetworkServiceShutdown,
     pq_block_broadcast_channel,
 };
+#[cfg(feature = "pq-proposer")]
+use network::{
+    PqLocalAttestationBatchPublishProgress, PqLocalAttestationBatchPublishRetryError,
+    PqLocalAttestationBatchPublishSender,
+};
+#[cfg(feature = "pq-proposer")]
+use pq_attester_service::{
+    PqAttestationCompletion, PqAttesterPublicationError, PqAttesterService, PqAttesterServiceError,
+};
 use pq_http_api::PqHttpApi;
 #[cfg(feature = "pq-proposer")]
 use pq_proposer_service::{
@@ -51,6 +60,10 @@ const PQ_HTTP_LOOPBACK_CONNECTION_CAPACITY: usize = 2;
 const PQ_HTTP_REMOTE_CONNECTION_CAPACITY: usize = 16;
 #[cfg(feature = "pq-proposer")]
 const PQ_PROPOSER_RETRY_DELAY: Duration = Duration::from_secs(1);
+#[cfg(feature = "pq-proposer")]
+const PQ_ATTESTER_RETRY_DELAY: Duration = Duration::from_secs(1);
+#[cfg(feature = "pq-proposer")]
+const PQ_ATTESTER_MINIMUM_REMAINING: Duration = Duration::from_secs(180);
 
 const PQ_TESTNET_CONFIG_FILE: &str = "config.yaml";
 const PQ_TESTNET_DEPOSIT_BLOCK_FILE: &str = "deposit_contract_block.txt";
@@ -545,11 +558,104 @@ struct PqParkedProposerLoop {
     shutdown: PqProposerLoopShutdown,
 }
 
+#[cfg(feature = "pq-proposer")]
+struct PqAttesterLoopShutdown {
+    shutdown_sender: Option<tokio::sync::oneshot::Sender<()>>,
+    publication_stop: tokio_util::sync::CancellationToken,
+    task:
+        tokio::sync::oneshot::Receiver<Result<Result<(), PqRuntimeError>, tokio::task::JoinError>>,
+    #[cfg(feature = "pq-startup-testing")]
+    observer: Arc<PqAttesterLoopObserver>,
+}
+
+#[cfg(feature = "pq-proposer")]
+struct PqParkedAttesterLoop {
+    release_sender: Option<tokio::sync::oneshot::Sender<()>>,
+    shutdown: PqAttesterLoopShutdown,
+}
+
 #[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
 struct PqProposerLoopObserver {
     attempts: std::sync::atomic::AtomicUsize,
     max_retained_receipts: std::sync::atomic::AtomicUsize,
     attempt: tokio::sync::Notify,
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+struct PqAttesterLoopObserver {
+    attempts: std::sync::atomic::AtomicUsize,
+    completed_slots: std::sync::atomic::AtomicUsize,
+    last_completion: std::sync::Mutex<Option<TestingPqAttesterLoopCompletion>>,
+    max_retained_receipts: std::sync::atomic::AtomicUsize,
+    attempt: tokio::sync::Notify,
+    completion: tokio::sync::Notify,
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+async fn wait_for_pq_loop_attempt(
+    attempts: &std::sync::atomic::AtomicUsize,
+    notification: &tokio::sync::Notify,
+    mut after_check: impl FnMut(),
+) {
+    loop {
+        let attempted = notification.notified();
+        if attempts.load(Ordering::SeqCst) > 0 {
+            return;
+        }
+        after_check();
+        attempted.await;
+    }
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum TestingPqAttesterLoopCompletion {
+    NoDuty { slot: types::Slot },
+    Consumed { slot: types::Slot },
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+#[doc(hidden)]
+pub struct TestingPqAttesterPublicationBarrier {
+    entered: std::sync::atomic::AtomicUsize,
+    entered_notify: tokio::sync::Notify,
+    release: tokio_util::sync::CancellationToken,
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+impl TestingPqAttesterPublicationBarrier {
+    pub fn new() -> Self {
+        Self {
+            entered: std::sync::atomic::AtomicUsize::new(0),
+            entered_notify: tokio::sync::Notify::new(),
+            release: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    pub async fn wait_until_blocked(&self) -> Result<(), PqRuntimeError> {
+        loop {
+            let entered = self.entered_notify.notified();
+            if self.entered.load(Ordering::SeqCst) > 0 {
+                return Ok(());
+            }
+            entered.await;
+        }
+    }
+
+    pub fn release(&self) {
+        self.release.cancel();
+    }
+
+    async fn wait_for_release_or_stop(&self, stop: tokio_util::sync::CancellationToken) -> bool {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        self.entered_notify.notify_waiters();
+        tokio::select! {
+            biased;
+            _ = stop.cancelled() => false,
+            _ = self.release.cancelled() => true,
+        }
+    }
 }
 
 #[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
@@ -563,12 +669,30 @@ impl PqProposerLoopObserver {
     }
 }
 
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+impl PqAttesterLoopObserver {
+    fn new() -> Self {
+        Self {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+            completed_slots: std::sync::atomic::AtomicUsize::new(0),
+            last_completion: std::sync::Mutex::new(None),
+            max_retained_receipts: std::sync::atomic::AtomicUsize::new(0),
+            attempt: tokio::sync::Notify::new(),
+            completion: tokio::sync::Notify::new(),
+        }
+    }
+}
+
 #[cfg(feature = "pq-proposer")]
 impl PqProposerLoopShutdown {
-    async fn wait(mut self) -> Result<(), PqRuntimeError> {
+    fn stop(&mut self) {
         if let Some(sender) = self.shutdown_sender.take() {
             let _ = sender.send(());
         }
+    }
+
+    async fn wait(mut self) -> Result<(), PqRuntimeError> {
+        self.stop();
         match self.task.await {
             Ok(Ok(Ok(()))) => Ok(()),
             Ok(Ok(Err(error))) => Err(PqRuntimeError::Proposer(error)),
@@ -594,8 +718,49 @@ impl PqProposerLoopShutdown {
 }
 
 #[cfg(feature = "pq-proposer")]
+impl PqAttesterLoopShutdown {
+    fn stop(&mut self) {
+        self.publication_stop.cancel();
+        if let Some(sender) = self.shutdown_sender.take() {
+            let _ = sender.send(());
+        }
+    }
+
+    async fn wait(mut self) -> Result<(), PqRuntimeError> {
+        self.stop();
+        match self.task.await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(PqRuntimeError::TaskJoin(error.to_string())),
+            Err(_) => Err(PqRuntimeError::TaskUnavailable),
+        }
+    }
+}
+
+#[cfg(feature = "pq-proposer")]
 impl PqParkedProposerLoop {
     async fn release(mut self) -> Result<PqProposerLoopShutdown, PqRuntimeError> {
+        if self
+            .release_sender
+            .take()
+            .ok_or(PqRuntimeError::TaskUnavailable)?
+            .send(())
+            .is_err()
+        {
+            let _ = self.shutdown.wait().await;
+            return Err(PqRuntimeError::TaskUnavailable);
+        }
+        Ok(self.shutdown)
+    }
+
+    async fn wait(self) -> Result<(), PqRuntimeError> {
+        drop(self.release_sender);
+        self.shutdown.wait().await
+    }
+}
+
+#[cfg(feature = "pq-proposer")]
+impl PqParkedAttesterLoop {
+    async fn release(mut self) -> Result<PqAttesterLoopShutdown, PqRuntimeError> {
         if self
             .release_sender
             .take()
@@ -961,6 +1126,671 @@ async fn start_pq_proposer_loop_source_parked<S: PqProposerLoopSource>(
 }
 
 #[cfg(feature = "pq-proposer")]
+fn pq_attester_loop_error_is_pre_sign_retryable(error: &PqRuntimeError) -> bool {
+    matches!(
+        error,
+        PqRuntimeError::Attester(error)
+            if error.is_pre_sign_retryable()
+                || matches!(
+                    error,
+                    PqAttesterServiceError::ClockUnavailable
+                        | PqAttesterServiceError::Busy { .. }
+                        | PqAttesterServiceError::SlotRollback { .. }
+                )
+    )
+}
+
+#[cfg(feature = "pq-proposer")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PqAttesterLoopCompletion {
+    NoDuty { slot: types::Slot },
+    Verified { slot: types::Slot },
+}
+
+#[cfg(feature = "pq-proposer")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PqAttesterPublicationFinish {
+    Consumed,
+    StoppedAtSafeBoundary,
+}
+
+#[cfg(feature = "pq-proposer")]
+trait PqAttesterLoopReceipt: Send + 'static {
+    fn completion(
+        self,
+    ) -> futures::future::BoxFuture<'static, Result<PqAttesterLoopCompletion, PqRuntimeError>>;
+}
+
+#[cfg(feature = "pq-proposer")]
+impl PqAttesterLoopReceipt for pq_attester_service::PqAttestationReceipt {
+    fn completion(
+        self,
+    ) -> futures::future::BoxFuture<'static, Result<PqAttesterLoopCompletion, PqRuntimeError>> {
+        async move {
+            self.wait()
+                .await
+                .map(|completion| match completion {
+                    PqAttestationCompletion::NoDuty { slot } => {
+                        PqAttesterLoopCompletion::NoDuty { slot }
+                    }
+                    PqAttestationCompletion::Verified(metadata) => {
+                        PqAttesterLoopCompletion::Verified {
+                            slot: metadata.slot,
+                        }
+                    }
+                })
+                .map_err(PqRuntimeError::Attester)
+        }
+        .boxed()
+    }
+}
+
+#[cfg(feature = "pq-proposer")]
+trait PqAttesterLoopSource: Send + Sync + 'static {
+    type Receipt: PqAttesterLoopReceipt;
+
+    fn now(&self) -> Option<types::Slot>;
+    fn genesis_slot(&self) -> types::Slot;
+    fn duration_to_next_slot(&self) -> Option<Duration>;
+    fn try_attest_current_slot(&self) -> Result<Self::Receipt, PqRuntimeError>;
+    fn finish_verified(
+        &self,
+        stop: tokio_util::sync::CancellationToken,
+    ) -> futures::future::BoxFuture<'_, Result<PqAttesterPublicationFinish, PqRuntimeError>>;
+}
+
+#[cfg(feature = "pq-proposer")]
+struct ProductionPqAttesterLoopSource<T>
+where
+    T: beacon_chain::BeaconChainTypes<EthSpec = MinimalEthSpec, SlotClock = SystemTimeSlotClock>,
+{
+    service: Arc<PqAttesterService<T>>,
+    sender: PqLocalAttestationBatchPublishSender<MinimalEthSpec>,
+    clock: SystemTimeSlotClock,
+    #[cfg(feature = "pq-startup-testing")]
+    publication_barrier: Option<Arc<TestingPqAttesterPublicationBarrier>>,
+}
+
+#[cfg(feature = "pq-proposer")]
+fn pq_attester_publication_is_complete(
+    progress: &PqLocalAttestationBatchPublishProgress<MinimalEthSpec>,
+) -> bool {
+    progress.is_successfully_consumed()
+}
+
+#[cfg(feature = "pq-proposer")]
+fn pq_attester_admission_window_is_open(
+    sampled_slot: types::Slot,
+    current_slot: types::Slot,
+    remaining: Duration,
+    genesis_slot: types::Slot,
+    completed_slot: Option<types::Slot>,
+) -> bool {
+    sampled_slot == current_slot
+        && current_slot != genesis_slot
+        && completed_slot.is_none_or(|slot| current_slot > slot)
+        && remaining >= PQ_ATTESTER_MINIMUM_REMAINING
+}
+
+#[cfg(feature = "pq-proposer")]
+async fn finish_pq_attester_publication<T>(
+    service: &PqAttesterService<T>,
+    sender: &PqLocalAttestationBatchPublishSender<MinimalEthSpec>,
+    stop: tokio_util::sync::CancellationToken,
+) -> Result<PqAttesterPublicationFinish, PqRuntimeError>
+where
+    T: beacon_chain::BeaconChainTypes<EthSpec = MinimalEthSpec, SlotClock = SystemTimeSlotClock>,
+{
+    let mut receipt = loop {
+        if stop.is_cancelled() {
+            return Ok(PqAttesterPublicationFinish::StoppedAtSafeBoundary);
+        }
+        match service.try_publish_owned_verified_batch(sender) {
+            Ok(receipt) => break receipt,
+            Err(PqAttesterPublicationError::Capacity) => {
+                tokio::select! {
+                    biased;
+                    _ = stop.cancelled() => {
+                        return Ok(PqAttesterPublicationFinish::StoppedAtSafeBoundary);
+                    }
+                    _ = tokio::time::sleep(PQ_ATTESTER_RETRY_DELAY) => {}
+                }
+            }
+            Err(error) => return Err(PqRuntimeError::AttesterPublication(error)),
+        }
+    };
+
+    loop {
+        let mut progress = tokio::select! {
+            biased;
+            _ = stop.cancelled() => {
+                return Ok(PqAttesterPublicationFinish::StoppedAtSafeBoundary);
+            }
+            progress = receipt.wait() => {
+                progress.ok_or(PqRuntimeError::AttesterPublicationMissing)?
+            }
+        };
+        if pq_attester_publication_is_complete(&progress) {
+            return Ok(PqAttesterPublicationFinish::Consumed);
+        }
+        if progress.is_terminal() {
+            return Err(PqRuntimeError::AttesterPublicationTerminal);
+        }
+        if !progress.is_retryable() {
+            return Err(PqRuntimeError::AttesterPublicationIncomplete);
+        }
+        let stopping = tokio::select! {
+            biased;
+            _ = stop.cancelled() => true,
+            _ = tokio::time::sleep(PQ_ATTESTER_RETRY_DELAY) => false,
+        };
+        if stopping {
+            drop(progress);
+            return Ok(PqAttesterPublicationFinish::StoppedAtSafeBoundary);
+        }
+        receipt = loop {
+            if stop.is_cancelled() {
+                drop(progress);
+                return Ok(PqAttesterPublicationFinish::StoppedAtSafeBoundary);
+            }
+            match sender.try_retry(progress) {
+                Ok(receipt) => break receipt,
+                Err(PqLocalAttestationBatchPublishRetryError::Capacity(returned)) => {
+                    progress = returned;
+                    tokio::select! {
+                        biased;
+                        _ = stop.cancelled() => {
+                            drop(progress);
+                            return Ok(PqAttesterPublicationFinish::StoppedAtSafeBoundary);
+                        }
+                        _ = tokio::time::sleep(PQ_ATTESTER_RETRY_DELAY) => {}
+                    }
+                }
+                Err(PqLocalAttestationBatchPublishRetryError::Closed(_)) => {
+                    return Err(PqRuntimeError::AttesterPublication(
+                        PqAttesterPublicationError::Closed,
+                    ));
+                }
+                Err(PqLocalAttestationBatchPublishRetryError::NotRetryable(_)) => {
+                    return Err(PqRuntimeError::AttesterPublicationIncomplete);
+                }
+            }
+        };
+    }
+}
+
+#[cfg(feature = "pq-proposer")]
+impl<T> PqAttesterLoopSource for ProductionPqAttesterLoopSource<T>
+where
+    T: beacon_chain::BeaconChainTypes<EthSpec = MinimalEthSpec, SlotClock = SystemTimeSlotClock>,
+{
+    type Receipt = pq_attester_service::PqAttestationReceipt;
+
+    fn now(&self) -> Option<types::Slot> {
+        self.clock.now()
+    }
+
+    fn genesis_slot(&self) -> types::Slot {
+        self.clock.genesis_slot()
+    }
+
+    fn duration_to_next_slot(&self) -> Option<Duration> {
+        self.clock.duration_to_next_slot()
+    }
+
+    fn try_attest_current_slot(&self) -> Result<Self::Receipt, PqRuntimeError> {
+        self.service
+            .try_attest_current_slot()
+            .map_err(PqRuntimeError::Attester)
+    }
+
+    fn finish_verified(
+        &self,
+        stop: tokio_util::sync::CancellationToken,
+    ) -> futures::future::BoxFuture<'_, Result<PqAttesterPublicationFinish, PqRuntimeError>> {
+        #[cfg(feature = "pq-startup-testing")]
+        let publication_barrier = self.publication_barrier.as_ref().map(Arc::clone);
+        async move {
+            #[cfg(feature = "pq-startup-testing")]
+            if let Some(barrier) = publication_barrier
+                && !barrier.wait_for_release_or_stop(stop.clone()).await
+            {
+                return Ok(PqAttesterPublicationFinish::StoppedAtSafeBoundary);
+            }
+            finish_pq_attester_publication(&self.service, &self.sender, stop).await
+        }
+        .boxed()
+    }
+}
+
+#[cfg(feature = "pq-proposer")]
+async fn run_pq_attester_loop<S: PqAttesterLoopSource>(
+    source: S,
+    publication_stop: tokio_util::sync::CancellationToken,
+    shutdown_receiver: tokio::sync::oneshot::Receiver<()>,
+    exit: impl std::future::Future<Output = ()> + Send + 'static,
+    startup: PqRuntimeStartup,
+    #[cfg(feature = "pq-startup-testing")] observer: Arc<PqAttesterLoopObserver>,
+) -> Result<(), PqRuntimeError> {
+    let mut shutdown: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+        Box::pin(async move {
+            tokio::select! {
+                _ = exit => {}
+                _ = shutdown_receiver => {}
+            }
+        });
+    let mut completed_slot = None;
+
+    if startup == PqRuntimeStartup::Resume {
+        let observed_slot = loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.as_mut() => return Ok(()),
+                _ = std::future::ready(()) => {}
+            }
+            if let Some(slot) = source.now() {
+                break slot;
+            }
+            tokio::select! {
+                biased;
+                _ = shutdown.as_mut() => return Ok(()),
+                _ = tokio::time::sleep(PQ_ATTESTER_RETRY_DELAY) => {}
+            }
+        };
+        let first_admissible_slot = types::Slot::new(
+            observed_slot
+                .as_u64()
+                .checked_add(1)
+                .ok_or(PqRuntimeError::AttesterTimingOverflow)?,
+        );
+        completed_slot = Some(observed_slot);
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.as_mut() => return Ok(()),
+                _ = std::future::ready(()) => {}
+            }
+            if source
+                .now()
+                .is_some_and(|slot| slot >= first_admissible_slot)
+            {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.as_mut() => return Ok(()),
+                    _ = std::future::ready(()) => {}
+                }
+                break;
+            }
+            let delay = source
+                .duration_to_next_slot()
+                .unwrap_or(PQ_ATTESTER_RETRY_DELAY);
+            tokio::select! {
+                biased;
+                _ = shutdown.as_mut() => return Ok(()),
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
+    }
+
+    loop {
+        let Some(sampled_slot) = source.now() else {
+            tokio::select! {
+                biased;
+                _ = shutdown.as_mut() => return Ok(()),
+                _ = tokio::time::sleep(PQ_ATTESTER_RETRY_DELAY) => continue,
+            }
+        };
+        let remaining = source
+            .duration_to_next_slot()
+            .unwrap_or(PQ_ATTESTER_RETRY_DELAY);
+        let Some(current_slot) = source.now() else {
+            tokio::select! {
+                biased;
+                _ = shutdown.as_mut() => return Ok(()),
+                _ = tokio::time::sleep(PQ_ATTESTER_RETRY_DELAY) => continue,
+            }
+        };
+        if !pq_attester_admission_window_is_open(
+            sampled_slot,
+            current_slot,
+            remaining,
+            source.genesis_slot(),
+            completed_slot,
+        ) {
+            let delay = if remaining.is_zero() {
+                PQ_ATTESTER_RETRY_DELAY
+            } else {
+                remaining.min(PQ_ATTESTER_RETRY_DELAY)
+            };
+            tokio::select! {
+                biased;
+                _ = shutdown.as_mut() => return Ok(()),
+                _ = tokio::time::sleep(delay) => continue,
+            }
+        }
+        let publication_deadline = tokio::time::Instant::now()
+            .checked_add(remaining)
+            .ok_or(PqRuntimeError::AttesterTimingOverflow)?;
+
+        tokio::select! {
+            biased;
+            _ = shutdown.as_mut() => return Ok(()),
+            _ = std::future::ready(()) => {}
+        }
+        let receipt = match source.try_attest_current_slot() {
+            Ok(receipt) => receipt,
+            Err(PqRuntimeError::Attester(PqAttesterServiceError::PreviouslyTransferred {
+                requested,
+                ..
+            })) => {
+                completed_slot = Some(requested);
+                continue;
+            }
+            Err(error) if pq_attester_loop_error_is_pre_sign_retryable(&error) => {
+                tokio::time::sleep(PQ_ATTESTER_RETRY_DELAY).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        #[cfg(feature = "pq-startup-testing")]
+        {
+            observer.attempts.fetch_add(1, Ordering::SeqCst);
+            observer
+                .max_retained_receipts
+                .fetch_max(1, Ordering::SeqCst);
+            observer.attempt.notify_waiters();
+        }
+        match receipt.completion().await {
+            Ok(PqAttesterLoopCompletion::NoDuty { slot }) => {
+                if slot != current_slot {
+                    return Err(PqRuntimeError::AttesterCompletionSlotMismatch {
+                        expected: current_slot,
+                        actual: slot,
+                    });
+                }
+                completed_slot = Some(slot);
+                #[cfg(feature = "pq-startup-testing")]
+                {
+                    *observer
+                        .last_completion
+                        .lock()
+                        .map_err(|_| PqRuntimeError::TaskUnavailable)? =
+                        Some(TestingPqAttesterLoopCompletion::NoDuty { slot });
+                    observer.completed_slots.fetch_add(1, Ordering::SeqCst);
+                    observer.completion.notify_waiters();
+                }
+            }
+            Ok(PqAttesterLoopCompletion::Verified { slot }) => {
+                if slot != current_slot {
+                    return Err(PqRuntimeError::AttesterCompletionSlotMismatch {
+                        expected: current_slot,
+                        actual: slot,
+                    });
+                }
+                let finish = tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(publication_deadline) => {
+                        return Err(PqRuntimeError::AttesterPublicationDeadline { slot });
+                    }
+                    result = source.finish_verified(publication_stop.clone()) => result?,
+                };
+                if finish == PqAttesterPublicationFinish::StoppedAtSafeBoundary {
+                    return Ok(());
+                }
+                completed_slot = Some(slot);
+                #[cfg(feature = "pq-startup-testing")]
+                {
+                    *observer
+                        .last_completion
+                        .lock()
+                        .map_err(|_| PqRuntimeError::TaskUnavailable)? =
+                        Some(TestingPqAttesterLoopCompletion::Consumed { slot });
+                    observer.completed_slots.fetch_add(1, Ordering::SeqCst);
+                    observer.completion.notify_waiters();
+                }
+            }
+            Err(error) if pq_attester_loop_error_is_pre_sign_retryable(&error) => {
+                tokio::time::sleep(PQ_ATTESTER_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(feature = "pq-proposer")]
+fn pq_attester_loop_error_requires_global_failure(error: &PqRuntimeError) -> bool {
+    match error {
+        PqRuntimeError::Attester(error) => !matches!(
+            error,
+            PqAttesterServiceError::Context(_)
+                | PqAttesterServiceError::Planning(_)
+                | PqAttesterServiceError::Signing(_)
+                | PqAttesterServiceError::TaskUnavailable
+                | PqAttesterServiceError::TaskPanic
+                | PqAttesterServiceError::LocalProof(_)
+                | PqAttesterServiceError::AtomicBatchMissing
+        ),
+        PqRuntimeError::AttesterPublication(PqAttesterPublicationError::StatePoisoned)
+        | PqRuntimeError::AttesterPublication(PqAttesterPublicationError::NoVerifiedBatch)
+        | PqRuntimeError::AttesterPublicationMissing
+        | PqRuntimeError::AttesterPublicationIncomplete
+        | PqRuntimeError::AttesterCompletionSlotMismatch { .. }
+        | PqRuntimeError::AttesterTimingOverflow
+        | PqRuntimeError::AttesterPublicationDeadline { .. } => true,
+        PqRuntimeError::AttesterPublication(PqAttesterPublicationError::Capacity)
+        | PqRuntimeError::AttesterPublication(PqAttesterPublicationError::Closed)
+        | PqRuntimeError::AttesterPublicationTerminal => false,
+        _ => false,
+    }
+}
+
+#[cfg(feature = "pq-proposer")]
+async fn start_pq_attester_loop_parked<T>(
+    service: Arc<PqAttesterService<T>>,
+    sender: PqLocalAttestationBatchPublishSender<MinimalEthSpec>,
+    clock: SystemTimeSlotClock,
+    task_executor: task_executor::TaskExecutor,
+    startup: PqRuntimeStartup,
+) -> Result<PqParkedAttesterLoop, PqRuntimeError>
+where
+    T: beacon_chain::BeaconChainTypes<EthSpec = MinimalEthSpec, SlotClock = SystemTimeSlotClock>,
+{
+    start_pq_attester_loop_source_parked(
+        ProductionPqAttesterLoopSource {
+            service,
+            sender,
+            clock,
+            #[cfg(feature = "pq-startup-testing")]
+            publication_barrier: None,
+        },
+        task_executor,
+        startup,
+    )
+    .await
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+#[doc(hidden)]
+pub struct TestingPqParkedAttesterLoop {
+    inner: PqParkedAttesterLoop,
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+#[doc(hidden)]
+pub struct TestingPqAttesterLoop {
+    inner: PqAttesterLoopShutdown,
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+impl TestingPqParkedAttesterLoop {
+    pub async fn release(self) -> Result<TestingPqAttesterLoop, PqRuntimeError> {
+        self.inner
+            .release()
+            .await
+            .map(|inner| TestingPqAttesterLoop { inner })
+    }
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+impl TestingPqAttesterLoop {
+    pub fn completed_slot_count(&self) -> usize {
+        self.inner.observer.completed_slots.load(Ordering::SeqCst)
+    }
+
+    pub async fn wait_for_completed_slot(&self) -> Result<(), PqRuntimeError> {
+        self.wait_for_completion().await.map(|_| ())
+    }
+
+    pub fn completion(&self) -> Result<Option<TestingPqAttesterLoopCompletion>, PqRuntimeError> {
+        self.inner
+            .observer
+            .last_completion
+            .lock()
+            .map(|completion| *completion)
+            .map_err(|_| PqRuntimeError::TaskUnavailable)
+    }
+
+    pub async fn wait_for_completion(
+        &self,
+    ) -> Result<TestingPqAttesterLoopCompletion, PqRuntimeError> {
+        loop {
+            let completion = self.inner.observer.completion.notified();
+            if let Some(completion) = self.completion()? {
+                return Ok(completion);
+            }
+            completion.await;
+        }
+    }
+
+    pub async fn stop_and_wait(mut self) -> Result<(), PqRuntimeError> {
+        self.inner.stop();
+        self.inner.wait().await
+    }
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+#[doc(hidden)]
+pub async fn testing_only_start_pq_attester_loop_parked<T>(
+    service: Arc<PqAttesterService<T>>,
+    sender: PqLocalAttestationBatchPublishSender<MinimalEthSpec>,
+    clock: SystemTimeSlotClock,
+    task_executor: task_executor::TaskExecutor,
+    startup: PqRuntimeStartup,
+) -> Result<TestingPqParkedAttesterLoop, PqRuntimeError>
+where
+    T: beacon_chain::BeaconChainTypes<EthSpec = MinimalEthSpec, SlotClock = SystemTimeSlotClock>,
+{
+    start_pq_attester_loop_parked(service, sender, clock, task_executor, startup)
+        .await
+        .map(|inner| TestingPqParkedAttesterLoop { inner })
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+#[doc(hidden)]
+pub async fn testing_only_start_pq_attester_loop_parked_with_publication_barrier<T>(
+    service: Arc<PqAttesterService<T>>,
+    sender: PqLocalAttestationBatchPublishSender<MinimalEthSpec>,
+    clock: SystemTimeSlotClock,
+    task_executor: task_executor::TaskExecutor,
+    startup: PqRuntimeStartup,
+    publication_barrier: Arc<TestingPqAttesterPublicationBarrier>,
+) -> Result<TestingPqParkedAttesterLoop, PqRuntimeError>
+where
+    T: beacon_chain::BeaconChainTypes<EthSpec = MinimalEthSpec, SlotClock = SystemTimeSlotClock>,
+{
+    start_pq_attester_loop_source_parked(
+        ProductionPqAttesterLoopSource {
+            service,
+            sender,
+            clock,
+            publication_barrier: Some(publication_barrier),
+        },
+        task_executor,
+        startup,
+    )
+    .await
+    .map(|inner| TestingPqParkedAttesterLoop { inner })
+}
+
+#[cfg(feature = "pq-proposer")]
+async fn start_pq_attester_loop_source_parked<S: PqAttesterLoopSource>(
+    source: S,
+    task_executor: task_executor::TaskExecutor,
+    startup: PqRuntimeStartup,
+) -> Result<PqParkedAttesterLoop, PqRuntimeError> {
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+    let publication_stop = tokio_util::sync::CancellationToken::new();
+    let task_publication_stop = publication_stop.clone();
+    let (release_sender, release_receiver) = tokio::sync::oneshot::channel();
+    let (live_sender, live_receiver) = tokio::sync::oneshot::channel();
+    #[cfg(feature = "pq-startup-testing")]
+    let observer = Arc::new(PqAttesterLoopObserver::new());
+    #[cfg(feature = "pq-startup-testing")]
+    let task_observer = Arc::clone(&observer);
+    let exit = task_executor.exit();
+    let mut process_shutdown = task_executor.shutdown_sender();
+    let mut task = task_executor
+        .spawn_handle_without_exit(
+            async move {
+                let _ = live_sender.send(());
+                let mut exit = Box::pin(exit);
+                let mut shutdown_receiver = shutdown_receiver;
+                tokio::select! {
+                    biased;
+                    _ = exit.as_mut() => return Ok(()),
+                    _ = &mut shutdown_receiver => return Ok(()),
+                    release = release_receiver => {
+                        if release.is_err() {
+                            return Ok(());
+                        }
+                    }
+                }
+                let result = run_pq_attester_loop(
+                    source,
+                    task_publication_stop,
+                    shutdown_receiver,
+                    exit,
+                    startup,
+                    #[cfg(feature = "pq-startup-testing")]
+                    task_observer,
+                )
+                .await;
+                if result
+                    .as_ref()
+                    .is_err_and(pq_attester_loop_error_requires_global_failure)
+                {
+                    let _ = process_shutdown.try_send(task_executor::ShutdownReason::Failure(
+                        "PQ attester loop failed",
+                    ));
+                }
+                result
+            },
+            "pq_attester_loop",
+        )
+        .ok_or(PqRuntimeError::TaskUnavailable)?;
+    tokio::select! {
+        biased;
+        result = &mut task => match result {
+            Ok(Ok(Err(error))) => Err(error),
+            Ok(Ok(Ok(()))) | Ok(Err(_)) | Err(_) => Err(PqRuntimeError::TaskUnavailable),
+        },
+        live = live_receiver => {
+            live.map_err(|_| PqRuntimeError::TaskUnavailable)?;
+            Ok(PqParkedAttesterLoop {
+                release_sender: Some(release_sender),
+                shutdown: PqAttesterLoopShutdown {
+                    shutdown_sender: Some(shutdown_sender),
+                    publication_stop,
+                    task,
+                    #[cfg(feature = "pq-startup-testing")]
+                    observer,
+                },
+            })
+        }
+    }
+}
+
+#[cfg(all(feature = "pq-proposer", test))]
 async fn acknowledge_runtime_ready_and_release_proposer(
     operational_events: &Arc<PqOperationalEventSink>,
     runtime_ready_event: PqOperationalEvent,
@@ -1530,6 +2360,10 @@ pub(crate) struct PqRuntimeOwner {
     _proposer_service: Option<Arc<PqProposerService<SystemTimeSlotClock>>>,
     #[cfg(feature = "pq-proposer")]
     proposer_loop: Option<PqProposerLoopShutdown>,
+    #[cfg(feature = "pq-proposer")]
+    _attester_service: Option<Arc<PqAttesterService<PqDiskWitness>>>,
+    #[cfg(feature = "pq-proposer")]
+    attester_loop: Option<PqAttesterLoopShutdown>,
     #[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
     validator_identities: Option<Vec<(consensus_signature::ValidatorPublicKeyBytes, u64)>>,
     network_shutdown: PqNetworkServiceShutdown,
@@ -1912,6 +2746,8 @@ impl PqRuntimeOwner {
             slot: ready_identity.slot,
             block_root: ready_identity.block_root,
             execution_hash: ready_identity.execution_hash,
+            justified_epoch: ready_identity.justified_epoch,
+            justified_root: ready_identity.justified_root,
             finalized_epoch: ready_identity.finalized_epoch,
             finalized_root: ready_identity.finalized_root,
             signed_ssz_digest: ready_identity.signed_ssz_digest,
@@ -1964,6 +2800,8 @@ impl PqRuntimeOwner {
         )
         .await
         .map_err(PqRuntimeError::Network)?;
+        #[cfg(feature = "pq-proposer")]
+        let local_attestation_publish_sender = service.local_attestation_batch_publish_sender();
         let network_globals = service.network_globals();
         let network_shutdown = service
             .start_with_shutdown_receipt()
@@ -2004,7 +2842,7 @@ impl PqRuntimeOwner {
             .as_ref()
             .and_then(|store| store.pq_validator_identity_snapshot());
         #[cfg(feature = "pq-proposer")]
-        let proposer_service_result = (|| {
+        let signer_services_result = (|| {
             Ok(match validator_store {
                 Some(validator_store) => {
                     #[cfg(feature = "pq-startup-testing")]
@@ -2020,22 +2858,31 @@ impl PqRuntimeOwner {
                         reqwest::Client::builder().no_proxy().http1_only(),
                     )
                     .map_err(PqRuntimeError::HttpClient)?;
-                    Some(Arc::new(
+                    let proposer_service = Arc::new(
                         PqProposerService::new(
                             chain.slot_clock.clone(),
                             executor.clone(),
-                            validator_store,
+                            Arc::clone(&validator_store),
                             beacon_node,
                         )
                         .map_err(PqRuntimeError::Proposer)?,
-                    ))
+                    );
+                    let attester_service = Arc::new(
+                        PqAttesterService::new(
+                            Arc::clone(&chain),
+                            validator_store,
+                            executor.clone(),
+                        )
+                        .map_err(PqRuntimeError::Attester)?,
+                    );
+                    Some((proposer_service, attester_service))
                 }
                 None => None,
             })
         })();
         #[cfg(feature = "pq-proposer")]
-        let proposer_service = match proposer_service_result {
-            Ok(service) => service,
+        let signer_services = match signer_services_result {
+            Ok(services) => services,
             Err(error) => {
                 Box::pin(cleanup_pq_post_bind_owners(
                     http_shutdown.take(),
@@ -2050,6 +2897,14 @@ impl PqRuntimeOwner {
             }
         };
         #[cfg(feature = "pq-proposer")]
+        let proposer_service = signer_services
+            .as_ref()
+            .map(|(service, _)| Arc::clone(service));
+        #[cfg(feature = "pq-proposer")]
+        let attester_service = signer_services
+            .as_ref()
+            .map(|(_, service)| Arc::clone(service));
+        #[cfg(feature = "pq-proposer")]
         let parked_proposer_loop = match proposer_service.as_ref() {
             Some(service) => {
                 #[cfg(feature = "pq-startup-testing")]
@@ -2059,7 +2914,7 @@ impl PqRuntimeOwner {
                     start_pq_proposer_loop_parked(
                         Arc::clone(service),
                         chain.slot_clock.clone(),
-                        executor,
+                        executor.clone(),
                         runtime_startup,
                     )
                     .await
@@ -2068,7 +2923,7 @@ impl PqRuntimeOwner {
                 let start = start_pq_proposer_loop_parked(
                     Arc::clone(service),
                     chain.slot_clock.clone(),
-                    executor,
+                    executor.clone(),
                     runtime_startup,
                 )
                 .await;
@@ -2090,31 +2945,113 @@ impl PqRuntimeOwner {
             }
             None => None,
         };
+        #[cfg(feature = "pq-proposer")]
+        let parked_attester_loop = match attester_service.as_ref() {
+            Some(service) => match start_pq_attester_loop_parked(
+                Arc::clone(service),
+                local_attestation_publish_sender,
+                chain.slot_clock.clone(),
+                executor,
+                runtime_startup,
+            )
+            .await
+            {
+                Ok(attester_loop) => Some(attester_loop),
+                Err(error) => {
+                    if let Some(proposer_loop) = parked_proposer_loop {
+                        let _ = proposer_loop.wait().await;
+                    }
+                    let _ = service.close_and_drain().await;
+                    Box::pin(cleanup_pq_post_bind_owners(
+                        http_shutdown.take(),
+                        broadcaster,
+                        network_shutdown,
+                        Arc::clone(&chain),
+                        operational_events,
+                        operational_event_completion,
+                    ))
+                    .await;
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
         #[cfg(feature = "pq-startup-testing")]
         if fail_runtime_ready_event {
             operational_events.testing_only_fail_closed();
         }
         #[cfg(feature = "pq-proposer")]
-        let proposer_loop = match acknowledge_runtime_ready_and_release_proposer(
-            &operational_events,
-            runtime_ready_event,
-            parked_proposer_loop,
-        )
-        .await
-        {
-            Ok(proposer_loop) => proposer_loop,
-            Err(error) => {
-                Box::pin(cleanup_pq_post_bind_owners(
-                    http_shutdown.take(),
-                    broadcaster,
-                    network_shutdown,
-                    Arc::clone(&chain),
-                    operational_events,
-                    operational_event_completion,
-                ))
-                .await;
-                return Err(error);
+        if let Err(error) = operational_events.emit_and_wait(runtime_ready_event).await {
+            if let Some(proposer_loop) = parked_proposer_loop {
+                let _ = proposer_loop.wait().await;
             }
+            if let Some(attester_loop) = parked_attester_loop {
+                let _ = attester_loop.wait().await;
+            }
+            if let Some(service) = attester_service.as_ref() {
+                let _ = service.close_and_drain().await;
+            }
+            Box::pin(cleanup_pq_post_bind_owners(
+                http_shutdown.take(),
+                broadcaster,
+                network_shutdown,
+                Arc::clone(&chain),
+                operational_events,
+                operational_event_completion,
+            ))
+            .await;
+            return Err(PqRuntimeError::OperationalEvent(error));
+        }
+        #[cfg(feature = "pq-proposer")]
+        let proposer_loop = match parked_proposer_loop {
+            Some(proposer_loop) => match proposer_loop.release().await {
+                Ok(proposer_loop) => Some(proposer_loop),
+                Err(error) => {
+                    if let Some(attester_loop) = parked_attester_loop {
+                        let _ = attester_loop.wait().await;
+                    }
+                    if let Some(service) = attester_service.as_ref() {
+                        let _ = service.close_and_drain().await;
+                    }
+                    Box::pin(cleanup_pq_post_bind_owners(
+                        http_shutdown.take(),
+                        broadcaster,
+                        network_shutdown,
+                        Arc::clone(&chain),
+                        operational_events,
+                        operational_event_completion,
+                    ))
+                    .await;
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
+        #[cfg(feature = "pq-proposer")]
+        let attester_loop = match parked_attester_loop {
+            Some(attester_loop) => match attester_loop.release().await {
+                Ok(attester_loop) => Some(attester_loop),
+                Err(error) => {
+                    if let Some(mut proposer_loop) = proposer_loop {
+                        proposer_loop.stop();
+                        let _ = proposer_loop.wait().await;
+                    }
+                    if let Some(service) = attester_service.as_ref() {
+                        let _ = service.close_and_drain().await;
+                    }
+                    Box::pin(cleanup_pq_post_bind_owners(
+                        http_shutdown.take(),
+                        broadcaster,
+                        network_shutdown,
+                        Arc::clone(&chain),
+                        operational_events,
+                        operational_event_completion,
+                    ))
+                    .await;
+                    return Err(error);
+                }
+            },
+            None => None,
         };
         #[cfg(not(feature = "pq-proposer"))]
         if let Err(error) = operational_events.emit_and_wait(runtime_ready_event).await {
@@ -2140,6 +3077,10 @@ impl PqRuntimeOwner {
             _proposer_service: proposer_service,
             #[cfg(feature = "pq-proposer")]
             proposer_loop,
+            #[cfg(feature = "pq-proposer")]
+            _attester_service: attester_service,
+            #[cfg(feature = "pq-proposer")]
+            attester_loop,
             #[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
             validator_identities,
             network_shutdown,
@@ -2167,7 +3108,11 @@ impl PqRuntimeOwner {
             #[cfg(feature = "pq-proposer")]
                 _proposer_service: proposer_service,
             #[cfg(feature = "pq-proposer")]
-            proposer_loop,
+            mut proposer_loop,
+            #[cfg(feature = "pq-proposer")]
+                _attester_service: attester_service,
+            #[cfg(feature = "pq-proposer")]
+            mut attester_loop,
             #[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
                 validator_identities: _,
             network_shutdown,
@@ -2175,8 +3120,30 @@ impl PqRuntimeOwner {
             operational_event_completion,
         } = self;
         #[cfg(feature = "pq-proposer")]
+        {
+            if let Some(proposer_loop) = proposer_loop.as_mut() {
+                proposer_loop.stop();
+            }
+            if let Some(attester_loop) = attester_loop.as_mut() {
+                attester_loop.stop();
+            }
+        }
+        #[cfg(feature = "pq-proposer")]
         let proposer_result = match proposer_loop {
             Some(proposer_loop) => proposer_loop.wait().await,
+            None => Ok(()),
+        };
+        #[cfg(feature = "pq-proposer")]
+        let attester_loop_result = match attester_loop {
+            Some(attester_loop) => attester_loop.wait().await,
+            None => Ok(()),
+        };
+        #[cfg(feature = "pq-proposer")]
+        let attester_drain_result = match attester_service.as_ref() {
+            Some(service) => service
+                .close_and_drain()
+                .await
+                .map_err(PqRuntimeError::Attester),
             None => Ok(()),
         };
         let http_result = match http_shutdown {
@@ -2201,6 +3168,14 @@ impl PqRuntimeOwner {
         if let Err(error) = proposer_result {
             return Err(error);
         }
+        #[cfg(feature = "pq-proposer")]
+        if let Err(error) = attester_loop_result {
+            return Err(error);
+        }
+        #[cfg(feature = "pq-proposer")]
+        attester_drain_result?;
+        #[cfg(feature = "pq-proposer")]
+        drop(attester_service);
         operational_event_result?;
         match (http_result, network_result) {
             (Err(http_error), _) => Err(http_error),
@@ -2275,12 +3250,8 @@ impl Client<PqDiskWitness> {
             .and_then(|owner| owner.proposer_loop.as_ref())
             .ok_or(PqRuntimeError::TaskUnavailable)?
             .observer;
-        loop {
-            if observer.attempts.load(Ordering::SeqCst) > 0 {
-                return Ok(());
-            }
-            observer.attempt.notified().await;
-        }
+        wait_for_pq_loop_attempt(&observer.attempts, &observer.attempt, || {}).await;
+        Ok(())
     }
 
     #[cfg(all(feature = "pq-startup-testing", feature = "pq-proposer"))]
@@ -2290,6 +3261,39 @@ impl Client<PqDiskWitness> {
             .pq_runtime_owner
             .as_ref()?
             .proposer_loop
+            .as_ref()?
+            .observer;
+        Some(observer.max_retained_receipts.load(Ordering::SeqCst))
+    }
+
+    #[cfg(all(feature = "pq-startup-testing", feature = "pq-proposer"))]
+    #[doc(hidden)]
+    pub fn testing_only_pq_attester_is_running(&self) -> bool {
+        self.pq_runtime_owner
+            .as_ref()
+            .is_some_and(|owner| owner._attester_service.is_some())
+    }
+
+    #[cfg(all(feature = "pq-startup-testing", feature = "pq-proposer"))]
+    #[doc(hidden)]
+    pub async fn testing_only_wait_for_pq_attester_attempt(&self) -> Result<(), PqRuntimeError> {
+        let observer = &self
+            .pq_runtime_owner
+            .as_ref()
+            .and_then(|owner| owner.attester_loop.as_ref())
+            .ok_or(PqRuntimeError::TaskUnavailable)?
+            .observer;
+        wait_for_pq_loop_attempt(&observer.attempts, &observer.attempt, || {}).await;
+        Ok(())
+    }
+
+    #[cfg(all(feature = "pq-startup-testing", feature = "pq-proposer"))]
+    #[doc(hidden)]
+    pub fn testing_only_pq_attester_max_retained_receipts(&self) -> Option<usize> {
+        let observer = &self
+            .pq_runtime_owner
+            .as_ref()?
+            .attester_loop
             .as_ref()?
             .observer;
         Some(observer.max_retained_receipts.load(Ordering::SeqCst))
@@ -2340,6 +3344,27 @@ pub enum PqRuntimeError {
     HttpClient(eth2::Error),
     #[cfg(feature = "pq-proposer")]
     Proposer(pq_proposer_service::PqProposerServiceError),
+    #[cfg(feature = "pq-proposer")]
+    Attester(PqAttesterServiceError),
+    #[cfg(feature = "pq-proposer")]
+    AttesterPublication(PqAttesterPublicationError),
+    #[cfg(feature = "pq-proposer")]
+    AttesterPublicationMissing,
+    #[cfg(feature = "pq-proposer")]
+    AttesterPublicationTerminal,
+    #[cfg(feature = "pq-proposer")]
+    AttesterPublicationIncomplete,
+    #[cfg(feature = "pq-proposer")]
+    AttesterCompletionSlotMismatch {
+        expected: types::Slot,
+        actual: types::Slot,
+    },
+    #[cfg(feature = "pq-proposer")]
+    AttesterTimingOverflow,
+    #[cfg(feature = "pq-proposer")]
+    AttesterPublicationDeadline {
+        slot: types::Slot,
+    },
     TaskUnavailable,
     TaskJoin(String),
 }
@@ -2403,6 +3428,34 @@ impl std::fmt::Display for PqRuntimeError {
             ),
             #[cfg(feature = "pq-proposer")]
             Self::Proposer(error) => error.fmt(formatter),
+            #[cfg(feature = "pq-proposer")]
+            Self::Attester(error) => error.fmt(formatter),
+            #[cfg(feature = "pq-proposer")]
+            Self::AttesterPublication(error) => error.fmt(formatter),
+            #[cfg(feature = "pq-proposer")]
+            Self::AttesterPublicationMissing => {
+                formatter.write_str("PQ attester publication receipt lost its exact progress")
+            }
+            #[cfg(feature = "pq-proposer")]
+            Self::AttesterPublicationTerminal => {
+                formatter.write_str("PQ attester publication terminalized")
+            }
+            #[cfg(feature = "pq-proposer")]
+            Self::AttesterPublicationIncomplete => {
+                formatter.write_str("PQ attester publication completed without exact consumption")
+            }
+            #[cfg(feature = "pq-proposer")]
+            Self::AttesterCompletionSlotMismatch { expected, actual } => write!(
+                formatter,
+                "PQ attester completion slot mismatch: expected {expected}, actual {actual}",
+            ),
+            #[cfg(feature = "pq-proposer")]
+            Self::AttesterTimingOverflow => formatter.write_str("PQ attester slot timing overflow"),
+            #[cfg(feature = "pq-proposer")]
+            Self::AttesterPublicationDeadline { slot } => write!(
+                formatter,
+                "PQ attester publication did not finish before the end of slot {slot}",
+            ),
             Self::TaskUnavailable => formatter.write_str("PQ runtime executor is unavailable"),
             Self::TaskJoin(error) => write!(formatter, "PQ runtime blocking task failed: {error}"),
         }
@@ -2429,6 +3482,10 @@ impl std::error::Error for PqRuntimeError {
             #[cfg(feature = "pq-proposer")]
             Self::Proposer(error) => Some(error),
             #[cfg(feature = "pq-proposer")]
+            Self::Attester(error) => Some(error),
+            #[cfg(feature = "pq-proposer")]
+            Self::AttesterPublication(error) => Some(error),
+            #[cfg(feature = "pq-proposer")]
             Self::Slashing(_) => None,
             #[cfg(feature = "pq-proposer")]
             Self::HttpClient(_) => None,
@@ -2446,6 +3503,13 @@ impl std::error::Error for PqRuntimeError {
             | Self::HttpUnexpectedExit
             | Self::TaskUnavailable
             | Self::TaskJoin(_) => None,
+            #[cfg(feature = "pq-proposer")]
+            Self::AttesterPublicationMissing
+            | Self::AttesterPublicationTerminal
+            | Self::AttesterPublicationIncomplete
+            | Self::AttesterCompletionSlotMismatch { .. }
+            | Self::AttesterTimingOverflow
+            | Self::AttesterPublicationDeadline { .. } => None,
         }
     }
 }
@@ -2521,6 +3585,347 @@ mod proposer_loop_tests {
     use super::*;
     use std::collections::VecDeque;
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn attempt_wait_registers_before_the_counter_check() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let notification = tokio::sync::Notify::new();
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            wait_for_pq_loop_attempt(&attempts, &notification, || {
+                attempts.store(1, Ordering::SeqCst);
+                notification.notify_waiters();
+            }),
+        )
+        .await
+        .expect("the notification created before the check observes the raced wake");
+    }
+
+    struct TestingAttesterReceipt {
+        completion:
+            tokio::sync::oneshot::Receiver<Result<PqAttesterLoopCompletion, PqRuntimeError>>,
+    }
+
+    impl PqAttesterLoopReceipt for TestingAttesterReceipt {
+        fn completion(
+            self,
+        ) -> futures::future::BoxFuture<'static, Result<PqAttesterLoopCompletion, PqRuntimeError>>
+        {
+            async move {
+                self.completion
+                    .await
+                    .map_err(|_| PqRuntimeError::AttesterPublicationMissing)?
+            }
+            .boxed()
+        }
+    }
+
+    struct TestingAttesterSource {
+        now: std::sync::atomic::AtomicU64,
+        starts: std::sync::atomic::AtomicUsize,
+        publications: std::sync::atomic::AtomicUsize,
+        script: Mutex<VecDeque<Result<TestingAttesterReceipt, PqRuntimeError>>>,
+    }
+
+    impl TestingAttesterSource {
+        fn new(
+            slot: types::Slot,
+            script: Vec<Result<TestingAttesterReceipt, PqRuntimeError>>,
+        ) -> Self {
+            Self {
+                now: std::sync::atomic::AtomicU64::new(slot.as_u64()),
+                starts: std::sync::atomic::AtomicUsize::new(0),
+                publications: std::sync::atomic::AtomicUsize::new(0),
+                script: Mutex::new(script.into()),
+            }
+        }
+    }
+
+    impl PqAttesterLoopSource for Arc<TestingAttesterSource> {
+        type Receipt = TestingAttesterReceipt;
+
+        fn now(&self) -> Option<types::Slot> {
+            Some(types::Slot::new(self.now.load(Ordering::SeqCst)))
+        }
+
+        fn genesis_slot(&self) -> types::Slot {
+            types::Slot::new(0)
+        }
+
+        fn duration_to_next_slot(&self) -> Option<Duration> {
+            Some(Duration::from_secs(300))
+        }
+
+        fn try_attest_current_slot(&self) -> Result<Self::Receipt, PqRuntimeError> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            self.script
+                .lock()
+                .expect("attester script lock")
+                .pop_front()
+                .unwrap_or(Err(PqRuntimeError::TaskUnavailable))
+        }
+
+        fn finish_verified(
+            &self,
+            _stop: tokio_util::sync::CancellationToken,
+        ) -> futures::future::BoxFuture<'_, Result<PqAttesterPublicationFinish, PqRuntimeError>>
+        {
+            self.publications.fetch_add(1, Ordering::SeqCst);
+            async { Ok(PqAttesterPublicationFinish::Consumed) }.boxed()
+        }
+    }
+
+    struct StoppingAttesterSource {
+        starts: std::sync::atomic::AtomicUsize,
+        publications: std::sync::atomic::AtomicUsize,
+        completion: Mutex<Option<TestingAttesterReceipt>>,
+    }
+
+    impl PqAttesterLoopSource for Arc<StoppingAttesterSource> {
+        type Receipt = TestingAttesterReceipt;
+
+        fn now(&self) -> Option<types::Slot> {
+            Some(types::Slot::new(1))
+        }
+
+        fn genesis_slot(&self) -> types::Slot {
+            types::Slot::new(0)
+        }
+
+        fn duration_to_next_slot(&self) -> Option<Duration> {
+            Some(Duration::from_secs(300))
+        }
+
+        fn try_attest_current_slot(&self) -> Result<Self::Receipt, PqRuntimeError> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            self.completion
+                .lock()
+                .expect("stopping receipt lock")
+                .take()
+                .ok_or(PqRuntimeError::TaskUnavailable)
+        }
+
+        fn finish_verified(
+            &self,
+            stop: tokio_util::sync::CancellationToken,
+        ) -> futures::future::BoxFuture<'_, Result<PqAttesterPublicationFinish, PqRuntimeError>>
+        {
+            self.publications.fetch_add(1, Ordering::SeqCst);
+            async move {
+                stop.cancelled().await;
+                Ok(PqAttesterPublicationFinish::StoppedAtSafeBoundary)
+            }
+            .boxed()
+        }
+    }
+
+    #[test]
+    fn attester_admission_window_requires_one_coherent_current_slot_and_the_full_floor() {
+        let slot = types::Slot::new(4);
+        let genesis = types::Slot::new(0);
+        assert!(pq_attester_admission_window_is_open(
+            slot,
+            slot,
+            PQ_ATTESTER_MINIMUM_REMAINING,
+            genesis,
+            Some(types::Slot::new(3)),
+        ));
+        assert!(!pq_attester_admission_window_is_open(
+            slot,
+            slot,
+            PQ_ATTESTER_MINIMUM_REMAINING - Duration::from_millis(1),
+            genesis,
+            None,
+        ));
+        assert!(!pq_attester_admission_window_is_open(
+            slot,
+            types::Slot::new(5),
+            Duration::from_secs(300),
+            genesis,
+            None,
+        ));
+        assert!(!pq_attester_admission_window_is_open(
+            genesis,
+            genesis,
+            Duration::from_secs(300),
+            genesis,
+            None,
+        ));
+        assert!(!pq_attester_admission_window_is_open(
+            slot,
+            slot,
+            Duration::from_secs(300),
+            genesis,
+            Some(slot),
+        ));
+    }
+
+    #[tokio::test]
+    async fn attester_loop_is_parked_until_release_and_completes_one_verified_slot_once() {
+        let (completion_sender, completion) = tokio::sync::oneshot::channel();
+        let source = Arc::new(TestingAttesterSource::new(
+            types::Slot::new(1),
+            vec![Ok(TestingAttesterReceipt { completion })],
+        ));
+        let (exit_sender, exit_receiver) = async_channel::bounded(1);
+        let (process_shutdown, _process_shutdown_receiver) = futures::channel::mpsc::channel(1);
+        let executor = task_executor::TaskExecutor::new(
+            tokio::runtime::Handle::current(),
+            exit_receiver,
+            process_shutdown,
+        );
+        let parked = start_pq_attester_loop_source_parked(
+            Arc::clone(&source),
+            executor,
+            PqRuntimeStartup::Fresh,
+        )
+        .await
+        .expect("live parked attester loop");
+        tokio::task::yield_now().await;
+        assert_eq!(source.starts.load(Ordering::SeqCst), 0);
+
+        let shutdown = parked.release().await.expect("release after RuntimeReady");
+        let observer = Arc::clone(&shutdown.observer);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while source.starts.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("one attester admission");
+        completion_sender
+            .send(Ok(PqAttesterLoopCompletion::Verified {
+                slot: types::Slot::new(1),
+            }))
+            .expect("complete verified duty");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while source.publications.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("one publication handoff");
+        tokio::task::yield_now().await;
+        assert_eq!(source.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(source.publications.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *observer
+                .last_completion
+                .lock()
+                .expect("attester completion lock"),
+            Some(TestingPqAttesterLoopCompletion::Consumed {
+                slot: types::Slot::new(1),
+            }),
+        );
+        shutdown.wait().await.expect("clean attester stop");
+        drop(exit_sender);
+    }
+
+    #[tokio::test]
+    async fn attester_loop_stop_does_not_wait_forever_for_retryable_publication() {
+        let (completion_sender, completion) = tokio::sync::oneshot::channel();
+        let source = Arc::new(StoppingAttesterSource {
+            starts: std::sync::atomic::AtomicUsize::new(0),
+            publications: std::sync::atomic::AtomicUsize::new(0),
+            completion: Mutex::new(Some(TestingAttesterReceipt { completion })),
+        });
+        let (exit_sender, exit_receiver) = async_channel::bounded(1);
+        let (process_shutdown, _process_shutdown_receiver) = futures::channel::mpsc::channel(1);
+        let executor = task_executor::TaskExecutor::new(
+            tokio::runtime::Handle::current(),
+            exit_receiver,
+            process_shutdown,
+        );
+        let parked = start_pq_attester_loop_source_parked(
+            Arc::clone(&source),
+            executor,
+            PqRuntimeStartup::Fresh,
+        )
+        .await
+        .expect("live parked attester loop");
+        let shutdown = parked.release().await.expect("release attester loop");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while source.starts.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("attester admission");
+        completion_sender
+            .send(Ok(PqAttesterLoopCompletion::Verified {
+                slot: types::Slot::new(1),
+            }))
+            .expect("verified completion");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while source.publications.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("publication phase entered");
+        let observer = Arc::clone(&shutdown.observer);
+        tokio::time::timeout(Duration::from_millis(100), shutdown.wait())
+            .await
+            .expect("explicit stop must bound publication retry")
+            .expect("clean attester stop");
+        assert_eq!(
+            observer.completed_slots.load(Ordering::SeqCst),
+            0,
+            "a stopped publication is not a consumed attestation duty",
+        );
+        assert_eq!(
+            *observer
+                .last_completion
+                .lock()
+                .expect("attester completion lock"),
+            None,
+        );
+        drop(exit_sender);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attester_publication_cannot_block_duties_beyond_the_signed_slot() {
+        let (completion_sender, completion) = tokio::sync::oneshot::channel();
+        let source = Arc::new(StoppingAttesterSource {
+            starts: std::sync::atomic::AtomicUsize::new(0),
+            publications: std::sync::atomic::AtomicUsize::new(0),
+            completion: Mutex::new(Some(TestingAttesterReceipt { completion })),
+        });
+        let (_shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        let (_exit_sender, exit_receiver) = tokio::sync::oneshot::channel::<()>();
+        let observer = Arc::new(PqAttesterLoopObserver::new());
+        let task = tokio::spawn(run_pq_attester_loop(
+            Arc::clone(&source),
+            tokio_util::sync::CancellationToken::new(),
+            shutdown_receiver,
+            async move {
+                let _ = exit_receiver.await;
+            },
+            PqRuntimeStartup::Fresh,
+            Arc::clone(&observer),
+        ));
+
+        tokio::task::yield_now().await;
+        completion_sender
+            .send(Ok(PqAttesterLoopCompletion::Verified {
+                slot: types::Slot::new(1),
+            }))
+            .expect("complete verified duty");
+        while source.publications.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(300)).await;
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("publication deadline terminates the slot owner")
+                .expect("scheduler task joins"),
+            Err(PqRuntimeError::AttesterPublicationDeadline { slot })
+                if slot == types::Slot::new(1)
+        ));
+        assert_eq!(observer.completed_slots.load(Ordering::SeqCst), 0);
+    }
 
     struct TestingReceipt {
         slot: types::Slot,
@@ -3280,6 +4685,8 @@ mod proposer_loop_tests {
                     slot: types::Slot::new(0),
                     block_root: types::Hash256::ZERO,
                     execution_hash: types::ExecutionBlockHash::zero(),
+                    justified_epoch: types::Epoch::new(0),
+                    justified_root: types::Hash256::ZERO,
                     finalized_epoch: types::Epoch::new(0),
                     finalized_root: types::Hash256::ZERO,
                     signed_ssz_digest: [0; 32],

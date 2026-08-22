@@ -721,6 +721,50 @@ mod behavior {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chain_terminal_consumption_is_terminal_progress_without_a_second_failure_owner() {
+        let (_exit_owner, exit_receiver) = async_channel::bounded(1);
+        let (shutdown_sender, _shutdown_receiver) = futures::channel::mpsc::channel(1);
+        let task_executor = task_executor::TaskExecutor::new(
+            tokio::runtime::Handle::current(),
+            exit_receiver,
+            shutdown_sender,
+        );
+        let (sender, mut service) =
+            testing_only_pq_local_attestation_post_publish_service_channel();
+        let (batch, guards) = empty_verified_batch_with_guards();
+        let receipt = sender.try_publish(batch).expect("whole batch is admitted");
+
+        assert!(service.start_next_from_actual_publish_cursor(
+            task_executor,
+            1,
+            &[PqLocalAttestationPublishTestOutcome::Published],
+            &[PqSingleConsumptionResult::Terminal],
+            std::sync::Arc::new(|| {}),
+        ));
+        assert!(service.finish_next_post_publish().await);
+        let terminal = receipt
+            .wait()
+            .await
+            .expect("chain terminal disposition returns the exact progress owner");
+
+        assert!(
+            terminal.is_terminal(),
+            "a chain-owned terminal disposition must not be reclassified as an incomplete client failure",
+        );
+        assert!(matches!(
+            terminal.member_progress(),
+            [network::PqLocalAttestationMemberPublishProgress::Consumed {
+                result: PqSingleConsumptionResult::Terminal,
+                ..
+            }],
+        ));
+        assert_eq!(service.fail_closed_call_count(), 0);
+        assert_eq!(guards.available_permits(), 1);
+        drop(terminal);
+        service.close_and_drain().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn all_local_wire_success_waits_for_exact_chain_consumption_before_receipt() {
         let (exit_owner, exit_receiver) = async_channel::bounded(1);
         let (shutdown_sender, _shutdown_receiver) = futures::channel::mpsc::channel(1);
@@ -814,6 +858,10 @@ mod behavior {
             ] if *message_id == lighthouse_network::MessageId(vec![0])
                 && *queued_message_id == lighthouse_network::MessageId(vec![1])
         ));
+        assert!(
+            !completed.is_successfully_consumed(),
+            "success requires the exact original verified-member cardinality, not only consumed-looking metadata",
+        );
         assert_eq!(
             guards.available_permits(),
             1,

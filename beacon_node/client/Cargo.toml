@@ -28,12 +28,14 @@ pq-proposer = [
     "pq-devnet",
     "dep:initialized_validators",
     "dep:lighthouse_validator_store",
+    "dep:pq_attester_service",
     "dep:pq_proposer_service",
     "dep:reqwest",
     "dep:slashing_protection",
     "initialized_validators/pq-devnet",
     "lighthouse_validator_store/pq-devnet",
     "network/pq-proposer",
+    "pq_attester_service/pq-proposer",
     "pq_proposer_service/pq-devnet",
     "slashing_protection/pq-devnet",
 ]
@@ -41,6 +43,7 @@ pq-startup-testing = [
     "pq-devnet",
     "beacon_chain/pq-startup-testing",
     "network/pq-startup-testing",
+    "pq_attester_service?/pq-startup-testing",
     "pq_http_api/pq-startup-testing",
 ]
 
@@ -68,6 +71,7 @@ logging = { workspace = true }
 metrics = { workspace = true }
 monitoring_api = { workspace = true }
 network = { path = "../network", default-features = false }
+pq_attester_service = { path = "../../validator_client/pq_attester_service", optional = true, default-features = false }
 pq_http_api = { workspace = true, optional = true }
 pq_proposer_service = { workspace = true, optional = true }
 rand = { workspace = true }

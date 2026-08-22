@@ -56,7 +56,10 @@
 //! ```
 
 #[cfg(feature = "pq-transition")]
-use crate::{ConsensusContext, ContextError, SignatureSetError};
+use crate::{
+    ConsensusContext, ContextError, SignatureSetError,
+    common::get_attestation_participation_flag_indices,
+};
 use crate::{
     PqAttestationError, PqAttestationInvalid, PqAttestationLocalError, PqValidatorKeyCache,
     PreparedPqAttestation, VerifiedPqAttestation,
@@ -71,9 +74,11 @@ use consensus_signature::{
     AggregationSigner, OneTimeUseId, SameMessageClaim, SameMessageEvidence, SigningDuty,
     SigningIdError, VerificationClass,
 };
+#[cfg(feature = "pq-transition")]
+use safe_arith::SafeArith;
 use std::sync::Arc;
 #[cfg(feature = "pq-transition")]
-use types::{Attestation, AttestationRef};
+use types::{Attestation, AttestationRef, ParticipationFlags};
 use types::{
     BeaconBlock, BeaconBlockRef, BeaconState, BeaconStateError, ChainSpec, Domain, EthSpec,
     ForkName, SignedAggregateAndProof, SignedBeaconBlock, SignedRoot, Slot,
@@ -89,6 +94,7 @@ pub enum PqBlockAttestationSelectionLocalError {
     ConsensusContext(ContextError),
     Arithmetic(safe_arith::ArithError),
     Attestation(PqAttestationLocalError),
+    SignerIndexOverflow(u64),
 }
 
 #[cfg(feature = "pq-transition")]
@@ -124,6 +130,26 @@ impl std::error::Error for PqBlockAttestationSelectionError {
             Self::Local(error) => Some(error),
         }
     }
+}
+
+/// Returns true when the authenticated signer set would gain at least one awarded participation
+/// flag in the selected epoch's participation vector.
+#[cfg(feature = "pq-transition")]
+pub fn pq_signers_add_marginal_participation(
+    signer_participation: &[ParticipationFlags],
+    awarded_flags: &[usize],
+) -> Result<bool, PqBlockAttestationSelectionLocalError> {
+    for participation in signer_participation {
+        for flag_index in awarded_flags {
+            if !participation
+                .has_flag(*flag_index)
+                .map_err(PqBlockAttestationSelectionLocalError::Arithmetic)?
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -619,7 +645,51 @@ pub fn validate_pq_attestation_for_block_selection<E: EthSpec>(
             ));
         }
     }
-    Ok(true)
+    let data = attestation.data();
+    let inclusion_delay = state
+        .slot()
+        .safe_sub(data.slot)
+        .map_err(|error| {
+            PqBlockAttestationSelectionError::Local(
+                PqBlockAttestationSelectionLocalError::Arithmetic(error),
+            )
+        })?
+        .as_u64();
+    let awarded_flags =
+        get_attestation_participation_flag_indices(state, data, inclusion_delay, spec).map_err(
+            |error| {
+                PqBlockAttestationSelectionError::Local(
+                    PqBlockAttestationSelectionLocalError::State(error),
+                )
+            },
+        )?;
+    let epoch_participation = if data.target.epoch == state.current_epoch() {
+        state.current_epoch_participation()
+    } else if data.target.epoch == state.previous_epoch() {
+        state.previous_epoch_participation()
+    } else {
+        return Ok(false);
+    }
+    .map_err(|error| {
+        PqBlockAttestationSelectionError::Local(PqBlockAttestationSelectionLocalError::State(error))
+    })?;
+    let signer_participation = candidate
+        .signer_indices()
+        .iter()
+        .map(|signer_index| {
+            let signer_position = usize::try_from(*signer_index).map_err(|_| {
+                PqBlockAttestationSelectionLocalError::SignerIndexOverflow(*signer_index)
+            })?;
+            epoch_participation.get(signer_position).copied().ok_or(
+                PqBlockAttestationSelectionLocalError::State(
+                    BeaconStateError::ParticipationOutOfBounds(signer_position),
+                ),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(PqBlockAttestationSelectionError::Local)?;
+    pq_signers_add_marginal_participation(&signer_participation, &awarded_flags)
+        .map_err(PqBlockAttestationSelectionError::Local)
 }
 
 pub fn prepare_pq_local_block<E: EthSpec>(

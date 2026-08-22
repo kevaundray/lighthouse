@@ -473,6 +473,8 @@ impl PqNewPayloadTransport<MinimalEthSpec> for RecordingExecution {
     fn notify_forkchoice_updated<'a>(
         &'a self,
         _head_block_hash: types::ExecutionBlockHash,
+        _safe_block_hash: types::ExecutionBlockHash,
+        _finalized_block_hash: types::ExecutionBlockHash,
         _current_slot: Slot,
         _head_block_root: Hash256,
     ) -> std::pin::Pin<
@@ -2964,6 +2966,8 @@ async fn production_execution_layer_uses_exact_parent_local_payload_and_bypasses
 
     let observed_fcu = Arc::new(Mutex::new(None));
     let observed_fcu_for_hook = Arc::clone(&observed_fcu);
+    let observed_reconciliation_fcu = Arc::new(Mutex::new(None));
+    let observed_reconciliation_fcu_for_hook = Arc::clone(&observed_reconciliation_fcu);
     let forkchoice_calls = Arc::new(AtomicUsize::new(0));
     let forkchoice_calls_for_hook = Arc::clone(&forkchoice_calls);
     let payload_forkchoice_hook = TestingPqBlockingHook::blocking();
@@ -2981,6 +2985,11 @@ async fn production_execution_layer_uses_exact_parent_local_payload_and_bypasses
                     payload_attributes.map(execution_layer::PayloadAttributes::from),
                 ));
                 payload_forkchoice_hook_for_engine.run();
+            } else {
+                *observed_reconciliation_fcu_for_hook
+                    .lock()
+                    .expect("reconciliation FCU observation lock") =
+                    Some(execution_layer::ForkchoiceState::from(state));
             }
             None
         }));
@@ -3158,8 +3167,16 @@ async fn production_execution_layer_uses_exact_parent_local_payload_and_bypasses
         observation.forkchoice_head_hash(),
         Some(execution_parent_hash)
     );
-    assert_eq!(observation.forkchoice_justified_hash(), None);
-    assert_eq!(observation.forkchoice_finalized_hash(), None);
+    assert_eq!(
+        observation.forkchoice_justified_hash(),
+        Some(execution_parent_hash),
+        "the epoch-zero justified checkpoint binds the exact genesis execution anchor",
+    );
+    assert_eq!(
+        observation.forkchoice_finalized_hash(),
+        Some(execution_parent_hash),
+        "the epoch-zero finalized checkpoint binds the exact genesis execution anchor",
+    );
 
     let (forkchoice, payload_attributes) = observed_fcu
         .lock()
@@ -3167,8 +3184,25 @@ async fn production_execution_layer_uses_exact_parent_local_payload_and_bypasses
         .take()
         .expect("MockEngine FCU observed");
     assert_eq!(forkchoice.head_block_hash, execution_parent_hash);
-    assert_eq!(forkchoice.safe_block_hash, ExecutionBlockHash::zero());
-    assert_eq!(forkchoice.finalized_block_hash, ExecutionBlockHash::zero());
+    assert_eq!(forkchoice.safe_block_hash, execution_parent_hash);
+    assert_eq!(forkchoice.finalized_block_hash, execution_parent_hash);
+    let reconciliation_forkchoice = observed_reconciliation_fcu
+        .lock()
+        .expect("reconciliation FCU observation lock")
+        .take()
+        .expect("startup reconciliation FCU observed after payload lock release");
+    assert_eq!(
+        reconciliation_forkchoice.head_block_hash,
+        execution_parent_hash
+    );
+    assert_eq!(
+        reconciliation_forkchoice.safe_block_hash,
+        execution_parent_hash
+    );
+    assert_eq!(
+        reconciliation_forkchoice.finalized_block_hash,
+        execution_parent_hash,
+    );
     let payload_attributes = payload_attributes.expect("FCU payload attributes");
     assert_eq!(payload_attributes.suggested_fee_recipient(), fee_recipient);
     assert_eq!(
