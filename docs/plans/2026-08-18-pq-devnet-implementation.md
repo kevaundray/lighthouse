@@ -3421,3 +3421,20 @@ unit tests.
 git add docs/pq-devnet-findings.md
 git commit -m "docs: record verified PQ devnet results"
 ```
+
+Completion checkpoint (2026-08-22): Milestone 8 is complete. The final implementation was frozen
+at `e2c830e6bb40150bea799262fd717b5c597b9505` after the default workspace warning check, repository
+check, `make lint`, default affected suites, supported PQ verifier/proposer graphs, format, sort, and
+diff gates passed. The last reviewed regression preserves ordinary corrupt-payload detection while
+keeping PQ payload existence bounded and key-only; its default behavioral test and the PQ storage
+suite passed 1/1 and 2/2 respectively.
+
+From that exact clean commit, `scripts/local_testnet/pq/run-finality-smoke.sh` passed 1/1 in
+11,093.27 seconds with fresh temporary stores. The retained trace is
+`target/pq-finality-logs/two-process-slot32-20260822T175455Z.log`. At slot 32 both nodes agreed on
+head `0x0ed64a7f926ae350e20a6690ef898a381e86a5e1fd7a29fcbcad5b8a2a5b7ff8`, safe
+`0x7b6e5e95ce479232f31106d1690c1d8ff13b89fce69df5635bfc501a95e0fdd3`, and finalized epoch-2
+execution hash `0x8189d159979dec3db6b60b64f9fd3710bb8f863cece8d63a29efaa3eade26d92`. Both independently
+persisted chains restarted and replayed those exact values without replaying `newPayload`. The
+requirement-by-requirement evidence table is in `docs/pq-devnet-findings.md` under “Final clean-data
+completion audit.”

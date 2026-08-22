@@ -2489,3 +2489,42 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   warning-denied AVX2 run measured raw-plus-raw aggregation at 7.403579676 seconds, raw-plus-child at
   81.374353111 seconds, and child-plus-child at 72.617374039 seconds; the full test passed 1/1 in
   209.82 seconds.
+
+### 2026-08-22: Final clean-data completion audit
+
+- The implementation audited below is commit
+  `e2c830e6bb40150bea799262fd717b5c597b9505` (`fix: close PQ devnet completion gaps`). The worktree
+  was clean when the smoke started. The checked-in launcher explicitly unsets
+  `PQ_E4F_VERIFIER_ONLY_DIAGNOSTIC`, and the test creates fresh temporary stores, so this run could
+  not reuse either node's earlier chain data or take the three-slot diagnostic branch.
+- The exact acceptance command was `scripts/local_testnet/pq/run-finality-smoke.sh`. It passed 1/1
+  in **11,093.27 seconds** (3 h 4 min 53.27 s). The retained trace is
+  `target/pq-finality-logs/two-process-slot32-20260822T175455Z.log`.
+- Both nodes proposed, signed, published, imported, persisted, and reconciled all 32 scheduled
+  blocks. At slot 24 they agreed on safe execution hash
+  `0x8189d159979dec3db6b60b64f9fd3710bb8f863cece8d63a29efaa3eade26d92` while finality remained
+  genesis. At slot 32 they agreed on head
+  `0x0ed64a7f926ae350e20a6690ef898a381e86a5e1fd7a29fcbcad5b8a2a5b7ff8`, safe
+  `0x7b6e5e95ce479232f31106d1690c1d8ff13b89fce69df5635bfc501a95e0fdd3`, and finalized epoch-2
+  execution hash `0x8189d159979dec3db6b60b64f9fd3710bb8f863cece8d63a29efaa3eade26d92`.
+- Each independent store was then reopened. Both restarted chains emitted one no-attributes FCU
+  carrying those exact head, safe, and finalized hashes; no `newPayload` replay occurred. The
+  acceptance also checked exact stored block/state identities, participation, aggregate-bearing
+  block evidence, proposal-signature size, checkpoint state, empty rebuilt ephemeral pools, and
+  live-empty failure channels before graceful shutdown.
+
+#### Definition of Done evidence
+
+| # | Requirement | Direct evidence on the final implementation |
+|---|---|---|
+| 1 | Plan and findings match the implementation | This plan/finding pair records the Status-only RPC profile, compile-time omitted integrations, shared transport/storage size contract, final scheduler/aggregation design, exact commit, and clean-data trace. `git diff --check` passed before the implementation commit. |
+| 2 | Default BLS build and affected tests remain green | `RUSTFLAGS='-D warnings' cargo +1.88 check --workspace` passed; `make lint` passed; default `store --lib` passed 17/17, default `lighthouse_network --lib` passed 85/85, and the default consensus-signature schema suite passed 4/4. |
+| 3 | PQ build has no validator-signature BLS fallback | `RUSTFLAGS='-D warnings' cargo +1.88 check -p lighthouse --no-default-features --features pq-proposer,pq-startup-testing` passed. PQ wire/profile tests bind validator proposal and attestation evidence to PQ aliases, and incompatible ordinary full-runtime/BLS combinations are compile-time excluded. The slot-32 acceptance checked the 1,215-byte PQ proposal signature on every persisted block. |
+| 4 | PQ keys are generated, stored, loaded, and not reused | The deterministic provisioner/validator-directory hostile-input suites pass; the journal owns the bounded one-time-use range and exact-duty claims. Focused journal mutation suites reject duplicate and mismatched claims. The two-process acceptance exercises the normal sealed-journal proposal and scheduled attestation duties through slot 32. |
+| 5 | PQ proposals and individual attestations are produced and verified | The final acceptance produced and persisted 32 signed PQ blocks and internally asserted exact block identities, PQ attestation-body counts, recursive aggregate presence, and proposal-signature size. Separate authentic exact-attestation regressions bind individual identities through the real verifier/import path; the proposer-service warning-denied suite passed 40/40. |
+| 6 | Recursive attestation aggregation proves and verifies | `pq_dependency_smoke` passed 1/1 with raw+raw, raw+child, and child+child proofs; isolated verification of the 106,895-byte two-signer proof took 1.559338080 s. The final smoke requires at least one persisted recursive aggregate attestation and passed. |
+| 7 | Sync committee is PQ-backed or explicitly disabled | The PQ transition accepts only the canonical empty sync aggregate; mutation tests reject non-zero bits/evidence, and the PQ gossip-topic test proves sync topics are absent. No BLS sync signer is compiled into the PQ binary. |
+| 8 | PQ encoding, transport, RPC, storage, and allocation limits are explicit | `PqSignedBlockSizeLimits` is shared by HTTP, proposer response, Snappy/gossipsub, and storage. Exact-cap/cap+1 transport tests and `pq_storage_bounds` 2/2 passed. The mutation-sensitive RPC-profile test proves only Status v2/v1 plus Goodbye/Ping/Metadata are advertised; PQ block/attestation data RPC is intentionally unsupported rather than BLS-shaped. |
+| 9 | Multi-node PQ genesis reaches finality | The clean two-process, sixteen-validator Minimal/Electra run passed 1/1 through slot 32, finalized non-genesis epoch 2 on both nodes, and replayed the exact result after independent-store restart. |
+| 10 | Launch/provenance/resource evidence is recorded | Launcher, exact commit, validator count, 300-second slot timing, 1.559338080-second isolated verification, proof sizes (106,895/106,546/164,420/159,551 bytes), and measured 2,663,836 KiB peak command-tree RSS with zero swap are recorded above. The final smoke runtime and trace path are recorded separately and make no new RSS claim. |
+| 11 | Repository compilation gate passes after all code changes | Fresh `RUSTFLAGS='-D warnings' cargo +1.88 check --workspace`, repository `cargo check`, supported verifier/proposer PQ graphs, `cargo +1.88 fmt --all -- --check`, `cargo +1.88 sort --workspace --check`, and `make lint` all exited successfully before commit `e2c830e6b`. |
