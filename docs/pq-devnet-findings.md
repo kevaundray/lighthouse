@@ -2148,3 +2148,62 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   It does not claim operation-pool or naive-aggregation-pool insertion, aggregation or block
   inclusion, or justification/finality beyond genesis. Pool insertion, aggregation, inclusion,
   finality, and persisted attester/pool/fork-choice recovery across restart remain separate work.
+
+### 2026-08-22: Verified PQ attestation operation-pool retention completed (Task 5.2b Cycle 4, Steps 1-3)
+
+- This checkpoint supersedes only the preceding statement that operation-pool insertion was still
+  absent. The PQ `OperationPool` now privately owns exactly one
+  `PqAttestationAggregationCoordinator`, constructed from the chain's existing process-wide
+  `AggregationService`. Its optional dependency uses `default-features = false`; ordinary
+  operation-pool builds do not activate `attestation_aggregation`. Startup-only read access proves
+  service identity and bounded snapshots without exposing a pool reference, source enum, raw
+  candidate constructor, or mutation API.
+- The actual inbound verified-single and post-wire local-batch consumers now linearly move sealed
+  `VerifiedPqAttestation` values into that coordinator only after successful fork-choice
+  disposition. The inbound order is fork choice, explicit fork-choice guard drop, pool insertion,
+  source-trace commit, then observation finalization. Local `LocalReserved` and `Coalesced` members
+  use the same fork-choice-before-pool order and consume their exact candidate before finalization.
+  Pool insertion performs no additional signature proof or fork-choice application.
+- Snapshot coherence uses the documented lock order
+  `snapshot_guard -> coordinator -> source_trace`. Candidate count and sorted signer sets come from
+  one coordinator state lock, with validator indices derived from that same snapshot. An authentic
+  before-source-trace barrier proved fork choice was already unlocked and the observation remained
+  `ConsumptionPending`; a concurrent snapshot stayed blocked until both the candidate and its
+  source trace were committed. The post-insert hook runs only after the transaction guard is
+  released.
+- The exhaustive production classifier preserves the distinction between bounded resource
+  pressure and impossible sealed state. `Inserted { removed_subsets }` is stored success and
+  `Dominated` is non-fatal dominated success. Candidate, bucket, and retained-evidence exhaustion
+  are non-fatal `ResourceLimited` outcomes because the fork-choice vote is already valid.
+  `UnsupportedCandidate` and `GenerationExhausted` are typed invariants: they terminalize the exact
+  observation/reservation, retain their error source, and trigger the single failure owner.
+- The in-memory inventory remains bounded at 64 distinct buckets, 16 candidates per bucket, and
+  8 MiB of retained evidence. Subset dominance and pruning account for released candidates and
+  evidence. The inventory is deliberately ephemeral: no operation-pool persistence or restart
+  recovery is claimed.
+- Strict RED evidence covered the initially missing private owner/accessors, central disposition
+  facade, real inbound/local insertion seams, coherent snapshot transaction, fork-choice try-lock,
+  generation exhaustion injection, local invariant route, and source-specific hooks. Review REDs
+  also caught a direct test dependency without `default-features = false`, an exposed source enum
+  and classifier, and a missing `Error::source`. Restored fast GREEN evidence was 3/3 pool tests in
+  26.32 seconds, 3/3 review tests, and 6/6 local/post-wire tests.
+- The authentic inbound success test passed 1/1 in 130.89 seconds, observing fork choice unlocked,
+  the exact observation still `ConsumptionPending`, the concurrent snapshot blocked during the
+  candidate/trace transaction, and the coherent one-candidate gossip snapshot after release. The
+  authentic generation-exhaustion test passed 1/1 in 131.49 seconds with fork-choice count one,
+  pool count zero, terminal observation, one `ShutdownReason::Failure`, and complete drain.
+- The exact warning-denied AVX2 two-worker command remained:
+
+  `RUSTFLAGS='-D warnings -C target-feature=+avx2' cargo +1.88 test -p lighthouse --no-default-features --features pq-proposer,pq-startup-testing --test pq_e4f_launch direct_pq_attester_service_converges_two_independent_workers_exactly_once -- --exact --nocapture`
+
+  It passed 1/1 in 459.15 seconds. Phase timestamps were private cache clone 0.242317 seconds,
+  authority open 278.276839 seconds, RANDAO verification 305.764989 seconds, concurrent independent
+  slot-1 imports 457.931880 seconds, service verification 458.991716 seconds, and complete drain
+  459.142415 seconds.
+- The final exact sender snapshot contained two sorted singleton signer sets `{[v0], [v1]}` with
+  `gossip_inserted = 1`, `local_inserted = 1`, and `local_dominated = 1`. The independent peer
+  contained `{[v0]}` with `gossip_inserted = 1`. The duplicate cross-source candidate was dominated
+  without an extra proof, fork-choice call, or retained candidate; both distinct sender identities
+  remained stored. This completes private ownership, real consumer insertion, and bounded
+  classification only. Deterministic selection, background aggregation, block inclusion,
+  participation/finality progress, and candidate-pool recovery across restart remain pending.

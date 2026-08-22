@@ -61,7 +61,16 @@ pq-beacon-import-testing = [
     "beacon_chain/pq-proposer",
     "network/pq-startup-testing",
     "lighthouse_network/pq-proposer",
+    "dep:operation_pool",
     "eth2/pq-wire",
+]
+pq-attestation-pool-testing = [
+    "pq-beacon-startup-testing",
+    "beacon_chain/pq-proposer",
+    "dep:attestation_aggregation",
+    "dep:execution_layer",
+    "dep:operation_pool",
+    "operation_pool/pq-startup-testing",
 ]
 pq-randao-transport-testing = [
     "dep:consensus_signature",
@@ -93,6 +102,7 @@ lighthouse_network = { path = "../../beacon_node/lighthouse_network", optional =
 lighthouse_validator_store = { path = "../../validator_client/lighthouse_validator_store", optional = true, default-features = false, features = ["pq-devnet"] }
 network = { path = "../../beacon_node/network", optional = true, default-features = false, features = ["pq-devnet"] }
 network_utils = { workspace = true, optional = true }
+operation_pool = { workspace = true, optional = true, default-features = false }
 pq_http_api = { path = "../../beacon_node/pq_http_api", optional = true, default-features = false, features = ["pq-startup-testing"] }
 pq_proposer_service = { path = "../../validator_client/pq_proposer_service", optional = true, default-features = false, features = ["pq-devnet"] }
 pq_signing = { workspace = true, optional = true, features = ["pq-devnet"] }
@@ -177,6 +187,16 @@ required-features = ["pq-beacon-import-testing"]
 name = "pq_attestation_fork_choice"
 path = "tests/pq_attestation_fork_choice.rs"
 required-features = ["pq-beacon-import-testing"]
+
+[[test]]
+name = "pq_attestation_pool"
+path = "tests/pq_attestation_pool.rs"
+required-features = ["pq-attestation-pool-testing"]
+
+[[test]]
+name = "pq_attestation_pool_review"
+path = "tests/pq_attestation_pool_review.rs"
+required-features = ["pq-attestation-pool-testing"]
 
 [[test]]
 name = "pq_local_attester_context"

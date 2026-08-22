@@ -1121,6 +1121,27 @@ where
         )
     }
 
+    #[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+    #[doc(hidden)]
+    pub fn testing_only_completed_verified_observation_identities(
+        &self,
+    ) -> Option<Vec<beacon_chain::PqSingleObservationIdentity>> {
+        let control = self.shared.control.lock().ok()?;
+        let PqAttesterState::CompletedVerified {
+            owned: Some(owned), ..
+        } = &control.state
+        else {
+            return None;
+        };
+        Some(
+            owned
+                .verified()
+                .iter()
+                .map(beacon_chain::PqVerifiedLocalSingle::observation_identity)
+                .collect(),
+        )
+    }
+
     #[cfg(feature = "pq-startup-testing")]
     #[doc(hidden)]
     pub fn testing_only_take_owned_verified_batch(

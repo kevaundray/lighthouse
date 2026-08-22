@@ -3,6 +3,8 @@
 use beacon_node::beacon_chain::{
     BeaconChain, PqLocalAttesterIdentity, PqNewPayloadTransport, PqOperationalEvent,
     PqOperationalEventRole, PqOperationalEventSink, PqSingleConsumptionResult,
+    PqSingleObservationStatus, PqSingleWireMessageId, TestingPqAttestationPoolSnapshot,
+    TestingPqBlockingHook,
     builder::{BeaconChainBuilder, Witness},
     testing_only_pq_local_candidate_batch_fixture, testing_only_running_pq_operational_event_sink,
 };
@@ -581,6 +583,11 @@ async fn direct_pq_attester_service_converges_two_independent_workers_exactly_on
         0,
     );
     assert_eq!(
+        fixture.chain.testing_only_pq_attestation_pool_snapshot(),
+        TestingPqAttestationPoolSnapshot::default(),
+        "local proof alone must not insert before successful fork-choice disposition",
+    );
+    assert_eq!(
         fixture.chain.slot_clock.now(),
         Some(Slot::new(1)),
         "the authentic attester must start during the imported slot-one head",
@@ -666,6 +673,14 @@ async fn direct_pq_attester_service_converges_two_independent_workers_exactly_on
         .testing_only_completed_verified_wire_trace()
         .expect("read-only exact wire trace does not take the retained batch");
     assert_eq!(expected_wire.len(), fixture.expected.len());
+    let expected_observation_identities = fixture
+        .service
+        .testing_only_completed_verified_observation_identities()
+        .expect("read-only exact identities do not take the retained batch");
+    assert_eq!(
+        expected_observation_identities.len(),
+        fixture.expected.len()
+    );
     let expected_encoded = expected_wire
         .iter()
         .map(|(signed_ssz, signed_ssz_digest, subnet, slot)| {
@@ -921,6 +936,24 @@ async fn direct_pq_attester_service_converges_two_independent_workers_exactly_on
         None,
         "current-slot peer consumption is queued, not prematurely a latest message",
     );
+    let peer_pool = fixture
+        .receiver_chain
+        .testing_only_pq_attestation_pool_snapshot();
+    assert_eq!(
+        peer_pool,
+        TestingPqAttestationPoolSnapshot {
+            candidate_validator_indices: vec![fixture.expected[0].validator_index],
+            candidate_count: 1,
+            candidate_signer_sets: vec![vec![fixture.expected[0].validator_index]],
+            gossip_inserted: 1,
+            gossip_dominated: 0,
+            gossip_removed_subsets: 0,
+            local_inserted: 0,
+            local_dominated: 0,
+            local_removed_subsets: 0,
+        },
+        "the independent peer stores only the exact sender-published member zero after FC",
+    );
     assert_eq!(
         publish_receipt
             .testing_only_shared_member_progress_trace()
@@ -947,7 +980,37 @@ async fn direct_pq_attester_service_converges_two_independent_workers_exactly_on
         None,
         "the pending production receipt, not the service, owns the exact batch",
     );
+    let local_post_insert = TestingPqBlockingHook::blocking();
+    fixture
+        .chain
+        .testing_only_set_pq_attestation_pool_local_post_insert_hook(Some(Arc::clone(
+            &local_post_insert,
+        )));
     inbound_barrier.release();
+    tokio::time::timeout(Duration::from_secs(300), async {
+        while local_post_insert.entered() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("local-only post-insert barrier after remote completion");
+    assert_eq!(
+        fixture
+            .chain
+            .testing_only_pq_fork_choice_attestation_calls(),
+        fixture.expected.len(),
+        "remote member and fresh local member reach fork choice before local pool finalization",
+    );
+    assert_eq!(
+        fixture.chain.pq_attestation_consumption_status(
+            &expected_observation_identities[0],
+            PqSingleWireMessageId::try_from(expected_encoded[0].1.0.as_slice())
+                .expect("exact anonymous member-zero wire ID"),
+        ),
+        PqSingleObservationStatus::ConsumptionPending,
+        "the source-specific local hook blocks after insertion and before exact finalization",
+    );
+    local_post_insert.release();
     let progress = tokio::time::timeout(Duration::from_secs(300), publication)
         .await
         .expect("bounded two-worker publication and coalescence")
@@ -1015,6 +1078,31 @@ async fn direct_pq_attester_service_converges_two_independent_workers_exactly_on
             "each exact local-or-remote member remains queued in source-neutral history",
         );
     }
+    let mut pooled_validator_indices = fixture
+        .expected
+        .iter()
+        .map(|expected| expected.validator_index)
+        .collect::<Vec<_>>();
+    pooled_validator_indices.sort_unstable();
+    let sender_pool = fixture.chain.testing_only_pq_attestation_pool_snapshot();
+    assert_eq!(
+        sender_pool,
+        TestingPqAttestationPoolSnapshot {
+            candidate_validator_indices: pooled_validator_indices,
+            candidate_count: fixture.expected.len(),
+            candidate_signer_sets: vec![
+                vec![fixture.expected[0].validator_index],
+                vec![fixture.expected[1].validator_index],
+            ],
+            gossip_inserted: 1,
+            gossip_dominated: 0,
+            gossip_removed_subsets: 0,
+            local_inserted: 1,
+            local_dominated: 1,
+            local_removed_subsets: 0,
+        },
+        "remote member one is stored once, local member zero is stored once, and the retained local copy of member one is dominated",
+    );
     assert_eq!(
         fixture
             .chain

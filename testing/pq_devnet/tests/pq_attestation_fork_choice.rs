@@ -1,7 +1,8 @@
 #[cfg(target_feature = "avx2")]
 mod avx2 {
     use beacon_chain::{
-        BeaconChain, PqLocalAttesterIdentity, PqNewPayloadTransport,
+        BeaconChain, PqLocalAttesterIdentity, PqNewPayloadTransport, PqSingleObservationStatus,
+        TestingPqAttestationPoolSnapshot,
         builder::{BeaconChainBuilder, Witness},
     };
     use consensus_signature::{
@@ -964,6 +965,21 @@ mod avx2 {
             transport,
             ..
         } = fixture;
+        assert_eq!(
+            chain.testing_only_pq_attestation_pool_snapshot(),
+            TestingPqAttestationPoolSnapshot::default(),
+            "the actual chain starts with one empty private PQ pool",
+        );
+        assert!(
+            chain.testing_only_pq_attestation_pool_uses_aggregation_service(
+                &chain.pq_aggregation_service,
+            ),
+            "the actual pool coordinator must use the chain's existing process service",
+        );
+        assert!(matches!(
+            AggregationService::new(),
+            Err(consensus_signature::AggregationError::AlreadyActive)
+        ));
         chain.slot_clock.set_slot(1);
         let import = {
             let processor = Arc::clone(&processor);
@@ -993,6 +1009,12 @@ mod avx2 {
                 panic!("valid single was ignored: {error:?}")
             }
         };
+        let observation_identity = token
+            .observation_identity()
+            .expect("blocking preparation seals exact identity");
+        let observation_wire_id = token
+            .observation_wire_id()
+            .expect("blocking preparation seals exact wire id");
         let verified = (*token)
             .mark_propagated()
             .expect("finalize actual propagation");
@@ -1018,6 +1040,14 @@ mod avx2 {
             !drain.is_finished(),
             "propagated vote must retain shutdown activity"
         );
+        let post_insert = beacon_chain::TestingPqBlockingHook::blocking();
+        chain.testing_only_set_pq_attestation_pool_gossip_post_insert_hook(Some(Arc::clone(
+            &post_insert,
+        )));
+        let before_source_trace = beacon_chain::TestingPqBlockingHook::blocking();
+        chain.testing_only_set_pq_attestation_pool_gossip_before_source_trace_hook(Some(
+            Arc::clone(&before_source_trace),
+        ));
         let consumption = {
             let chain = Arc::clone(&chain);
             tokio::spawn(async move { chain.consume_pq_verified_gossip_single(verified).await })
@@ -1069,10 +1099,91 @@ mod avx2 {
         assert_eq!(transport.new_payload_calls.load(Ordering::SeqCst), 1);
         assert_eq!(transport.forkchoice_calls.load(Ordering::SeqCst), 1);
         wait_for_test_condition(
-            || chain.testing_only_pq_fork_choice_attestation_calls() == 1,
-            "cancel-safe chain-owned attestation continuation",
+            || before_source_trace.entered() == 1,
+            "pool candidate inserted before its source trace commits",
         )
         .await;
+        assert!(
+            chain.testing_only_try_lock_pq_fork_choice(),
+            "the source-trace transaction begins after releasing fork choice",
+        );
+        assert_eq!(
+            chain.pq_attestation_consumption_status(&observation_identity, observation_wire_id,),
+            PqSingleObservationStatus::ConsumptionPending,
+            "the exact observation remains pending until the coherent pool transaction commits",
+        );
+        let blocked_snapshot = {
+            let chain = Arc::clone(&chain);
+            tokio::task::spawn_blocking(move || chain.testing_only_pq_attestation_pool_snapshot())
+        };
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !blocked_snapshot.is_finished(),
+            "snapshot must not expose a candidate before its source trace commits",
+        );
+        before_source_trace.release();
+        let coherent_snapshot =
+            tokio::time::timeout(std::time::Duration::from_secs(1), blocked_snapshot)
+                .await
+                .expect("snapshot unblocks after the source trace transaction")
+                .expect("snapshot blocking task");
+        assert_eq!(
+            coherent_snapshot,
+            TestingPqAttestationPoolSnapshot {
+                candidate_validator_indices: vec![attester_index],
+                candidate_count: 1,
+                candidate_signer_sets: vec![vec![attester_index]],
+                gossip_inserted: 1,
+                gossip_dominated: 0,
+                gossip_removed_subsets: 0,
+                local_inserted: 0,
+                local_dominated: 0,
+                local_removed_subsets: 0,
+            },
+            "candidate contents and source trace become visible atomically",
+        );
+        wait_for_test_condition(
+            || post_insert.entered() == 1,
+            "post-FC pool insertion before observation finalization",
+        )
+        .await;
+        assert!(
+            chain.testing_only_try_lock_pq_fork_choice(),
+            "the post-insert barrier must run after releasing the fork-choice guard",
+        );
+        let pool_snapshot = chain.testing_only_pq_attestation_pool_snapshot();
+        assert_eq!(
+            pool_snapshot,
+            TestingPqAttestationPoolSnapshot {
+                candidate_validator_indices: vec![attester_index],
+                candidate_count: 1,
+                candidate_signer_sets: vec![vec![attester_index]],
+                gossip_inserted: 1,
+                gossip_dominated: 0,
+                gossip_removed_subsets: 0,
+                local_inserted: 0,
+                local_dominated: 0,
+                local_removed_subsets: 0,
+            },
+        );
+        assert_eq!(
+            chain.pq_attestation_consumption_status(&observation_identity, observation_wire_id,),
+            PqSingleObservationStatus::ConsumptionPending,
+            "pool insertion must precede exact observation finalization",
+        );
+        assert_eq!(chain.testing_only_pq_fork_choice_attestation_calls(), 1);
+        assert_eq!(
+            chain.testing_only_pq_local_attestation_batch_verification_count(),
+            0,
+            "remote consumption must not invoke the local whole-batch proof",
+        );
+        assert!(
+            !drain.is_finished(),
+            "the blocked post-insert continuation must retain activity after caller cancellation",
+        );
+        post_insert.release();
         tokio::time::timeout(std::time::Duration::from_secs(1), drain)
             .await
             .expect("drain completes after vote consumption")
@@ -1094,6 +1205,108 @@ mod avx2 {
         assert_eq!(
             chain.testing_only_pq_fork_choice_latest_message(attester_index),
             Some((Slot::new(1), block_root))
+        );
+        let pool_snapshot = chain.testing_only_pq_attestation_pool_snapshot();
+        assert_eq!(
+            pool_snapshot,
+            TestingPqAttestationPoolSnapshot {
+                candidate_validator_indices: vec![attester_index],
+                candidate_count: 1,
+                candidate_signer_sets: vec![vec![attester_index]],
+                gossip_inserted: 1,
+                gossip_dominated: 0,
+                gossip_removed_subsets: 0,
+                local_inserted: 0,
+                local_dominated: 0,
+                local_removed_subsets: 0,
+            },
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn inbound_pool_generation_exhaustion_is_terminal_after_one_fork_choice_disposition() {
+        let fixture = fresh_slot_one_fixture().await;
+        let (single, subnet) = slot_one_single_attestation(&fixture);
+        let FreshSlotOneFixture {
+            executor_exit_sender,
+            _temporary_directory,
+            chain,
+            processor,
+            signed,
+            attester_index,
+            transport,
+            mut shutdown_receiver,
+            ..
+        } = fixture;
+        let _executor_exit_sender = executor_exit_sender;
+        chain.slot_clock.set_slot(1);
+        chain.testing_only_set_pq_attestation_pool_next_generation(u64::MAX);
+
+        let import = {
+            let processor = Arc::clone(&processor);
+            tokio::spawn(async move { processor.import_rpc_block(signed).await })
+        };
+        wait_for_test_condition(
+            || transport.forkchoice_calls.load(Ordering::SeqCst) == 1,
+            "slot-one reconciliation before pool generation exhaustion",
+        )
+        .await;
+        transport.forkchoice_release.add_permits(1);
+        import.await.expect("import task").expect("slot-one import");
+
+        let token = match processor.verify_gossip_attestation(single, subnet).await {
+            PqGossipAttestationDisposition::Accept(token) => token,
+            PqGossipAttestationDisposition::Reject(_) => {
+                panic!("valid single was rejected before the actual inbound consumer")
+            }
+            PqGossipAttestationDisposition::Ignore(_) => {
+                panic!("valid single was ignored before the actual inbound consumer")
+            }
+        };
+        let identity = token.observation_identity().expect("sealed exact identity");
+        let wire_id = token.observation_wire_id().expect("sealed exact wire ID");
+        let verified = (*token).mark_propagated().expect("propagated single");
+
+        assert!(matches!(
+            chain.consume_pq_verified_gossip_single(verified).await,
+            Err(beacon_chain::PqForkChoiceAttestationError::Pool(
+                operation_pool::PqAttestationPoolInsertInvariant::GenerationExhausted,
+            ))
+        ));
+        assert_eq!(chain.testing_only_pq_fork_choice_attestation_calls(), 1);
+        assert_eq!(
+            chain.testing_only_pq_attestation_pool_snapshot(),
+            TestingPqAttestationPoolSnapshot::default(),
+            "an impossible pool generation cannot publish a candidate",
+        );
+        assert_eq!(
+            chain.pq_attestation_consumption_status(&identity, wire_id),
+            PqSingleObservationStatus::Consumed(beacon_chain::PqSingleConsumptionResult::Terminal,),
+        );
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), shutdown_receiver.next())
+                .await
+                .expect("one bounded failure signal"),
+            Some(task_executor::ShutdownReason::Failure(_))
+        ));
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                shutdown_receiver.next(),
+            )
+            .await
+            .is_err(),
+            "pool invariant failure must signal shutdown exactly once",
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            chain.close_and_drain_pq_imports(),
+        )
+        .await
+        .expect("terminal inbound candidate drains without a false success");
+        assert_eq!(
+            chain.testing_only_pq_single_consumption_result(types::Epoch::new(0), attester_index),
+            Some(beacon_chain::PqSingleConsumptionResult::Terminal),
         );
     }
 
@@ -1208,6 +1421,11 @@ mod avx2 {
             Some(task_executor::ShutdownReason::Failure(_))
         ));
         assert_eq!(chain.testing_only_pq_fork_choice_attestation_calls(), 0);
+        assert_eq!(
+            chain.testing_only_pq_attestation_pool_snapshot(),
+            TestingPqAttestationPoolSnapshot::default(),
+            "terminal reconciliation must not insert a candidate without FC success",
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

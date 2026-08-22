@@ -537,6 +537,34 @@ impl<E: EthSpec> PqAttestationAggregationCoordinator<E> {
         }
     }
 
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_uses_aggregation_service(&self, service: &Arc<AggregationService>) -> bool {
+        Arc::ptr_eq(&self.inner.service, service)
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_candidate_signer_sets(&self) -> Vec<Vec<u64>> {
+        let mut signer_sets = self
+            .inner
+            .state
+            .lock()
+            .buckets
+            .values()
+            .flat_map(|bucket| bucket.candidates.iter())
+            .map(|candidate| candidate.signer_indices.clone())
+            .collect::<Vec<_>>();
+        signer_sets.sort_unstable();
+        signer_sets
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_set_next_generation(&self, next_generation: u64) {
+        self.inner.state.lock().next_id = next_generation;
+    }
+
     /// Inserts one sealed candidate, applying deterministic set dominance within its exact bucket.
     pub fn insert_verified(&self, candidate: VerifiedPqAttestation<E>) -> InsertOutcome {
         let Some((data, committee_index)) = bucket_parts(candidate.attestation()) else {

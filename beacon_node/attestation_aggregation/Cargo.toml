@@ -14,6 +14,7 @@ pq-attestation = [
     "state_processing/pq-attestation",
     "types/pq-devnet",
 ]
+pq-startup-testing = ["pq-attestation"]
 
 [dependencies]
 consensus_signature = { workspace = true, optional = true }

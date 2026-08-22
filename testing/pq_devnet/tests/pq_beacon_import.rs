@@ -95,6 +95,14 @@ fn pq_attestation_errors_expose_nested_local_causes() {
         gossip_error.source().map(ToString::to_string),
         Some(aggregation.to_string())
     );
+
+    let pool_invariant = operation_pool::PqAttestationPoolInsertInvariant::GenerationExhausted;
+    let pool_error = PqForkChoiceAttestationError::Pool(pool_invariant);
+    assert_eq!(
+        pool_error.source().map(ToString::to_string),
+        Some(pool_invariant.to_string()),
+        "the inbound typed pool failure preserves its invariant source",
+    );
 }
 
 #[test]
@@ -1112,6 +1120,48 @@ async fn pq_published_local_batch_consumption_is_atomic_ordered_and_fail_closed(
             "dropping the post-wire owner must terminalize every local reservation",
         );
     }
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn pq_published_local_pool_invariant_terminalizes_exact_reservation_once() {
+    let identity = |validator_index, root_byte, digest_byte| {
+        PqSingleObservationIdentity::new(
+            types::Epoch::new(0),
+            validator_index,
+            Slot::new(1),
+            types::SubnetId::new(3),
+            Hash256::repeat_byte(root_byte),
+            [digest_byte; 32],
+        )
+    };
+    let first = identity(1, 0x11, 0x21);
+    let second = identity(2, 0x12, 0x22);
+    let cache = TestingPqAttestationObservationOwnerCache::default();
+    let trace = cache
+        .consume_published_local_batch_with_pool_invariant_for_testing(&[first, second], 1)
+        .await;
+
+    assert!(matches!(
+        trace.result,
+        Err(
+            PqPublishedLocalAttestationBatchConsumptionError::PoolInvariant {
+                index: 1,
+                invariant: operation_pool::PqAttestationPoolInsertInvariant::GenerationExhausted,
+            }
+        )
+    ));
+    assert_eq!(trace.apply_attempt_order, vec![0, 1]);
+    assert_eq!(trace.fail_closed_calls, 1);
+    assert_eq!(
+        cache.exact_single_status(&first),
+        PqSingleObservationStatus::Consumed(PqSingleConsumptionResult::Applied),
+    );
+    assert_eq!(
+        cache.exact_single_status(&second),
+        PqSingleObservationStatus::Consumed(PqSingleConsumptionResult::Terminal),
+        "the failed member reservation must not remain ConsumptionPending",
+    );
 }
 
 #[cfg(target_feature = "avx2")]

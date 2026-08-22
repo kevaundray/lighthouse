@@ -8,11 +8,20 @@ edition = { workspace = true }
 default = ["leveldb"]
 leveldb = ["store/leveldb"]
 portable = ["beacon_chain/portable"]
-pq-devnet = ["state_processing/pq-transition", "types/pq-devnet"]
+pq-devnet = [
+    "attestation_aggregation/pq-attestation",
+    "dep:attestation_aggregation",
+    "dep:consensus_signature",
+    "state_processing/pq-transition",
+    "types/pq-devnet",
+]
+pq-startup-testing = ["attestation_aggregation/pq-startup-testing", "pq-devnet"]
 
 [dependencies]
+attestation_aggregation = { workspace = true, optional = true, default-features = false }
 bitvec = { workspace = true }
 bls = { workspace = true }
+consensus_signature = { workspace = true, optional = true }
 educe = { workspace = true }
 ethereum_ssz = { workspace = true }
 ethereum_ssz_derive = { workspace = true }

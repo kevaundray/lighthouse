@@ -6849,9 +6849,11 @@ dependencies = [
 name = "operation_pool"
 version = "0.2.0"
 dependencies = [
+ "attestation_aggregation",
  "beacon_chain",
  "bitvec",
  "bls",
+ "consensus_signature",
  "educe",
  "ethereum_ssz",
  "ethereum_ssz_derive",
@@ -7321,6 +7323,7 @@ dependencies = [
  "lighthouse_validator_store",
  "network",
  "network_utils",
+ "operation_pool",
  "pq_http_api",
  "pq_proposer_service",
  "pq_signing",

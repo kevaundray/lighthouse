@@ -5,6 +5,9 @@ use lighthouse_network::{
     GossipTopic, IdentTopic, PqLocalSinglePublicationToken, pq_anonymous_message_id,
     types::{GossipEncoding, GossipKind},
 };
+#[cfg(feature = "pq-startup-testing")]
+use operation_pool::PqAttestationPoolInsertDisposition;
+use operation_pool::{OperationPool, PqAttestationPoolInsertInvariant};
 use parking_lot::{Mutex, RwLock};
 #[cfg(feature = "pq-proposer")]
 use sha2::{Digest, Sha256};
@@ -33,6 +36,17 @@ pub(crate) enum PqForkChoiceAncestryQueryError {
 }
 
 pub const PQ_FORK_CHOICE_TICK_MAX_ADVANCE: u64 = 8;
+
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Default)]
+struct TestingPqAttestationPoolSourceTrace {
+    gossip_inserted: usize,
+    gossip_dominated: usize,
+    gossip_removed_subsets: usize,
+    local_inserted: usize,
+    local_dominated: usize,
+    local_removed_subsets: usize,
+}
 
 #[cfg(feature = "pq-proposer")]
 #[allow(clippy::too_many_arguments)]
@@ -99,6 +113,7 @@ pub enum PqForkChoiceAttestationError {
     BoundHeadUnavailable {
         block_root: Hash256,
     },
+    Pool(PqAttestationPoolInsertInvariant),
     ForkChoice(fork_choice::Error<crate::beacon_fork_choice_store::Error>),
 }
 
@@ -146,12 +161,20 @@ impl std::fmt::Display for PqForkChoiceAttestationError {
                 formatter,
                 "PQ attestation head {block_root:?} is absent from reconciled fork choice"
             ),
+            Self::Pool(error) => write!(formatter, "PQ attestation pool failed: {error}"),
             Self::ForkChoice(error) => write!(formatter, "PQ fork-choice failed: {error:?}"),
         }
     }
 }
 
-impl std::error::Error for PqForkChoiceAttestationError {}
+impl std::error::Error for PqForkChoiceAttestationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Pool(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PqExecutionReconciliationState {
@@ -629,11 +652,25 @@ pub struct BeaconChain<T: BeaconChainTypes> {
     #[cfg(feature = "pq-startup-testing")]
     pub(crate) pq_attestation_lineage_test_hook: Mutex<Option<Arc<crate::TestingPqBlockingHook>>>,
     #[cfg(feature = "pq-startup-testing")]
+    pq_attestation_pool_gossip_post_insert_test_hook:
+        Mutex<Option<Arc<crate::TestingPqBlockingHook>>>,
+    #[cfg(feature = "pq-startup-testing")]
+    pq_attestation_pool_gossip_before_source_trace_test_hook:
+        Mutex<Option<Arc<crate::TestingPqBlockingHook>>>,
+    #[cfg(feature = "pq-startup-testing")]
+    pq_attestation_pool_local_post_insert_test_hook:
+        Mutex<Option<Arc<crate::TestingPqBlockingHook>>>,
+    #[cfg(feature = "pq-startup-testing")]
+    pq_attestation_pool_snapshot_guard: Mutex<()>,
+    #[cfg(feature = "pq-startup-testing")]
+    pq_attestation_pool_source_trace: Mutex<TestingPqAttestationPoolSourceTrace>,
+    #[cfg(feature = "pq-startup-testing")]
     pq_fork_choice_attestation_calls: std::sync::atomic::AtomicUsize,
     #[cfg(feature = "pq-startup-testing")]
     pub(crate) pq_local_attestation_batch_verification_calls: std::sync::atomic::AtomicUsize,
     pub pq_validator_key_cache: Arc<PqValidatorKeyCache>,
     pub pq_aggregation_service: Arc<AggregationService>,
+    _pq_attestation_pool: OperationPool<T::EthSpec>,
     pub slot_clock: T::SlotClock,
     marker: PhantomData<T>,
 }
@@ -762,6 +799,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         slot_clock: T::SlotClock,
     ) -> Result<Self, PqRuntimeError> {
         let initial_block_root = canonical_head.beacon_block_root;
+        let pq_attestation_pool = OperationPool::new(Arc::clone(&pq_aggregation_service));
         // Task 7.2 cycle 1 deliberately establishes only an in-memory Fresh fork choice. Resume
         // reconstruction/persistence is a later vertical slice and must not be inferred here.
         let pq_fork_choice = if canonical_head.beacon_state.slot() == spec.genesis_slot {
@@ -844,14 +882,175 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             #[cfg(feature = "pq-startup-testing")]
             pq_attestation_lineage_test_hook: Mutex::new(None),
             #[cfg(feature = "pq-startup-testing")]
+            pq_attestation_pool_gossip_post_insert_test_hook: Mutex::new(None),
+            #[cfg(feature = "pq-startup-testing")]
+            pq_attestation_pool_gossip_before_source_trace_test_hook: Mutex::new(None),
+            #[cfg(feature = "pq-startup-testing")]
+            pq_attestation_pool_local_post_insert_test_hook: Mutex::new(None),
+            #[cfg(feature = "pq-startup-testing")]
+            pq_attestation_pool_snapshot_guard: Mutex::new(()),
+            #[cfg(feature = "pq-startup-testing")]
+            pq_attestation_pool_source_trace: Mutex::new(
+                TestingPqAttestationPoolSourceTrace::default(),
+            ),
+            #[cfg(feature = "pq-startup-testing")]
             pq_fork_choice_attestation_calls: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "pq-startup-testing")]
             pq_local_attestation_batch_verification_calls: std::sync::atomic::AtomicUsize::new(0),
             pq_validator_key_cache,
             pq_aggregation_service,
+            _pq_attestation_pool: pq_attestation_pool,
             slot_clock,
             marker: PhantomData,
         })
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_pq_attestation_pool_uses_aggregation_service(
+        &self,
+        service: &Arc<AggregationService>,
+    ) -> bool {
+        self._pq_attestation_pool
+            .testing_only_pq_uses_aggregation_service(service)
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_pq_attestation_pool_snapshot(
+        &self,
+    ) -> operation_pool::TestingPqAttestationPoolSnapshot {
+        let _snapshot_guard = self.pq_attestation_pool_snapshot_guard.lock();
+        let mut snapshot = self._pq_attestation_pool.testing_only_pq_snapshot();
+        let trace = self.pq_attestation_pool_source_trace.lock();
+        snapshot.gossip_inserted = trace.gossip_inserted;
+        snapshot.gossip_dominated = trace.gossip_dominated;
+        snapshot.gossip_removed_subsets = trace.gossip_removed_subsets;
+        snapshot.local_inserted = trace.local_inserted;
+        snapshot.local_dominated = trace.local_dominated;
+        snapshot.local_removed_subsets = trace.local_removed_subsets;
+        snapshot
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_set_pq_attestation_pool_gossip_post_insert_hook(
+        &self,
+        hook: Option<Arc<crate::TestingPqBlockingHook>>,
+    ) {
+        *self.pq_attestation_pool_gossip_post_insert_test_hook.lock() = hook;
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_set_pq_attestation_pool_gossip_before_source_trace_hook(
+        &self,
+        hook: Option<Arc<crate::TestingPqBlockingHook>>,
+    ) {
+        *self
+            .pq_attestation_pool_gossip_before_source_trace_test_hook
+            .lock() = hook;
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_set_pq_attestation_pool_local_post_insert_hook(
+        &self,
+        hook: Option<Arc<crate::TestingPqBlockingHook>>,
+    ) {
+        *self.pq_attestation_pool_local_post_insert_test_hook.lock() = hook;
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_set_pq_attestation_pool_next_generation(&self, next_generation: u64) {
+        self._pq_attestation_pool
+            .testing_only_set_pq_next_generation(next_generation);
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_try_lock_pq_fork_choice(&self) -> bool {
+        self.pq_fork_choice
+            .as_ref()
+            .and_then(|fork_choice| fork_choice.try_lock())
+            .is_some()
+    }
+
+    fn insert_pq_gossip_attestation_pool_candidate(
+        &self,
+        candidate: state_processing::VerifiedPqAttestation<T::EthSpec>,
+    ) -> Result<(), PqAttestationPoolInsertInvariant> {
+        #[cfg(feature = "pq-startup-testing")]
+        let snapshot_guard = self.pq_attestation_pool_snapshot_guard.lock();
+        let _disposition = self._pq_attestation_pool.insert_verified(candidate)?;
+        #[cfg(feature = "pq-startup-testing")]
+        {
+            if let Some(hook) = self
+                .pq_attestation_pool_gossip_before_source_trace_test_hook
+                .lock()
+                .clone()
+            {
+                hook.run();
+            }
+            let mut trace = self.pq_attestation_pool_source_trace.lock();
+            match _disposition {
+                PqAttestationPoolInsertDisposition::Inserted { removed_subsets } => {
+                    trace.gossip_inserted = trace.gossip_inserted.saturating_add(1);
+                    trace.gossip_removed_subsets =
+                        trace.gossip_removed_subsets.saturating_add(removed_subsets);
+                }
+                PqAttestationPoolInsertDisposition::Dominated => {
+                    trace.gossip_dominated = trace.gossip_dominated.saturating_add(1);
+                }
+                PqAttestationPoolInsertDisposition::ResourceLimited(_) => {}
+            }
+            drop(trace);
+            drop(snapshot_guard);
+            if let Some(hook) = self
+                .pq_attestation_pool_gossip_post_insert_test_hook
+                .lock()
+                .clone()
+            {
+                hook.run();
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "pq-proposer")]
+    fn insert_pq_local_attestation_pool_candidate(
+        &self,
+        candidate: state_processing::VerifiedPqAttestation<T::EthSpec>,
+    ) -> Result<(), PqAttestationPoolInsertInvariant> {
+        #[cfg(feature = "pq-startup-testing")]
+        let snapshot_guard = self.pq_attestation_pool_snapshot_guard.lock();
+        let _disposition = self._pq_attestation_pool.insert_verified(candidate)?;
+        #[cfg(feature = "pq-startup-testing")]
+        {
+            let mut trace = self.pq_attestation_pool_source_trace.lock();
+            match _disposition {
+                PqAttestationPoolInsertDisposition::Inserted { removed_subsets } => {
+                    trace.local_inserted = trace.local_inserted.saturating_add(1);
+                    trace.local_removed_subsets =
+                        trace.local_removed_subsets.saturating_add(removed_subsets);
+                }
+                PqAttestationPoolInsertDisposition::Dominated => {
+                    trace.local_dominated = trace.local_dominated.saturating_add(1);
+                }
+                PqAttestationPoolInsertDisposition::ResourceLimited(_) => {}
+            }
+            drop(trace);
+            drop(snapshot_guard);
+            if let Some(hook) = self
+                .pq_attestation_pool_local_post_insert_test_hook
+                .lock()
+                .clone()
+            {
+                hook.run();
+            }
+        }
+        Ok(())
     }
 
     #[cfg(feature = "pq-startup-testing")]
@@ -1148,6 +1347,8 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             .ok_or(crate::PqPublishedLocalAttestationBatchConsumptionError::TaskUnavailable)?;
         let spec = Arc::clone(&self.spec);
         let slot_clock = self.slot_clock.clone();
+        let mut pool_candidates = batch.into_pool_candidate_batch();
+        let pool_chain = Arc::clone(self);
         #[cfg(feature = "pq-startup-testing")]
         let call_chain = Arc::clone(self);
         let Some(blocking) = self.task_executor.spawn_blocking_handle_without_exit(
@@ -1160,36 +1361,57 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                     |fork_choice| fork_choice.fc_store().get_current_slot(),
                     |fork_choice, bound, current| fork_choice.is_descendant(bound, current),
                     |fork_choice, current_slot| {
-                        owner.consume_all_local(|index| {
-                            let indexed = indexed.get(index).ok_or(())?;
-                            let queued_before = fork_choice.queued_attestations().len();
-                            fork_choice
-                                .on_attestation(
-                                    current_slot,
-                                    indexed.to_ref(),
-                                    fork_choice::AttestationFromBlock::False,
-                                    &spec,
-                                )
-                                .map_err(|_| ())?;
-                            #[cfg(feature = "pq-startup-testing")]
-                            call_chain
-                                .pq_fork_choice_attestation_calls
-                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            if fork_choice.queued_attestations().len() > queued_before {
-                                Ok::<PqForkChoiceAttestationOutcome, ()>(
-                                    PqForkChoiceAttestationOutcome::Queued,
-                                )
-                            } else {
-                                Ok::<PqForkChoiceAttestationOutcome, ()>(
-                                    PqForkChoiceAttestationOutcome::Applied,
-                                )
-                            }
-                        })
+                        // Every member follows one irreversible order: fork-choice disposition,
+                        // then sealed pool insertion, then observation finalization.  The
+                        // callback runs for both fresh-local and coalesced dispositions before
+                        // `consume_all_local_after_disposition` finalizes any local reservation.
+                        owner.consume_all_local_after_disposition(
+                            |index| {
+                                let indexed = indexed.get(index).ok_or(())?;
+                                let queued_before = fork_choice.queued_attestations().len();
+                                fork_choice
+                                    .on_attestation(
+                                        current_slot,
+                                        indexed.to_ref(),
+                                        fork_choice::AttestationFromBlock::False,
+                                        &spec,
+                                    )
+                                    .map_err(|_| ())?;
+                                #[cfg(feature = "pq-startup-testing")]
+                                call_chain
+                                    .pq_fork_choice_attestation_calls
+                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                if fork_choice.queued_attestations().len() > queued_before {
+                                    Ok::<PqForkChoiceAttestationOutcome, ()>(
+                                        PqForkChoiceAttestationOutcome::Queued,
+                                    )
+                                } else {
+                                    Ok::<PqForkChoiceAttestationOutcome, ()>(
+                                        PqForkChoiceAttestationOutcome::Applied,
+                                    )
+                                }
+                            },
+                            |index, _result| {
+                                let (validator_index, candidate) = pool_candidates.take(index).ok_or(
+                                    PqAttestationPoolInsertInvariant::UnsupportedCandidate,
+                                )?;
+                                if candidate.signer_indices() != [validator_index] {
+                                    return Err(
+                                        PqAttestationPoolInsertInvariant::UnsupportedCandidate,
+                                    );
+                                }
+                                // A fresh local member reaches fork choice first; both fresh and
+                                // coalesced members then move their exact sealed candidate into the
+                                // pool before their observation reservation is finalized.
+                                pool_chain
+                                    .insert_pq_local_attestation_pool_candidate(candidate)?;
+                                Ok(())
+                            },
+                        )
                     },
                 )
                 .map_err(crate::PqPublishedLocalAttestationBatchConsumptionError::Preflight)
                 .and_then(std::convert::identity);
-                drop(batch);
                 result
             },
             "pq-published-local-attestation-batch-fork-choice",
@@ -1361,7 +1583,9 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             .single_attestation()
             .to_indexed::<T::EthSpec>(types::ForkName::Electra)
             .map_err(|_| PqForkChoiceAttestationError::InvalidIndexedAttestation)?;
+        let (_single, pool_candidate) = verified.into_parts();
         let spec = Arc::clone(&self.spec);
+        let pool_chain = Arc::clone(self);
         let Some(blocking) = self.task_executor.spawn_blocking_handle_without_exit(
             move || {
                 let mut fork_choice = fork_choice.lock();
@@ -1374,11 +1598,25 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                         &spec,
                     )
                     .map_err(PqForkChoiceAttestationError::ForkChoice)?;
-                if fork_choice.queued_attestations().len() > queued_before {
-                    Ok(PqForkChoiceAttestationOutcome::Queued)
+                let outcome = if fork_choice.queued_attestations().len() > queued_before {
+                    PqForkChoiceAttestationOutcome::Queued
                 } else {
-                    Ok(PqForkChoiceAttestationOutcome::Applied)
-                }
+                    PqForkChoiceAttestationOutcome::Applied
+                };
+                #[cfg(feature = "pq-startup-testing")]
+                pool_chain
+                    .pq_fork_choice_attestation_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(fork_choice);
+                // Keep the verified candidate sealed through the successful fork-choice
+                // disposition, then release the FC guard before touching the independent pool.
+                // Observation finalization happens only after this closure returns, so the pool
+                // insertion cannot race ahead of fork choice or trail a visible consumed
+                // observation.
+                pool_chain
+                    .insert_pq_gossip_attestation_pool_candidate(pool_candidate)
+                    .map_err(PqForkChoiceAttestationError::Pool)?;
+                Ok(outcome)
             },
             "pq-attestation-fork-choice-blocking",
         ) else {
@@ -1396,9 +1634,6 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 return Err(PqForkChoiceAttestationError::TaskUnavailable);
             }
         };
-        #[cfg(feature = "pq-startup-testing")]
-        self.pq_fork_choice_attestation_calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         consumption
             .finalize_fork_choice(outcome)
             .map_err(|_| PqForkChoiceAttestationError::ObservationLost)?;

@@ -355,6 +355,8 @@ pub use kzg::{Kzg, TrustedSetup};
 pub use metrics::scrape_for_metrics;
 #[cfg(not(feature = "pq-devnet"))]
 pub use migrate::MigratorConfig;
+#[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
+pub use operation_pool::TestingPqAttestationPoolSnapshot;
 pub use parking_lot;
 pub use slot_clock;
 #[cfg(not(feature = "pq-devnet"))]

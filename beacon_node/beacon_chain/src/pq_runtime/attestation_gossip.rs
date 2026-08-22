@@ -6,6 +6,8 @@ use futures::StreamExt;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use slot_clock::SlotClock;
+#[cfg(feature = "pq-proposer")]
+use state_processing::VerifiedPqAttestation;
 use state_processing::{
     PqAttestationError, PqAttestationInvalid, PqAttestationLocalError, PqConsensusError,
     PqConsensusInvalid, PqConsensusLocalError, PreparedPqAggregateAndProof,
@@ -723,6 +725,10 @@ pub enum PqPublishedLocalAttestationBatchConsumptionError {
     ObservationLost {
         index: usize,
     },
+    PoolInvariant {
+        index: usize,
+        invariant: operation_pool::PqAttestationPoolInsertInvariant,
+    },
     TaskUnavailable,
 }
 
@@ -742,6 +748,7 @@ impl std::error::Error for PqPublishedLocalAttestationBatchConsumptionError {
             Self::Evidence(error) => Some(error),
             Self::Preflight(error) => Some(error),
             Self::Observation(error) => Some(error),
+            Self::PoolInvariant { invariant, .. } => Some(invariant),
             _ => None,
         }
     }
@@ -1781,15 +1788,34 @@ impl<E: EthSpec> PqSingleObservationBatchResolutionOwner<E> {
         }
     }
 
+    #[cfg(feature = "pq-startup-testing")]
     pub(crate) fn consume_all_local<F, ApplyError>(
-        mut self,
-        mut apply: F,
+        self,
+        apply: F,
     ) -> Result<
         PqPublishedLocalAttestationBatchConsumptionOutcome,
         PqPublishedLocalAttestationBatchConsumptionError,
     >
     where
         F: FnMut(usize) -> Result<PqForkChoiceAttestationOutcome, ApplyError>,
+    {
+        self.consume_all_local_after_disposition(apply, |_, _| Ok(()))
+    }
+
+    pub(crate) fn consume_all_local_after_disposition<F, D, ApplyError>(
+        mut self,
+        mut apply: F,
+        mut after_disposition: D,
+    ) -> Result<
+        PqPublishedLocalAttestationBatchConsumptionOutcome,
+        PqPublishedLocalAttestationBatchConsumptionError,
+    >
+    where
+        F: FnMut(usize) -> Result<PqForkChoiceAttestationOutcome, ApplyError>,
+        D: FnMut(
+            usize,
+            PqSingleConsumptionResult,
+        ) -> Result<(), operation_pool::PqAttestationPoolInsertInvariant>,
     {
         let members = self
             .members
@@ -1819,6 +1845,19 @@ impl<E: EthSpec> PqSingleObservationBatchResolutionOwner<E> {
                         }
                     };
                     let result = pq_single_consumption_result_from_fork_choice(outcome);
+                    if let Err(invariant) = after_disposition(index, result) {
+                        drop(reservation);
+                        drop(members);
+                        if let Some(fail_closed) = self.fail_closed.take() {
+                            fail_closed();
+                        }
+                        return Err(
+                            PqPublishedLocalAttestationBatchConsumptionError::PoolInvariant {
+                                index,
+                                invariant,
+                            },
+                        );
+                    }
                     if reservation.finalize(result).is_err() {
                         drop(members);
                         if let Some(fail_closed) = self.fail_closed.take() {
@@ -1848,7 +1887,21 @@ impl<E: EthSpec> PqSingleObservationBatchResolutionOwner<E> {
                         },
                     );
                 }
-                PqSingleObservationOwnedMember::Coalesced(result) => results.push(result),
+                PqSingleObservationOwnedMember::Coalesced(result) => {
+                    if let Err(invariant) = after_disposition(index, result) {
+                        drop(members);
+                        if let Some(fail_closed) = self.fail_closed.take() {
+                            fail_closed();
+                        }
+                        return Err(
+                            PqPublishedLocalAttestationBatchConsumptionError::PoolInvariant {
+                                index,
+                                invariant,
+                            },
+                        );
+                    }
+                    results.push(result);
+                }
             }
         }
 
@@ -3444,6 +3497,47 @@ impl TestingPqAttestationObservationOwnerCache {
         }
     }
 
+    pub async fn consume_published_local_batch_with_pool_invariant_for_testing(
+        &self,
+        identities: &[PqSingleObservationIdentity],
+        failing_index: usize,
+    ) -> TestingPqPublishedLocalAttestationConsumptionTrace {
+        let fail_closed_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let owner_fail_closed_calls = Arc::clone(&fail_closed_calls);
+        let owner = PqSingleObservationBatchResolutionOwner::resolve_local_wire_success(
+            Arc::clone(&self.inner),
+            identities,
+            Slot::new(0),
+            Some(Box::new(move || {
+                owner_fail_closed_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })),
+        );
+        let mut apply_attempt_order = Vec::new();
+        let result = match owner {
+            Ok(owner) => owner.consume_all_local_after_disposition(
+                |index| {
+                    apply_attempt_order.push(index);
+                    Ok::<PqForkChoiceAttestationOutcome, ()>(
+                        PqForkChoiceAttestationOutcome::Applied,
+                    )
+                },
+                |index, _| {
+                    if index == failing_index {
+                        Err(operation_pool::PqAttestationPoolInsertInvariant::GenerationExhausted)
+                    } else {
+                        Ok(())
+                    }
+                },
+            ),
+            Err(error) => Err(PqPublishedLocalAttestationBatchConsumptionError::Observation(error)),
+        };
+        TestingPqPublishedLocalAttestationConsumptionTrace {
+            result,
+            apply_attempt_order,
+            fail_closed_calls: fail_closed_calls.load(std::sync::atomic::Ordering::SeqCst),
+        }
+    }
+
     pub fn start_published_local_batch_wait_for_testing(
         &self,
         inputs: &[TestingPqSingleObservationBatchInput],
@@ -3643,6 +3737,12 @@ pub struct PqVerifiedLocalSingle<E: EthSpec> {
     _activity: Arc<crate::beacon_chain::PqImportActivity>,
 }
 
+#[cfg(feature = "pq-proposer")]
+pub(crate) struct PqVerifiedLocalSinglePoolGuard {
+    _admission: OwnedSemaphorePermit,
+    _activity: Arc<crate::beacon_chain::PqImportActivity>,
+}
+
 impl<E: EthSpec> PqVerifiedLocalSingle<E> {
     pub const fn verified(&self) -> &VerifiedPqSingleAttestation<E> {
         &self.verified
@@ -3709,6 +3809,32 @@ impl<E: EthSpec> PqVerifiedLocalSingle<E> {
 
     pub const fn signed_ssz_digest(&self) -> [u8; 32] {
         self.signed_ssz_digest
+    }
+
+    #[cfg(feature = "pq-proposer")]
+    pub(crate) fn into_pool_parts(
+        self,
+    ) -> (
+        u64,
+        VerifiedPqAttestation<E>,
+        PqVerifiedLocalSinglePoolGuard,
+    ) {
+        let Self {
+            verified,
+            validator_index,
+            _admission,
+            _activity,
+            ..
+        } = self;
+        let (_single, candidate) = verified.into_parts();
+        (
+            validator_index,
+            candidate,
+            PqVerifiedLocalSinglePoolGuard {
+                _admission,
+                _activity,
+            },
+        )
     }
 }
 

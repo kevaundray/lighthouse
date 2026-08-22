@@ -42,6 +42,7 @@ pq-proposer = ["pq-devnet", "dep:lighthouse_network", "lighthouse_network/pq-pro
 pq-startup-testing = [
     "pq-devnet",
     "lighthouse_network?/pq-startup-testing",
+    "operation_pool/pq-startup-testing",
     "store/pq-startup-testing",
 ]
 

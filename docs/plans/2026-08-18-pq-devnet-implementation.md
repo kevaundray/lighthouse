@@ -2917,6 +2917,59 @@ from verified gossip/local singles to `VerifiedPqAttestation`; expose no raw con
 Insert only after successful fork-choice disposition. Keep default BLS modules and persistence
 byte-for-byte unchanged.
 
+**Cycle 4 Steps 1-3 completed (2026-08-22):** the PQ `OperationPool` now privately owns exactly
+one `PqAttestationAggregationCoordinator`, constructed from the `BeaconChain`'s existing
+process-wide `AggregationService`. The dependency is optional, uses `default-features = false`,
+and is absent from the ordinary operation-pool feature graph. Startup-only read access proved that
+the private pool uses the exact chain service; no public pool reference, source enum, candidate
+constructor, or mutation authority was added.
+
+Both real consumers now move their sealed `VerifiedPqAttestation` into that one pool after a
+successful fork-choice disposition. The inbound path performs fork choice, explicitly drops its
+fork-choice guard, inserts into the coordinator, commits the source trace, and only then finalizes
+the exact observation. The post-wire path follows the same fork-choice-before-pool order for both
+`LocalReserved` and already `Coalesced` members and consumes each sealed candidate linearly before
+observation finalization. Pool insertion never adds proof or fork-choice work. The cfg snapshot
+transaction lock order is `snapshot_guard -> coordinator -> source_trace`; the coordinator returns
+candidate count and sorted signer sets under one state lock, and the flattened validator-index
+view is derived from that same value. The before-source-trace barrier proved fork choice was already
+unlocked and the observation was still `ConsumptionPending`, while a concurrent snapshot remained
+blocked until candidate and source trace were coherently committed.
+
+The production-shared exhaustive classifier maps `Inserted { removed_subsets }` to stored success,
+`Dominated` to non-fatal dominated success, and candidate, bucket, or evidence exhaustion to
+non-fatal `ResourceLimited`. These resource outcomes preserve the already-valid fork-choice vote.
+`UnsupportedCandidate` and `GenerationExhausted` are typed invariants: they terminalize the exact
+observation/local reservation, retain their `Error::source`, and invoke the single failure owner.
+The ephemeral coordinator bounds remain exactly 64 distinct buckets, 16 candidates per bucket,
+and 8 MiB of retained evidence. Pruning and subset dominance release the corresponding bounded
+inventory; none of this candidate state is persisted or recovered across restart.
+
+The strict REDs first failed for the missing private ownership/accessors, exhaustive disposition
+facade, real consumer insertion seams, coherent snapshot transaction, fork-choice try-lock,
+generation setter, local invariant route, and source-specific hooks. A separate review target
+failed until the direct test dependency also used `default-features = false`, the public source
+enum/classifier were removed, and pool errors delegated their source. Restored focused evidence was
+3/3 pool tests in 26.32 seconds, 3/3 review tests, and 6/6 local/post-wire tests. The authentic
+inbound success passed 1/1 in 130.89 seconds with fork choice unlocked, the exact observation
+pending during insertion, and a coherent one-candidate gossip snapshot after release. Authentic
+generation exhaustion passed 1/1 in 131.49 seconds with fork-choice count one, pool count zero,
+terminal observation, exactly one failure signal, and complete drain.
+
+The final warning-denied AVX2 two-worker tracer passed 1/1 in 459.15 seconds. Its phases were private
+cache clone 0.242317 seconds, authority open 278.276839 seconds, RANDAO verification 305.764989
+seconds, concurrent slot-1 imports 457.931880 seconds, service verification 458.991716 seconds, and
+complete drain 459.142415 seconds. The sender's exact sorted candidate signer sets were `{[v0],
+[v1]}` with `gossip_inserted = 1`, `local_inserted = 1`, and `local_dominated = 1`; the independent
+peer retained `{[v0]}` with `gossip_inserted = 1`. Thus the same exact cross-source member was
+dominated without a second candidate, proof, or fork-choice application, while both distinct sender
+identities remained retained.
+
+This checkpoint completes Task 5.2b's private ownership, real inbound/local consumer insertion, and
+bounded disposition classification. Deterministic selection, background aggregation, block
+inclusion, participation/finality progress, and pool recovery across restart remain pending Steps
+4-7; this checkpoint makes no claim for them.
+
 **Step 4: Add deterministic block selection before background aggregation**
 
 Write REDs for bounded deterministic order, canonical inclusion validation, failed-production

@@ -1038,6 +1038,23 @@ pub struct PqVerifiedLocalAttestationBatch<E: EthSpec> {
     pub(crate) _candidate_guard: PqLocalAttestationProofBatchGuard,
 }
 
+#[cfg(feature = "pq-proposer")]
+pub(crate) struct PqLocalAttestationPoolCandidateBatch<E: EthSpec> {
+    candidates: Vec<Option<(u64, state_processing::VerifiedPqAttestation<E>)>>,
+    _single_guards: Vec<crate::pq_attestation_gossip::PqVerifiedLocalSinglePoolGuard>,
+    _candidate_guard: PqLocalAttestationProofBatchGuard,
+}
+
+#[cfg(feature = "pq-proposer")]
+impl<E: EthSpec> PqLocalAttestationPoolCandidateBatch<E> {
+    pub(crate) fn take(
+        &mut self,
+        index: usize,
+    ) -> Option<(u64, state_processing::VerifiedPqAttestation<E>)> {
+        self.candidates.get_mut(index)?.take()
+    }
+}
+
 impl<E: EthSpec> PqVerifiedLocalAttestationBatch<E> {
     pub fn len(&self) -> usize {
         self.verified.len()
@@ -1050,6 +1067,22 @@ impl<E: EthSpec> PqVerifiedLocalAttestationBatch<E> {
     /// Read-only verified bindings whose lifetime cannot outlive the retained candidate guards.
     pub fn verified(&self) -> &[crate::PqVerifiedLocalSingle<E>] {
         &self.verified
+    }
+
+    #[cfg(feature = "pq-proposer")]
+    pub(crate) fn into_pool_candidate_batch(self) -> PqLocalAttestationPoolCandidateBatch<E> {
+        let mut candidates = Vec::with_capacity(self.verified.len());
+        let mut single_guards = Vec::with_capacity(self.verified.len());
+        for verified in self.verified {
+            let (validator_index, candidate, guard) = verified.into_pool_parts();
+            candidates.push(Some((validator_index, candidate)));
+            single_guards.push(guard);
+        }
+        PqLocalAttestationPoolCandidateBatch {
+            candidates,
+            _single_guards: single_guards,
+            _candidate_guard: self._candidate_guard,
+        }
     }
 
     /// Binds this whole non-clone verified batch to the exact per-member wire evidence. Validation

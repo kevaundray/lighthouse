@@ -1,7 +1,7 @@
 //! Compile-time-selected operation pool runtime.
 //!
-//! The frozen PQ V1 profile deliberately starts with an ephemeral empty pool. Verified PQ
-//! attestation candidates are wired into the dedicated pools in Task 5.2b; unsupported BLS
+//! The frozen PQ V1 profile owns an ephemeral, bounded verified-attestation coordinator. Its
+//! candidates are inserted only after successful fork-choice disposition; unsupported BLS
 //! operations and persisted `opo` bytes are never interpreted in this profile.
 
 #[cfg(not(feature = "pq-devnet"))]
