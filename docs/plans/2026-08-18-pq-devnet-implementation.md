@@ -2838,43 +2838,100 @@ operation-pool or naive-aggregation-pool insertion, aggregation or block inclusi
 justification/finality beyond genesis. A monitored duty scheduler and persisted attester,
 pool/fork-choice, and finality recovery across restart also remain subsequent vertical slices.
 
+**Cycle 4 implementation design (next):** the file list below supersedes the earlier proposal to
+revive both BLS attestation mutation paths. Under `pq-devnet`, `operation_pool::attestation_storage`
+and `BeaconChain::naive_aggregation_pool` are deliberately not compiled. Reintroducing them would
+create two new mutation authorities beside the already failure-atomic
+`PqAttestationAggregationCoordinator`. Instead, the PQ `OperationPool` becomes the single deep
+facade over that coordinator. Its default/BLS build and persisted `opo` representation remain
+unchanged.
+
+Cycle 4 is split into dependency-ordered tracer bullets:
+
+1. The PQ `OperationPool` owns one coordinator constructed from the chain's existing process-wide
+   `AggregationService`. Both the inbound-single continuation and the post-wire local-batch
+   continuation move their already sealed `VerifiedPqAttestation` values into this pool only after
+   successful fork-choice disposition. Exact cross-source duplicates are dominated. Ordinary
+   bounded cache/resource rejection drops only the pool candidate and does not roll back a valid
+   fork-choice vote; impossible sealed-input or generation invariants fail closed.
+2. A deterministic selection API snapshots no more than 64 buckets and returns no more than the
+   Electra block maximum of eight sealed `Arc<VerifiedPqAttestation>` values. It validates each
+   candidate against the authoritative block-inclusion rules and the exact advanced pre-block
+   state. Slot-2 production passes the identical ordered sealed values into
+   `prepare_pq_local_block`; failed production leaves candidates retryable. A maximal aggregate is
+   preferred when already committed, otherwise verified raw singles are a liveness-preserving
+   fallback. This first inclusion tracer must advance participation for the exact included slot-1
+   validators before it claims progress toward finality.
+3. When a bucket gains a second disjoint candidate, chain-owned background work schedules at most
+   one active and one queued aggregation attempt. Snapshotting and commit remain under the
+   coordinator lock, while recursive proof work holds no pool lock. Backend/resource failure keeps
+   every source candidate available. Do not start a fresh proof after `getPayload`: the block
+   production budget is 120 seconds and authentic aggregation can exceed it.
+4. Live aggregate gossip follows only after it gains the single-attestation lifecycle:
+   post-propagation import activity, `ConsumptionPending`, a monitored non-cancellable chain
+   continuation, terminal failure ownership, and exact pool/fork-choice disposition. The current
+   `Observed`-at-propagation token is not sufficient because cancellation after `Accept` can
+   suppress a valid aggregate without storing it.
+
+The authentic Cycle-4 tracer extends the current two-worker E4F fixture through slot 2. It requires
+sender pool cardinality two and receiver cardinality one after slot-1 publication, exact aggregate
+union bits/signers when background proof is ready, deterministic raw-single fallback otherwise,
+actual V3 production/publication/import on both independent chains, and exact post-state
+participation changes. Wrong bit, evidence, key, data root, token order, or token count must fail
+before Engine, database, or head mutation. Restart retains the included block/state participation
+but deliberately starts with an empty ephemeral candidate pool. This checkpoint still does not
+claim justification or finality.
+
 **Files:**
 
-- Modify: `beacon_node/operation_pool/src/attestation_storage.rs`
-- Modify: `beacon_node/operation_pool/src/lib.rs`
-- Modify: `beacon_node/beacon_chain/src/naive_aggregation_pool.rs`
-- Modify: `beacon_node/beacon_chain/src/beacon_chain.rs`
-- Modify: beacon-chain startup/configuration and aggregate retrieval call sites
-- Modify: related operation-pool, naive-pool, and block-production tests
+- Modify: `beacon_node/operation_pool/Cargo.toml`
+- Modify: `beacon_node/operation_pool/src/pq_runtime.rs`
+- Modify: `beacon_node/beacon_chain/src/pq_runtime/beacon_chain.rs`
+- Modify: `beacon_node/beacon_chain/src/pq_runtime/attestation_gossip.rs`
+- Modify: `beacon_node/beacon_chain/src/pq_runtime/production.rs`
+- Modify: `beacon_node/attestation_aggregation/src/pq.rs` only for bounded selection/background
+  scheduling capabilities missing from the existing coordinator
+- Modify: `testing/pq_devnet/tests/pq_attestation_aggregation.rs`
+- Modify or create focused PQ pool/production tests under `testing/pq_devnet/tests/`
+- Extend: `lighthouse/tests/pq_e4f_launch.rs`
 
-**Step 1: Write failing real-caller tests**
+**Step 1: Write a failing real-consumer pool-insertion test**
 
-Cover verified single and aggregate gossip insertion, candidate dominance, on-demand local aggregate
-retrieval, block-selection retrieval, a concurrent arrival during proof construction, retry after
-resource failure, pruning during proof, and restart with an intentionally ephemeral candidate pool.
-Assert no method performs proving while holding an operation-pool or naive-pool lock.
+Drive one inbound verified single and one post-wire local batch through the actual chain consumers.
+Require sealed candidate insertion, exact cross-source dominance, bounded capacity behavior, and
+zero extra proof/fork-choice calls. The RED must fail because PQ `OperationPool` is currently empty
+and both consumers discard the sealed candidates after fork-choice application.
 
 **Step 2: Verify RED through the real PQ feature spine**
 
-Expected: both pools still attempt synchronous BLS point mutation. Do not treat a narrow unit target
-that omits either real pool as completion.
+Run the focused `pq_devnet` target with `RUSTFLAGS='-D warnings -C target-feature=+avx2'` and the
+smallest feature set that compiles the actual consumers. Expected: compile failure for the missing
+PQ pool ownership/insertion surface. Also prove the default operation-pool feature tree remains
+free of `attestation_aggregation`.
 
-**Step 3: Replace both mutation paths with the coordinator**
+**Step 3: Implement the single PQ OperationPool facade**
 
-Embed one shared coordinator/key-cache/service owner in `BeaconChain`. Route only the sealed
-`VerifiedPqAttestation` returned by the Task 5.3e BeaconChain gossip path, using the domain
-verification transition introduced in Task 5.3b, into candidate storage. Make PQ aggregate
-retrieval async and on-demand; snapshot under locks, release them, await `PreparedAggregate`, and
-then commit through the coordinator. Keep the default BLS pool and persisted `pkc` representation
+Add the coordinator as an optional `operation_pool/pq-devnet` dependency and construct exactly one
+PQ pool from the existing chain-owned `AggregationService`. Add crate-private consuming conversions
+from verified gossip/local singles to `VerifiedPqAttestation`; expose no raw constructor or clone.
+Insert only after successful fork-choice disposition. Keep default BLS modules and persistence
 byte-for-byte unchanged.
 
-For the first V1 operation pool, use candidate-only policy: retain verified aggregate gossip, drop
-dominated duplicates, and select maximal candidates for blocks. Do not synthesize cross-committee
-proofs, do not prove during synchronous insert/get paths, and do not re-prove persisted candidates
-during startup. Candidate state may remain ephemeral for the first devnet; restart recovery means
-the signing journal remains safe and the pool refills from gossip.
+**Step 4: Add deterministic block selection before background aggregation**
 
-**Step 4: Explicitly disable sync aggregation in V1**
+Write REDs for bounded deterministic order, canonical inclusion validation, failed-production
+retry, pruning, and slot-2 raw-single inclusion. Snapshot under pool locks, release them, then pass
+the exact sealed values to `prepare_pq_local_block`. Candidate state remains ephemeral; startup does
+not interpret BLS `opo` bytes or re-prove candidates.
+
+**Step 5: Add bounded background aggregation**
+
+Reuse `PreparedAggregate` and the coordinator's generation-bound in-flight RAII. REDs cover one
+active plus one queued attempt, concurrent arrival, prune during proof, backend/queue failure retry,
+cap-plus-one, heartbeat/no-lock-across-await, and caller/executor cancellation. Selection uses the
+committed maximal aggregate when available and raw singles otherwise.
+
+**Step 6: Retain explicit empty sync aggregation in V1**
 
 Disable validator sync duties and beacon-node sync contribution gossip/aggregation at startup.
 Block production must emit `SyncAggregate::empty()`: zero participant bits plus canonical absent PQ
@@ -2882,14 +2939,16 @@ evidence, consuming no XMSS leaf. Verification must accept exactly that pair, re
 with any set bit, and reject raw/aggregate evidence with zero bits. Never emulate BLS infinity or
 silently run the BLS sync path.
 
-**Step 5: Verify both profiles and commit**
+**Step 7: Verify both profiles, the slot-2 tracer, restart semantics, and commit**
 
-Run the real operation-pool, naive-pool, beacon-chain, and block-production suites in PQ and default
-BLS configurations, plus networking-size and restart smoke tests affected by larger aggregate
-evidence.
+Run the PQ operation-pool, coordinator, beacon-chain, and block-production suites; default BLS
+operation-pool/state-processing suites; warning-denied verifier/proposer feature checks; and the
+authentic two-worker slot-2 production/import/restart tracer. Record proof latency and raw-fallback
+behavior in the findings document.
 
 ```bash
-git add beacon_node/operation_pool beacon_node/beacon_chain \
+git add beacon_node/operation_pool beacon_node/attestation_aggregation beacon_node/beacon_chain \
+  testing/pq_devnet lighthouse/tests/pq_e4f_launch.rs \
   docs/plans/2026-08-18-pq-devnet-implementation.md docs/pq-devnet-findings.md
 git commit -m "feat: aggregate PQ attestations in beacon pools"
 ```
