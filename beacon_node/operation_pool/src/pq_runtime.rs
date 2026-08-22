@@ -1,12 +1,14 @@
-pub use attestation_aggregation::PqRetainedAttestationAssemblyError;
 use attestation_aggregation::{
-    InsertOutcome, PqAttestationAggregationCoordinator,
-    PqBlockAttestationSelection as AggregationPqBlockAttestationSelection,
+    AggregateFailure, AggregateOutcome, InsertOutcome, PqAttestationAggregationCoordinator,
+    PqBlockAttestationSelection as AggregationPqBlockAttestationSelection, PreparedAggregate,
 };
-use consensus_signature::AggregationService;
+pub use attestation_aggregation::{
+    PqRetainedAttestationAssemblyError, PrepareAggregateError as PqAttestationPoolPrepareError,
+};
+use consensus_signature::{AggregationError, AggregationService};
 use state_processing::{
-    PqBlockAttestationSelectionError, PqValidatorKeyCache, VerifiedPqAttestation,
-    VerifiedPqLocalBlock, VerifiedPqRandao,
+    PqAttestationLocalError, PqBlockAttestationSelectionError, PqValidatorKeyCache,
+    VerifiedPqAttestation, VerifiedPqLocalBlock, VerifiedPqRandao,
 };
 use std::sync::Arc;
 use types::{BeaconBlock, BeaconState, ChainSpec, EthSpec};
@@ -101,6 +103,47 @@ pub struct PqBlockAttestationSelection<E: EthSpec> {
     selected: AggregationPqBlockAttestationSelection<E>,
 }
 
+/// Non-cloneable ownership of one generation-bound background aggregation attempt.
+pub struct PqPreparedAttestationPoolAggregate<E: EthSpec> {
+    prepared: PreparedAggregate<E>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PqAttestationPoolAggregationDisposition {
+    Committed,
+    Stale,
+    Failed(AggregateFailure),
+    Invariant,
+}
+
+impl<E: EthSpec> PqPreparedAttestationPoolAggregate<E> {
+    pub async fn execute(self) -> PqAttestationPoolAggregationDisposition {
+        match self.prepared.execute().await {
+            AggregateOutcome::Aggregated(_) => PqAttestationPoolAggregationDisposition::Committed,
+            AggregateOutcome::StaleSnapshot => PqAttestationPoolAggregationDisposition::Stale,
+            AggregateOutcome::Failed(error) => {
+                PqAttestationPoolAggregationDisposition::Failed(error)
+            }
+            AggregateOutcome::Singleton(_) => PqAttestationPoolAggregationDisposition::Invariant,
+        }
+    }
+}
+
+impl PqAttestationPoolAggregationDisposition {
+    pub fn is_fatal(self) -> bool {
+        matches!(
+            self,
+            Self::Invariant
+                | Self::Failed(AggregateFailure::InvariantInvalid(_))
+                | Self::Failed(AggregateFailure::Local(
+                    PqAttestationLocalError::Aggregation(
+                        AggregationError::WorkerStopped | AggregationError::WorkerPanicked
+                    )
+                ))
+        )
+    }
+}
+
 impl<E: EthSpec> PqBlockAttestationSelection<E> {
     /// Consumes the only selection authority, installs exact attestation bytes, and seals the
     /// local block with the identical retained tokens.
@@ -137,6 +180,19 @@ impl<E: EthSpec> OperationPool<E> {
     ) -> Result<PqBlockAttestationSelection<E>, PqBlockAttestationSelectionError> {
         let selected = self._coordinator.select_for_block(state, key_cache, spec)?;
         Ok(PqBlockAttestationSelection { selected })
+    }
+
+    pub fn prepare_next_pq_attestation_aggregate(
+        &self,
+        state: &BeaconState<E>,
+        key_cache: &PqValidatorKeyCache,
+        spec: &ChainSpec,
+    ) -> Result<Option<PqPreparedAttestationPoolAggregate<E>>, PqAttestationPoolPrepareError> {
+        self._coordinator
+            .prepare_next_aggregate(state, key_cache, spec)
+            .map(|prepared| {
+                prepared.map(|prepared| PqPreparedAttestationPoolAggregate { prepared })
+            })
     }
 
     #[cfg(feature = "pq-startup-testing")]

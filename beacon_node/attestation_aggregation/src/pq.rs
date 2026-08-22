@@ -2,7 +2,7 @@
 
 use consensus_signature::{
     AggregationService, V1_MAX_AGGREGATION_CONTRIBUTIONS, V1_MAX_AGGREGATION_INPUT_BYTES,
-    V1_MAX_AGGREGATION_SIGNERS,
+    V1_MAX_AGGREGATION_SIGNERS, is_individual_same_message_evidence,
 };
 use parking_lot::Mutex;
 use ssz::Encode;
@@ -517,6 +517,36 @@ struct MachineSnapshot<T> {
     selected: Vec<SnapshotCandidate<T>>,
 }
 
+fn next_ready_pq_background_aggregation_bucket<T>(
+    state: &CoordinatorState<T>,
+    mut is_supported_raw_singleton: impl FnMut(&PqAttestationBucket, &T) -> bool,
+) -> Option<PqAttestationBucket> {
+    let mut ready = state
+        .buckets
+        .iter()
+        .filter_map(|(bucket, bucket_state)| {
+            if bucket_state.in_flight.is_some() {
+                return None;
+            }
+            let selected = select_disjoint(&bucket_state.candidates);
+            (selected.len() == 2
+                && selected.iter().all(|candidate| {
+                    candidate.signer_indices.len() == 1
+                        && is_supported_raw_singleton(bucket, &candidate.value)
+                }))
+            .then(|| bucket.clone())
+        })
+        .collect::<Vec<_>>();
+    ready.sort_unstable_by(|left, right| {
+        left.data
+            .slot
+            .cmp(&right.data.slot)
+            .then_with(|| left.data.as_ssz_bytes().cmp(&right.data.as_ssz_bytes()))
+            .then_with(|| left.committee_index.cmp(&right.committee_index))
+    });
+    ready.into_iter().next()
+}
+
 enum MachineExecution<T, E> {
     Committed(Arc<T>),
     Stale,
@@ -795,6 +825,49 @@ impl<E: EthSpec> PqAttestationAggregationCoordinator<E> {
     ) -> Result<PreparedAggregate<E>, PrepareAggregateError> {
         let snapshot = self.inner.state.lock().snapshot(bucket)?;
 
+        self.prepare_aggregate_snapshot(bucket.clone(), snapshot, state, key_cache, spec)
+    }
+
+    /// Selects the first canonical bucket containing exactly two disjoint raw singletons.
+    ///
+    /// Selection and the generation-bound in-flight mark are atomic under the coordinator lock.
+    /// Request construction remains off-lock and preserves the same failure-atomic RAII as an
+    /// explicitly addressed preparation.
+    pub fn prepare_next_aggregate(
+        &self,
+        state: &BeaconState<E>,
+        key_cache: &PqValidatorKeyCache,
+        spec: &ChainSpec,
+    ) -> Result<Option<PreparedAggregate<E>>, PrepareAggregateError> {
+        let next = {
+            let mut coordinator_state = self.inner.state.lock();
+            let Some(bucket) = next_ready_pq_background_aggregation_bucket(
+                &coordinator_state,
+                |_bucket, candidate: &VerifiedPqAttestation<E>| {
+                    let Attestation::Electra(attestation) = candidate.attestation() else {
+                        return false;
+                    };
+                    attestation.aggregation_bits.len() == 2
+                        && is_individual_same_message_evidence(&attestation.signature)
+                },
+            ) else {
+                return Ok(None);
+            };
+            let snapshot = coordinator_state.snapshot(&bucket)?;
+            (bucket, snapshot)
+        };
+        self.prepare_aggregate_snapshot(next.0, next.1, state, key_cache, spec)
+            .map(Some)
+    }
+
+    fn prepare_aggregate_snapshot(
+        &self,
+        bucket: PqAttestationBucket,
+        snapshot: MachineSnapshot<VerifiedPqAttestation<E>>,
+        state: &BeaconState<E>,
+        key_cache: &PqValidatorKeyCache,
+        spec: &ChainSpec,
+    ) -> Result<PreparedAggregate<E>, PrepareAggregateError> {
         let Some(_token) = snapshot.token else {
             let candidate = snapshot
                 .selected
@@ -805,8 +878,7 @@ impl<E: EthSpec> PqAttestationAggregationCoordinator<E> {
                 Arc::clone(&candidate.value),
             ));
         };
-        let execution =
-            PreparedExecution::new(Arc::clone(&self.inner.state), bucket.clone(), snapshot);
+        let execution = PreparedExecution::new(Arc::clone(&self.inner.state), bucket, snapshot);
         let contributions = execution
             .selected()
             .iter()
@@ -1334,6 +1406,44 @@ mod tests {
         let singleton = state.snapshot(&second).expect("other committee");
         assert!(singleton.token.is_none());
         assert_eq!(singleton.selected.len(), 1);
+    }
+
+    #[test]
+    fn next_background_bucket_is_canonical_and_requires_exactly_two_raw_singletons() {
+        let canonical = bucket_at(40, 0, 1);
+        let later = bucket_at(41, 0, 2);
+        let wrong_committee_size = bucket_at(38, 0, 0);
+        let singleton = bucket_at(39, 0, 0);
+        let contains_child = bucket_at(42, 0, 3);
+        let mut state = CoordinatorState::<u8>::default();
+
+        let _ = state.insert(wrong_committee_size.clone(), vec![8], 1);
+        let _ = state.insert(wrong_committee_size.clone(), vec![9], 2);
+        let _ = state.insert(later.clone(), vec![3], 3);
+        let _ = state.insert(later.clone(), vec![4], 4);
+        let _ = state.insert(canonical.clone(), vec![1], 1);
+        let _ = state.insert(canonical.clone(), vec![2], 2);
+        let _ = state.insert(singleton, vec![0], 0);
+        let _ = state.insert(contains_child, vec![5, 6], 5);
+        let _ = state.insert(bucket_at(42, 0, 3), vec![7], 7);
+
+        assert_eq!(
+            next_ready_pq_background_aggregation_bucket(&state, |bucket, candidate| {
+                bucket != &wrong_committee_size && *candidate < 5
+            }),
+            Some(canonical.clone()),
+        );
+
+        let held = state
+            .snapshot(&canonical)
+            .expect("canonical bucket in flight");
+        assert_eq!(
+            next_ready_pq_background_aggregation_bucket(&state, |bucket, candidate| {
+                bucket != &wrong_committee_size && *candidate < 5
+            }),
+            Some(later),
+        );
+        drop(held);
     }
 
     #[test]

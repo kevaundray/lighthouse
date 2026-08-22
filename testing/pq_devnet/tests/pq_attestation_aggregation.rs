@@ -244,8 +244,9 @@ fn real_two_raw_candidates_commit_one_contextual_aggregate_and_retry_after_failu
     ));
 
     let prepared = coordinator
-        .prepare_aggregate(&bucket, &state, &key_cache, &spec)
-        .expect("failure preserved both sources for retry");
+        .prepare_next_aggregate(&state, &key_cache, &spec)
+        .expect("canonical background selection succeeds")
+        .expect("failure preserved one exact two-raw bucket for retry");
     assert_eq!(
         coordinator
             .prepare_aggregate(&bucket, &state, &key_cache, &spec)
@@ -257,6 +258,13 @@ fn real_two_raw_candidates_commit_one_contextual_aggregate_and_retry_after_failu
     };
     assert_eq!(aggregate.signer_indices(), signer_indices);
     assert_eq!(aggregate.attestation().num_set_aggregation_bits(), 2);
+    assert!(
+        coordinator
+            .prepare_next_aggregate(&state, &key_cache, &spec)
+            .expect("committed child is a valid retained candidate")
+            .is_none(),
+        "a retained aggregate child must never schedule recursive background work",
+    );
 
     let singleton = coordinator
         .prepare_aggregate(&bucket, &state, &key_cache, &spec)

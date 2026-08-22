@@ -199,6 +199,11 @@ path = "tests/pq_attestation_pool_review.rs"
 required-features = ["pq-attestation-pool-testing"]
 
 [[test]]
+name = "pq_background_attestation_aggregation"
+path = "tests/pq_background_attestation_aggregation.rs"
+required-features = ["pq-attestation-pool-testing"]
+
+[[test]]
 name = "pq_local_attester_context"
 path = "tests/pq_local_attester_context.rs"
 required-features = ["pq-beacon-import-testing"]

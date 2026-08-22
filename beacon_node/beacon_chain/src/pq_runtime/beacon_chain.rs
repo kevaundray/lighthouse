@@ -20,6 +20,8 @@ use store::{HotColdDB, ItemStore};
 use task_executor::TaskExecutor;
 use types::{BeaconState, ChainSpec, EthSpec, Hash256, SignedBeaconBlock, Slot};
 
+use crate::pq_background_attestation_aggregation::PqBackgroundAttestationAggregator;
+
 type PqForkChoice<T> = fork_choice::ForkChoice<
     crate::beacon_fork_choice_store::BeaconForkChoiceStore<
         <T as BeaconChainTypes>::EthSpec,
@@ -36,6 +38,188 @@ pub(crate) enum PqForkChoiceAncestryQueryError {
 }
 
 pub const PQ_FORK_CHOICE_TICK_MAX_ADVANCE: u64 = 8;
+
+const PQ_BACKGROUND_AGGREGATION_SLOT_DURATION: Duration = Duration::from_secs(300);
+const PQ_BACKGROUND_AGGREGATION_MINIMUM_REMAINING: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PqBackgroundAggregationCandidateShape {
+    TwoRawSingletons,
+    #[cfg(feature = "pq-startup-testing")]
+    ContainsAggregate,
+    #[cfg(feature = "pq-startup-testing")]
+    WrongContributionCount,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PqBackgroundAggregationDecision {
+    Admitted,
+    UnsupportedProfile,
+    UnsupportedCandidateShape,
+    HeadNotCurrent,
+    HeadNotReconciled,
+    InsufficientRemaining,
+    AlreadyStartedThisSlot,
+    DisabledAfterOverrun,
+}
+
+pub(crate) struct PqBackgroundAggregationGate {
+    slot_duration: Duration,
+    last_started_slot: Option<Slot>,
+    disabled_after_overrun: bool,
+}
+
+impl PqBackgroundAggregationGate {
+    pub(crate) fn new(slot_duration: Duration) -> Self {
+        Self {
+            slot_duration,
+            last_started_slot: None,
+            disabled_after_overrun: false,
+        }
+    }
+
+    pub(crate) fn try_admit(
+        &mut self,
+        clock_slot: Slot,
+        head_slot: Slot,
+        reconciled_slot: Slot,
+        remaining: Duration,
+        candidate_shape: PqBackgroundAggregationCandidateShape,
+    ) -> PqBackgroundAggregationDecision {
+        if self.disabled_after_overrun {
+            return PqBackgroundAggregationDecision::DisabledAfterOverrun;
+        }
+        if self.slot_duration != PQ_BACKGROUND_AGGREGATION_SLOT_DURATION {
+            return PqBackgroundAggregationDecision::UnsupportedProfile;
+        }
+        if candidate_shape != PqBackgroundAggregationCandidateShape::TwoRawSingletons {
+            return PqBackgroundAggregationDecision::UnsupportedCandidateShape;
+        }
+        if head_slot != clock_slot {
+            return PqBackgroundAggregationDecision::HeadNotCurrent;
+        }
+        if reconciled_slot != head_slot {
+            return PqBackgroundAggregationDecision::HeadNotReconciled;
+        }
+        if remaining < PQ_BACKGROUND_AGGREGATION_MINIMUM_REMAINING {
+            return PqBackgroundAggregationDecision::InsufficientRemaining;
+        }
+        if self
+            .last_started_slot
+            .is_some_and(|last_started_slot| clock_slot <= last_started_slot)
+        {
+            return PqBackgroundAggregationDecision::AlreadyStartedThisSlot;
+        }
+        self.last_started_slot = Some(clock_slot);
+        PqBackgroundAggregationDecision::Admitted
+    }
+
+    pub(crate) fn record_completion(&mut self, elapsed: Duration) {
+        if elapsed > PQ_BACKGROUND_AGGREGATION_MINIMUM_REMAINING {
+            self.disabled_after_overrun = true;
+        }
+    }
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TestingPqBackgroundAggregationCandidateShape {
+    TwoRawSingletons,
+    ContainsAggregate,
+    WrongContributionCount,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+impl From<TestingPqBackgroundAggregationCandidateShape> for PqBackgroundAggregationCandidateShape {
+    fn from(shape: TestingPqBackgroundAggregationCandidateShape) -> Self {
+        match shape {
+            TestingPqBackgroundAggregationCandidateShape::TwoRawSingletons => {
+                Self::TwoRawSingletons
+            }
+            TestingPqBackgroundAggregationCandidateShape::ContainsAggregate => {
+                Self::ContainsAggregate
+            }
+            TestingPqBackgroundAggregationCandidateShape::WrongContributionCount => {
+                Self::WrongContributionCount
+            }
+        }
+    }
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TestingPqBackgroundAggregationDecision {
+    Admitted,
+    UnsupportedProfile,
+    UnsupportedCandidateShape,
+    HeadNotCurrent,
+    HeadNotReconciled,
+    InsufficientRemaining,
+    AlreadyStartedThisSlot,
+    DisabledAfterOverrun,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+impl From<PqBackgroundAggregationDecision> for TestingPqBackgroundAggregationDecision {
+    fn from(decision: PqBackgroundAggregationDecision) -> Self {
+        match decision {
+            PqBackgroundAggregationDecision::Admitted => Self::Admitted,
+            PqBackgroundAggregationDecision::UnsupportedProfile => Self::UnsupportedProfile,
+            PqBackgroundAggregationDecision::UnsupportedCandidateShape => {
+                Self::UnsupportedCandidateShape
+            }
+            PqBackgroundAggregationDecision::HeadNotCurrent => Self::HeadNotCurrent,
+            PqBackgroundAggregationDecision::HeadNotReconciled => Self::HeadNotReconciled,
+            PqBackgroundAggregationDecision::InsufficientRemaining => Self::InsufficientRemaining,
+            PqBackgroundAggregationDecision::AlreadyStartedThisSlot => Self::AlreadyStartedThisSlot,
+            PqBackgroundAggregationDecision::DisabledAfterOverrun => Self::DisabledAfterOverrun,
+        }
+    }
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub struct TestingPqBackgroundAggregationGate(PqBackgroundAggregationGate);
+
+#[cfg(feature = "pq-startup-testing")]
+impl TestingPqBackgroundAggregationGate {
+    pub fn new(slot_duration: Duration) -> Self {
+        Self(PqBackgroundAggregationGate::new(slot_duration))
+    }
+
+    pub fn try_admit(
+        &mut self,
+        clock_slot: Slot,
+        head_slot: Slot,
+        reconciled_slot: Slot,
+        remaining: Duration,
+        candidate_shape: TestingPqBackgroundAggregationCandidateShape,
+    ) -> TestingPqBackgroundAggregationDecision {
+        self.0
+            .try_admit(
+                clock_slot,
+                head_slot,
+                reconciled_slot,
+                remaining,
+                candidate_shape.into(),
+            )
+            .into()
+    }
+
+    pub fn last_started_slot(&self) -> Option<Slot> {
+        self.0.last_started_slot
+    }
+
+    pub fn record_completion(&mut self, elapsed: Duration) {
+        self.0.record_completion(elapsed);
+    }
+
+    pub fn is_disabled(&self) -> bool {
+        self.0.disabled_after_overrun
+    }
+}
 
 #[cfg(feature = "pq-startup-testing")]
 #[derive(Default)]
@@ -673,7 +857,9 @@ pub struct BeaconChain<T: BeaconChainTypes> {
     pub(crate) pq_local_attestation_batch_verification_calls: std::sync::atomic::AtomicUsize,
     pub pq_validator_key_cache: Arc<PqValidatorKeyCache>,
     pub pq_aggregation_service: Arc<AggregationService>,
-    _pq_attestation_pool: OperationPool<T::EthSpec>,
+    _pq_attestation_pool: Arc<OperationPool<T::EthSpec>>,
+    pub(crate) pq_background_attestation_aggregator:
+        PqBackgroundAttestationAggregator<T::EthSpec, T::SlotClock>,
     pub slot_clock: T::SlotClock,
     marker: PhantomData<T>,
 }
@@ -802,7 +988,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         slot_clock: T::SlotClock,
     ) -> Result<Self, PqRuntimeError> {
         let initial_block_root = canonical_head.beacon_block_root;
-        let pq_attestation_pool = OperationPool::new(Arc::clone(&pq_aggregation_service));
+        let pq_attestation_pool = Arc::new(OperationPool::new(Arc::clone(&pq_aggregation_service)));
         // Task 7.2 cycle 1 deliberately establishes only an in-memory Fresh fork choice. Resume
         // reconstruction/persistence is a later vertical slice and must not be inferred here.
         let pq_fork_choice = if canonical_head.beacon_state.slot() == spec.genesis_slot {
@@ -825,10 +1011,26 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         } else {
             None
         };
+        let canonical_head = Arc::new(RwLock::new(Arc::new(canonical_head)));
+        let pq_execution_reconciliation = Arc::new(PqExecutionReconciliation::new(
+            PqExecutionReconciliationState::Pending {
+                block_root: initial_block_root,
+            },
+        ));
+        let pq_background_attestation_aggregator = PqBackgroundAttestationAggregator::spawn(
+            Arc::clone(&pq_attestation_pool),
+            Arc::clone(&canonical_head),
+            Arc::clone(&pq_execution_reconciliation),
+            Arc::clone(&pq_validator_key_cache),
+            Arc::clone(&spec),
+            slot_clock.clone(),
+            task_executor.clone(),
+        )
+        .ok_or(PqRuntimeError::MissingTaskExecutor)?;
         Ok(Self {
             spec,
             store,
-            canonical_head: Arc::new(RwLock::new(Arc::new(canonical_head))),
+            canonical_head,
             pq_fork_choice,
             observed_pq_blocks: Arc::new(Mutex::new(
                 crate::pq_import::PqGossipObservationCache::default(),
@@ -858,11 +1060,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             )),
             pq_execution_notifier,
             pq_operational_events,
-            pq_execution_reconciliation: Arc::new(PqExecutionReconciliation::new(
-                PqExecutionReconciliationState::Pending {
-                    block_root: initial_block_root,
-                },
-            )),
+            pq_execution_reconciliation,
             task_executor,
             #[cfg(feature = "pq-startup-testing")]
             pq_blocking_test_hook,
@@ -905,6 +1103,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             pq_validator_key_cache,
             pq_aggregation_service,
             _pq_attestation_pool: pq_attestation_pool,
+            pq_background_attestation_aggregator,
             slot_clock,
             marker: PhantomData,
         })
@@ -1061,6 +1260,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 hook.run();
             }
         }
+        self.pq_background_attestation_aggregator.kick();
         Ok(())
     }
 
@@ -1096,6 +1296,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 hook.run();
             }
         }
+        self.pq_background_attestation_aggregator.kick();
         Ok(())
     }
 
@@ -1856,7 +2057,21 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
     /// Stops new PQ block and fork-choice imports and awaits all admitted proof, persistence,
     /// reconciliation and vote ownership. Runtime shutdown must await this after closing ingress.
     pub async fn close_and_drain_pq_imports(&self) {
+        self.pq_import_coordinator.close();
+        self.pq_background_attestation_aggregator
+            .close_and_drain()
+            .await;
         self.pq_import_coordinator.close_and_drain().await;
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_set_pq_background_aggregation_close_hook(
+        &self,
+        hook: Option<Arc<crate::TestingPqBlockingHook>>,
+    ) {
+        self.pq_background_attestation_aggregator
+            .testing_only_set_close_hook(hook);
     }
 
     #[cfg(feature = "pq-startup-testing")]

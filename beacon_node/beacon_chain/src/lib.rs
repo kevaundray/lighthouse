@@ -118,6 +118,9 @@ mod persisted_fork_choice;
 #[path = "pq_runtime/attestation_gossip.rs"]
 mod pq_attestation_gossip;
 #[cfg(feature = "pq-devnet")]
+#[path = "pq_runtime/attestation_aggregation.rs"]
+mod pq_background_attestation_aggregation;
+#[cfg(feature = "pq-devnet")]
 #[path = "pq_runtime/import.rs"]
 mod pq_import;
 #[cfg(feature = "pq-devnet")]
@@ -183,7 +186,8 @@ pub use self::beacon_chain::{
 #[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
 #[doc(hidden)]
 pub use self::beacon_chain::{
-    TestingPqPublishedLocalAttestationSupervisorFailure,
+    TestingPqBackgroundAggregationCandidateShape, TestingPqBackgroundAggregationDecision,
+    TestingPqBackgroundAggregationGate, TestingPqPublishedLocalAttestationSupervisorFailure,
     TestingPqPublishedLocalAttestationSupervisorHarness,
     TestingPqPublishedLocalAttestationSupervisorReceipt, testing_only_pq_import_drain_race,
 };
@@ -237,6 +241,12 @@ pub use self::pq_attestation_gossip::{
     TestingPqPublishedLocalAttestationEvidenceTrace, TestingPqPublishedLocalLateApplyHarness,
     TestingPqPublishedLocalMemberResolver, TestingPqPublishedLocalMemberWire,
     TestingPqRemotePublicationEvidenceStatus, testing_only_pq_published_local_member_resolver,
+};
+#[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
+#[doc(hidden)]
+pub use self::pq_background_attestation_aggregation::{
+    testing_only_pq_background_aggregation_submission_is_open,
+    testing_only_pq_background_aggregation_window_is_coherent,
 };
 #[cfg(feature = "pq-devnet")]
 pub use self::pq_import::{

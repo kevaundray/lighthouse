@@ -1910,7 +1910,11 @@ async fn actual_block_production_selects_one_retained_authentic_pq_attestation_b
     let _service_guard = REAL_AGGREGATION_SERVICE_TEST_LOCK.lock().await;
     let runtime = task_executor::test_utils::TestRuntime::default();
     let temporary_directory = tempfile::TempDir::new().expect("selection fixture directory");
-    let spec = Arc::new(electra_spec());
+    let spec = Arc::new(
+        ForkName::Electra
+            .make_genesis_spec(MinimalEthSpec::default_spec())
+            .set_slot_duration_ms::<MinimalEthSpec>(300_000),
+    );
     let provisional_validators = (1..=16)
         .map(|byte| state_processing::DirectGenesisValidator {
             public_key: PqPublicKey::deserialize(&[byte; 32])
@@ -2487,6 +2491,32 @@ async fn actual_block_production_selects_one_retained_authentic_pq_attestation_b
         canonical_head.beacon_state.finalized_checkpoint(),
         genesis_finalized_checkpoint,
     );
+
+    let mut expected_union = vec![
+        u64::try_from(attester_index).expect("bounded attester index"),
+        u64::try_from(late_attester_index).expect("bounded late attester index"),
+    ];
+    expected_union.sort_unstable();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let snapshot = chain.testing_only_pq_attestation_pool_snapshot();
+            if snapshot.candidate_count == 1
+                && snapshot.candidate_signer_sets == [expected_union.clone()]
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect(
+        "the reconciled current head must automatically aggregate the two retained raw singles",
+    );
+    let aggregated_snapshot = chain.testing_only_pq_attestation_pool_snapshot();
+    assert_eq!(aggregated_snapshot.candidate_count, 1);
+    assert_eq!(aggregated_snapshot.candidate_signer_sets, [expected_union]);
+    assert_eq!(aggregated_snapshot.gossip_inserted, 2);
+    assert_eq!(aggregated_snapshot.local_inserted, 0);
 }
 
 #[cfg(target_feature = "avx2")]

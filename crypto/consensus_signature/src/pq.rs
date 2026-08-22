@@ -312,6 +312,10 @@ pub fn verify_aggregate_evidence(
 fn execute_aggregation_job(
     job: ValidatedAggregationJob,
 ) -> Result<PqSameMessageEvidence, AggregationError> {
+    #[cfg(test)]
+    if job.contributions.len() > 1 {
+        PQ_AGGREGATE_EXECUTIONS_STARTED.fetch_add(1, Ordering::SeqCst);
+    }
     let claim = PqSigningClaim::new(job.claim.signing_root, job.claim.one_time_use_id);
     let mut decoded = Vec::with_capacity(job.contributions.len());
     for contribution in &job.contributions {
@@ -461,6 +465,8 @@ use futures::channel::oneshot;
 use parking_lot::{Condvar, Mutex};
 #[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
 use std::panic::{AssertUnwindSafe, catch_unwind};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 #[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx2")))]
 use std::sync::atomic::{AtomicU8, Ordering};
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -476,6 +482,13 @@ use std::{collections::VecDeque, sync::Arc};
 const PQ_WORKER_STACK_SIZE: usize = 512 * 1024 * 1024;
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 static PQ_PROVER_LIFECYCLE: ProverLifecycle = ProverLifecycle::idle();
+#[cfg(test)]
+static PQ_AGGREGATE_EXECUTIONS_STARTED: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+fn testing_only_aggregate_executions_started() -> usize {
+    PQ_AGGREGATE_EXECUTIONS_STARTED.load(Ordering::SeqCst)
+}
 
 /// A local build or process state that cannot provide the experimental prover.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2434,11 +2447,12 @@ mod tests {
         use super::{PqProver, ProverError};
         use crate::aggregation::{
             AggregationContribution, AggregationJob, AggregationService, AggregationSigner,
-            SameMessageClaim,
+            SameMessageClaim, VerificationClass,
         };
-        use std::time::Instant;
+        use std::{sync::Arc, time::Instant};
 
-        let service = AggregationService::new().expect("PQ prover worker starts and initializes");
+        let service =
+            Arc::new(AggregationService::new().expect("PQ prover worker starts and initializes"));
         assert!(matches!(
             PqProver::new(),
             Err(ProverError::Unavailable(ProverUnavailable::AlreadyActive))
@@ -2485,11 +2499,11 @@ mod tests {
             expected_signers: pair_signers.clone(),
             contributions: vec![
                 AggregationContribution {
-                    signers: vec![first_signer],
+                    signers: vec![first_signer.clone()],
                     evidence: PqSameMessageEvidence::from(&first_raw),
                 },
                 AggregationContribution {
-                    signers: vec![second_signer],
+                    signers: vec![second_signer.clone()],
                     evidence: PqSameMessageEvidence::from(&second_raw),
                 },
             ],
@@ -2502,6 +2516,67 @@ mod tests {
         );
         assert_eq!(&evidence.as_bytes()[..7], b"LHPQ\x01\x01\x01");
         assert_eq!(&evidence.as_bytes()[7..13], b"LMSI\x01\x01");
+
+        let aggregate_executions_before = super::testing_only_aggregate_executions_started();
+        let concurrent_service = Arc::clone(&service);
+        let concurrent_signers = pair_signers.clone();
+        let concurrent_first_signer = first_signer.clone();
+        let concurrent_second_signer = second_signer.clone();
+        let concurrent_first_evidence = PqSameMessageEvidence::from(&first_raw);
+        let concurrent_second_evidence = PqSameMessageEvidence::from(&second_raw);
+        let concurrent_started = Instant::now();
+        let concurrent_aggregate = std::thread::spawn(move || {
+            futures::executor::block_on(concurrent_service.aggregate(AggregationJob {
+                claim: common_claim,
+                expected_signers: concurrent_signers,
+                contributions: vec![
+                    AggregationContribution {
+                        signers: vec![concurrent_first_signer],
+                        evidence: concurrent_first_evidence,
+                    },
+                    AggregationContribution {
+                        signers: vec![concurrent_second_signer],
+                        evidence: concurrent_second_evidence,
+                    },
+                ],
+            }))
+        });
+        while super::testing_only_aggregate_executions_started() == aggregate_executions_before {
+            assert!(
+                concurrent_started.elapsed() < std::time::Duration::from_secs(60),
+                "the admitted real aggregate must begin inside its safe window",
+            );
+            std::thread::yield_now();
+        }
+        let critical_started = Instant::now();
+        let critical = futures::executor::block_on(service.verify(
+            VerificationClass::Block,
+            AggregationJob {
+                claim: common_claim,
+                expected_signers: vec![first_signer.clone()],
+                contributions: vec![AggregationContribution {
+                    signers: vec![first_signer.clone()],
+                    evidence: PqSameMessageEvidence::from(&first_raw),
+                }],
+            },
+        ))
+        .expect("Block-class verification admitted behind the real raw-plus-raw aggregate");
+        assert_eq!(
+            critical.as_bytes(),
+            PqSameMessageEvidence::from(&first_raw).as_bytes()
+        );
+        assert!(
+            critical_started.elapsed() <= std::time::Duration::from_secs(60),
+            "the non-preemptive aggregate plus Block-class verification must fit the gate budget",
+        );
+        concurrent_aggregate
+            .join()
+            .expect("real aggregate caller thread")
+            .expect("real aggregate completes before the critical request budget");
+        assert!(
+            concurrent_started.elapsed() <= std::time::Duration::from_secs(60),
+            "the admitted real raw-plus-raw aggregate must fit the gate budget",
+        );
 
         let third_signing_key = signing_key(0x44);
         let fourth_signing_key = signing_key(0x55);

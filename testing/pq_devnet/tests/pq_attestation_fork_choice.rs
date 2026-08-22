@@ -1525,8 +1525,24 @@ mod avx2 {
         )
         .await;
         let drain = {
-            let chain = Arc::clone(&chain);
-            tokio::spawn(async move { chain.close_and_drain_pq_imports().await })
+            let background_close = beacon_chain::TestingPqBlockingHook::blocking();
+            chain.testing_only_set_pq_background_aggregation_close_hook(Some(Arc::clone(
+                &background_close,
+            )));
+            let draining_chain = Arc::clone(&chain);
+            let drain =
+                tokio::spawn(async move { draining_chain.close_and_drain_pq_imports().await });
+            wait_for_test_condition(
+                || background_close.entered() == 1,
+                "background aggregation close boundary",
+            )
+            .await;
+            assert!(matches!(
+                chain.testing_only_try_start_pq_fork_choice_ingress(),
+                Err(beacon_chain::PqForkChoiceAttestationError::ShuttingDown)
+            ));
+            background_close.release();
+            drain
         };
         for _ in 0..64 {
             tokio::task::yield_now().await;

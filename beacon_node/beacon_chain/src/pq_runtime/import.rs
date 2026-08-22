@@ -1932,6 +1932,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                     block_root: head_block_root,
                 },
             );
+            self.pq_background_attestation_aggregator.kick();
         }
         result
     }
@@ -2721,6 +2722,9 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                     },
                 );
             }
+        }
+        if reconciliation_result.is_ok() && fork_choice_result.is_ok() {
+            self.pq_background_attestation_aggregator.kick();
         }
         let reconciled_event_error = if reconciliation_result.is_ok() && fork_choice_result.is_ok()
         {

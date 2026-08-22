@@ -2292,3 +2292,58 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   participation mutation on one chain. This is not evidence for background aggregate proof work,
   aggregate gossip, a second-node slot-2 import, justification/finality, or operation-pool recovery
   after restart; those remain Steps 5-7.
+
+### 2026-08-22: Background aggregation requires a measured non-preemption window
+
+- The process-wide PQ prover has reserved Block, Gossip, and Aggregate queues, but priority applies
+  only before the worker pops a job. The recursive backend call is synchronous and non-cancellable,
+  so a later critical verification waits for an already-running aggregate. A Tokio heartbeat alone
+  cannot establish consensus-proof liveness.
+- The frozen first devnet sharply bounds the relevant job. Minimal has eight slots per epoch and the
+  registry is capped at sixteen validators, yielding one two-validator committee per slot. The
+  background coordinator can therefore construct only two-raw-single aggregation; the 76-86 second
+  raw-plus-child and child-plus-child shapes require at least three committee members and are not
+  admissible in this profile. Two measured warning/AVX debug raw-plus-raw jobs took 7.723 and 7.405
+  seconds. Slots are 300 seconds.
+- Step 5 will retain the singleton prover and admit at most one background aggregate per slot, only
+  for exact Minimal/Electra/300, exactly two raw singleton contributions, a reconciled current-slot
+  head, an unchanged final clock sample, and at least 60 seconds remaining. At 59.999 seconds the
+  prepared owner must be dropped without prover submission; generation RAII clears its in-flight
+  marker and raw candidates remain selectable. A measured overrun disables later launches while
+  retaining raw fallback. This 60-second floor is an experimental host/profile bound, not a portable
+  worst-case guarantee.
+- The first liveness evidence must deliberately admit a real Block-class verification after the
+  raw-plus-raw job starts, observe that non-preemption makes it wait, and show both jobs finish within
+  the admitted window while the async runtime remains responsive. A second ready bucket in the same
+  slot must not start another proof. Automatic aggregate gossip is excluded: the committed value is
+  only an inner attestation and has no aggregator duty, outer `AggregateAndProof` signature, or
+  post-propagation authority.
+
+### 2026-08-22: Bounded chain-owned raw-plus-raw aggregation is live
+
+- `BeaconChain` owns one persistent result-bearing background worker. Insertions and successful
+  reconciliation only perform a non-waiting capacity-one kick after pool/source locks are released;
+  one running proof and one coalesced rescan are the complete scheduling state. The pool remains the
+  sole candidate authority and returns an opaque generation-bound prepared aggregate whose drop,
+  stale completion, or failed gate preserves the raw candidates through existing RAII.
+- Preparation chooses one canonical bucket only when it contains exactly two disjoint signer-one raw
+  contributions and the Electra aggregation-bit length is exactly two. The final gate requires the
+  frozen Minimal/Electra/300-second profile, a current reconciled head, a coherent
+  slot/remaining/slot sample, at least 60 seconds remaining, and a strictly increasing launch slot.
+  Closure and executor exit are rechecked immediately before non-cancellable submission; a measured
+  overrun disables later starts while raw selection remains available.
+- The authentic production trace retained two journal-verified slot-1 singles, rejected kicks while
+  the clock was at slot 2 but the canonical head was still slot 0/pending, accepted the reconciliation
+  kick, completed the real aggregate proof in 7.21 seconds, and committed one sorted two-validator
+  candidate. The warning-denied AVX2 test passed 1/1 in 191.35 seconds with exact gossip/local source
+  counters.
+- Non-preemption is tested at the process singleton rather than inferred from queue priority. After a
+  real Aggregate-class raw-plus-raw execution started, a real Block-class verification was admitted;
+  both completed inside the 60-second gate budget. The same run measured raw-plus-child at 81.17
+  seconds and child-plus-child at 72.19 seconds, so recursive child shapes remain deliberately
+  excluded from automatic work.
+- Shutdown closes import ingress synchronously before waiting for the background worker, rejects new
+  fork-choice work while the background close boundary is held, drops prepared-but-unsubmitted work,
+  and drains already-admitted proof ownership. This checkpoint commits only the verified inner
+  aggregate to the local pool; it does not claim aggregate gossip, an outer aggregator signature,
+  sync-committee support, finality, or restart recovery.

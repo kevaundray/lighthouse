@@ -3035,10 +3035,49 @@ slot-2 import, or pool recovery across restart.
 
 **Step 5: Add bounded background aggregation**
 
-Reuse `PreparedAggregate` and the coordinator's generation-bound in-flight RAII. REDs cover one
-active plus one queued attempt, concurrent arrival, prune during proof, backend/queue failure retry,
-cap-plus-one, heartbeat/no-lock-across-await, and caller/executor cancellation. Selection uses the
-committed maximal aggregate when available and raw singles otherwise.
+Reuse `PreparedAggregate` and the coordinator's generation-bound in-flight RAII, but account for
+the process-wide prover's deliberately non-preemptive backend call. Automatic work is permitted
+only for the frozen Minimal/Electra/300-second profile and exactly two raw singleton contributions;
+an aggregate child or committee-size drift disables the background path and preserves raw block
+selection. The chain may launch at most one aggregate per slot. It must sample a reconciled
+current-slot head before preparation, then resample immediately before `PreparedAggregate::execute`
+and require the same slot with at least 60 seconds remaining. A failed gate drops the prepared
+owner, clears the generation through RAII, and leaves both raw candidates selectable. The 60-second
+floor is an experimental measured bound—roughly 7.5 times the observed 7.8-second raw-plus-raw
+maximum on the target host—not a portable real-time guarantee. Any observed overrun disables later
+background starts while retaining raw fallback.
+
+Own one persistent result-bearing worker in `BeaconChain`, driven by a non-waiting capacity-one
+kick channel: one active proof plus one coalesced request for a fresh rescan, never a second prepared
+aggregate. Pool insertion may only kick after its pool/source locks are released; it must never read
+head state, prepare work, or await while the local fork-choice guard is held. REDs cover the
+59.999-second rejection boundary, exact 60-second admission, a real Block-class request waiting
+behind and completing within the admitted raw-plus-raw job, one launch per slot despite another
+ready bucket, current-head/final-clock mutations, concurrent arrival, prune during proof,
+backend/queue failure, heartbeat/no-lock-across-await, and executor/shutdown drain. Selection uses
+the committed maximal aggregate when available and raw singles otherwise. This step commits only
+the verified inner aggregate to the pool; aggregate gossip remains deferred until there is explicit
+aggregator-duty, outer-signature, and post-propagation authority.
+
+Implementation checkpoint (2026-08-22): the chain now owns that persistent worker and the pool
+provides one opaque generation-bound prepare-next capability. The coordinator canonically chooses
+only a bucket with exactly two disjoint raw singleton contributions whose Electra committee length
+is exactly two; a retained child aggregate is never scheduled recursively. An authentic production
+trace retained two journal-verified raw singles, ignored pre-reconciliation kicks, launched after
+the slot-2 head became current and reconciled, completed one real aggregate proof in 7.21 seconds,
+and replaced the raws with one sorted two-signer candidate while preserving source accounting. The
+full warning-denied trace passed 1/1 in 191.35 seconds.
+
+The admission gate now requires a coherent slot/remaining/slot sample, a strictly monotonic
+one-launch-per-slot watermark, exact Minimal/Electra/300-second timing, and at least 60 seconds
+remaining. It rechecks explicit closure and executor exit immediately before the non-cancellable
+proof submission. A real singleton-prover contention test admitted a Block-class verification only
+after observing that a raw-plus-raw Aggregate-class job had started; both completed within the
+60-second budget, while the same suite measured raw-plus-child at 81.17 seconds and
+child-plus-child at 72.19 seconds, confirming why those shapes remain disabled. Shutdown closes
+import ingress before awaiting the background owner, clears the one queued kick, does not submit a
+prepared proof after closure, and drains any already-admitted proof. Aggregate gossip remains out of
+scope for this step.
 
 **Step 6: Retain explicit empty sync aggregation in V1**
 
