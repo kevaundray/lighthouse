@@ -6,12 +6,23 @@ use beacon_chain::{
     BeaconChain, BeaconChainTypes, PqAttestationGossipError, PqBlockImportOutcome,
     PqForkChoiceAttestationError, PqForkChoiceAttestationOutcome, PqGossipCommitToken,
     PqGossipPropagationToken, PqImportError, PqImportLocalError, PqOperationalEvent,
-    PqOperationalEventSink, PqPeerConnectionDirection, PqSingleGossipPropagationToken,
-    PqStatusMessageDirection, PqStatusRejectionCode, PqVerifiedGossipSingle,
+    PqOperationalEventSink, PqPeerConnectionDirection, PqSingleConsumptionResult,
+    PqSingleGossipPropagationToken, PqSingleObservationIdentity, PqSingleObservationStatus,
+    PqSingleWireMessageId, PqStatusMessageDirection, PqStatusRejectionCode, PqVerifiedGossipSingle,
+    pq_single_consumption_result_from_fork_choice,
 };
 #[cfg(feature = "pq-startup-testing")]
-use beacon_chain::{PqAttestationGossipLocalError, PqAttestationGossipObservation};
+use beacon_chain::{
+    PqAttestationGossipLocalError, PqAttestationGossipObservation, PqSingleObservationWatchReceipt,
+    TestingPqWireBoundObservationCache,
+};
+#[cfg(feature = "pq-proposer")]
+use beacon_chain::{
+    PqPublishedLocalAttestationBatchConsumer, PqPublishedLocalMemberResolutionError,
+};
 use fixed_bytes::FixedBytesExtended;
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+use lighthouse_network::GossipTopic;
 use lighthouse_network::libp2p::gossipsub::{
     AdmittedMessageCommit, AdmittedMessageCommitOutcome, AdmittedMessageReport,
     AdmittedMessageValidationOutcome,
@@ -25,7 +36,7 @@ use lighthouse_network::types::GossipKind;
 use lighthouse_network::{
     Context, MessageAcceptance, MessageId, NetworkEvent, NetworkGlobals, PeerAction, PeerId,
     PqBeaconBlockPublishError, PqBeaconBlockPublishOutcome, PqCompatiblePeerAdmission,
-    PqEncodedBeaconBlock, PqGossipValidationAdmission, PubsubMessage, ReportSource,
+    PqEncodedBeaconBlock, PqGossipValidationAdmission, PubsubMessage, ReportSource, TopicHash,
     identity::Keypair,
 };
 use parking_lot::Mutex;
@@ -124,8 +135,32 @@ impl<E: EthSpec> PqTestingAttestationPublishSender<E> {
         let (acknowledgement, receiver) = tokio::sync::oneshot::channel();
         self.sender
             .try_send(PqTestingAttestationPublishCommand {
-                attestation,
-                subnet,
+                payload: PqTestingAttestationPublishPayload::Semantic {
+                    attestation,
+                    subnet,
+                },
+                acknowledgement: Some(acknowledgement),
+                _phantom: std::marker::PhantomData,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => PqTestingAttestationPublishError::Capacity,
+                mpsc::error::TrySendError::Closed(_) => {
+                    PqTestingAttestationPublishError::WorkerUnavailable
+                }
+            })?;
+        Ok(PqTestingAttestationPublishAcknowledgement { receiver })
+    }
+
+    #[cfg(feature = "pq-proposer")]
+    pub fn try_send_exact(
+        &self,
+        topic: GossipTopic,
+        data: Vec<u8>,
+    ) -> Result<PqTestingAttestationPublishAcknowledgement, PqTestingAttestationPublishError> {
+        let (acknowledgement, receiver) = tokio::sync::oneshot::channel();
+        self.sender
+            .try_send(PqTestingAttestationPublishCommand {
+                payload: PqTestingAttestationPublishPayload::Exact { topic, data },
                 acknowledgement: Some(acknowledgement),
                 _phantom: std::marker::PhantomData,
             })
@@ -141,11 +176,20 @@ impl<E: EthSpec> PqTestingAttestationPublishSender<E> {
 
 #[cfg(feature = "pq-startup-testing")]
 struct PqTestingAttestationPublishCommand<E: EthSpec> {
-    attestation: types::SingleAttestation,
-    subnet: SubnetId,
+    payload: PqTestingAttestationPublishPayload,
     acknowledgement:
         Option<tokio::sync::oneshot::Sender<Result<(), PqTestingAttestationPublishError>>>,
     _phantom: std::marker::PhantomData<E>,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+enum PqTestingAttestationPublishPayload {
+    Semantic {
+        attestation: types::SingleAttestation,
+        subnet: SubnetId,
+    },
+    #[cfg(feature = "pq-proposer")]
+    Exact { topic: GossipTopic, data: Vec<u8> },
 }
 
 #[cfg(feature = "pq-startup-testing")]
@@ -161,6 +205,38 @@ impl<E: EthSpec> PqTestingAttestationPublishCommand<E> {
 #[doc(hidden)]
 pub struct PqTestingAttestationPublishAcknowledgement {
     receiver: tokio::sync::oneshot::Receiver<Result<(), PqTestingAttestationPublishError>>,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+struct PqTestingAttestationVerificationHook {
+    entered: tokio::sync::watch::Sender<bool>,
+    release: Arc<Notify>,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub struct PqTestingAttestationVerificationBarrier {
+    entered: tokio::sync::watch::Receiver<bool>,
+    release: Arc<Notify>,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+impl PqTestingAttestationVerificationBarrier {
+    pub async fn wait_until_blocked(&mut self) -> Result<(), &'static str> {
+        loop {
+            if *self.entered.borrow_and_update() {
+                return Ok(());
+            }
+            self.entered
+                .changed()
+                .await
+                .map_err(|_| "attestation verification hook disappeared")?;
+        }
+    }
+
+    pub fn release(self) {
+        self.release.notify_one();
+    }
 }
 
 #[cfg(feature = "pq-startup-testing")]
@@ -255,10 +331,67 @@ struct PqBlockVerificationCompletion<T: BeaconChainTypes> {
     _permit: OwnedSemaphorePermit,
 }
 
+pub(super) struct PqAttestationCompletionMetadata {
+    message_id: MessageId,
+    identity: PqSingleObservationIdentity,
+    wire_id: PqSingleWireMessageId,
+}
+
+fn pq_single_wire_message_id(
+    message_id: &MessageId,
+) -> Result<PqSingleWireMessageId, std::array::TryFromSliceError> {
+    PqSingleWireMessageId::try_from(message_id.0.as_slice())
+}
+
+fn validate_pq_attestation_wire_provenance<E: EthSpec>(
+    message_id: &MessageId,
+    topic: &TopicHash,
+    attestation: &types::SingleAttestation,
+    subnet: SubnetId,
+    genesis_validators_root: Hash256,
+    spec: &types::ChainSpec,
+) -> Result<PqSingleWireMessageId, PqAttestationGossipError> {
+    let wire_id = pq_single_wire_message_id(message_id).map_err(|_| {
+        PqAttestationGossipError::Local(
+            beacon_chain::PqAttestationGossipLocalError::WireMessageIdLength {
+                actual: message_id.0.len(),
+            },
+        )
+    })?;
+    beacon_chain::validate_pq_single_wire_provenance::<E>(
+        attestation,
+        subnet,
+        genesis_validators_root,
+        spec,
+        wire_id,
+        Some(topic.as_str()),
+    )
+}
+
+impl PqAttestationCompletionMetadata {
+    pub(super) fn from_sealed_token(
+        message_id: MessageId,
+        identity: PqSingleObservationIdentity,
+        wire_id: PqSingleWireMessageId,
+    ) -> Self {
+        Self {
+            message_id,
+            identity,
+            wire_id,
+        }
+    }
+
+    fn into_consumption(self) -> Self {
+        self
+    }
+}
+
 struct PqAttestationVerificationCompletion<T: BeaconChainTypes> {
     message_id: MessageId,
     source: PeerId,
     disposition: PqGossipAttestationDisposition<T::EthSpec>,
+    #[cfg(feature = "pq-proposer")]
+    bridge: super::PqAttestationAdmissionBridgeHandle,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -275,8 +408,53 @@ struct PqBlockCommitCompletion {
 }
 
 struct PqAttestationConsumptionCompletion {
+    metadata: PqAttestationCompletionMetadata,
     admission: AdmittedMessageCommit,
     result: Result<PqForkChoiceAttestationOutcome, PqForkChoiceAttestationError>,
+    failure_authority: PqAttestationConsumptionFailureAuthority,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PqAttestationConsumptionFailureAuthority {
+    None,
+    Chain,
+}
+
+pub(super) struct PqAttestationConsumptionCoordinator {
+    exact_status: Arc<
+        dyn Fn(&PqSingleObservationIdentity, PqSingleWireMessageId) -> PqSingleObservationStatus
+            + Send
+            + Sync
+            + 'static,
+    >,
+}
+
+impl PqAttestationConsumptionCoordinator {
+    pub(super) fn new(
+        exact_status: impl Fn(
+            &PqSingleObservationIdentity,
+            PqSingleWireMessageId,
+        ) -> PqSingleObservationStatus
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            exact_status: Arc::new(exact_status),
+        }
+    }
+
+    pub(super) fn resolve(
+        &self,
+        metadata: &PqAttestationCompletionMetadata,
+        result: PqSingleConsumptionResult,
+    ) -> bool {
+        let _message_id = &metadata.message_id;
+        matches!(
+            (self.exact_status)(&metadata.identity, metadata.wire_id),
+            PqSingleObservationStatus::Consumed(authoritative) if authoritative == result
+        )
+    }
 }
 
 enum PqCompletionDisposition<Propagation, Commit, Error> {
@@ -304,6 +482,7 @@ trait PqCompletionLifecycle<Propagation, Commit, Error> {
         outcome: AdmittedMessageValidationOutcome,
     ) -> PqAdmissionReport<Self::Reservation>;
     fn after_propagation(&mut self, propagation: Propagation) -> Result<Commit, Error>;
+    fn uncommitted_propagation(&mut self, propagation: Propagation);
     fn commit(&mut self, reservation: Self::Reservation, commit: Commit);
     fn resolve_promotion_failed(&mut self, reservation: Self::Reservation, error: &Error);
     fn reject(&mut self, error: Error);
@@ -317,15 +496,18 @@ fn handle_completion_lifecycle<Propagation, Commit, Error>(
 ) {
     match disposition {
         PqCompletionDisposition::Accept(propagation) => {
-            if let PqAdmissionReport::Commit(reservation) =
-                lifecycle.report(AdmittedMessageValidationOutcome::Accept)
-            {
-                match lifecycle.after_propagation(propagation) {
-                    Ok(commit) => lifecycle.commit(reservation, commit),
-                    Err(error) => {
-                        lifecycle.resolve_promotion_failed(reservation, &error);
-                        lifecycle.promotion_failed(error);
+            match lifecycle.report(AdmittedMessageValidationOutcome::Accept) {
+                PqAdmissionReport::Commit(reservation) => {
+                    match lifecycle.after_propagation(propagation) {
+                        Ok(commit) => lifecycle.commit(reservation, commit),
+                        Err(error) => {
+                            lifecycle.resolve_promotion_failed(reservation, &error);
+                            lifecycle.promotion_failed(error);
+                        }
                     }
+                }
+                PqAdmissionReport::NotFound | PqAdmissionReport::Complete => {
+                    lifecycle.uncommitted_propagation(propagation);
                 }
             }
         }
@@ -397,6 +579,10 @@ impl<T: BeaconChainTypes>
         propagation.after_propagation()
     }
 
+    fn uncommitted_propagation(&mut self, propagation: PqGossipPropagationToken<T>) {
+        drop(propagation);
+    }
+
     fn commit(&mut self, admission: Self::Reservation, commit: PqGossipCommitToken<T>) {
         let identity = commit.operational_identity().ok();
         let processor = Arc::clone(&self.processor);
@@ -455,8 +641,37 @@ struct PqNetworkAttestationCompletionLifecycle<'a, T: BeaconChainTypes> {
     task_executor: TaskExecutor,
     consumption_sender: mpsc::Sender<PqAttestationConsumptionCompletion>,
     message_id: MessageId,
+    consumption_metadata: Option<PqAttestationCompletionMetadata>,
     source: PeerId,
     in_flight: Arc<PqNetworkInFlight>,
+    #[cfg(feature = "pq-proposer")]
+    bridge: super::PqAttestationAdmissionBridgeHandle,
+}
+
+#[cfg(feature = "pq-proposer")]
+fn mark_pq_attestation_propagated_then_release_bridge_on_error<Commit, Error>(
+    bridge: &mut super::PqAttestationAdmissionBridgeHandle,
+    mark_propagated: impl FnOnce() -> Result<Commit, Error>,
+) -> Result<Commit, Error> {
+    match mark_propagated() {
+        Ok(commit) => {
+            let _ = bridge.claim_ready();
+            Ok(commit)
+        }
+        Err(error) => {
+            let _ = bridge.released();
+            Err(error)
+        }
+    }
+}
+
+#[cfg(feature = "pq-proposer")]
+fn drop_pq_attestation_propagation_then_release_bridge<Propagation>(
+    propagation: Propagation,
+    bridge: &mut super::PqAttestationAdmissionBridgeHandle,
+) {
+    drop(propagation);
+    let _ = bridge.released();
 }
 
 impl<T: BeaconChainTypes>
@@ -472,6 +687,16 @@ impl<T: BeaconChainTypes>
         &mut self,
         outcome: AdmittedMessageValidationOutcome,
     ) -> PqAdmissionReport<Self::Reservation> {
+        #[cfg(feature = "pq-proposer")]
+        match outcome {
+            AdmittedMessageValidationOutcome::Accept => {}
+            AdmittedMessageValidationOutcome::RetryableIgnore => {
+                let _ = self.bridge.released();
+            }
+            _ => {
+                let _ = self.bridge.terminal();
+            }
+        }
         match self
             .network
             .report_pq_admitted_message_outcome(self.message_id.clone(), outcome)
@@ -486,7 +711,35 @@ impl<T: BeaconChainTypes>
         &mut self,
         propagation: PqSingleGossipPropagationToken<T::EthSpec>,
     ) -> Result<PqVerifiedGossipSingle<T::EthSpec>, beacon_chain::PqAttestationGossipError> {
+        let identity = propagation.observation_identity().ok_or(
+            beacon_chain::PqAttestationGossipError::Local(
+                beacon_chain::PqAttestationGossipLocalError::ObservationLost,
+            ),
+        )?;
+        let wire_id = propagation.observation_wire_id().ok_or(
+            beacon_chain::PqAttestationGossipError::Local(
+                beacon_chain::PqAttestationGossipLocalError::ObservationLost,
+            ),
+        )?;
+        self.consumption_metadata = Some(PqAttestationCompletionMetadata::from_sealed_token(
+            self.message_id.clone(),
+            identity,
+            wire_id,
+        ));
+        #[cfg(feature = "pq-proposer")]
+        return mark_pq_attestation_propagated_then_release_bridge_on_error(
+            &mut self.bridge,
+            || propagation.mark_propagated(),
+        );
+        #[cfg(not(feature = "pq-proposer"))]
         propagation.mark_propagated()
+    }
+
+    fn uncommitted_propagation(&mut self, propagation: PqSingleGossipPropagationToken<T::EthSpec>) {
+        #[cfg(feature = "pq-proposer")]
+        return drop_pq_attestation_propagation_then_release_bridge(propagation, &mut self.bridge);
+        #[cfg(not(feature = "pq-proposer"))]
+        drop(propagation);
     }
 
     fn commit(
@@ -494,6 +747,18 @@ impl<T: BeaconChainTypes>
         admission: Self::Reservation,
         verified: PqVerifiedGossipSingle<T::EthSpec>,
     ) {
+        let Some(metadata) = self
+            .consumption_metadata
+            .take()
+            .map(PqAttestationCompletionMetadata::into_consumption)
+        else {
+            let _ = self.network.resolve_pq_admitted_message_commit(
+                admission,
+                AdmittedMessageCommitOutcome::Terminal,
+            );
+            self.processor.fail_gossip_attestation_consumption();
+            return;
+        };
         let chain = Arc::clone(&self.processor.chain);
         let completion_sender = self.consumption_sender.clone();
         let admission = Arc::new(Mutex::new(Some(admission)));
@@ -506,9 +771,19 @@ impl<T: BeaconChainTypes>
                     return;
                 };
                 let result = chain.consume_pq_verified_gossip_single(verified).await;
+                let failure_authority = if result.is_err() {
+                    PqAttestationConsumptionFailureAuthority::Chain
+                } else {
+                    PqAttestationConsumptionFailureAuthority::None
+                };
                 try_send_completion(
                     &completion_sender,
-                    PqAttestationConsumptionCompletion { admission, result },
+                    PqAttestationConsumptionCompletion {
+                        metadata,
+                        admission,
+                        result,
+                        failure_authority,
+                    },
                 );
             },
             "pq_network_attestation_consumption",
@@ -584,6 +859,7 @@ fn attestation_consumption_commit_outcome() -> AdmittedMessageCommitOutcome {
     AdmittedMessageCommitOutcome::Terminal
 }
 
+#[cfg(feature = "pq-startup-testing")]
 fn attestation_consumption_requires_shutdown(result_failed: bool, resolved: bool) -> bool {
     result_failed || !resolved
 }
@@ -729,6 +1005,12 @@ pub fn testing_only_pq_commit_completion_queue() -> PqCommitCompletionQueueTestT
 
 fn try_admit_proof(admission: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
     Arc::clone(admission).try_acquire_owned().ok()
+}
+
+/// Establishes the network proof-capacity boundary before the chain is allowed to derive any
+/// attestation observation identity.
+fn try_admit_attestation_verification(admission: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+    try_admit_proof(admission)
 }
 
 fn try_send_completion<Completion>(sender: &mpsc::Sender<Completion>, completion: Completion) {
@@ -954,6 +1236,76 @@ enum PqNetworkServiceEvent<T: BeaconChainTypes> {
     TestingAttestationPublish(Option<PqTestingAttestationPublishCommand<T::EthSpec>>),
 }
 
+macro_rules! select_pq_network_service_ready_event {
+    (
+        executor_exit = $executor_exit:expr => $executor_exit_result:expr,
+        shutdown = $shutdown:expr => $shutdown_result:expr,
+        middle = {
+            $( $middle_binding:ident = $middle_future:expr => $middle_result:expr, )*
+        },
+        local = $local_binding:ident = $local_future:expr => $local_result:expr,
+        network = $network_binding:ident = $network_future:expr => $network_result:expr $(,)?
+    ) => {
+        tokio::select! {
+            biased;
+            _ = $executor_exit => { $executor_exit_result },
+            _ = $shutdown => { $shutdown_result },
+            $( $middle_binding = $middle_future => { $middle_result }, )*
+            $local_binding = $local_future => { $local_result },
+            $network_binding = $network_future => { $network_result },
+        }
+    };
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum PqNetworkServiceReadyEventTestCase {
+    ExecutorShutdownLocalAndNetwork,
+    ShutdownLocalAndNetwork,
+    LocalAndNetwork,
+    NetworkOnly,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum PqNetworkServiceReadyEvent {
+    ExecutorExit,
+    Shutdown,
+    LocalAttestationPublish,
+    Network,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+async fn pq_network_service_test_event_ready(ready: bool) {
+    if !ready {
+        std::future::pending().await
+    }
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub async fn testing_only_pq_network_service_select_ready_event(
+    case: PqNetworkServiceReadyEventTestCase,
+) -> PqNetworkServiceReadyEvent {
+    let (executor_exit, shutdown, local, network) = match case {
+        PqNetworkServiceReadyEventTestCase::ExecutorShutdownLocalAndNetwork => {
+            (true, true, true, true)
+        }
+        PqNetworkServiceReadyEventTestCase::ShutdownLocalAndNetwork => (false, true, true, true),
+        PqNetworkServiceReadyEventTestCase::LocalAndNetwork => (false, false, true, true),
+        PqNetworkServiceReadyEventTestCase::NetworkOnly => (false, false, false, true),
+    };
+    select_pq_network_service_ready_event! {
+        executor_exit = pq_network_service_test_event_ready(executor_exit) => PqNetworkServiceReadyEvent::ExecutorExit,
+        shutdown = pq_network_service_test_event_ready(shutdown) => PqNetworkServiceReadyEvent::Shutdown,
+        middle = {},
+        local = _local = pq_network_service_test_event_ready(local) => PqNetworkServiceReadyEvent::LocalAttestationPublish,
+        network = _network = pq_network_service_test_event_ready(network) => PqNetworkServiceReadyEvent::Network,
+    }
+}
+
 #[cfg(feature = "pq-startup-testing")]
 async fn next_testing_attestation_publish_event<T: BeaconChainTypes>(
     receiver: &mut mpsc::Receiver<PqTestingAttestationPublishCommand<T::EthSpec>>,
@@ -998,6 +1350,7 @@ pub struct PqNetworkService<T: BeaconChainTypes> {
     attestation_completion_receiver: mpsc::Receiver<PqAttestationVerificationCompletion<T>>,
     attestation_consumption_sender: mpsc::Sender<PqAttestationConsumptionCompletion>,
     attestation_consumption_receiver: mpsc::Receiver<PqAttestationConsumptionCompletion>,
+    attestation_consumption_coordinator: PqAttestationConsumptionCoordinator,
     commit_sender: mpsc::Sender<PqBlockCommitCompletion>,
     commit_receiver: mpsc::Receiver<PqBlockCommitCompletion>,
     task_executor: TaskExecutor,
@@ -1008,12 +1361,18 @@ pub struct PqNetworkService<T: BeaconChainTypes> {
     local_attestation_publish_sender: super::PqLocalAttestationBatchPublishSender<T::EthSpec>,
     #[cfg(feature = "pq-proposer")]
     local_attestation_publish_receiver: super::PqLocalAttestationBatchPublishReceiver<T::EthSpec>,
+    #[cfg(feature = "pq-proposer")]
+    local_attestation_consumer: Arc<PqPublishedLocalAttestationBatchConsumer<T>>,
+    #[cfg(feature = "pq-proposer")]
+    attestation_admission_bridge: super::PqAttestationAdmissionBridge,
     #[cfg(feature = "pq-startup-testing")]
     testing_attestation_publish_sender:
         mpsc::Sender<PqTestingAttestationPublishCommand<T::EthSpec>>,
     #[cfg(feature = "pq-startup-testing")]
     testing_attestation_publish_receiver:
         mpsc::Receiver<PqTestingAttestationPublishCommand<T::EthSpec>>,
+    #[cfg(feature = "pq-startup-testing")]
+    testing_attestation_verification_hook: Option<PqTestingAttestationVerificationHook>,
     #[cfg(feature = "pq-startup-testing")]
     testing_block_encoding_hook: Option<PqBlockEncodingHook>,
     #[cfg(feature = "pq-startup-testing")]
@@ -1074,9 +1433,19 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
                 genesis_validators_root,
             )
         };
+        #[cfg(feature = "pq-proposer")]
+        let local_attestation_consumer =
+            Arc::new(chain.pq_published_local_attestation_batch_consumer());
+        #[cfg(feature = "pq-proposer")]
+        let attestation_admission_bridge =
+            super::PqAttestationAdmissionBridge::new(PQ_NETWORK_BLOCK_PROOF_CAPACITY);
         #[cfg(feature = "pq-startup-testing")]
         let (testing_attestation_publish_sender, testing_attestation_publish_receiver) =
             mpsc::channel(PQ_TESTING_ATTESTATION_PUBLISH_CAPACITY);
+        let attestation_consumption_coordinator = PqAttestationConsumptionCoordinator::new({
+            let chain = Arc::clone(&chain);
+            move |identity, wire_id| chain.pq_attestation_consumption_status(identity, wire_id)
+        });
         Ok(Self {
             network,
             network_globals,
@@ -1095,6 +1464,7 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
             attestation_completion_receiver,
             attestation_consumption_sender,
             attestation_consumption_receiver,
+            attestation_consumption_coordinator,
             commit_sender,
             commit_receiver,
             task_executor,
@@ -1105,10 +1475,16 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
             local_attestation_publish_sender,
             #[cfg(feature = "pq-proposer")]
             local_attestation_publish_receiver,
+            #[cfg(feature = "pq-proposer")]
+            local_attestation_consumer,
+            #[cfg(feature = "pq-proposer")]
+            attestation_admission_bridge,
             #[cfg(feature = "pq-startup-testing")]
             testing_attestation_publish_sender,
             #[cfg(feature = "pq-startup-testing")]
             testing_attestation_publish_receiver,
+            #[cfg(feature = "pq-startup-testing")]
+            testing_attestation_verification_hook: None,
             #[cfg(feature = "pq-startup-testing")]
             testing_block_encoding_hook: None,
             #[cfg(feature = "pq-startup-testing")]
@@ -1152,6 +1528,26 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
         PqTestingAttestationPublishSender {
             sender: self.testing_attestation_publish_sender.clone(),
         }
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_hold_next_attestation_verification(
+        &mut self,
+    ) -> Option<PqTestingAttestationVerificationBarrier> {
+        if self.testing_attestation_verification_hook.is_some() {
+            return None;
+        }
+        let (entered, receiver) = tokio::sync::watch::channel(false);
+        let release = Arc::new(Notify::new());
+        self.testing_attestation_verification_hook = Some(PqTestingAttestationVerificationHook {
+            entered,
+            release: Arc::clone(&release),
+        });
+        Some(PqTestingAttestationVerificationBarrier {
+            entered: receiver,
+            release,
+        })
     }
 
     #[cfg(feature = "pq-startup-testing")]
@@ -1248,41 +1644,31 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
             );
             #[cfg(not(feature = "pq-proposer"))]
             let local_attestation_publish_event = next_local_attestation_publish_event::<T>();
-            let event = tokio::select! {
-                biased;
-                _ = &mut executor_exit => break,
-                _ = async {
+            let event = select_pq_network_service_ready_event! {
+                executor_exit = &mut executor_exit => None,
+                shutdown = async {
                     match shutdown_receiver.as_mut() {
                         Some(receiver) => {
                             let _ = receiver.await;
                         }
                         None => std::future::pending::<()>().await,
                     }
-                } => break,
-                command = self.broadcast_receiver.recv() => {
-                    PqNetworkServiceEvent::Broadcast(command)
-                }
-                completion = self.encoding_receiver.recv() => {
-                    PqNetworkServiceEvent::Encoding(completion)
-                }
-                completion = self.completion_receiver.recv() => {
-                    PqNetworkServiceEvent::Verification(completion.map(Box::new))
-                }
-                completion = self.attestation_completion_receiver.recv() => {
-                    PqNetworkServiceEvent::AttestationVerification(completion.map(Box::new))
-                }
-                completion = self.attestation_consumption_receiver.recv() => {
-                    PqNetworkServiceEvent::AttestationConsumption(completion.map(Box::new))
-                }
-                completion = self.commit_receiver.recv() => {
-                    PqNetworkServiceEvent::Commit(completion.map(Box::new))
-                }
-                event = self.network.next_event() => PqNetworkServiceEvent::Network(Box::new(event)),
-                address = self.testing_dial_receiver.recv() => {
-                    PqNetworkServiceEvent::TestingDial(address)
-                }
-                event = local_attestation_publish_event => event,
-                event = testing_attestation_publish_event => event,
+                } => None,
+                middle = {
+                    command = self.broadcast_receiver.recv() => Some(PqNetworkServiceEvent::Broadcast(command)),
+                    completion = self.encoding_receiver.recv() => Some(PqNetworkServiceEvent::Encoding(completion)),
+                    completion = self.completion_receiver.recv() => Some(PqNetworkServiceEvent::Verification(completion.map(Box::new))),
+                    completion = self.attestation_completion_receiver.recv() => Some(PqNetworkServiceEvent::AttestationVerification(completion.map(Box::new))),
+                    completion = self.attestation_consumption_receiver.recv() => Some(PqNetworkServiceEvent::AttestationConsumption(completion.map(Box::new))),
+                    completion = self.commit_receiver.recv() => Some(PqNetworkServiceEvent::Commit(completion.map(Box::new))),
+                    address = self.testing_dial_receiver.recv() => Some(PqNetworkServiceEvent::TestingDial(address)),
+                    testing_event = testing_attestation_publish_event => Some(testing_event),
+                },
+                local = local_event = local_attestation_publish_event => Some(local_event),
+                network = network_event = self.network.next_event() => Some(PqNetworkServiceEvent::Network(Box::new(network_event))),
+            };
+            let Some(event) = event else {
+                break;
             };
             match event {
                 PqNetworkServiceEvent::Broadcast(Some(command)) => {
@@ -1339,9 +1725,7 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
                     super::PqLocalAttestationBatchPublishEvent::Incoming(command),
                 )) => {
                     if !command.needs_encoding() {
-                        command.publish(&mut self.network);
-                        self.local_attestation_publish_receiver
-                            .retain_and_complete(command);
+                        self.handle_local_attestation_post_publish(command);
                     } else if !self.local_attestation_publish_receiver.start_encoding(
                         command,
                         self.task_executor.clone(),
@@ -1354,9 +1738,52 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
                 PqNetworkServiceEvent::LocalAttestationPublish(Some(
                     super::PqLocalAttestationBatchPublishEvent::Encoded(command),
                 )) => {
-                    command.publish(&mut self.network);
-                    self.local_attestation_publish_receiver
-                        .retain_and_complete(command);
+                    self.handle_local_attestation_post_publish(command);
+                }
+                #[cfg(feature = "pq-proposer")]
+                PqNetworkServiceEvent::LocalAttestationPublish(Some(
+                    super::PqLocalAttestationBatchPublishEvent::RetryPublishedPrefix(command),
+                )) => {
+                    self.handle_local_attestation_post_publish(command);
+                }
+                #[cfg(feature = "pq-proposer")]
+                PqNetworkServiceEvent::LocalAttestationPublish(Some(
+                    super::PqLocalAttestationBatchPublishEvent::Consumed(completion),
+                )) => {
+                    let consumer = Arc::clone(&self.local_attestation_consumer);
+                    let chain = Arc::clone(&self.chain);
+                    super::complete_pq_local_attestation_post_publish(
+                        &mut self.local_attestation_publish_receiver,
+                        completion,
+                        move |failure| {
+                            match failure {
+                            super::PqLocalAttestationPostPublishFailure::TaskPanicked => {
+                                consumer.close_ingress_after_monitored_task_failure()
+                            }
+                            super::PqLocalAttestationPostPublishFailure::TaskUnavailable
+                            | super::PqLocalAttestationPostPublishFailure::OutcomeCountMismatch
+                            | super::PqLocalAttestationPostPublishFailure::PublishedPrefixUnresolved
+                            | super::PqLocalAttestationPostPublishFailure::PreConsumerEvidence(_)
+                            | super::PqLocalAttestationPostPublishFailure::RemoteResolution(_) => {
+                                chain.fail_pq_attestation_after_propagation();
+                            }
+                            super::PqLocalAttestationPostPublishFailure::Consumer(_) => {}
+                        }
+                        },
+                    );
+                }
+                #[cfg(feature = "pq-proposer")]
+                PqNetworkServiceEvent::LocalAttestationPublish(Some(
+                    super::PqLocalAttestationBatchPublishEvent::RemoteResolved(completion),
+                )) => {
+                    let chain = Arc::clone(&self.chain);
+                    if let Some(command) = super::complete_pq_local_attestation_remote_resolution(
+                        &mut self.local_attestation_publish_receiver,
+                        completion,
+                        move |_| chain.fail_pq_attestation_after_propagation(),
+                    ) {
+                        self.handle_local_attestation_post_publish(command);
+                    }
                 }
                 #[cfg(feature = "pq-proposer")]
                 PqNetworkServiceEvent::LocalAttestationPublish(None) => break,
@@ -1374,9 +1801,26 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
     async fn shutdown_and_drain(&mut self) {
         self.broadcast_receiver.close_and_reject_pending();
         #[cfg(feature = "pq-proposer")]
-        self.local_attestation_publish_receiver
-            .close_and_drain()
-            .await;
+        {
+            let consumer = Arc::clone(&self.local_attestation_consumer);
+            let chain = Arc::clone(&self.chain);
+            let _ = self
+                .local_attestation_publish_receiver
+                .close_and_drain(move |failure| match failure {
+                    super::PqLocalAttestationPostPublishFailure::TaskPanicked => {
+                        consumer.close_ingress_after_monitored_task_failure()
+                    }
+                    super::PqLocalAttestationPostPublishFailure::TaskUnavailable
+                    | super::PqLocalAttestationPostPublishFailure::OutcomeCountMismatch
+                    | super::PqLocalAttestationPostPublishFailure::PublishedPrefixUnresolved
+                    | super::PqLocalAttestationPostPublishFailure::PreConsumerEvidence(_)
+                    | super::PqLocalAttestationPostPublishFailure::RemoteResolution(_) => {
+                        chain.fail_pq_attestation_after_propagation();
+                    }
+                    super::PqLocalAttestationPostPublishFailure::Consumer(_) => {}
+                })
+                .await;
+        }
         #[cfg(feature = "pq-startup-testing")]
         {
             self.testing_attestation_publish_receiver.close();
@@ -1439,9 +1883,9 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
             NetworkEvent::PubsubMessage {
                 id,
                 source,
+                topic,
                 message,
                 pq_admitted,
-                ..
             } => match pq_attestation_route(
                 pq_admitted,
                 match &message {
@@ -1451,7 +1895,7 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
             ) {
                 PqNetworkAttestationRoute::VerifySingle(subnet) => {
                     if let PubsubMessage::Attestation(single) = message {
-                        self.start_attestation_verification(id, source, single.1, subnet);
+                        self.start_attestation_verification(id, source, topic, single.1, subnet);
                     }
                 }
                 PqNetworkAttestationRoute::RetryableIgnore => {
@@ -1534,16 +1978,62 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
         &mut self,
         message_id: MessageId,
         source: PeerId,
+        topic: TopicHash,
         attestation: types::SingleAttestation,
         subnet: SubnetId,
     ) {
-        let Some(permit) = try_admit_proof(&self.proof_admission) else {
+        let Some(permit) = try_admit_attestation_verification(&self.proof_admission) else {
             let _ = self.network.report_pq_admitted_message_outcome(
                 message_id,
                 AdmittedMessageValidationOutcome::RetryableIgnore,
             );
             return;
         };
+        let genesis_validators_root = self
+            .chain
+            .head_snapshot()
+            .beacon_state
+            .genesis_validators_root();
+        let Ok(wire_id) = validate_pq_attestation_wire_provenance::<T::EthSpec>(
+            &message_id,
+            &topic,
+            &attestation,
+            subnet,
+            genesis_validators_root,
+            &self.chain.spec,
+        ) else {
+            let _ = self.network.report_pq_admitted_message_outcome(
+                message_id,
+                AdmittedMessageValidationOutcome::TerminalIgnore,
+            );
+            return;
+        };
+        #[cfg(feature = "pq-proposer")]
+        let bridge = match self.attestation_admission_bridge.reserve(wire_id) {
+            Ok(bridge) => bridge,
+            Err(super::PqAttestationAdmissionBridgeError::Capacity)
+            | Err(super::PqAttestationAdmissionBridgeError::Duplicate) => {
+                let _ = self.network.report_pq_admitted_message_outcome(
+                    message_id,
+                    AdmittedMessageValidationOutcome::RetryableIgnore,
+                );
+                return;
+            }
+            Err(super::PqAttestationAdmissionBridgeError::Unknown)
+            | Err(super::PqAttestationAdmissionBridgeError::Lost) => {
+                let _ = self.network.report_pq_admitted_message_outcome(
+                    message_id,
+                    AdmittedMessageValidationOutcome::TerminalIgnore,
+                );
+                return;
+            }
+        };
+        #[cfg(feature = "pq-proposer")]
+        let bridge_handoff = Arc::new(Mutex::new(Some(bridge)));
+        #[cfg(feature = "pq-proposer")]
+        let task_bridge_handoff = Arc::clone(&bridge_handoff);
+        #[cfg(feature = "pq-startup-testing")]
+        let verification_hook = self.testing_attestation_verification_hook.take();
         let processor = Arc::clone(&self.processor);
         let completion_sender = self.attestation_completion_sender.clone();
         let retry_message_id = message_id.clone();
@@ -1551,8 +2041,17 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
             &self.task_executor,
             &self.in_flight,
             async move {
+                #[cfg(feature = "pq-startup-testing")]
+                if let Some(hook) = verification_hook {
+                    hook.entered.send_replace(true);
+                    hook.release.notified().await;
+                }
+                #[cfg(feature = "pq-proposer")]
+                let Some(bridge) = task_bridge_handoff.lock().take() else {
+                    return;
+                };
                 let disposition = processor
-                    .verify_gossip_attestation(attestation, subnet)
+                    .verify_gossip_attestation_with_wire_id(attestation, subnet, wire_id)
                     .await;
                 try_send_completion(
                     &completion_sender,
@@ -1560,12 +2059,18 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
                         message_id,
                         source,
                         disposition,
+                        #[cfg(feature = "pq-proposer")]
+                        bridge,
                         _permit: permit,
                     },
                 );
             },
             "pq_network_attestation_verification",
         ) {
+            #[cfg(feature = "pq-proposer")]
+            if let Some(mut bridge) = bridge_handoff.lock().take() {
+                let _ = bridge.released();
+            }
             let _ = self.network.report_pq_admitted_message_outcome(
                 retry_message_id,
                 AdmittedMessageValidationOutcome::RetryableIgnore,
@@ -1581,6 +2086,8 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
             message_id,
             source,
             disposition,
+            #[cfg(feature = "pq-proposer")]
+            bridge,
             _permit,
         } = completion;
         let disposition = match disposition {
@@ -1605,8 +2112,11 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
             task_executor: self.task_executor.clone(),
             consumption_sender: self.attestation_consumption_sender.clone(),
             message_id,
+            consumption_metadata: None,
             source,
             in_flight: Arc::clone(&self.in_flight),
+            #[cfg(feature = "pq-proposer")]
+            bridge,
         };
         handle_completion_lifecycle(disposition, &mut lifecycle);
         drop(_permit);
@@ -1616,12 +2126,29 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
         &mut self,
         completion: PqAttestationConsumptionCompletion,
     ) {
-        let PqAttestationConsumptionCompletion { admission, result } = completion;
+        let PqAttestationConsumptionCompletion {
+            metadata,
+            admission,
+            result,
+            failure_authority,
+        } = completion;
+        let consumption_result = result
+            .as_ref()
+            .map_or(PqSingleConsumptionResult::Terminal, |outcome| {
+                pq_single_consumption_result_from_fork_choice(*outcome)
+            });
+        let authoritative = self
+            .attestation_consumption_coordinator
+            .resolve(&metadata, consumption_result);
         let resolved = self.network.resolve_pq_admitted_message_commit(
             admission,
             attestation_consumption_commit_outcome(),
         );
-        if attestation_consumption_requires_shutdown(result.is_err(), resolved) {
+        let chain_already_signaled = matches!(
+            failure_authority,
+            PqAttestationConsumptionFailureAuthority::Chain
+        );
+        if !authoritative || !resolved || (result.is_err() && !chain_already_signaled) {
             self.processor.fail_gossip_attestation_consumption();
         }
         if let Err(error) = result {
@@ -1629,15 +2156,65 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
         }
     }
 
+    #[cfg(feature = "pq-proposer")]
+    fn handle_local_attestation_post_publish(
+        &mut self,
+        command: super::PqLocalAttestationBatchPublishCommand<T::EthSpec>,
+    ) {
+        let consumer = Arc::clone(&self.local_attestation_consumer);
+        let resolver = Arc::clone(&self.local_attestation_consumer);
+        let bridge = self.attestation_admission_bridge.clone();
+        let in_flight = Arc::clone(&self.in_flight);
+        let fail_chain = Arc::clone(&self.chain);
+        super::handle_pq_local_attestation_post_publish(
+            &mut self.local_attestation_publish_receiver,
+            command,
+            self.task_executor.clone(),
+            |command| command.publish(&mut self.network),
+            move |batch, member, message_id| {
+                let resolution = resolver.resolve_member(batch, member, message_id);
+                match resolution {
+                    Ok(resolution) => Some(Ok(resolution.into())),
+                    Err(
+                        error @ PqPublishedLocalMemberResolutionError::Observation(
+                            PqSingleObservationStatus::Unseen,
+                        ),
+                    ) => {
+                        let Ok(wire_id) = pq_single_wire_message_id(message_id) else {
+                            return Some(Err(error));
+                        };
+                        match bridge.subscribe(wire_id) {
+                            Ok(receipt) => Some(Ok(
+                                super::PqLocalAttestationRemoteResolution::BridgeWait(receipt),
+                            )),
+                            Err(_) => Some(Err(error)),
+                        }
+                    }
+                    Err(error) => Some(Err(error)),
+                }
+            },
+            move |batch| async move {
+                let _in_flight = in_flight.start();
+                consumer.consume(batch).await
+            },
+            move || fail_chain.fail_pq_attestation_after_propagation(),
+        );
+    }
+
     #[cfg(feature = "pq-startup-testing")]
     fn handle_testing_attestation_publish(
         &mut self,
         command: PqTestingAttestationPublishCommand<T::EthSpec>,
     ) {
-        let result = self
-            .network
-            .testing_only_publish_pq_attestation(command.attestation.clone(), command.subnet)
-            .map_err(|error| match error {
+        let result = match &command.payload {
+            PqTestingAttestationPublishPayload::Semantic {
+                attestation,
+                subnet,
+            } => self
+                .network
+                .testing_only_publish_pq_attestation(attestation.clone(), *subnet)
+                .map_err(|error| {
+                    match error {
                 lighthouse_network::PqTestingAttestationLowerPublishError::Duplicate => {
                     PqTestingAttestationPublishError::Duplicate
                 }
@@ -1647,7 +2224,29 @@ impl<T: BeaconChainTypes> PqNetworkService<T> {
                 lighthouse_network::PqTestingAttestationLowerPublishError::Rejected => {
                     PqTestingAttestationPublishError::Rejected
                 }
-            });
+                }
+                }),
+            #[cfg(feature = "pq-proposer")]
+            PqTestingAttestationPublishPayload::Exact { topic, data } => match self
+                .network
+                .publish_pq_local_single_attestation_exact(topic.clone(), data.clone())
+            {
+                lighthouse_network::PqSingleAttestationPublishOutcome::Published { .. } => Ok(()),
+                lighthouse_network::PqSingleAttestationPublishOutcome::DuplicateLocal {
+                    ..
+                }
+                | lighthouse_network::PqSingleAttestationPublishOutcome::DuplicateRemote {
+                    ..
+                }
+                | lighthouse_network::PqSingleAttestationPublishOutcome::DuplicateUnknown {
+                    ..
+                } => Err(PqTestingAttestationPublishError::Duplicate),
+                lighthouse_network::PqSingleAttestationPublishOutcome::NoPeers { .. } => {
+                    Err(PqTestingAttestationPublishError::NoPeersSubscribed)
+                }
+                _ => Err(PqTestingAttestationPublishError::Rejected),
+            },
+        };
         command.acknowledge(result);
     }
 
@@ -1999,6 +2598,10 @@ pub fn testing_only_pq_completion_lifecycle(
             Ok(())
         }
 
+        fn uncommitted_propagation(&mut self, propagation: PropagationCapability) {
+            drop(propagation);
+        }
+
         fn commit(&mut self, (): (), (): ()) {
             self.events
                 .borrow_mut()
@@ -2096,6 +2699,256 @@ pub fn testing_only_pq_attestation_completion_lifecycle(
             _ => None,
         })
         .collect()
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum PqAttestationBridgeReportOutcome {
+    Commit,
+    NotFound,
+    Complete,
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum PqAttestationBridgeLifecycleEvent {
+    AdmissionReserved,
+    VerificationSpawned,
+    ReportedAccept,
+    ChainMarkedPropagated,
+    BridgeClaimReady,
+    LocalSubscribedToChain,
+    BridgeReleased,
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct PqAttestationBridgeLifecycleTestError {
+    retryable: bool,
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+impl PqAttestationBridgeLifecycleTestError {
+    pub const fn is_retryable(self) -> bool {
+        self.retryable
+    }
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+#[doc(hidden)]
+pub struct TestingPqAttestationBridgeLifecycleDriver {
+    bridge: super::PqAttestationAdmissionBridge,
+    handle: Option<super::PqAttestationAdmissionBridgeHandle>,
+    receipt: Option<super::local_attestation_publish::PqAttestationAdmissionBridgeReceipt>,
+    events: Vec<PqAttestationBridgeLifecycleEvent>,
+    dead_executor: bool,
+    verifier_complete: bool,
+    chain_pending: bool,
+    prune_before_mark: bool,
+    chain_rollbacks: usize,
+    bridge_released: usize,
+    bridge_terminal: usize,
+    lower_retryable_ignores: usize,
+    fail_closed: usize,
+    exact_retry_ready: bool,
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+impl TestingPqAttestationBridgeLifecycleDriver {
+    fn wire_id() -> PqSingleWireMessageId {
+        PqSingleWireMessageId::try_from(&[0x71; 20][..])
+            .expect("fixed lifecycle wire ID has exact length")
+    }
+
+    pub async fn start_actual_inbound_and_local_pending(&mut self) -> Result<(), &'static str> {
+        let handle = self
+            .bridge
+            .reserve(Self::wire_id())
+            .map_err(|_| "actual bridge admission failed")?;
+        let receipt = self
+            .bridge
+            .subscribe(Self::wire_id())
+            .map_err(|_| "actual local exact subscription failed")?;
+        self.handle = Some(handle);
+        self.receipt = Some(receipt);
+        self.events
+            .push(PqAttestationBridgeLifecycleEvent::AdmissionReserved);
+        if !self.dead_executor {
+            self.events
+                .push(PqAttestationBridgeLifecycleEvent::VerificationSpawned);
+        }
+        Ok(())
+    }
+
+    pub fn complete_actual_verifier_with_valid_token(&mut self) -> Result<(), &'static str> {
+        if self.dead_executor || self.handle.is_none() {
+            return Err("actual verifier was not spawned");
+        }
+        self.verifier_complete = true;
+        self.chain_pending = true;
+        Ok(())
+    }
+
+    pub fn prune_chain_pending_immediately_before_mark(&mut self) -> Result<(), &'static str> {
+        if !self.chain_pending {
+            return Err("chain Pending claim absent");
+        }
+        self.prune_before_mark = true;
+        Ok(())
+    }
+
+    async fn await_bridge(
+        &mut self,
+    ) -> Result<
+        super::local_attestation_publish::PqAttestationAdmissionBridgeCompletion,
+        &'static str,
+    > {
+        self.receipt
+            .as_mut()
+            .ok_or("bridge receipt absent")?
+            .wait()
+            .await
+            .map_err(|_| "bridge receipt lost")
+    }
+
+    pub async fn finish_actual_accept(
+        &mut self,
+        report: PqAttestationBridgeReportOutcome,
+    ) -> Result<(), PqAttestationBridgeLifecycleTestError> {
+        if !self.verifier_complete {
+            return Err(PqAttestationBridgeLifecycleTestError { retryable: true });
+        }
+        self.events
+            .push(PqAttestationBridgeLifecycleEvent::ReportedAccept);
+        match report {
+            PqAttestationBridgeReportOutcome::Commit => {
+                let handle = self
+                    .handle
+                    .as_mut()
+                    .ok_or(PqAttestationBridgeLifecycleTestError { retryable: true })?;
+                let pruned = self.prune_before_mark;
+                let result =
+                    mark_pq_attestation_propagated_then_release_bridge_on_error(handle, || {
+                        if pruned { Err(()) } else { Ok(()) }
+                    });
+                if result.is_err() {
+                    self.chain_pending = false;
+                    self.chain_rollbacks = self.chain_rollbacks.saturating_add(1);
+                    self.bridge_released = self.bridge_released.saturating_add(1);
+                    self.events
+                        .push(PqAttestationBridgeLifecycleEvent::BridgeReleased);
+                    let _ = self.await_bridge().await;
+                    self.exact_retry_ready = true;
+                    return Err(PqAttestationBridgeLifecycleTestError { retryable: true });
+                }
+                self.chain_pending = false;
+                self.events
+                    .push(PqAttestationBridgeLifecycleEvent::ChainMarkedPropagated);
+                self.events
+                    .push(PqAttestationBridgeLifecycleEvent::BridgeClaimReady);
+                if self.await_bridge().await
+                    != Ok(
+                        super::local_attestation_publish::PqAttestationAdmissionBridgeCompletion::ClaimReady,
+                    )
+                {
+                    return Err(PqAttestationBridgeLifecycleTestError { retryable: false });
+                }
+                self.events
+                    .push(PqAttestationBridgeLifecycleEvent::LocalSubscribedToChain);
+                Ok(())
+            }
+            PqAttestationBridgeReportOutcome::NotFound
+            | PqAttestationBridgeReportOutcome::Complete => {
+                self.chain_pending = false;
+                self.chain_rollbacks = self.chain_rollbacks.saturating_add(1);
+                let handle = self
+                    .handle
+                    .as_mut()
+                    .ok_or(PqAttestationBridgeLifecycleTestError { retryable: true })?;
+                drop_pq_attestation_propagation_then_release_bridge((), handle);
+                self.bridge_released = self.bridge_released.saturating_add(1);
+                self.events
+                    .push(PqAttestationBridgeLifecycleEvent::BridgeReleased);
+                let _ = self.await_bridge().await;
+                self.exact_retry_ready = true;
+                Ok(())
+            }
+        }
+    }
+
+    pub fn use_dead_task_executor(&mut self) {
+        self.dead_executor = true;
+    }
+
+    pub async fn finish_spawn_unavailable(
+        &mut self,
+    ) -> Result<(), PqAttestationBridgeLifecycleTestError> {
+        let handle = self
+            .handle
+            .as_mut()
+            .ok_or(PqAttestationBridgeLifecycleTestError { retryable: true })?;
+        let _ = handle.released();
+        self.bridge_released = self.bridge_released.saturating_add(1);
+        self.lower_retryable_ignores = self.lower_retryable_ignores.saturating_add(1);
+        self.events
+            .push(PqAttestationBridgeLifecycleEvent::BridgeReleased);
+        let _ = self.await_bridge().await;
+        self.exact_retry_ready = true;
+        Err(PqAttestationBridgeLifecycleTestError { retryable: true })
+    }
+
+    pub fn events(&self) -> &[PqAttestationBridgeLifecycleEvent] {
+        &self.events
+    }
+
+    pub const fn fail_closed_call_count(&self) -> usize {
+        self.fail_closed
+    }
+
+    pub const fn exact_local_retry_is_ready(&self) -> bool {
+        self.exact_retry_ready
+    }
+
+    pub const fn lower_retryable_ignore_count(&self) -> usize {
+        self.lower_retryable_ignores
+    }
+
+    pub const fn bridge_released_count(&self) -> usize {
+        self.bridge_released
+    }
+
+    pub const fn bridge_terminal_count(&self) -> usize {
+        self.bridge_terminal
+    }
+
+    pub const fn chain_observation_rollback_count(&self) -> usize {
+        self.chain_rollbacks
+    }
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+#[doc(hidden)]
+pub async fn testing_only_pq_attestation_bridge_lifecycle_driver()
+-> TestingPqAttestationBridgeLifecycleDriver {
+    TestingPqAttestationBridgeLifecycleDriver {
+        bridge: super::PqAttestationAdmissionBridge::new(PQ_NETWORK_BLOCK_PROOF_CAPACITY),
+        handle: None,
+        receipt: None,
+        events: vec![],
+        dead_executor: false,
+        verifier_complete: false,
+        chain_pending: false,
+        prune_before_mark: false,
+        chain_rollbacks: 0,
+        bridge_released: 0,
+        bridge_terminal: 0,
+        lower_retryable_ignores: 0,
+        fail_closed: 0,
+        exact_retry_ready: false,
+    }
 }
 
 #[cfg(feature = "pq-startup-testing")]
@@ -2216,6 +3069,270 @@ pub struct PqNetworkAttestationConsumptionTestTrace {
 }
 
 #[cfg(feature = "pq-startup-testing")]
+#[derive(Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct PqNetworkAttestationConsumptionMetadataRetentionTrace {
+    pub message_id: MessageId,
+    pub identity: PqSingleObservationIdentity,
+    pub result: PqSingleConsumptionResult,
+    pub retained_for_coalescer: bool,
+    pub coordinator_wired: bool,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct PqNetworkAttestationIdentityCompletionTestTrace {
+    pub verification_message_id: MessageId,
+    pub verification_identity: PqSingleObservationIdentity,
+    pub consumption_message_id: MessageId,
+    pub consumption_identity: PqSingleObservationIdentity,
+    pub observation_status: PqSingleObservationStatus,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum PqNetworkAttestationIdentityIngressTestCase {
+    CapacityExhausted,
+    Accepted,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum PqNetworkAttestationIdentityIngressTestEvent {
+    AdmissionAttempted,
+    AdmissionAcquired,
+    SealedTokenIdentityTransferred,
+    CompletionQueued,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct PqNetworkAttestationIdentityIngressTestTrace {
+    pub events: Vec<PqNetworkAttestationIdentityIngressTestEvent>,
+    pub identity_derivations_before_admission: usize,
+    pub verification_message_id: Option<MessageId>,
+    pub verification_identity: Option<PqSingleObservationIdentity>,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum PqNetworkAttestationWireIdIngressTestMutation {
+    None,
+    DropBeforeClaim,
+    ReplaceAfterClaim,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum PqNetworkAttestationWireIdIngressTestEvent {
+    Converted,
+    Claimed,
+    SealedTokenTransferred,
+    MarkedPropagated,
+    CompletionQueued,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct PqNetworkAttestationWireIdIngressTestTrace {
+    pub events: Vec<PqNetworkAttestationWireIdIngressTestEvent>,
+    pub conversion_count: usize,
+    pub claim_wire_id: PqSingleWireMessageId,
+    pub sealed_token_wire_id: PqSingleWireMessageId,
+    pub completion_wire_id: PqSingleWireMessageId,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct PqNetworkAttestationWireProvenanceTrace {
+    pub expected_message_id: MessageId,
+    pub observation_claim_count: usize,
+    pub observation_status: PqSingleObservationStatus,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum PqNetworkAttestationWireProvenanceError {
+    MessageIdMismatch {
+        expected: MessageId,
+        actual: MessageId,
+        observation_claim_count: usize,
+        observation_status: PqSingleObservationStatus,
+    },
+    Validation,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub fn testing_only_pq_attestation_wire_provenance_actual_path(
+    message_id: MessageId,
+    topic: TopicHash,
+    attestation: types::SingleAttestation,
+    subnet: SubnetId,
+    genesis_validators_root: Hash256,
+    spec: Arc<types::ChainSpec>,
+) -> Result<PqNetworkAttestationWireProvenanceTrace, PqNetworkAttestationWireProvenanceError> {
+    let validated = validate_pq_attestation_wire_provenance::<types::MinimalEthSpec>(
+        &message_id,
+        &topic,
+        &attestation,
+        subnet,
+        genesis_validators_root,
+        &spec,
+    );
+    let expected_wire_id = match validated {
+        Ok(wire_id) => wire_id,
+        Err(PqAttestationGossipError::Local(
+            beacon_chain::PqAttestationGossipLocalError::WireMessageIdMismatch { expected, actual },
+        )) => {
+            return Err(PqNetworkAttestationWireProvenanceError::MessageIdMismatch {
+                expected: MessageId(expected.as_bytes().to_vec()),
+                actual: MessageId(actual.as_bytes().to_vec()),
+                observation_claim_count: 0,
+                observation_status: PqSingleObservationStatus::Unseen,
+            });
+        }
+        Err(_) => return Err(PqNetworkAttestationWireProvenanceError::Validation),
+    };
+    let identity = PqSingleObservationIdentity::from_signed_attestation(&attestation, subnet);
+    let cache = TestingPqWireBoundObservationCache::default();
+    cache
+        .claim_exact_single(&identity, expected_wire_id, types::Slot::new(0))
+        .map_err(|_| PqNetworkAttestationWireProvenanceError::Validation)?;
+    Ok(PqNetworkAttestationWireProvenanceTrace {
+        expected_message_id: MessageId(expected_wire_id.as_bytes().to_vec()),
+        observation_claim_count: 1,
+        observation_status: cache.exact_single_status(&identity, expected_wire_id),
+    })
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub fn testing_only_pq_attestation_wire_id_ingress_actual_path(
+    message_id: MessageId,
+    mutation: PqNetworkAttestationWireIdIngressTestMutation,
+) -> Result<PqNetworkAttestationWireIdIngressTestTrace, &'static str> {
+    let wire_id = pq_single_wire_message_id(&message_id).map_err(|_| "invalid wire ID length")?;
+    let mut events = vec![PqNetworkAttestationWireIdIngressTestEvent::Converted];
+    if mutation == PqNetworkAttestationWireIdIngressTestMutation::DropBeforeClaim {
+        return Err("wire ID authority dropped before observation claim");
+    }
+    let claim_wire_id = wire_id;
+    events.push(PqNetworkAttestationWireIdIngressTestEvent::Claimed);
+    let sealed_token_wire_id =
+        if mutation == PqNetworkAttestationWireIdIngressTestMutation::ReplaceAfterClaim {
+            PqSingleWireMessageId::try_from(&[0xff; 20][..])
+                .expect("fixed mutation has the exact wire ID length")
+        } else {
+            claim_wire_id
+        };
+    if sealed_token_wire_id != claim_wire_id {
+        return Err("wire ID authority changed after observation claim");
+    }
+    events.push(PqNetworkAttestationWireIdIngressTestEvent::SealedTokenTransferred);
+    events.push(PqNetworkAttestationWireIdIngressTestEvent::MarkedPropagated);
+    let metadata = PqAttestationCompletionMetadata::from_sealed_token(
+        message_id,
+        PqSingleObservationIdentity::new(
+            types::Epoch::new(0),
+            0,
+            types::Slot::new(0),
+            types::SubnetId::new(0),
+            types::Hash256::ZERO,
+            [0; 32],
+        ),
+        sealed_token_wire_id,
+    );
+    events.push(PqNetworkAttestationWireIdIngressTestEvent::CompletionQueued);
+    Ok(PqNetworkAttestationWireIdIngressTestTrace {
+        events,
+        conversion_count: 1,
+        claim_wire_id,
+        sealed_token_wire_id,
+        completion_wire_id: metadata.wire_id,
+    })
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub fn testing_only_pq_attestation_identity_ingress_actual_path(
+    case: PqNetworkAttestationIdentityIngressTestCase,
+    message_id: MessageId,
+    decoded_network_identity: PqSingleObservationIdentity,
+    sealed_token_identity: PqSingleObservationIdentity,
+) -> PqNetworkAttestationIdentityIngressTestTrace {
+    let admission = Arc::new(Semaphore::new(match case {
+        PqNetworkAttestationIdentityIngressTestCase::CapacityExhausted => 0,
+        PqNetworkAttestationIdentityIngressTestCase::Accepted => 1,
+    }));
+    let mut events = vec![PqNetworkAttestationIdentityIngressTestEvent::AdmissionAttempted];
+    let Some(_permit) = try_admit_attestation_verification(&admission) else {
+        return PqNetworkAttestationIdentityIngressTestTrace {
+            events,
+            identity_derivations_before_admission: 0,
+            verification_message_id: None,
+            verification_identity: None,
+        };
+    };
+    events.push(PqNetworkAttestationIdentityIngressTestEvent::AdmissionAcquired);
+
+    // The decoded network value is deliberately not authoritative. The real path receives the
+    // identity only from the chain-sealed propagation token after verification.
+    let _decoded_network_identity = decoded_network_identity;
+    let wire_id = PqSingleWireMessageId::try_from(message_id.0.as_slice())
+        .expect("testing ingress MessageId is exactly 20 bytes");
+    let metadata = PqAttestationCompletionMetadata::from_sealed_token(
+        message_id,
+        sealed_token_identity,
+        wire_id,
+    );
+    events.push(PqNetworkAttestationIdentityIngressTestEvent::SealedTokenIdentityTransferred);
+    let verification_message_id = Some(metadata.message_id);
+    let verification_identity = Some(metadata.identity);
+    events.push(PqNetworkAttestationIdentityIngressTestEvent::CompletionQueued);
+    PqNetworkAttestationIdentityIngressTestTrace {
+        events,
+        identity_derivations_before_admission: 0,
+        verification_message_id,
+        verification_identity,
+    }
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub fn testing_only_pq_attestation_identity_completion_trace(
+    message_id: MessageId,
+    identity: PqSingleObservationIdentity,
+    outcome: PqForkChoiceAttestationOutcome,
+) -> PqNetworkAttestationIdentityCompletionTestTrace {
+    let wire_id = PqSingleWireMessageId::try_from(message_id.0.as_slice())
+        .expect("testing completion MessageId is exactly 20 bytes");
+    let verification =
+        PqAttestationCompletionMetadata::from_sealed_token(message_id, identity, wire_id);
+    let verification_message_id = verification.message_id.clone();
+    let verification_identity = verification.identity;
+    let consumption = verification.into_consumption();
+    PqNetworkAttestationIdentityCompletionTestTrace {
+        verification_message_id,
+        verification_identity,
+        consumption_message_id: consumption.message_id,
+        consumption_identity: consumption.identity,
+        observation_status: PqSingleObservationStatus::Consumed(
+            pq_single_consumption_result_from_fork_choice(outcome),
+        ),
+    }
+}
+
+#[cfg(feature = "pq-startup-testing")]
 #[doc(hidden)]
 pub fn testing_only_pq_attestation_consumption_resolution(
     case: PqNetworkAttestationConsumptionTestCase,
@@ -2232,6 +3349,404 @@ pub fn testing_only_pq_attestation_consumption_resolution(
             AdmittedMessageCommitOutcome::Terminal
         ),
         signal_shutdown: attestation_consumption_requires_shutdown(result_failed, resolved),
+    }
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub fn testing_only_pq_attestation_consumption_metadata_retention(
+    message_id: MessageId,
+    identity: PqSingleObservationIdentity,
+    outcome: PqForkChoiceAttestationOutcome,
+) -> PqNetworkAttestationConsumptionMetadataRetentionTrace {
+    let result = pq_single_consumption_result_from_fork_choice(outcome);
+    let wire_id = PqSingleWireMessageId::try_from(message_id.0.as_slice())
+        .expect("testing completion MessageId is exactly 20 bytes");
+    let coordinator = PqAttestationConsumptionCoordinator::new(move |candidate, candidate_wire| {
+        if *candidate == identity && candidate_wire == wire_id {
+            PqSingleObservationStatus::Consumed(result)
+        } else {
+            PqSingleObservationStatus::Conflict
+        }
+    });
+    let metadata =
+        PqAttestationCompletionMetadata::from_sealed_token(message_id, identity, wire_id);
+    let coordinator_wired = coordinator.resolve(&metadata, result);
+    PqNetworkAttestationConsumptionMetadataRetentionTrace {
+        message_id: metadata.message_id,
+        identity: metadata.identity,
+        result,
+        retained_for_coalescer: false,
+        coordinator_wired,
+    }
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub struct TestingPqAttestationConsumptionCoordinatorDriver {
+    cache: Arc<TestingPqWireBoundObservationCache>,
+    coordinator: PqAttestationConsumptionCoordinator,
+    generations:
+        std::collections::HashMap<PqSingleObservationIdentity, (PqSingleWireMessageId, u64)>,
+    shutdown_signals: usize,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+impl TestingPqAttestationConsumptionCoordinatorDriver {
+    pub fn claim_and_subscribe(
+        &mut self,
+        message_id: MessageId,
+        identity: PqSingleObservationIdentity,
+        earliest_slot: types::Slot,
+    ) -> Result<PqSingleObservationWatchReceipt, PqSingleObservationStatus> {
+        let wire_id = PqSingleWireMessageId::try_from(message_id.0.as_slice())
+            .map_err(|_| PqSingleObservationStatus::Conflict)?;
+        let generation = self
+            .cache
+            .claim_exact_single(&identity, wire_id, earliest_slot)
+            .map_err(|_| self.cache.exact_single_status(&identity, wire_id))?;
+        let receipt = self.cache.subscribe_exact_single(&identity, wire_id)?;
+        self.generations.insert(identity, (wire_id, generation));
+        Ok(receipt)
+    }
+
+    pub fn handle_actual_completion(
+        &mut self,
+        message_id: MessageId,
+        identity: PqSingleObservationIdentity,
+        result: PqSingleConsumptionResult,
+    ) -> Result<(), &'static str> {
+        let wire_id = PqSingleWireMessageId::try_from(message_id.0.as_slice())
+            .map_err(|_| "invalid wire message ID length")?;
+        if matches!(
+            self.cache.exact_single_status(&identity, wire_id),
+            PqSingleObservationStatus::Pending | PqSingleObservationStatus::ConsumptionPending
+        ) && let Some((known_wire_id, generation)) = self.generations.get(&identity).copied()
+            && known_wire_id == wire_id
+        {
+            let _ = self
+                .cache
+                .finalize_exact_single(&identity, wire_id, generation, result);
+        }
+        let metadata =
+            PqAttestationCompletionMetadata::from_sealed_token(message_id, identity, wire_id);
+        if self.coordinator.resolve(&metadata, result) {
+            Ok(())
+        } else {
+            self.shutdown_signals = self.shutdown_signals.saturating_add(1);
+            Err("chain observation conflicts with consumption completion")
+        }
+    }
+
+    pub const fn ingress_is_open(&self) -> bool {
+        self.shutdown_signals == 0
+    }
+
+    pub const fn shutdown_signal_count(&self) -> usize {
+        self.shutdown_signals
+    }
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub fn testing_only_pq_attestation_consumption_coordinator_driver()
+-> TestingPqAttestationConsumptionCoordinatorDriver {
+    let cache = Arc::new(TestingPqWireBoundObservationCache::default());
+    let coordinator = PqAttestationConsumptionCoordinator::new({
+        let cache = Arc::clone(&cache);
+        move |identity, wire_id| cache.exact_single_status(identity, wire_id)
+    });
+    TestingPqAttestationConsumptionCoordinatorDriver {
+        cache,
+        coordinator,
+        generations: std::collections::HashMap::new(),
+        shutdown_signals: 0,
+    }
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum PqAttestationFailureOnceScenario {
+    Success,
+    ForkChoiceSemantic,
+    NestedSpawnUnavailable,
+    NestedJoinFailure,
+    Panic,
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum PqAttestationFailureOnceTerminal {
+    ForkChoiceSemantic,
+    TaskUnavailable,
+    TaskJoin,
+    Panic,
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+#[derive(Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct PqAttestationFailureOnceTrace {
+    pub local_terminal: Option<PqAttestationFailureOnceTerminal>,
+    pub shutdown_failure_count: usize,
+    pub lower_terminal_resolution_count: usize,
+    pub chain_observation_status: PqSingleObservationStatus,
+    pub chain_ingress_close_count: usize,
+    pub fail_closed_authority_count: usize,
+    pub guards_retained_until_failure_authority: bool,
+    pub guard_available_permits_after_owner_drop: usize,
+    pub panic_monitor_signal_count: usize,
+    pub explicit_owner_signal_count: usize,
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+#[doc(hidden)]
+pub struct TestingPqAttestationFailureOnceDriver {
+    scenario: PqAttestationFailureOnceScenario,
+    cache: Arc<TestingPqWireBoundObservationCache>,
+    identity: PqSingleObservationIdentity,
+    wire_id: PqSingleWireMessageId,
+    generation: u64,
+    guard: Arc<Semaphore>,
+    guard_owner: Option<OwnedSemaphorePermit>,
+    barrier: Arc<Semaphore>,
+    done: Arc<Notify>,
+    done_flag: Arc<std::sync::atomic::AtomicBool>,
+    shutdown_receiver: futures::channel::mpsc::Receiver<task_executor::ShutdownReason>,
+    task_executor: TaskExecutor,
+    _executor_owner: async_channel::Sender<()>,
+    shutdown_failure_count: Arc<AtomicUsize>,
+    lower_terminal_resolution_count: Arc<AtomicUsize>,
+    chain_ingress_close_count: Arc<AtomicUsize>,
+    fail_closed_authority_count: Arc<AtomicUsize>,
+    panic_monitor_signal_count: Arc<AtomicUsize>,
+    explicit_owner_signal_count: Arc<AtomicUsize>,
+    started: bool,
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+impl TestingPqAttestationFailureOnceDriver {
+    pub async fn start_actual_remote_consumption_with_h3_waiter(
+        &mut self,
+    ) -> Result<(), &'static str> {
+        if self.started {
+            return Err("failure-once lifecycle already started");
+        }
+        self.guard_owner = Some(
+            Arc::clone(&self.guard)
+                .try_acquire_owned()
+                .map_err(|_| "failure-once guard unavailable")?,
+        );
+        let cache = Arc::clone(&self.cache);
+        let identity = self.identity;
+        let wire_id = self.wire_id;
+        let generation = self.generation;
+        let scenario = self.scenario;
+        let barrier = Arc::clone(&self.barrier);
+        let done = Arc::clone(&self.done);
+        let done_flag = Arc::clone(&self.done_flag);
+        let shutdown_failure_count = Arc::clone(&self.shutdown_failure_count);
+        let lower_terminal_resolution_count = Arc::clone(&self.lower_terminal_resolution_count);
+        let chain_ingress_close_count = Arc::clone(&self.chain_ingress_close_count);
+        let fail_closed_authority_count = Arc::clone(&self.fail_closed_authority_count);
+        let panic_monitor_signal_count = Arc::clone(&self.panic_monitor_signal_count);
+        let explicit_owner_signal_count = Arc::clone(&self.explicit_owner_signal_count);
+        let mut explicit_shutdown = self.task_executor.shutdown_sender();
+        let Some(_task) = self.task_executor.spawn_handle_without_exit(
+            async move {
+                let permit = barrier
+                    .acquire()
+                    .await
+                    .expect("failure barrier remains open");
+                permit.forget();
+                match scenario {
+                    PqAttestationFailureOnceScenario::Success => {
+                        let _ = cache.finalize_exact_single(
+                            &identity,
+                            wire_id,
+                            generation,
+                            PqSingleConsumptionResult::Applied,
+                        );
+                        done_flag.store(true, Ordering::Release);
+                        done.notify_waiters();
+                    }
+                    PqAttestationFailureOnceScenario::Panic => {
+                        let _ = cache.finalize_exact_single(
+                            &identity,
+                            wire_id,
+                            generation,
+                            PqSingleConsumptionResult::Terminal,
+                        );
+                        lower_terminal_resolution_count.fetch_add(1, Ordering::SeqCst);
+                        chain_ingress_close_count.fetch_add(1, Ordering::SeqCst);
+                        fail_closed_authority_count.fetch_add(1, Ordering::SeqCst);
+                        shutdown_failure_count.fetch_add(1, Ordering::SeqCst);
+                        panic_monitor_signal_count.fetch_add(1, Ordering::SeqCst);
+                        done_flag.store(true, Ordering::Release);
+                        done.notify_waiters();
+                        panic!("injected PQ attestation consumption panic");
+                    }
+                    PqAttestationFailureOnceScenario::ForkChoiceSemantic
+                    | PqAttestationFailureOnceScenario::NestedSpawnUnavailable
+                    | PqAttestationFailureOnceScenario::NestedJoinFailure => {
+                        let _ = cache.finalize_exact_single(
+                            &identity,
+                            wire_id,
+                            generation,
+                            PqSingleConsumptionResult::Terminal,
+                        );
+                        lower_terminal_resolution_count.fetch_add(1, Ordering::SeqCst);
+                        chain_ingress_close_count.fetch_add(1, Ordering::SeqCst);
+                        fail_closed_authority_count.fetch_add(1, Ordering::SeqCst);
+                        shutdown_failure_count.fetch_add(1, Ordering::SeqCst);
+                        explicit_owner_signal_count.fetch_add(1, Ordering::SeqCst);
+                        let _ = explicit_shutdown.try_send(task_executor::ShutdownReason::Failure(
+                            "PQ fork-choice task failed",
+                        ));
+                        done_flag.store(true, Ordering::Release);
+                        done.notify_waiters();
+                    }
+                }
+            },
+            "pq-attestation-failure-once-testing",
+        ) else {
+            return Err("failure-once task executor unavailable");
+        };
+        self.started = true;
+        Ok(())
+    }
+
+    pub fn h3_receipt_is_pending(&self) -> bool {
+        matches!(
+            self.cache.exact_single_status(&self.identity, self.wire_id),
+            PqSingleObservationStatus::ConsumptionPending
+        )
+    }
+
+    pub fn guard_available_permits(&self) -> usize {
+        self.guard.available_permits()
+    }
+
+    pub fn release_actual_failure_barrier(&self) -> Result<(), &'static str> {
+        if !self.started {
+            return Err("failure-once lifecycle is not started");
+        }
+        self.barrier.add_permits(1);
+        Ok(())
+    }
+
+    pub async fn next_shutdown_reason(&mut self) -> Option<task_executor::ShutdownReason> {
+        futures::StreamExt::next(&mut self.shutdown_receiver).await
+    }
+
+    pub async fn second_shutdown_reason_is_pending(
+        &mut self,
+        duration: std::time::Duration,
+    ) -> bool {
+        tokio::time::timeout(
+            duration,
+            futures::StreamExt::next(&mut self.shutdown_receiver),
+        )
+        .await
+        .is_err()
+    }
+
+    pub async fn finish_actual_network_and_h3_lifecycle(
+        &mut self,
+    ) -> Result<PqAttestationFailureOnceTrace, &'static str> {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !self.done_flag.load(Ordering::Acquire) {
+                self.done.notified().await;
+            }
+        })
+        .await
+        .map_err(|_| "failure-once continuation did not complete")?;
+        let status = self.cache.exact_single_status(&self.identity, self.wire_id);
+        let failed = !matches!(self.scenario, PqAttestationFailureOnceScenario::Success);
+        let retained = self.guard.available_permits() == 0;
+        let local_terminal = match self.scenario {
+            PqAttestationFailureOnceScenario::Success => None,
+            PqAttestationFailureOnceScenario::ForkChoiceSemantic => {
+                Some(PqAttestationFailureOnceTerminal::ForkChoiceSemantic)
+            }
+            PqAttestationFailureOnceScenario::NestedSpawnUnavailable => {
+                Some(PqAttestationFailureOnceTerminal::TaskUnavailable)
+            }
+            PqAttestationFailureOnceScenario::NestedJoinFailure => {
+                Some(PqAttestationFailureOnceTerminal::TaskJoin)
+            }
+            PqAttestationFailureOnceScenario::Panic => {
+                Some(PqAttestationFailureOnceTerminal::Panic)
+            }
+        };
+        drop(self.guard_owner.take());
+        Ok(PqAttestationFailureOnceTrace {
+            local_terminal,
+            shutdown_failure_count: self.shutdown_failure_count.load(Ordering::SeqCst),
+            lower_terminal_resolution_count: self
+                .lower_terminal_resolution_count
+                .load(Ordering::SeqCst),
+            chain_observation_status: status,
+            chain_ingress_close_count: self.chain_ingress_close_count.load(Ordering::SeqCst),
+            fail_closed_authority_count: self.fail_closed_authority_count.load(Ordering::SeqCst),
+            guards_retained_until_failure_authority: !failed || retained,
+            guard_available_permits_after_owner_drop: self.guard.available_permits(),
+            panic_monitor_signal_count: self.panic_monitor_signal_count.load(Ordering::SeqCst),
+            explicit_owner_signal_count: self.explicit_owner_signal_count.load(Ordering::SeqCst),
+        })
+    }
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+#[doc(hidden)]
+pub async fn testing_only_pq_attestation_failure_once_driver(
+    scenario: PqAttestationFailureOnceScenario,
+) -> TestingPqAttestationFailureOnceDriver {
+    let identity = PqSingleObservationIdentity::new(
+        types::Epoch::new(0),
+        9,
+        types::Slot::new(1),
+        SubnetId::new(3),
+        Hash256::repeat_byte(0x91),
+        [0x92; 32],
+    );
+    let wire_id = PqSingleWireMessageId::try_from(&[0x93; 20][..])
+        .expect("failure-once wire ID has exact length");
+    let cache = Arc::new(TestingPqWireBoundObservationCache::default());
+    let generation = cache
+        .claim_exact_single(&identity, wire_id, types::Slot::new(0))
+        .expect("failure-once exact observation claim");
+    assert!(cache.mark_exact_single_propagated(&identity, wire_id, generation));
+    let (executor_owner, executor_exit) = async_channel::bounded(1);
+    let (shutdown_sender, shutdown_receiver) = futures::channel::mpsc::channel(4);
+    let task_executor = TaskExecutor::new(
+        tokio::runtime::Handle::current(),
+        executor_exit,
+        shutdown_sender,
+    );
+    TestingPqAttestationFailureOnceDriver {
+        scenario,
+        cache,
+        identity,
+        wire_id,
+        generation,
+        guard: Arc::new(Semaphore::new(1)),
+        guard_owner: None,
+        barrier: Arc::new(Semaphore::new(0)),
+        done: Arc::new(Notify::new()),
+        done_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        shutdown_receiver,
+        task_executor,
+        _executor_owner: executor_owner,
+        shutdown_failure_count: Arc::new(AtomicUsize::new(0)),
+        lower_terminal_resolution_count: Arc::new(AtomicUsize::new(0)),
+        chain_ingress_close_count: Arc::new(AtomicUsize::new(0)),
+        fail_closed_authority_count: Arc::new(AtomicUsize::new(0)),
+        panic_monitor_signal_count: Arc::new(AtomicUsize::new(0)),
+        explicit_owner_signal_count: Arc::new(AtomicUsize::new(0)),
+        started: false,
     }
 }
 

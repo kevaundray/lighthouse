@@ -105,6 +105,8 @@ pub use crate::types::{
 pub use prometheus_client;
 
 pub use config::Config as NetworkConfig;
+#[cfg(feature = "pq-proposer")]
+pub use config::pq_anonymous_message_id;
 #[cfg(feature = "pq-devnet")]
 pub use config::{
     PQ_COMPATIBLE_PEER_CAPACITY, PqCompatiblePeerAdmission, PqGossipValidationAdmission,
@@ -126,9 +128,15 @@ pub use peer_manager::{
 #[doc(hidden)]
 pub use service::PqTestingAttestationLowerPublishError;
 pub use service::api_types::Response;
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+#[doc(hidden)]
+pub use service::testing_only_classify_pq_local_single_publication;
 pub use service::utils::*;
 pub use service::{Gossipsub, NetworkEvent};
 #[cfg(feature = "pq-devnet")]
 pub use service::{PqBeaconBlockPublishError, PqBeaconBlockPublishOutcome, PqEncodedBeaconBlock};
 #[cfg(feature = "pq-proposer")]
-pub use service::{PqSingleAttestationPublishOutcome, classify_pq_single_publish_result};
+pub use service::{
+    PqLocalSinglePublicationToken, PqSingleAttestationPublishOutcome,
+    classify_pq_single_publish_result,
+};

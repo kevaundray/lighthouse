@@ -701,8 +701,13 @@ mod avx2 {
         );
         assert_eq!(
             chain.testing_only_pq_attestation_gossip_available_permits(),
-            beacon_chain::PQ_ATTESTATION_GOSSIP_ADMISSION_CAPACITY - 1,
-            "a retained local pre-propagation token must retain proof admission",
+            beacon_chain::PQ_ATTESTATION_GOSSIP_ADMISSION_CAPACITY,
+            "a retained local proof must not consume remote gossip admission",
+        );
+        assert_eq!(
+            chain.testing_only_pq_local_attestation_proof_available_permits(),
+            beacon_chain::PQ_LOCAL_ATTESTATION_PROOF_ADMISSION_CAPACITY - 1,
+            "a retained local pre-propagation token must retain local proof admission",
         );
         let transfer_context = chain
             .pq_local_attestation_context(identities)
@@ -730,6 +735,11 @@ mod avx2 {
             "a retained local pre-propagation token must retain chain activity",
         );
         drop(verified);
+        assert_eq!(
+            chain.testing_only_pq_local_attestation_proof_available_permits(),
+            beacon_chain::PQ_LOCAL_ATTESTATION_PROOF_ADMISSION_CAPACITY,
+            "dropping the retained local proof releases only local proof admission",
+        );
         for _ in 0..64 {
             tokio::task::yield_now().await;
         }
@@ -752,8 +762,100 @@ mod avx2 {
             beacon_chain::PQ_ATTESTATION_GOSSIP_ADMISSION_CAPACITY,
         );
         assert_eq!(
+            chain.testing_only_pq_local_attestation_proof_available_permits(),
+            beacon_chain::PQ_LOCAL_ATTESTATION_PROOF_ADMISSION_CAPACITY,
+        );
+        assert_eq!(
             chain.testing_only_pq_local_attestation_context_available_permits(),
             beacon_chain::PQ_LOCAL_ATTESTATION_CONTEXT_ADMISSION_CAPACITY,
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_and_remote_attestation_proof_admission_are_independently_bounded() {
+        let test_runtime = task_executor::test_utils::TestRuntime::default();
+        let spec = Arc::new(electra_spec());
+        let genesis = state_processing::initialize_beacon_state_from_validators::<MinimalEthSpec>(
+            Hash256::ZERO,
+            0,
+            (1..=16)
+                .map(|byte| state_processing::DirectGenesisValidator {
+                    public_key: PqPublicKey::deserialize(&[byte; 32])
+                        .expect("canonical synthetic public key"),
+                    withdrawal_credentials: Hash256::ZERO,
+                })
+                .collect(),
+            None,
+            &spec,
+        )
+        .expect("direct PQ genesis");
+        let chain = Arc::new(
+            BeaconChainBuilder::<TestWitness>::pq_new(MinimalEthSpec)
+                .store(exact_snapshot_store(Arc::clone(&spec)))
+                .custom_spec(Arc::clone(&spec))
+                .genesis_state(genesis)
+                .expect("persist genesis")
+                .pq_aggregation_service(Arc::new(
+                    AggregationService::new().expect("PQ aggregation service"),
+                ))
+                .task_executor(test_runtime.task_executor.clone())
+                .testing_only_pq_execution_notifier(Arc::new(BlockingForkchoiceTransport::new()))
+                .build()
+                .expect("fresh PQ chain"),
+        );
+
+        let first_local = chain
+            .testing_try_reserve_pq_local_attestation_proof_admission()
+            .expect("first local proof admission");
+        let second_local = chain
+            .testing_try_reserve_pq_local_attestation_proof_admission()
+            .expect("second local proof admission");
+        assert!(
+            chain
+                .testing_try_reserve_pq_local_attestation_proof_admission()
+                .is_err(),
+            "local proof cap+1 must fail",
+        );
+        assert_eq!(
+            chain.testing_only_pq_attestation_gossip_available_permits(),
+            beacon_chain::PQ_ATTESTATION_GOSSIP_ADMISSION_CAPACITY,
+            "retained local proofs must leave the entire inbound gossip domain available",
+        );
+
+        let first_remote = chain
+            .testing_try_reserve_pq_attestation_gossip_admission()
+            .expect("first remote gossip admission");
+        let second_remote = chain
+            .testing_try_reserve_pq_attestation_gossip_admission()
+            .expect("second remote gossip admission");
+        assert!(
+            chain
+                .testing_try_reserve_pq_attestation_gossip_admission()
+                .is_err(),
+            "remote gossip cap+1 must fail",
+        );
+        assert_eq!(
+            chain.testing_only_pq_local_attestation_proof_available_permits(),
+            0,
+            "retained remote proofs must not release or replace local proof ownership",
+        );
+
+        drop(first_local);
+        drop(second_local);
+        assert_eq!(
+            chain.testing_only_pq_local_attestation_proof_available_permits(),
+            beacon_chain::PQ_LOCAL_ATTESTATION_PROOF_ADMISSION_CAPACITY,
+        );
+        assert_eq!(
+            chain.testing_only_pq_attestation_gossip_available_permits(),
+            0,
+            "local proof release must not alter retained remote admission",
+        );
+        drop(first_remote);
+        drop(second_remote);
+        assert_eq!(
+            chain.testing_only_pq_attestation_gossip_available_permits(),
+            beacon_chain::PQ_ATTESTATION_GOSSIP_ADMISSION_CAPACITY,
         );
     }
 

@@ -1,6 +1,8 @@
 #![cfg(feature = "pq-proposer")]
 
-use beacon_chain::PqVerifiedLocalAttestationBatch;
+use beacon_chain::{
+    BeaconChain, PqPublishedLocalAttestationBatchConsumer, PqVerifiedLocalAttestationBatch,
+};
 #[cfg(feature = "pq-startup-testing")]
 use beacon_chain::{
     TestingPqLocalCandidateBatchGuards, testing_only_pq_local_candidate_batch_fixture,
@@ -42,6 +44,25 @@ fn whole_verified_batch_command_is_unique_and_result_bearing() {
 }
 
 #[allow(dead_code)]
+fn post_publish_consumption_is_an_opaque_chain_bound_capability<
+    T: beacon_chain::BeaconChainTypes,
+>(
+    chain: &std::sync::Arc<BeaconChain<T>>,
+) {
+    let _: PqPublishedLocalAttestationBatchConsumer<T> =
+        BeaconChain::<T>::pq_published_local_attestation_batch_consumer(chain);
+}
+
+#[test]
+fn plain_post_publish_chain_consume_endpoint_is_not_public() {
+    let source = include_str!("../../beacon_chain/src/pq_runtime/beacon_chain.rs");
+    assert!(
+        !source.contains("pub async fn consume_pq_published_local_attestation_batch("),
+        "network must own an opaque chain-bound consumer instead of exposing raw batch consumption",
+    );
+}
+
+#[allow(dead_code)]
 fn retry_consumes_only_the_opaque_progress_owner(
     sender: &PqLocalAttestationBatchPublishSender<MinimalEthSpec>,
     progress: network::PqLocalAttestationBatchPublishProgress<MinimalEthSpec>,
@@ -55,6 +76,11 @@ fn retry_consumes_only_the_opaque_progress_owner(
 #[cfg(feature = "pq-startup-testing")]
 mod behavior {
     use super::*;
+    use beacon_chain::PqSingleConsumptionResult;
+    use network::{
+        PqLocalAttestationEvidenceMutation, PqLocalAttestationPreConsumerEvidenceFailure,
+        testing_only_pq_local_attestation_post_publish_service_channel,
+    };
     use types::EthSpec;
 
     #[test]
@@ -626,5 +652,654 @@ mod behavior {
         .expect("shutdown drops retained retry progress and drains");
         assert_eq!(guards.available_permits(), 1);
         drop(receiver);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lower_retry_and_terminal_outcomes_never_start_post_publish_consumption() {
+        let (_exit_owner, exit_receiver) = async_channel::bounded(1);
+        let (shutdown_sender, _shutdown_receiver) = futures::channel::mpsc::channel(1);
+        let task_executor = task_executor::TaskExecutor::new(
+            tokio::runtime::Handle::current(),
+            exit_receiver,
+            shutdown_sender,
+        );
+
+        for lower_outcome in [
+            PqLocalAttestationPublishTestOutcome::NoPeers,
+            PqLocalAttestationPublishTestOutcome::ValidationAdmissionFull,
+            PqLocalAttestationPublishTestOutcome::AllQueuesFull,
+        ] {
+            let (sender, mut service) =
+                testing_only_pq_local_attestation_post_publish_service_channel();
+            let (batch, guards) = empty_verified_batch_with_guards();
+            let receipt = sender.try_publish(batch).expect("whole batch is admitted");
+            assert!(service.start_next_from_actual_publish_cursor(
+                task_executor.clone(),
+                2,
+                &[lower_outcome],
+                &[],
+                std::sync::Arc::new(|| {}),
+            ));
+            assert!(service.finish_next_post_publish().await);
+
+            let retry = receipt
+                .wait()
+                .await
+                .expect("retryable progress returns to the live receipt");
+            assert!(retry.is_retryable());
+            assert_eq!(service.consumer_call_count(), 0);
+            assert_eq!(service.fail_closed_call_count(), 0);
+            assert_eq!(guards.available_permits(), 0);
+            drop(retry);
+            assert_eq!(guards.available_permits(), 1);
+            service.close_and_drain().await;
+        }
+
+        let (sender, mut service) =
+            testing_only_pq_local_attestation_post_publish_service_channel();
+        let (batch, guards) = empty_verified_batch_with_guards();
+        let receipt = sender.try_publish(batch).expect("whole batch is admitted");
+        assert!(service.start_next_from_actual_publish_cursor(
+            task_executor,
+            2,
+            &[PqLocalAttestationPublishTestOutcome::DuplicateUnknown],
+            &[],
+            std::sync::Arc::new(|| {}),
+        ));
+        assert!(service.finish_next_post_publish().await);
+        let terminal = receipt
+            .wait()
+            .await
+            .expect("typed terminal progress returns to the live receipt");
+        assert!(terminal.is_terminal());
+        assert_eq!(service.consumer_call_count(), 0);
+        assert_eq!(service.fail_closed_call_count(), 0);
+        assert_eq!(guards.available_permits(), 0);
+        drop(terminal);
+        assert_eq!(guards.available_permits(), 1);
+        service.close_and_drain().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn all_local_wire_success_waits_for_exact_chain_consumption_before_receipt() {
+        let (exit_owner, exit_receiver) = async_channel::bounded(1);
+        let (shutdown_sender, _shutdown_receiver) = futures::channel::mpsc::channel(1);
+        let task_executor = task_executor::TaskExecutor::new(
+            tokio::runtime::Handle::current(),
+            exit_receiver,
+            shutdown_sender,
+        );
+        let executor_exit_owner = task_executor.clone();
+        let (sender, mut service) =
+            testing_only_pq_local_attestation_post_publish_service_channel();
+        let (batch, guards) = empty_verified_batch_with_guards();
+        let receipt = sender.try_publish(batch).expect("whole batch is admitted");
+        let (entered_sender, entered_receiver) = tokio::sync::oneshot::channel();
+        let entered_sender = std::sync::Mutex::new(Some(entered_sender));
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let release_receiver = std::sync::Mutex::new(release_receiver);
+        assert!(service.start_next_from_actual_publish_cursor(
+            task_executor,
+            2,
+            &[
+                PqLocalAttestationPublishTestOutcome::Published,
+                PqLocalAttestationPublishTestOutcome::DuplicateLocal,
+            ],
+            &[
+                PqSingleConsumptionResult::Applied,
+                PqSingleConsumptionResult::Queued,
+            ],
+            std::sync::Arc::new(move || {
+                if let Some(sender) = entered_sender.lock().expect("entered lock").take() {
+                    let _ = sender.send(());
+                }
+                let _ = release_receiver.lock().expect("release lock").recv();
+            }),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered_receiver)
+            .await
+            .expect("post-publish consumer entered")
+            .expect("consumer reports entry");
+        assert_eq!(service.consumer_call_count(), 1);
+        assert_eq!(guards.available_permits(), 0);
+
+        let mut receipt = Box::pin(receipt.wait());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut receipt)
+                .await
+                .is_err(),
+            "wire publication alone must not complete the batch receipt",
+        );
+        exit_owner
+            .try_send(())
+            .expect("executor exit must not cancel the no-exit consumer");
+        drop(executor_exit_owner);
+        let close = tokio::spawn(async move { service.close_and_drain().await });
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(25),
+                &mut Box::pin(async {
+                    while !close.is_finished() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+            )
+            .await
+            .is_err(),
+            "service close must drain the blocked chain consumer",
+        );
+
+        release_sender.send(()).expect("release chain consumer");
+        tokio::time::timeout(std::time::Duration::from_secs(2), close)
+            .await
+            .expect("service close completes after consumer")
+            .expect("close task joins");
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(2), receipt)
+            .await
+            .expect("live receipt completes after chain consumption")
+            .expect("whole progress owner remains available");
+        assert!(matches!(
+            completed.member_progress(),
+            [
+                network::PqLocalAttestationMemberPublishProgress::Consumed {
+                    message_id,
+                    result: PqSingleConsumptionResult::Applied,
+                    ..
+                },
+                network::PqLocalAttestationMemberPublishProgress::Consumed {
+                    message_id: queued_message_id,
+                    result: PqSingleConsumptionResult::Queued,
+                    ..
+                },
+            ] if *message_id == lighthouse_network::MessageId(vec![0])
+                && *queued_message_id == lighthouse_network::MessageId(vec![1])
+        ));
+        assert_eq!(
+            guards.available_permits(),
+            1,
+            "successful chain consumption drops the sealed proof guards before metadata receipt",
+        );
+        drop(completed);
+        assert_eq!(guards.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_receipt_and_executor_exit_do_not_cancel_post_publish_consumption() {
+        let (exit_owner, exit_receiver) = async_channel::bounded(1);
+        let (shutdown_sender, _shutdown_receiver) = futures::channel::mpsc::channel(1);
+        let task_executor = task_executor::TaskExecutor::new(
+            tokio::runtime::Handle::current(),
+            exit_receiver,
+            shutdown_sender,
+        );
+        let executor_exit_owner = task_executor.clone();
+        let (sender, mut service) =
+            testing_only_pq_local_attestation_post_publish_service_channel();
+        let (batch, guards) = empty_verified_batch_with_guards();
+        let receipt = sender.try_publish(batch).expect("whole batch is admitted");
+        drop(receipt);
+        let (entered_sender, entered_receiver) = tokio::sync::oneshot::channel();
+        let entered_sender = std::sync::Mutex::new(Some(entered_sender));
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let release_receiver = std::sync::Mutex::new(release_receiver);
+        assert!(service.start_next_from_actual_publish_cursor(
+            task_executor,
+            2,
+            &[
+                PqLocalAttestationPublishTestOutcome::Published,
+                PqLocalAttestationPublishTestOutcome::DuplicateLocal,
+            ],
+            &[
+                PqSingleConsumptionResult::Applied,
+                PqSingleConsumptionResult::Queued,
+            ],
+            std::sync::Arc::new(move || {
+                if let Some(sender) = entered_sender.lock().expect("entered lock").take() {
+                    let _ = sender.send(());
+                }
+                let _ = release_receiver.lock().expect("release lock").recv();
+            }),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered_receiver)
+            .await
+            .expect("post-publish consumer entered")
+            .expect("consumer reports entry");
+        assert_eq!(guards.available_permits(), 0);
+        exit_owner.try_send(()).expect("executor exit signal");
+        drop(executor_exit_owner);
+        release_sender.send(()).expect("release chain consumer");
+        assert!(service.finish_next_post_publish().await);
+        assert_eq!(service.consumer_call_count(), 1);
+        assert_eq!(service.completed_owner_count(), 1);
+        assert_eq!(guards.available_permits(), 1);
+        let completed = service
+            .take_completed_for_test()
+            .expect("service retains consumed metadata after receipt abandonment");
+        assert!(matches!(
+            completed.member_progress(),
+            [
+                network::PqLocalAttestationMemberPublishProgress::Consumed {
+                    result: PqSingleConsumptionResult::Applied,
+                    ..
+                },
+                network::PqLocalAttestationMemberPublishProgress::Consumed {
+                    result: PqSingleConsumptionResult::Queued,
+                    ..
+                },
+            ]
+        ));
+        drop(completed);
+        service.close_and_drain().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn post_publish_task_panic_is_typed_and_fails_closed_exactly_once() {
+        let (_exit_owner, exit_receiver) = async_channel::bounded(1);
+        let (shutdown_sender, mut shutdown_receiver) = futures::channel::mpsc::channel(1);
+        let task_executor = task_executor::TaskExecutor::new(
+            tokio::runtime::Handle::current(),
+            exit_receiver,
+            shutdown_sender,
+        );
+        let (sender, mut service) =
+            testing_only_pq_local_attestation_post_publish_service_channel();
+        let (batch, guards) = empty_verified_batch_with_guards();
+        let receipt = sender.try_publish(batch).expect("whole batch is admitted");
+        assert!(service.start_next_from_actual_publish_cursor(
+            task_executor,
+            2,
+            &[
+                PqLocalAttestationPublishTestOutcome::Published,
+                PqLocalAttestationPublishTestOutcome::DuplicateLocal,
+            ],
+            &[
+                PqSingleConsumptionResult::Applied,
+                PqSingleConsumptionResult::Queued,
+            ],
+            std::sync::Arc::new(|| panic!("injected post-publish consumer panic")),
+        ));
+        assert!(service.finish_next_post_publish().await);
+        let terminal = receipt
+            .wait()
+            .await
+            .expect("panic returns typed terminal metadata to the receipt");
+        assert_eq!(
+            terminal.post_publish_failure(),
+            Some(network::PqLocalAttestationPostPublishFailure::TaskPanicked),
+        );
+        assert!(terminal.is_terminal());
+        assert_eq!(service.consumer_call_count(), 1);
+        assert_eq!(service.fail_closed_call_count(), 1);
+        assert_eq!(guards.available_permits(), 1);
+        assert!(matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                futures::StreamExt::next(&mut shutdown_receiver),
+            )
+            .await
+            .expect("panic failure signal is bounded"),
+            Some(task_executor::ShutdownReason::Failure(_)),
+        ));
+        drop(terminal);
+        service.close_and_drain().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn published_prefix_stays_service_owned_across_retry_remote_wait_and_terminal_close() {
+        let (_exit_owner, exit_receiver) = async_channel::bounded(1);
+        let (shutdown_sender, _shutdown_receiver) = futures::channel::mpsc::channel(1);
+        let task_executor = task_executor::TaskExecutor::new(
+            tokio::runtime::Handle::current(),
+            exit_receiver,
+            shutdown_sender,
+        );
+
+        // A retry after one irreversible wire publication remains internal to the service.  The
+        // same encoded member and MessageId are retried, while member zero's non-clone
+        // publication token remains owned by the command.
+        let (sender, mut service) =
+            testing_only_pq_local_attestation_post_publish_service_channel();
+        let (batch, guards) = empty_verified_batch_with_guards();
+        let receipt = sender.try_publish(batch).expect("whole batch is admitted");
+        assert!(service.start_next_from_actual_publish_cursor(
+            task_executor.clone(),
+            2,
+            &[
+                PqLocalAttestationPublishTestOutcome::Published,
+                PqLocalAttestationPublishTestOutcome::NoPeers,
+                PqLocalAttestationPublishTestOutcome::Published,
+            ],
+            &[
+                PqSingleConsumptionResult::Applied,
+                PqSingleConsumptionResult::Queued,
+            ],
+            std::sync::Arc::new(|| {}),
+        ));
+        let mut receipt = Box::pin(receipt.wait());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut receipt)
+                .await
+                .is_err(),
+            "a published prefix plus retryable suffix must not complete the public receipt",
+        );
+        assert_eq!(guards.available_permits(), 0);
+        assert_eq!(service.published_prefix_owner_count(), 1);
+        let before_retry = service
+            .published_prefix_trace()
+            .expect("service retains the published prefix and exact retry request");
+        assert_eq!(before_retry.attempted_members, vec![0, 1]);
+        assert_eq!(
+            before_retry.attempted_message_ids,
+            vec![
+                lighthouse_network::MessageId(vec![0]),
+                lighthouse_network::MessageId(vec![1]),
+            ],
+        );
+        assert_eq!(
+            before_retry.attempted_signed_ssz_digests,
+            vec![
+                <[u8; 32]>::from(Sha256::digest([0])),
+                <[u8; 32]>::from(Sha256::digest([1])),
+            ],
+        );
+        assert_eq!(
+            before_retry.published_token_message_ids,
+            vec![(0, lighthouse_network::MessageId(vec![0]))],
+        );
+        assert!(
+            service.finish_next_post_publish().await,
+            "the production event path automatically retries the retained suffix after backoff",
+        );
+        let after_retry = service
+            .published_prefix_trace()
+            .expect("service retains exact cumulative publication evidence until consumption");
+        assert_eq!(after_retry.attempted_members, vec![0, 1, 1]);
+        assert_eq!(
+            after_retry.attempted_message_ids[1], after_retry.attempted_message_ids[2],
+            "retry must reuse the exact MessageId",
+        );
+        assert_eq!(
+            after_retry.attempted_signed_ssz_digests[1],
+            after_retry.attempted_signed_ssz_digests[2],
+            "retry must reuse the exact encoded bytes",
+        );
+        assert_eq!(
+            after_retry.published_token_message_ids,
+            vec![
+                (0, lighthouse_network::MessageId(vec![0])),
+                (1, lighthouse_network::MessageId(vec![1])),
+            ],
+        );
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(2), receipt)
+            .await
+            .expect("receipt completes only after exact post-wire consumption")
+            .expect("service returns typed consumed metadata");
+        assert!(matches!(
+            completed.member_progress(),
+            [
+                network::PqLocalAttestationMemberPublishProgress::Consumed { .. },
+                network::PqLocalAttestationMemberPublishProgress::Consumed { .. },
+            ],
+        ));
+        assert_eq!(guards.available_permits(), 1);
+        drop(completed);
+        service.close_and_drain().await;
+
+        // A remote-pending suffix is also unresolved service-owned work.  Abandoning the receipt
+        // and closing the service must fail-close the irreversible prefix exactly once before
+        // dropping the guards.
+        let (sender, mut service) =
+            testing_only_pq_local_attestation_post_publish_service_channel();
+        let (batch, guards) = empty_verified_batch_with_guards();
+        let receipt = sender.try_publish(batch).expect("whole batch is admitted");
+        assert!(service.start_next_from_actual_publish_cursor(
+            task_executor.clone(),
+            2,
+            &[
+                PqLocalAttestationPublishTestOutcome::Published,
+                PqLocalAttestationPublishTestOutcome::PendingRemote,
+            ],
+            &[],
+            std::sync::Arc::new(|| {}),
+        ));
+        let mut receipt = Box::pin(receipt.wait());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut receipt)
+                .await
+                .is_err(),
+            "a published prefix plus remote-pending suffix remains unresolved",
+        );
+        assert_eq!(service.published_prefix_owner_count(), 1);
+        let waiting = service
+            .published_prefix_trace()
+            .expect("service owns both the token and remote wait state");
+        assert_eq!(waiting.waiting_remote_members, vec![1]);
+        assert_eq!(
+            waiting.published_token_message_ids,
+            vec![(0, lighthouse_network::MessageId(vec![0]))],
+        );
+        assert_eq!(guards.available_permits(), 0);
+        drop(receipt);
+        service.close_and_drain_in_place().await;
+        assert_eq!(service.fail_closed_call_count(), 1);
+        assert_eq!(guards.available_permits(), 1);
+        drop(service);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn published_prefix_terminal_fails_closed_synchronously_before_receipt() {
+        let (_exit_owner, exit_receiver) = async_channel::bounded(1);
+        let (shutdown_sender, _shutdown_receiver) = futures::channel::mpsc::channel(1);
+        let task_executor = task_executor::TaskExecutor::new(
+            tokio::runtime::Handle::current(),
+            exit_receiver,
+            shutdown_sender,
+        );
+        let (sender, mut service) =
+            testing_only_pq_local_attestation_post_publish_service_channel();
+        let (batch, guards) = empty_verified_batch_with_guards();
+        let receipt = sender.try_publish(batch).expect("whole batch is admitted");
+
+        assert!(service.start_next_from_actual_publish_cursor(
+            task_executor,
+            2,
+            &[
+                PqLocalAttestationPublishTestOutcome::Published,
+                PqLocalAttestationPublishTestOutcome::DuplicateUnknown,
+            ],
+            &[],
+            std::sync::Arc::new(|| {}),
+        ));
+        assert_eq!(
+            service.fail_closed_call_count(),
+            1,
+            "the post-publish handler must fail-close before returning to the outer select",
+        );
+        let terminal = receipt
+            .wait()
+            .await
+            .expect("receipt completes only after synchronous terminal finalization");
+        assert!(terminal.is_terminal());
+        assert!(matches!(
+            terminal.member_progress(),
+            [
+                network::PqLocalAttestationMemberPublishProgress::Published { .. },
+                network::PqLocalAttestationMemberPublishProgress::Terminal { .. },
+            ],
+        ));
+        assert_eq!(guards.available_permits(), 0);
+        drop(terminal);
+        assert_eq!(guards.available_permits(), 1);
+        service.close_and_drain_in_place().await;
+        assert_eq!(service.fail_closed_call_count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn published_prefix_close_invokes_fail_closed_before_releasing_live_or_abandoned_owner() {
+        for abandon_receipt in [false, true] {
+            let (_exit_owner, exit_receiver) = async_channel::bounded(1);
+            let (shutdown_sender, _shutdown_receiver) = futures::channel::mpsc::channel(1);
+            let task_executor = task_executor::TaskExecutor::new(
+                tokio::runtime::Handle::current(),
+                exit_receiver,
+                shutdown_sender,
+            );
+            let (sender, mut service) =
+                testing_only_pq_local_attestation_post_publish_service_channel();
+            let (batch, guards) = empty_verified_batch_with_guards();
+            let receipt = sender.try_publish(batch).expect("whole batch is admitted");
+            assert!(service.start_next_from_actual_publish_cursor(
+                task_executor,
+                2,
+                &[
+                    PqLocalAttestationPublishTestOutcome::Published,
+                    PqLocalAttestationPublishTestOutcome::PendingRemote,
+                ],
+                &[],
+                std::sync::Arc::new(|| {}),
+            ));
+            assert_eq!(guards.available_permits(), 0);
+
+            let callback_calls = std::sync::atomic::AtomicUsize::new(0);
+            if abandon_receipt {
+                drop(receipt);
+                service
+                    .close_and_drain_in_place_with_fail_closed(|| {
+                        assert_eq!(
+                            guards.available_permits(),
+                            0,
+                            "fail-close authority runs before abandoned ownership is dropped",
+                        );
+                        callback_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    })
+                    .await;
+                assert_eq!(callback_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert_eq!(guards.available_permits(), 1);
+            } else {
+                service
+                    .close_and_drain_in_place_with_fail_closed(|| {
+                        assert_eq!(
+                            guards.available_permits(),
+                            0,
+                            "fail-close authority runs before the live receipt is completed",
+                        );
+                        callback_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    })
+                    .await;
+                assert_eq!(callback_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                let terminal = receipt
+                    .wait()
+                    .await
+                    .expect("live receipt receives typed terminal ownership after fail-close");
+                assert_eq!(guards.available_permits(), 0);
+                assert!(terminal.is_terminal());
+                drop(terminal);
+                assert_eq!(guards.available_permits(), 1);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn post_wire_evidence_is_validated_atomically_before_any_consumer_or_owner_release() {
+        for mutation in [
+            PqLocalAttestationEvidenceMutation::RemoveToken { member: 1 },
+            PqLocalAttestationEvidenceMutation::CorruptToken { member: 1 },
+        ] {
+            let (_exit_owner, exit_receiver) = async_channel::bounded(1);
+            let (shutdown_sender, _shutdown_receiver) = futures::channel::mpsc::channel(1);
+            let task_executor = task_executor::TaskExecutor::new(
+                tokio::runtime::Handle::current(),
+                exit_receiver,
+                shutdown_sender,
+            );
+            let (sender, mut service) =
+                testing_only_pq_local_attestation_post_publish_service_channel();
+            let (batch, guards) = empty_verified_batch_with_guards();
+            let guards = std::sync::Arc::new(guards);
+            let receipt = sender.try_publish(batch).expect("whole batch is admitted");
+            let fail_closed_observed_with_guard =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let fail_closed_observed = std::sync::Arc::clone(&fail_closed_observed_with_guard);
+            let guards_during_fail = std::sync::Arc::clone(&guards);
+
+            assert!(service.start_next_from_actual_publish_cursor_with_evidence_mutation(
+                task_executor,
+                2,
+                &[
+                    PqLocalAttestationPublishTestOutcome::Published,
+                    PqLocalAttestationPublishTestOutcome::DuplicateLocal,
+                ],
+                mutation,
+                move || {
+                    assert_eq!(
+                        guards_during_fail.available_permits(),
+                        0,
+                        "fail-close must run while both tokens and the whole guard remain owned",
+                    );
+                    fail_closed_observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                },
+            ));
+            assert!(service.finish_next_post_publish().await);
+            assert_eq!(service.consumer_call_count(), 0);
+            assert_eq!(service.fail_closed_call_count(), 1);
+            assert!(fail_closed_observed_with_guard.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(guards.available_permits(), 0);
+
+            let terminal = receipt
+                .wait()
+                .await
+                .expect("receipt completes only after synchronous fail-close");
+            assert_eq!(
+                terminal.post_publish_failure(),
+                Some(
+                    network::PqLocalAttestationPostPublishFailure::PreConsumerEvidence(
+                        PqLocalAttestationPreConsumerEvidenceFailure::MemberToken { member: 1 },
+                    )
+                ),
+                "evidence preparation failure is typed before the consumer boundary",
+            );
+            assert!(terminal.is_terminal());
+            assert_eq!(guards.available_permits(), 0);
+            drop(terminal);
+            assert_eq!(guards.available_permits(), 1);
+            service.close_and_drain().await;
+        }
+
+        let (_exit_owner, exit_receiver) = async_channel::bounded(1);
+        let (shutdown_sender, _shutdown_receiver) = futures::channel::mpsc::channel(1);
+        let task_executor = task_executor::TaskExecutor::new(
+            tokio::runtime::Handle::current(),
+            exit_receiver,
+            shutdown_sender,
+        );
+        let (sender, mut service) =
+            testing_only_pq_local_attestation_post_publish_service_channel();
+        let (batch, guards) = empty_verified_batch_with_guards();
+        let guards = std::sync::Arc::new(guards);
+        let receipt = sender.try_publish(batch).expect("whole batch is admitted");
+        assert!(
+            service.start_next_from_actual_publish_cursor_with_evidence_mutation(
+                task_executor,
+                2,
+                &[
+                    PqLocalAttestationPublishTestOutcome::Published,
+                    PqLocalAttestationPublishTestOutcome::DuplicateLocal,
+                ],
+                PqLocalAttestationEvidenceMutation::RemoveToken { member: 1 },
+                || {},
+            )
+        );
+        drop(receipt);
+        let callback_calls = std::sync::atomic::AtomicUsize::new(0);
+        let guards_during_fail = std::sync::Arc::clone(&guards);
+        service
+            .close_and_drain_in_place_with_fail_closed(|| {
+                assert_eq!(guards_during_fail.available_permits(), 0);
+                callback_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+            .await;
+        assert_eq!(callback_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(service.consumer_call_count(), 0);
+        assert_eq!(guards.available_permits(), 1);
     }
 }

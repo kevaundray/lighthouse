@@ -22,13 +22,21 @@ pq-devnet = [
     "types/pq-devnet",
     "dep:validator_store",
 ]
-pq-startup-testing = ["pq-devnet", "beacon_chain/pq-startup-testing"]
+pq-proposer = ["pq-devnet", "dep:network", "network/pq-proposer"]
+pq-startup-testing = [
+    "pq-devnet",
+    "beacon_chain/pq-startup-testing",
+    "dep:ethereum_ssz",
+    "network?/pq-startup-testing",
+]
 
 [dependencies]
 beacon_chain = { path = "../../beacon_node/beacon_chain", default-features = false, optional = true }
 consensus_signature = { workspace = true, optional = true }
+ethereum_ssz = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 lighthouse_validator_store = { path = "../lighthouse_validator_store", default-features = false, optional = true }
+network = { path = "../../beacon_node/network", default-features = false, optional = true }
 slot_clock = { workspace = true, optional = true }
 store = { path = "../../beacon_node/store", default-features = false, optional = true }
 task_executor = { workspace = true, optional = true }

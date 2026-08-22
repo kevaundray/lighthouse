@@ -2,9 +2,9 @@
 
 use beacon_node::beacon_chain::{
     BeaconChain, PqLocalAttesterIdentity, PqNewPayloadTransport, PqOperationalEvent,
-    PqOperationalEventRole, PqOperationalEventSink,
+    PqOperationalEventRole, PqOperationalEventSink, PqSingleConsumptionResult,
     builder::{BeaconChainBuilder, Witness},
-    testing_only_running_pq_operational_event_sink,
+    testing_only_pq_local_candidate_batch_fixture, testing_only_running_pq_operational_event_sink,
 };
 use consensus_signature::{AggregationService, PqValidatorRegistryEntry};
 use execution_layer::auth::JwtKey;
@@ -18,10 +18,10 @@ use lighthouse_network::{
 use lighthouse_validator_store::{Config as ValidatorStoreConfig, LighthouseValidatorStore};
 use network::{
     PqLocalAttestationMemberPublishProgress, PqNetworkBlockProcessor, PqNetworkService,
-    pq_block_broadcast_channel,
+    pq_block_broadcast_channel, testing_only_pq_local_attestation_batch_publish_channel,
 };
 use network_utils::enr_ext::EnrExt;
-use pq_attester_service::{PqAttestationCompletion, PqAttesterService};
+use pq_attester_service::{PqAttestationCompletion, PqAttesterPublicationError, PqAttesterService};
 use pq_devnet::{production_config, provision_devnet};
 use rusqlite::{Connection, MAIN_DB, params};
 use serde_json::Value;
@@ -44,7 +44,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use store::{HotColdDB, MemoryStore, StoreConfig};
 use tempfile::TempDir;
 use types::{
-    BeaconBlock, BeaconState, ChainSpec, EthSpec, ExecutionBlockHash, ExecutionPayloadRef,
+    BeaconBlock, BeaconState, ChainSpec, Epoch, EthSpec, ExecutionBlockHash, ExecutionPayloadRef,
     ForkContext, ForkName, Hash256, MinimalEthSpec, SignedBeaconBlock, Slot, SubnetId, Uint256,
 };
 use validator_dir::{PqDevnetBundle, PqDevnetManifest};
@@ -64,6 +64,7 @@ const PROCESS_START_TIMEOUT: Duration = Duration::from_secs(900);
 const STATUS_EVENT_TIMEOUT: Duration = Duration::from_secs(240);
 const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 const PQ_SLOT_SECONDS: u64 = 300;
+const DIRECT_ATTESTER_MIN_SLOT_ONE_BUDGET: Duration = Duration::from_secs(120);
 const THREE_SLOT_TARGET: u64 = 3;
 const PROPOSAL_COMPLETION_SECONDS: u64 = 285;
 const RESTART_STOP_MARGIN_SECONDS: u64 = 5;
@@ -118,6 +119,32 @@ fn direct_attester_store(
     config.hierarchy_config.exponents = vec![0];
     config.block_cache_size = 0;
     Arc::new(HotColdDB::open_ephemeral(config, spec).expect("snapshot-every-slot store"))
+}
+
+fn direct_attester_network_context(
+    chain: &Arc<BeaconChain<DirectAttesterWitness>>,
+    network_dir: &Path,
+) -> Context<'static> {
+    let head = chain.head_snapshot();
+    let genesis_validators_root = head.beacon_state.genesis_validators_root();
+    let mut network_config = NetworkConfig::default();
+    network_config.set_ipv4_listening_address(Ipv4Addr::LOCALHOST, 0, 0, 0);
+    network_config.enr_address = (Some(Ipv4Addr::LOCALHOST), None);
+    network_config.disable_discovery = true;
+    network_config.network_dir = network_dir.to_path_buf();
+    Context {
+        config: Arc::new(network_config),
+        enr_fork_id: chain
+            .spec
+            .enr_fork_id::<MinimalEthSpec>(head.beacon_block.slot(), genesis_validators_root),
+        fork_context: Arc::new(ForkContext::new::<MinimalEthSpec>(
+            head.beacon_block.slot(),
+            genesis_validators_root,
+            &chain.spec,
+        )),
+        chain_spec: Arc::clone(&chain.spec),
+        libp2p_registry: None,
+    }
 }
 
 fn clone_validated_attester_template() -> (TempDir, PqNetworkIdentity) {
@@ -189,12 +216,29 @@ impl<T> Deref for RootLastOwner<T> {
 struct AuthenticDirectAttesterOwners {
     _executor_exit_sender: async_channel::Sender<()>,
     chain: Arc<BeaconChain<DirectAttesterWitness>>,
+    receiver_chain: Arc<BeaconChain<DirectAttesterWitness>>,
     service: Arc<PqAttesterService<DirectAttesterWitness>>,
     prechecks: Arc<std::sync::atomic::AtomicUsize>,
     expected: Vec<ExpectedDirectAttestation>,
+    chain_failure_receiver: futures::channel::mpsc::Receiver<task_executor::ShutdownReason>,
 }
 
 type AuthenticDirectAttesterFixture = RootLastOwner<AuthenticDirectAttesterOwners>;
+
+fn empty_verified_batch_for_publication_capacity()
+-> beacon_node::beacon_chain::PqVerifiedLocalAttestationBatch<MinimalEthSpec> {
+    let (candidates, signed, spec) = testing_only_pq_local_candidate_batch_fixture(0);
+    let returned = candidates
+        .candidates()
+        .iter()
+        .map(|candidate| candidate.validator_index())
+        .zip(signed)
+        .collect();
+    candidates
+        .seal_exact_ordered(returned, &spec)
+        .expect("empty publication-capacity batch seals exactly")
+        .testing_only_into_empty_verified_batch()
+}
 
 struct RootPresenceOnOwnerDrop {
     root: PathBuf,
@@ -265,7 +309,7 @@ async fn authentic_system_slot_one_attester_fixture() -> AuthenticDirectAttester
         started.elapsed()
     );
     let (executor_exit_sender, executor_exit) = async_channel::bounded(1);
-    let (shutdown_sender, _shutdown_receiver) = futures::channel::mpsc::channel(2);
+    let (shutdown_sender, chain_failure_receiver) = futures::channel::mpsc::channel(2);
     let task_executor = task_executor::TaskExecutor::new(
         tokio::runtime::Handle::current(),
         executor_exit,
@@ -346,11 +390,23 @@ async fn authentic_system_slot_one_attester_fixture() -> AuthenticDirectAttester
             .custom_spec(Arc::clone(&spec))
             .genesis_state(genesis.clone())
             .expect("persist exact 16-validator genesis")
-            .pq_aggregation_service(aggregation_service)
+            .pq_aggregation_service(Arc::clone(&aggregation_service))
             .task_executor(task_executor.clone())
             .testing_only_pq_execution_notifier(Arc::new(DirectAttesterExecution))
             .build()
             .expect("SystemTime direct-attester chain"),
+    );
+    let receiver_chain = Arc::new(
+        BeaconChainBuilder::<DirectAttesterWitness>::pq_new(MinimalEthSpec)
+            .store(direct_attester_store(Arc::clone(&spec)))
+            .custom_spec(Arc::clone(&spec))
+            .genesis_state(genesis.clone())
+            .expect("persist the receiver's independent exact genesis")
+            .pq_aggregation_service(aggregation_service)
+            .task_executor(task_executor.clone())
+            .testing_only_pq_execution_notifier(Arc::new(DirectAttesterExecution))
+            .build()
+            .expect("independent receiver SystemTime chain"),
     );
 
     let genesis_root = chain.head_snapshot().beacon_block_root;
@@ -431,11 +487,15 @@ async fn authentic_system_slot_one_attester_fixture() -> AuthenticDirectAttester
     let signed: Arc<SignedBeaconBlock<MinimalEthSpec>> = Arc::clone(signed.signed_block());
     let block_root = signed.canonical_root();
     wait_for_direct_attester_slot_one(&clock).await;
-    PqNetworkBlockProcessor::new(Arc::clone(&chain))
-        .import_rpc_block(signed)
-        .await
-        .expect("execution-VALID slot-one import");
+    let sender_processor = PqNetworkBlockProcessor::new(Arc::clone(&chain));
+    let receiver_processor = PqNetworkBlockProcessor::new(Arc::clone(&receiver_chain));
+    let sender_import = sender_processor.import_rpc_block(Arc::clone(&signed));
+    let receiver_import = receiver_processor.import_rpc_block(signed);
+    let (sender_import, receiver_import) = tokio::join!(sender_import, receiver_import);
+    sender_import.expect("execution-VALID slot-one import");
+    receiver_import.expect("independent receiver execution-VALID slot-one import");
     assert!(chain.testing_only_pq_execution_reconciled(block_root));
+    assert!(receiver_chain.testing_only_pq_execution_reconciled(block_root));
     eprintln!(
         "PQ direct attester: slot one imported after {:?}",
         started.elapsed()
@@ -481,23 +541,58 @@ async fn authentic_system_slot_one_attester_fixture() -> AuthenticDirectAttester
         owner: AuthenticDirectAttesterOwners {
             _executor_exit_sender: executor_exit_sender,
             chain,
+            receiver_chain,
             service,
             prechecks,
             expected,
+            chain_failure_receiver,
         },
     }
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn direct_pq_attester_service_authentically_signs_and_proves_slot_once() {
+async fn direct_pq_attester_service_converges_two_independent_workers_exactly_once() {
     let started = Instant::now();
-    let fixture = authentic_system_slot_one_attester_fixture().await;
+    let mut fixture = authentic_system_slot_one_attester_fixture().await;
+    assert!(
+        !Arc::ptr_eq(&fixture.chain, &fixture.receiver_chain),
+        "sender and receiver must own independent BeaconChain instances",
+    );
+    assert!(
+        !Arc::ptr_eq(&fixture.chain.store, &fixture.receiver_chain.store),
+        "sender and receiver must own independent stores",
+    );
+    assert!(
+        Arc::ptr_eq(
+            &fixture.chain.pq_aggregation_service,
+            &fixture.receiver_chain.pq_aggregation_service,
+        ),
+        "independent chains intentionally share the one process-wide aggregation service",
+    );
+    assert_eq!(
+        fixture.chain.head_snapshot().beacon_block_root,
+        fixture.receiver_chain.head_snapshot().beacon_block_root,
+        "both independent workers must import the identical slot-one head",
+    );
     assert_eq!(
         fixture
             .chain
             .testing_only_pq_attestation_gossip_observation_count(),
         0,
     );
+    assert_eq!(
+        fixture.chain.slot_clock.now(),
+        Some(Slot::new(1)),
+        "the authentic attester must start during the imported slot-one head",
+    );
+    let remaining = fixture
+        .chain
+        .slot_clock
+        .duration_to_next_slot()
+        .expect("slot-one remaining time is available");
+    let _checked_proof_budget = remaining
+        .checked_sub(DIRECT_ATTESTER_MIN_SLOT_ONE_BUDGET)
+        .expect("enough slot-one budget remains for both authentic proof paths");
     let first = fixture
         .service
         .try_attest_current_slot()
@@ -566,27 +661,24 @@ async fn direct_pq_attester_service_authentically_signs_and_proves_slot_once() {
         "local proof must not enter remote gossip observations",
     );
 
-    let verified_batch = fixture
+    let expected_wire = fixture
         .service
-        .testing_only_take_owned_verified_batch()
-        .expect("take the exact authentic batch once for the network tracer");
-    assert_eq!(verified_batch.len(), fixture.expected.len());
-    assert_eq!(fixture.service.testing_only_owned_verified_count(), None);
-    let expected_encoded = verified_batch
-        .verified()
+        .testing_only_completed_verified_wire_trace()
+        .expect("read-only exact wire trace does not take the retained batch");
+    assert_eq!(expected_wire.len(), fixture.expected.len());
+    let expected_encoded = expected_wire
         .iter()
-        .map(|verified| {
-            let signed_ssz = verified.single().as_ssz_bytes();
+        .map(|(signed_ssz, signed_ssz_digest, subnet, slot)| {
             assert_eq!(
-                <[u8; 32]>::from(Sha256::digest(&signed_ssz)),
-                verified.signed_ssz_digest(),
+                <[u8; 32]>::from(Sha256::digest(signed_ssz)),
+                *signed_ssz_digest,
                 "the independently encoded signed single binds the verified token digest",
             );
             let fork_digest = fixture
                 .chain
                 .spec
                 .enr_fork_id::<MinimalEthSpec>(
-                    verified.slot(),
+                    *slot,
                     fixture
                         .chain
                         .head_snapshot()
@@ -595,7 +687,7 @@ async fn direct_pq_attester_service_authentically_signs_and_proves_slot_once() {
                 )
                 .fork_digest;
             let topic = IdentTopic::from(GossipTopic::new(
-                GossipKind::Attestation(verified.subnet()),
+                GossipKind::Attestation(*subnet),
                 GossipEncoding::default(),
                 fork_digest,
             ));
@@ -610,7 +702,7 @@ async fn direct_pq_attester_service_authentically_signs_and_proves_slot_once() {
             message_id_preimage.extend_from_slice(&fixture.chain.spec.message_domain_valid_snappy);
             message_id_preimage.extend_from_slice(&topic_bytes.len().to_le_bytes());
             message_id_preimage.extend_from_slice(topic_bytes);
-            message_id_preimage.extend_from_slice(&signed_ssz);
+            message_id_preimage.extend_from_slice(signed_ssz);
             let message_id_digest = Sha256::digest(message_id_preimage);
             (
                 topic_hash.to_string(),
@@ -618,60 +710,248 @@ async fn direct_pq_attester_service_authentically_signs_and_proves_slot_once() {
             )
         })
         .collect::<Vec<_>>();
-    let network_dir = tempfile::tempdir().expect("private no-peer network directory");
-    let head = fixture.chain.head_snapshot();
-    let genesis_validators_root = head.beacon_state.genesis_validators_root();
-    let mut network_config = NetworkConfig::default();
-    network_config.set_ipv4_listening_address(Ipv4Addr::LOCALHOST, 0, 0, 0);
-    network_config.enr_address = (Some(Ipv4Addr::LOCALHOST), None);
-    network_config.disable_discovery = true;
-    network_config.network_dir = network_dir.path().to_path_buf();
-    let network_context = Context {
-        config: Arc::new(network_config),
-        enr_fork_id: fixture
-            .chain
-            .spec
-            .enr_fork_id::<MinimalEthSpec>(head.beacon_block.slot(), genesis_validators_root),
-        fork_context: Arc::new(ForkContext::new::<MinimalEthSpec>(
-            head.beacon_block.slot(),
-            genesis_validators_root,
-            &fixture.chain.spec,
-        )),
-        chain_spec: Arc::clone(&fixture.chain.spec),
-        libp2p_registry: None,
-    };
-    let (network_exit_owner, network_exit) = async_channel::bounded(1);
-    let (network_failure_sender, _network_failure_receiver) = futures::channel::mpsc::channel(2);
-    let network_executor = task_executor::TaskExecutor::new(
+    let sender_network_dir = tempfile::tempdir().expect("private sender network directory");
+    let peer_network_dir = tempfile::tempdir().expect("private peer network directory");
+    let (sender_network_exit_owner, sender_network_exit) = async_channel::bounded(1);
+    let (sender_network_failure, mut sender_network_failures) = futures::channel::mpsc::channel(2);
+    let sender_network_executor = task_executor::TaskExecutor::new(
         tokio::runtime::Handle::current(),
-        network_exit,
-        network_failure_sender,
+        sender_network_exit,
+        sender_network_failure,
     );
-    let (_block_broadcast_sender, block_broadcast_receiver) = pq_block_broadcast_channel();
-    let operational_events = testing_only_running_pq_operational_event_sink(&network_executor);
-    let network_service = PqNetworkService::new(
-        network_executor,
-        network_context,
+    let (peer_network_exit_owner, peer_network_exit) = async_channel::bounded(1);
+    let (peer_network_failure, mut peer_network_failures) = futures::channel::mpsc::channel(2);
+    let peer_network_executor = task_executor::TaskExecutor::new(
+        tokio::runtime::Handle::current(),
+        peer_network_exit,
+        peer_network_failure,
+    );
+    let (_sender_block_sender, sender_block_receiver) = pq_block_broadcast_channel();
+    let (_peer_block_sender, peer_block_receiver) = pq_block_broadcast_channel();
+    let sender_operational_events =
+        testing_only_running_pq_operational_event_sink(&sender_network_executor);
+    let peer_operational_events =
+        testing_only_running_pq_operational_event_sink(&peer_network_executor);
+    let mut sender_network_service = PqNetworkService::new(
+        sender_network_executor,
+        direct_attester_network_context(&fixture.chain, sender_network_dir.path()),
         fixture.chain.spec.custody_requirement,
         secp256k1::Keypair::generate().into(),
         Arc::clone(&fixture.chain),
-        block_broadcast_receiver,
-        Arc::clone(&operational_events),
+        sender_block_receiver,
+        Arc::clone(&sender_operational_events),
     )
     .await
-    .expect("actual no-peer PQ network service");
-    let publisher = network_service.local_attestation_batch_publish_sender();
-    let network_shutdown = network_service
+    .expect("actual sender PQ network service");
+    let publisher = sender_network_service.local_attestation_batch_publish_sender();
+    let sender_globals = sender_network_service.network_globals();
+    let sender_dial = sender_network_service.testing_only_dial_sender();
+    let sender_admission = sender_network_service.testing_only_gossip_admission();
+    let mut inbound_barrier = sender_network_service
+        .testing_only_hold_next_attestation_verification()
+        .expect("one exact sender inbound verification barrier");
+    let sender_shutdown = sender_network_service
         .start_with_shutdown_receipt()
         .await
-        .expect("actual network worker live");
-    let publish_receipt = publisher
-        .try_publish(verified_batch)
-        .expect("whole authentic verified batch admitted");
-    let progress = tokio::time::timeout(Duration::from_secs(10), publish_receipt.wait())
+        .expect("actual sender network worker live");
+
+    let peer_network_service = PqNetworkService::new(
+        peer_network_executor,
+        direct_attester_network_context(&fixture.receiver_chain, peer_network_dir.path()),
+        fixture.receiver_chain.spec.custody_requirement,
+        secp256k1::Keypair::generate().into(),
+        Arc::clone(&fixture.receiver_chain),
+        peer_block_receiver,
+        Arc::clone(&peer_operational_events),
+    )
+    .await
+    .expect("actual independent peer PQ network service");
+    let peer_globals = peer_network_service.network_globals();
+    let peer_admission = peer_network_service.testing_only_gossip_admission();
+    let peer_attestation_sender = peer_network_service.testing_only_attestation_publish_sender();
+    let peer_shutdown = peer_network_service
+        .start_with_shutdown_receipt()
         .await
-        .expect("bounded actual no-peer publication")
-        .expect("network returns the exact authentic batch owner");
+        .expect("actual independent peer worker live");
+
+    let peer_address = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(address) = peer_globals
+                .local_enr()
+                .multiaddr_p2p_tcp()
+                .into_iter()
+                .next()
+            {
+                break address;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("independent peer listening ENR");
+    sender_dial
+        .try_send(peer_address)
+        .expect("bounded exact peer dial");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while sender_globals.connected_peers() != 1 || peer_globals.connected_peers() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("independent PQ workers connect");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !sender_admission.has_compatible_peers() || !peer_admission.has_compatible_peers() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("independent workers exchange compatible Status");
+
+    let external_member_one_topic = GossipTopic::new(
+        GossipKind::Attestation(expected_wire[1].2),
+        GossipEncoding::default(),
+        fixture
+            .chain
+            .spec
+            .enr_fork_id::<MinimalEthSpec>(
+                expected_wire[1].3,
+                fixture
+                    .chain
+                    .head_snapshot()
+                    .beacon_state
+                    .genesis_validators_root(),
+            )
+            .fork_digest,
+    );
+    assert_eq!(
+        IdentTopic::from(external_member_one_topic.clone())
+            .hash()
+            .to_string(),
+        expected_encoded[1].0,
+        "the external source uses the exact independently derived member-one topic",
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let acknowledgement = peer_attestation_sender
+                .try_send_exact(
+                    external_member_one_topic.clone(),
+                    expected_wire[1].0.clone(),
+                )
+                .expect("bounded exact external member-one wire publication");
+            match acknowledgement.wait().await {
+                Ok(()) => break,
+                Err(network::PqTestingAttestationPublishError::NoPeersSubscribed) => {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("external member-one publication failed: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("independent peer injects exact member one");
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        inbound_barrier.wait_until_blocked(),
+    )
+    .await
+    .expect("sender receives member one before its chain claim")
+    .expect("sender verification barrier remains live");
+    assert_eq!(
+        sender_admission.testing_only_active_total(),
+        1,
+        "one exact remote member remains pending before local publication",
+    );
+    let (full_sender, _full_receiver) = testing_only_pq_local_attestation_batch_publish_channel();
+    let _full_receipt = full_sender
+        .try_publish(empty_verified_batch_for_publication_capacity())
+        .expect("fill the exact bounded publication channel");
+    assert!(matches!(
+        fixture
+            .service
+            .try_publish_owned_verified_batch(&full_sender),
+        Err(PqAttesterPublicationError::Capacity)
+    ));
+    assert_eq!(
+        fixture.service.testing_only_owned_verified_count(),
+        Some(fixture.expected.len()),
+        "capacity rejection restores the exact service-owned batch",
+    );
+
+    let (closed_sender, closed_receiver) =
+        testing_only_pq_local_attestation_batch_publish_channel();
+    drop(closed_receiver);
+    assert!(matches!(
+        fixture
+            .service
+            .try_publish_owned_verified_batch(&closed_sender),
+        Err(PqAttesterPublicationError::Closed)
+    ));
+    assert_eq!(
+        fixture.service.testing_only_owned_verified_count(),
+        Some(fixture.expected.len()),
+        "closed rejection restores the exact service-owned batch",
+    );
+
+    let publish_receipt = fixture
+        .service
+        .try_publish_owned_verified_batch(&publisher)
+        .expect("sealed authentic batch handoff is admitted once");
+    tokio::time::timeout(Duration::from_secs(300), async {
+        loop {
+            if fixture
+                .receiver_chain
+                .testing_only_pq_fork_choice_attestation_calls()
+                == 1
+                && fixture
+                    .receiver_chain
+                    .testing_only_pq_fork_choice_queued_attestation_count()
+                    == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the independent peer consumes exact member zero before sender release");
+    assert_eq!(
+        fixture
+            .receiver_chain
+            .testing_only_pq_fork_choice_latest_message(fixture.expected[0].validator_index),
+        None,
+        "current-slot peer consumption is queued, not prematurely a latest message",
+    );
+    assert_eq!(
+        publish_receipt
+            .testing_only_shared_member_progress_trace()
+            .expect("the live receipt retains a read-only shared progress trace"),
+        vec![
+            PqLocalAttestationMemberPublishProgress::Published {
+                message_id: expected_encoded[0].1.clone(),
+                duplicate: false,
+            },
+            PqLocalAttestationMemberPublishProgress::WaitingRemote {
+                message_id: expected_encoded[1].1.clone(),
+                retained: false,
+            },
+        ],
+        "PendingValidation is pending-not-yet-retained provenance until the bridge-backed chain claim resolves",
+    );
+    let mut publication = Box::pin(publish_receipt.wait());
+    tokio::select! {
+        _ = &mut publication => panic!("publication completed before remote resolution"),
+        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+    }
+    assert_eq!(
+        fixture.service.testing_only_owned_verified_count(),
+        None,
+        "the pending production receipt, not the service, owns the exact batch",
+    );
+    inbound_barrier.release();
+    let progress = tokio::time::timeout(Duration::from_secs(300), publication)
+        .await
+        .expect("bounded two-worker publication and coalescence")
+        .expect("network returns the exact consumed publication progress");
     assert_eq!(progress.verified_count(), fixture.expected.len());
     let encoding_trace = progress.testing_only_encoding_trace();
     assert_eq!(encoding_trace.encoded_member_count, expected_encoded.len());
@@ -683,33 +963,106 @@ async fn direct_pq_attester_service_authentically_signs_and_proves_slot_once() {
         encoding_trace.attempted_member0_message_id.as_ref(),
         Some(&expected_encoded[0].1),
     );
-    assert!(progress.is_retryable());
-    assert!(matches!(
+    assert!(!progress.is_retryable());
+    assert_eq!(
         progress.member_progress(),
-        [PqLocalAttestationMemberPublishProgress::Retryable { message_id },
-         PqLocalAttestationMemberPublishProgress::Verified]
-            if !message_id.0.is_empty(),
-    ));
+        [
+            PqLocalAttestationMemberPublishProgress::Consumed {
+                message_id: expected_encoded[0].1.clone(),
+                duplicate: false,
+                result: PqSingleConsumptionResult::Queued,
+            },
+            PqLocalAttestationMemberPublishProgress::Consumed {
+                message_id: expected_encoded[1].1.clone(),
+                duplicate: true,
+                result: PqSingleConsumptionResult::Queued,
+            },
+        ],
+        "both exact wire identities retain source provenance and current-slot queued outcomes",
+    );
+    assert_eq!(
+        fixture
+            .chain
+            .testing_only_pq_fork_choice_attestation_calls(),
+        fixture.expected.len(),
+        "the sender applies each exact identity once across local and remote sources",
+    );
+    tokio::time::timeout(Duration::from_secs(300), async {
+        while fixture
+            .receiver_chain
+            .testing_only_pq_fork_choice_attestation_calls()
+            != 1
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("independent peer consumes only sender-published member zero once");
     assert_eq!(
         fixture
             .chain
             .testing_only_pq_attestation_gossip_observation_count(),
-        0,
-        "local network publication must not enter remote gossip observations",
+        fixture.expected.len(),
+        "source-neutral exact-once history retains both local and remote consumed members",
+    );
+    for expected in &fixture.expected {
+        assert_eq!(
+            fixture.chain.testing_only_pq_single_consumption_result(
+                Epoch::new(0),
+                expected.validator_index,
+            ),
+            Some(PqSingleConsumptionResult::Queued),
+            "each exact local-or-remote member remains queued in source-neutral history",
+        );
+    }
+    assert_eq!(
+        fixture
+            .chain
+            .testing_only_pq_local_attestation_batch_verification_count(),
+        1,
+        "publication/coalescence must not repeat the whole-batch local proof",
+    );
+    assert_eq!(
+        fixture.prechecks.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "publication/coalescence must not repeat SQLite precheck or signing",
     );
     drop(progress);
-    network_shutdown
+    for (owner, receiver) in [
+        (
+            "chain task executor",
+            &mut fixture.owner.chain_failure_receiver,
+        ),
+        ("sender network task executor", &mut sender_network_failures),
+        ("peer network task executor", &mut peer_network_failures),
+    ] {
+        match receiver.try_next() {
+            Err(_) => {}
+            Ok(Some(reason)) => panic!("{owner} signalled before explicit stop/drain: {reason:?}"),
+            Ok(None) => {
+                panic!("{owner} failure channel closed before explicit stop/drain")
+            }
+        }
+    }
+    sender_shutdown
         .wait()
         .await
-        .expect("no-peer network service drains cleanly");
-    drop(operational_events);
-    drop(network_exit_owner);
+        .expect("sender network service drains cleanly");
+    peer_shutdown
+        .wait()
+        .await
+        .expect("independent peer network service drains cleanly");
+    drop(sender_operational_events);
+    drop(peer_operational_events);
+    drop(sender_network_exit_owner);
+    drop(peer_network_exit_owner);
     fixture
         .service
         .close_and_drain()
         .await
         .expect("drop service-owned real token batch");
     fixture.chain.close_and_drain_pq_imports().await;
+    fixture.receiver_chain.close_and_drain_pq_imports().await;
     assert!(matches!(
         fixture.service.try_attest_current_slot(),
         Err(pq_attester_service::PqAttesterServiceError::Closed)

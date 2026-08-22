@@ -18,13 +18,30 @@ pub use broadcast::{
     PqBlockBroadcastError, PqBlockBroadcastReceiver, PqBlockBroadcastSender,
     pq_block_broadcast_channel,
 };
+#[cfg(feature = "pq-proposer")]
+pub(crate) use local_attestation_publish::{
+    PqAttestationAdmissionBridge, PqAttestationAdmissionBridgeError,
+    PqAttestationAdmissionBridgeHandle, PqLocalAttestationBatchPublishCommand,
+    PqLocalAttestationBatchPublishEvent, PqLocalAttestationBatchPublishReceiver,
+    PqLocalAttestationRemoteResolution, complete_pq_local_attestation_post_publish,
+    complete_pq_local_attestation_remote_resolution, handle_pq_local_attestation_post_publish,
+    pq_local_attestation_batch_publish_channel,
+};
 #[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
 pub use local_attestation_publish::{
+    PqAttestationAdmissionBridgeFailure, PqAttestationAdmissionBridgeTestError,
+    PqAttestationAdmissionBridgeTiming, PqAttestationAdmissionBridgeTrace,
     PqLocalAttestationBatchEncoderTestTrace, PqLocalAttestationBatchEncodingTestTrace,
-    PqLocalAttestationExactSszBufferTestTrace, PqLocalAttestationPublishTestOutcome,
-    PqLocalAttestationPublishTestTrace, testing_only_pq_local_attestation_batch_publish_channel,
+    PqLocalAttestationEvidenceMutation, PqLocalAttestationExactSszBufferTestTrace,
+    PqLocalAttestationPublishTestOutcome, PqLocalAttestationPublishTestTrace, PqMixedRemoteFailure,
+    PqMixedRemotePublishTrace, PqMixedRemoteTiming,
+    TestingPqAttestationActiveAdmissionBridgeDriver, TestingPqChainAuthoritativeMixedPublishDriver,
+    testing_only_pq_attestation_active_admission_bridge_driver,
+    testing_only_pq_chain_authoritative_mixed_publish_driver,
+    testing_only_pq_local_attestation_batch_publish_channel,
     testing_only_pq_local_attestation_encode_batch,
     testing_only_pq_local_attestation_encode_exact_signed_ssz,
+    testing_only_pq_local_attestation_post_publish_service_channel,
     testing_only_pq_local_attestation_publish_progress,
 };
 #[cfg(feature = "pq-proposer")]
@@ -32,12 +49,8 @@ pub use local_attestation_publish::{
     PqLocalAttestationBatchEncodingFailure, PqLocalAttestationBatchPublishProgress,
     PqLocalAttestationBatchPublishReceipt, PqLocalAttestationBatchPublishRetryError,
     PqLocalAttestationBatchPublishSendError, PqLocalAttestationBatchPublishSender,
-    PqLocalAttestationMemberPublishProgress,
-};
-#[cfg(feature = "pq-proposer")]
-pub(crate) use local_attestation_publish::{
-    PqLocalAttestationBatchPublishEvent, PqLocalAttestationBatchPublishReceiver,
-    pq_local_attestation_batch_publish_channel,
+    PqLocalAttestationMemberPublishProgress, PqLocalAttestationPostPublishFailure,
+    PqLocalAttestationPreConsumerEvidenceFailure,
 };
 pub use publication::{
     PQ_BLOCK_PUBLICATION_ADMISSION_CAPACITY, PQ_BLOCK_PUBLICATION_BODY_CHUNK_CAPACITY,
@@ -52,27 +65,51 @@ pub use service::{
     PQ_NETWORK_BLOCK_PROOF_CAPACITY, PqNetworkService, PqNetworkServiceError,
     PqNetworkServiceShutdown,
 };
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+pub use service::{
+    PqAttestationBridgeLifecycleEvent, PqAttestationBridgeLifecycleTestError,
+    PqAttestationBridgeReportOutcome, PqAttestationFailureOnceScenario,
+    PqAttestationFailureOnceTerminal, PqAttestationFailureOnceTrace,
+    TestingPqAttestationBridgeLifecycleDriver, TestingPqAttestationFailureOnceDriver,
+    testing_only_pq_attestation_bridge_lifecycle_driver,
+    testing_only_pq_attestation_failure_once_driver,
+};
 #[cfg(feature = "pq-startup-testing")]
 pub use service::{
     PqCommitCompletionQueueTestTrace, PqCommitResolutionTestCase, PqCompletionQueueTestScenario,
     PqCompletionQueueTestTrace, PqCompletionTestDisposition, PqCompletionTestEvent,
     PqEncodingShutdownTestTrace, PqGossipImportedEventGateTestTrace,
     PqNetworkAttestationCompletionTestDisposition, PqNetworkAttestationCompletionTestEvent,
-    PqNetworkAttestationConsumptionTestCase, PqNetworkAttestationConsumptionTestTrace,
-    PqNetworkAttestationDetachedTestTrace, PqNetworkAttestationIgnoreTestCase,
-    PqNetworkAttestationIgnoreTestTrace, PqNetworkAttestationInFlightTestTrace,
-    PqNetworkAttestationRouteTestCase, PqNetworkAttestationRouteTestTrace,
-    PqProofAdmissionTestTrace, PqStatusTestEvent, PqStatusTestScenario, PqStatusTestTrace,
+    PqNetworkAttestationConsumptionMetadataRetentionTrace, PqNetworkAttestationConsumptionTestCase,
+    PqNetworkAttestationConsumptionTestTrace, PqNetworkAttestationDetachedTestTrace,
+    PqNetworkAttestationIdentityCompletionTestTrace, PqNetworkAttestationIdentityIngressTestCase,
+    PqNetworkAttestationIdentityIngressTestEvent, PqNetworkAttestationIdentityIngressTestTrace,
+    PqNetworkAttestationIgnoreTestCase, PqNetworkAttestationIgnoreTestTrace,
+    PqNetworkAttestationInFlightTestTrace, PqNetworkAttestationRouteTestCase,
+    PqNetworkAttestationRouteTestTrace, PqNetworkAttestationWireIdIngressTestEvent,
+    PqNetworkAttestationWireIdIngressTestMutation, PqNetworkAttestationWireIdIngressTestTrace,
+    PqNetworkAttestationWireProvenanceError, PqNetworkAttestationWireProvenanceTrace,
+    PqNetworkServiceReadyEvent, PqNetworkServiceReadyEventTestCase, PqProofAdmissionTestTrace,
+    PqStatusTestEvent, PqStatusTestScenario, PqStatusTestTrace,
     PqTestingAttestationPublishAcknowledgement, PqTestingAttestationPublishError,
-    PqTestingAttestationPublishSender, testing_only_pq_attestation_completion_lifecycle,
+    PqTestingAttestationPublishSender, PqTestingAttestationVerificationBarrier,
+    TestingPqAttestationConsumptionCoordinatorDriver,
+    testing_only_pq_attestation_completion_lifecycle,
+    testing_only_pq_attestation_consumption_coordinator_driver,
+    testing_only_pq_attestation_consumption_metadata_retention,
     testing_only_pq_attestation_consumption_resolution,
     testing_only_pq_attestation_detached_lifecycle,
+    testing_only_pq_attestation_identity_completion_trace,
+    testing_only_pq_attestation_identity_ingress_actual_path,
     testing_only_pq_attestation_ignore_classification,
     testing_only_pq_attestation_in_flight_lifecycle, testing_only_pq_attestation_route,
+    testing_only_pq_attestation_wire_id_ingress_actual_path,
+    testing_only_pq_attestation_wire_provenance_actual_path,
     testing_only_pq_commit_completion_queue, testing_only_pq_commit_resolution,
     testing_only_pq_completion_lifecycle, testing_only_pq_completion_queue,
     testing_only_pq_encoding_shutdown, testing_only_pq_gossip_imported_event_gate,
-    testing_only_pq_proof_admission, testing_only_pq_status_lifecycle,
+    testing_only_pq_network_service_select_ready_event, testing_only_pq_proof_admission,
+    testing_only_pq_status_lifecycle,
 };
 
 /// Result of full contextual and PQ evidence verification for unaggregated gossip.
@@ -121,6 +158,26 @@ impl<T: BeaconChainTypes> PqNetworkBlockProcessor<T> {
         Self { chain }
     }
 
+    pub async fn verify_gossip_attestation_with_wire_id(
+        &self,
+        attestation: SingleAttestation,
+        subnet: SubnetId,
+        wire_id: beacon_chain::PqSingleWireMessageId,
+    ) -> PqGossipAttestationDisposition<T::EthSpec> {
+        match self
+            .chain
+            .verify_pq_single_attestation_for_gossip_with_wire_id(attestation, subnet, wire_id)
+            .await
+        {
+            Ok(token) => PqGossipAttestationDisposition::Accept(Box::new(token)),
+            Err(error) if error.should_penalize_peer() => {
+                PqGossipAttestationDisposition::Reject(error)
+            }
+            Err(error) => PqGossipAttestationDisposition::Ignore(error),
+        }
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
     pub async fn verify_gossip_attestation(
         &self,
         attestation: SingleAttestation,

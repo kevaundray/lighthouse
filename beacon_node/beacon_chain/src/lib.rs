@@ -165,9 +165,8 @@ pub mod validator_monitor;
 #[cfg(not(feature = "pq-devnet"))]
 pub mod validator_pubkey_cache;
 
-#[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
-#[doc(hidden)]
-pub use self::beacon_chain::testing_only_pq_import_drain_race;
+#[cfg(all(feature = "pq-devnet", feature = "pq-proposer"))]
+pub use self::beacon_chain::PqPublishedLocalAttestationBatchConsumer;
 #[cfg(not(feature = "pq-devnet"))]
 pub use self::beacon_chain::{
     AttestationProcessingOutcome, AvailabilityProcessingStatus, BeaconBlockResponse,
@@ -181,6 +180,13 @@ pub use self::beacon_chain::{
     BeaconChain, BeaconChainTypes, BeaconSnapshot, BeaconStore, PQ_FORK_CHOICE_TICK_MAX_ADVANCE,
     PqForkChoiceAttestationError, PqForkChoiceAttestationOutcome, PqRuntimeError,
 };
+#[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
+#[doc(hidden)]
+pub use self::beacon_chain::{
+    TestingPqPublishedLocalAttestationSupervisorFailure,
+    TestingPqPublishedLocalAttestationSupervisorHarness,
+    TestingPqPublishedLocalAttestationSupervisorReceipt, testing_only_pq_import_drain_race,
+};
 #[cfg(not(feature = "pq-devnet"))]
 pub use self::beacon_snapshot::BeaconSnapshot;
 #[cfg(feature = "pq-devnet")]
@@ -192,19 +198,45 @@ pub use self::errors::{BeaconChainError, BlockProductionError};
 pub use self::historical_blocks::HistoricalBlockError;
 #[cfg(feature = "pq-devnet")]
 pub use self::pq_attestation_gossip::{
-    PQ_ATTESTATION_GOSSIP_ADMISSION_CAPACITY, PqAggregateGossipPropagationToken,
-    PqAttestationGossipError, PqAttestationGossipLocalError, PqAttestationGossipObservation,
-    PqAttestationGossipPeerInvalid, PqLocalAttestationBatchVerificationError,
-    PqLocalAttestationInvariant, PqLocalAttestationVerificationError, PqSingleConsumptionResult,
-    PqSingleGossipPropagationToken, PqVerifiedGossipAggregate, PqVerifiedGossipSingle,
-    PqVerifiedLocalSingle,
+    PQ_ATTESTATION_GOSSIP_ADMISSION_CAPACITY, PQ_LOCAL_ATTESTATION_PROOF_ADMISSION_CAPACITY,
+    PqAggregateGossipPropagationToken, PqAttestationGossipError, PqAttestationGossipLocalError,
+    PqAttestationGossipObservation, PqAttestationGossipPeerInvalid,
+    PqLocalAttestationBatchVerificationError, PqLocalAttestationInvariant,
+    PqLocalAttestationVerificationError, PqPublishedLocalAttestationBatchConsumptionError,
+    PqPublishedLocalAttestationBatchConsumptionOutcome, PqSingleConsumptionResult,
+    PqSingleGossipPropagationToken, PqSingleObservationBatchError, PqSingleObservationIdentity,
+    PqSingleObservationStatus, PqSingleWireMessageId, PqVerifiedGossipAggregate,
+    PqVerifiedGossipSingle, PqVerifiedLocalSingle, pq_single_consumption_result_from_fork_choice,
+    validate_pq_single_wire_provenance,
+};
+#[cfg(all(feature = "pq-devnet", feature = "pq-proposer"))]
+pub use self::pq_attestation_gossip::{
+    PqPublishedLocalMemberResolution, PqPublishedLocalMemberResolutionError,
+    PqSingleObservationCompletion, PqSingleObservationWatchError, PqSingleObservationWatchReceipt,
 };
 #[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
 pub use self::pq_attestation_gossip::{
-    TestingPqAtomicLocalBatchError, TestingPqAttestationObservationCache,
+    PqSingleObservationBatchResolution, TestingPqAtomicLocalBatchError,
+    TestingPqAttestationObservationCache, TestingPqAttestationObservationOwnerCache,
+    TestingPqPublishedLocalAttestationConsumptionTrace,
+    TestingPqPublishedLocalAttestationWaitReceipt, TestingPqSingleObservationBatchInput,
+    TestingPqSingleObservationResolutionReceipt, TestingPqWireBoundObservationCache,
     testing_only_collect_pq_local_batch_atomically, testing_only_pq_attestation_advance_distance,
     testing_only_pq_attestation_late_window, testing_only_pq_attestation_target_root,
     testing_only_pq_single_prepropagation_retry,
+};
+#[cfg(all(
+    feature = "pq-devnet",
+    feature = "pq-proposer",
+    feature = "pq-startup-testing"
+))]
+#[doc(hidden)]
+pub use self::pq_attestation_gossip::{
+    TestingPqPublishedLocalAttestationEvidenceHarness,
+    TestingPqPublishedLocalAttestationEvidenceMutation,
+    TestingPqPublishedLocalAttestationEvidenceTrace, TestingPqPublishedLocalLateApplyHarness,
+    TestingPqPublishedLocalMemberResolver, TestingPqPublishedLocalMemberWire,
+    TestingPqRemotePublicationEvidenceStatus, testing_only_pq_published_local_member_resolver,
 };
 #[cfg(feature = "pq-devnet")]
 pub use self::pq_import::{
@@ -226,16 +258,25 @@ pub use self::pq_import::{
 };
 #[cfg(feature = "pq-devnet")]
 pub use self::pq_local_attester_context::{
-    PQ_LOCAL_ATTESTATION_CONTEXT_ADMISSION_CAPACITY, PQ_LOCAL_ATTESTER_IDENTITY_CAPACITY,
-    PqCoherentLocalAttestationSnapshot, PqLocalAttestationBatchSealError,
-    PqLocalAttestationCandidate, PqLocalAttestationContext, PqLocalAttestationContextError,
-    PqLocalAttesterIdentity, PqLocalSingleConstructionError, PqLocallyConstructedSingle,
-    PqOwnedLocalAttestationCandidateBatch, PqSealedLocalAttestationBatch,
-    PqVerifiedLocalAttestationBatch,
+    PQ_LOCAL_ATTESTATION_CONTEXT_ADMISSION_CAPACITY, PQ_LOCAL_ATTESTATION_PREFLIGHT_CAPACITY,
+    PQ_LOCAL_ATTESTER_IDENTITY_CAPACITY, PqCoherentLocalAttestationSnapshot,
+    PqLocalAttestationBatchPreflightError, PqLocalAttestationBatchPreflightOutcome,
+    PqLocalAttestationBatchSealError, PqLocalAttestationCandidate, PqLocalAttestationContext,
+    PqLocalAttestationContextError, PqLocalAttesterIdentity, PqLocalSingleConstructionError,
+    PqLocallyConstructedSingle, PqOwnedLocalAttestationCandidateBatch,
+    PqSealedLocalAttestationBatch, PqVerifiedLocalAttestationBatch,
+};
+#[cfg(all(feature = "pq-devnet", feature = "pq-proposer"))]
+pub use self::pq_local_attester_context::{
+    PqPublishedLocalAttestationEvidenceBatch, PqPublishedLocalAttestationEvidenceError,
+    PqPublishedLocalAttestationMemberEvidence,
 };
 #[cfg(all(feature = "pq-devnet", feature = "pq-startup-testing"))]
 pub use self::pq_local_attester_context::{
-    TestingPqLocalCandidateBatchGuards, testing_only_pq_local_candidate_batch_fixture,
+    TestingPqLocalAttestationPreflightHarness, TestingPqLocalAttestationPreflightMember,
+    TestingPqLocalAttestationPreflightReconciliation,
+    TestingPqLocalAttestationPreflightRootAccessTrace, TestingPqLocalCandidateBatchGuards,
+    testing_only_pq_local_candidate_batch_fixture,
     testing_only_pq_local_candidate_batch_fixture_with_guards,
     testing_only_pq_local_candidate_fixture, testing_only_validate_pq_local_attester_profile,
 };

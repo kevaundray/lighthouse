@@ -1849,10 +1849,12 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   change. Nested signing-ID and aggregation errors retain the same `Error::source` chain on both
   paths.
 - Successful local verification returns a second private-field, non-`Clone` token that binds the
-  exact signed object and metadata while retaining the original two-item proof admission and PQ
-  import activity. Late-lineage blocking work owns that activity, so caller cancellation cannot let
-  shutdown drain finish while lineage database work is still running. Holding the returned token
-  continues to hold admission and keeps drain pending; dropping it releases both.
+  exact signed object and metadata while retaining its local proof admission and PQ import
+  activity. Local proof retention and inbound gossip proof retention are independent cap-two
+  domains, so the bounded total is two local plus two remote proofs rather than one global cap of
+  two. Late-lineage blocking work owns that activity, so caller cancellation cannot let shutdown
+  drain finish while lineage database work is still running. Holding the returned token continues
+  to hold admission and keeps drain pending; dropping it releases both.
 - Local verification never enters the remote gossip observation cache and does not mark gossip
   propagation, apply fork choice, or publish. The authentic imported-slot-1 proof originally passed
   in 131.90 seconds. Repaired warning-denied AVX2 regressions passed the remote one-snapshot race in
@@ -1974,9 +1976,10 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   expiry release leaves the duplicate/count retained and fails. The complete inventory test fills
   and rolls all 1,734 entries without exceeding the bound. The ordinary profile with no validation
   admission keeps its pre-existing duplicate-cache and mcache behavior.
-- This is only the bounded lower admission prerequisite. It adds no production attestation
-  publisher, does not transfer or consume the service-owned verified batch, and makes no new local
-  fork-choice application, scheduling, pool, persistence, justification, or finalization claim.
+- At this bounded lower-admission prerequisite, the production attestation publisher, transfer of
+  the service-owned verified batch, and local fork-choice application had not yet landed. The
+  integrated 2026-08-22 milestone below supersedes those limitations. Scheduling, pools,
+  persistence, justification, and finalization remain separate work.
 
 ### 2026-08-21: Source-aware lower PQ single publisher completed (Task 5.2b prerequisite)
 
@@ -2011,10 +2014,11 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   passes one outcome-table unit test and six real integration tests, including a compatible
   two-worker remote pending/terminal/retryable trace. Vendored admission and queue tests retain the
   ordinary no-admission path and exact rollback behavior.
-- This is only the source-aware lower gossipsub publisher. It adds no network-service command,
-  transfer from `PqAttesterService`, consumption of the service-owned verified batch, local
-  fork-choice application, scheduler, HTTP route, pool insertion, aggregation, persistence,
-  justification, or finalization claim.
+- At this source-aware lower-only checkpoint, the network-service command, transfer from
+  `PqAttesterService`, consumption of the verified batch, and local fork-choice application had not
+  yet landed. The integrated 2026-08-22 milestone below supersedes those limitations. Scheduler,
+  HTTP, pool insertion, aggregation, persistence, justification, and finalization remain separate
+  work.
 
 ### 2026-08-21: Network-owned whole-batch PQ attestation publication command completed
 
@@ -2063,7 +2067,84 @@ stale journal after later signatures is unsafe; key rotation is the safe recover
   message ID before handing over the still-whole batch. The returned progress proved both members
   were encoded, member zero reached exact `NoPeers`, member one remained `Verified`, remote
   observations stayed zero, and no local fork-choice application occurred.
-- This checkpoint does not wire the production `PqAttesterService` handoff, resolve remote pending
-  publication, coalesce wire and local outcomes, apply a local vote, schedule duties, publish to a
-  real second node, insert into either pool, aggregate, persist attester/fork-choice state, justify,
-  or finalize. The finalized checkpoint remains genesis.
+- At this command-only checkpoint, the production `PqAttesterService` handoff, remote-pending
+  coalescence, local application, and two-worker wire proof had not yet landed. The integrated
+  milestone below supersedes those four limitations. Scheduling, pool insertion, aggregation,
+  persistence, justification, and finalization remain outside this milestone.
+
+### 2026-08-22: Direct PQ attestation publication and cross-source convergence completed
+
+- The production `PqAttesterService` now transfers its service-owned verified batch directly into
+  the bounded `PqNetworkService` publication sender without exposing a raw batch or proof token.
+  Capacity and closed-channel failures restore the exact owner. After a successful transfer, a
+  monotonic watermark prevents the transferred slot or any lower slot from being signed again,
+  while a later slot may retry after a pre-sign retryable failure.
+- The final convergence blocker was admission-source coupling, not insufficient total capacity. A
+  retained two-member local verified batch occupied both permits of the original remote gossip
+  proof semaphore, so the authentic inbound member necessarily failed `IngressCapacity`; its
+  admission bridge emitted `Released`, and the sender retried that member as a local publication.
+  The fix keeps the existing remote single/aggregate gossip capacity at two and adds a separate
+  private local-proof capacity of two. This is source isolation, not a cap raise: at most two local
+  proofs plus two remote proofs are retained, and the whole-batch publication command remains
+  capacity one. The local atomic collector and attester service both use the chain-owned local
+  constant, preventing equal-valued constants from masking a future drift.
+- Fast production-sensitive tests held the local two permits and proved the remote two remained
+  available, and independently pinned cap-plus-one rejection in each domain. Routing the local
+  verifier back through the remote semaphore failed with zero remote permits where two were
+  required. A second mutation changed the remote constant while the local collector remained
+  bounded by the local constant. The restored authentic imported-slot context test passed 1/1 in
+  131.90 seconds with one local proof permit retained, all remote permits free, and shutdown
+  activity held until token drop.
+- The final warning-denied AVX2 two-worker command was:
+
+  `RUSTFLAGS='-D warnings -C target-feature=+avx2' cargo +1.88 test -p lighthouse --no-default-features --features pq-proposer,pq-startup-testing --test pq_e4f_launch direct_pq_attester_service_converges_two_independent_workers_exactly_once -- --exact --nocapture`
+
+  The final rerun passed 1/1 in 460.39 seconds. Recorded phases were cache clone 0.241 seconds,
+  authority open 279.806 seconds, RANDAO verification 307.448 seconds, concurrent independent
+  slot-1 imports 459.274 seconds, direct service verification 460.233 seconds, and complete drain
+  460.383 seconds.
+- Both workers used independent `BeaconChain`, validator-store, fork-choice, and network instances
+  over identical genesis and execution-VALID slot-1 heads; only the process-singleton aggregation
+  service was intentionally shared. The service journal-signed and locally proved the real
+  two-member batch once, the production sealed handoff preserved both members, and the network
+  encoded each exact signed SSZ buffer once with independently checked digest, subnet topic, fork
+  digest, and anonymous message ID. The independent peer supplied member one as the external
+  source while member zero followed the local publication path.
+- Before the inbound barrier was released, sender progress was exactly member zero
+  `Published { duplicate: false }` and member one `WaitingRemote { retained: false }`. The false
+  provenance is deliberate: vendored admission still reported `PendingValidation`, not retained
+  remote history, while the bounded active bridge covered the chain-claim gap. Final sender
+  progress was exact and ordered: member zero was
+  `Consumed { duplicate: false, result: Queued }`, while member one was
+  `Consumed { duplicate: true, result: Queued }`, each with its independently derived exact
+  `MessageId`. The sender performed exactly two fork-choice calls, once for each identity across
+  the local and remote sources; the receiver performed exactly one call for the wire-delivered
+  member zero. No member was signed, proved, encoded, or applied twice.
+- The sender observation cache correctly retained two source-neutral exact-once records, rather
+  than only the externally injected record. Locally published member zero transitioned through
+  `LocalWireSuccess` and `ConsumptionPending` to `Consumed(Queued)`; remotely consumed member one
+  was already `Consumed(Queued)` and coalesced without a second sender fork-choice call. Exact
+  `(target_epoch, validator_index)` queries returned `Queued` for both. The publication receipt,
+  verified-token guards, observation ownership, and admission activity survived remote waiting and
+  remained drain-owned through clean shutdown.
+- A commit-blocking review found that the early publication preflight was not sufficient after an
+  exact remote wait. The final route settles remote members first with no import gate held, then
+  acquires the import gate and coherently revalidates clock, canonical head/state slots, cached
+  validated state root, and reconciliation. It retains that gate into the blocking continuation,
+  acquires fork choice once, resamples the actual clock under the fork-choice mutex, validates
+  fork-choice time and bound-root ancestry under that same guard, and applies using the freshly
+  sampled current slot. The gate is never held across remote settlement or network work.
+- Production-sensitive mutations pinned both timing boundaries. Substituting the signed slot for
+  the actual post-settlement current slot made fork choice receive slot 1 instead of slot 2.
+  Removing the resample after fork-choice acquisition let a clock change while waiting for that
+  mutex incorrectly return `Complete { results: [Applied, Queued] }`; the exact expectation was
+  `ClockChanged { sampled: Slot(2), current: Slot(3) }`, zero local application, and one fail-close.
+  The restored shared route is called by both the real continuation and the cfg harness.
+- The retained chain TaskExecutor failure receiver and both independent network TaskExecutor
+  failure receivers were live and empty before explicit stop/drain, so the successful trace did
+  not hide a process-failure signal.
+- This closes direct local signing, sealed production handoff, real two-worker publication,
+  cross-source coalescence, and exact-once local fork-choice application for unaggregated singles.
+  It does not claim operation-pool or naive-aggregation-pool insertion, aggregation or block
+  inclusion, or justification/finality beyond genesis. Pool insertion, aggregation, inclusion,
+  finality, and persisted attester/pool/fork-choice recovery across restart remain separate work.

@@ -1,14 +1,28 @@
 #[cfg(target_feature = "avx2")]
 use beacon_chain::{
-    PQ_ATTESTATION_GOSSIP_ADMISSION_CAPACITY, PqNewPayloadTransport, TestingPqBlockingHook,
+    PQ_ATTESTATION_GOSSIP_ADMISSION_CAPACITY, PQ_LOCAL_ATTESTATION_PROOF_ADMISSION_CAPACITY,
+    PqNewPayloadTransport, TestingPqBlockingHook, TestingPqPublishedLocalLateApplyHarness,
     builder::{BeaconChainBuilder, Witness},
 };
 use beacon_chain::{
     PQ_BLOCK_IMPORT_ADMISSION_CAPACITY, PQ_FORWARD_RANGE_BLOCK_CAPACITY, PqAttestationGossipError,
     PqAttestationGossipLocalError, PqBlockImportSource, PqEnginePayloadDisposition,
-    PqEnginePayloadStatus, PqImportError, PqImportLocalError, PqImportPeerInvalid,
-    TestingPqAttestationObservationCache, TestingPqExternalReservation, TestingPqGossipClaim,
-    TestingPqGossipFinish, TestingPqGossipObservationCache, classify_pq_engine_payload_status,
+    PqEnginePayloadStatus, PqForkChoiceAttestationError, PqForkChoiceAttestationOutcome,
+    PqImportError, PqImportLocalError, PqImportPeerInvalid,
+    PqPublishedLocalAttestationBatchConsumptionError,
+    PqPublishedLocalAttestationBatchConsumptionOutcome, PqPublishedLocalAttestationEvidenceBatch,
+    PqPublishedLocalAttestationEvidenceError, PqSingleConsumptionResult,
+    PqSingleObservationBatchError, PqSingleObservationBatchResolution,
+    PqSingleObservationCompletion, PqSingleObservationIdentity, PqSingleObservationStatus,
+    PqSingleObservationWatchError, PqSingleObservationWatchReceipt, PqSingleWireMessageId,
+    TestingPqAttestationObservationCache, TestingPqAttestationObservationOwnerCache,
+    TestingPqExternalReservation, TestingPqGossipClaim, TestingPqGossipFinish,
+    TestingPqGossipObservationCache, TestingPqPublishedLocalAttestationEvidenceHarness,
+    TestingPqPublishedLocalAttestationEvidenceMutation,
+    TestingPqPublishedLocalAttestationSupervisorFailure,
+    TestingPqPublishedLocalAttestationSupervisorHarness, TestingPqRemotePublicationEvidenceStatus,
+    TestingPqSingleObservationBatchInput, TestingPqSingleObservationResolutionReceipt,
+    TestingPqWireBoundObservationCache, classify_pq_engine_payload_status,
     testing_only_pq_attestation_advance_distance, testing_only_pq_attestation_late_window,
     testing_only_pq_attestation_target_root, testing_only_pq_import_drain_race,
 };
@@ -17,6 +31,8 @@ use consensus_signature::{
     AggregationService, OneTimeUseId, PqPublicKey, PqRawSignature, PqSameMessageEvidence,
     SigningDuty,
 };
+#[cfg(target_feature = "avx2")]
+use lighthouse_network::MessageId;
 #[cfg(target_feature = "avx2")]
 use network::{
     PqGossipAggregateDisposition, PqGossipAttestationDisposition, PqGossipBlockDisposition,
@@ -349,6 +365,1408 @@ fn pq_single_observation_is_sealed_after_propagation_until_consumed() {
         cache.single_consumption_result(epoch, 4),
         Some(beacon_chain::PqSingleConsumptionResult::Terminal)
     );
+}
+
+#[test]
+fn pq_single_observation_exact_status_is_identity_aware() {
+    let identity = |validator_index, slot, subnet, signed_root_byte, signed_ssz_byte| {
+        PqSingleObservationIdentity::new(
+            types::Epoch::new(0),
+            validator_index,
+            Slot::new(slot),
+            types::SubnetId::new(subnet),
+            Hash256::repeat_byte(signed_root_byte),
+            [signed_ssz_byte; 32],
+        )
+    };
+    let mut cache = TestingPqAttestationObservationCache::default();
+    let earliest_slot = Slot::new(0);
+
+    let pending = identity(5, 1, 3, 0x11, 0x21);
+    let pending_generation = cache
+        .claim_exact_single(&pending, earliest_slot)
+        .expect("claim exact pending identity");
+    assert_eq!(
+        cache.exact_single_status(&pending),
+        PqSingleObservationStatus::Pending
+    );
+    for (conflicting_pending, changed_field) in [
+        (identity(5, 1, 3, 0x12, 0x21), "signed tree-hash root"),
+        (identity(5, 1, 3, 0x11, 0x22), "signed SSZ digest"),
+        (identity(5, 2, 3, 0x11, 0x21), "slot"),
+        (identity(5, 1, 4, 0x11, 0x21), "subnet"),
+    ] {
+        assert_eq!(
+            cache.exact_single_status(&conflicting_pending),
+            PqSingleObservationStatus::Conflict,
+            "the same validator/target with a different {changed_field} must conflict"
+        );
+    }
+
+    assert!(cache.mark_exact_single_propagated(&pending, pending_generation));
+    assert_eq!(
+        cache.exact_single_status(&pending),
+        PqSingleObservationStatus::ConsumptionPending
+    );
+
+    for (validator_index, result) in [
+        (6, PqSingleConsumptionResult::Applied),
+        (7, PqSingleConsumptionResult::Queued),
+        (8, PqSingleConsumptionResult::Terminal),
+    ] {
+        let consumed = identity(
+            validator_index,
+            1,
+            3,
+            0x30_u8.saturating_add(validator_index as u8),
+            0x40_u8.saturating_add(validator_index as u8),
+        );
+        let conflicting_consumed = identity(
+            validator_index,
+            1,
+            3,
+            0x50_u8.saturating_add(validator_index as u8),
+            0x60_u8.saturating_add(validator_index as u8),
+        );
+        let generation = cache
+            .claim_exact_single(&consumed, earliest_slot)
+            .expect("claim exact consumed identity");
+        assert!(cache.mark_exact_single_propagated(&consumed, generation));
+        assert!(cache.finalize_exact_single(&consumed, generation, result));
+        assert_eq!(
+            cache.exact_single_status(&consumed),
+            PqSingleObservationStatus::Consumed(result)
+        );
+        assert_eq!(
+            cache.exact_single_status(&conflicting_consumed),
+            PqSingleObservationStatus::Conflict,
+            "a consumed signed identity must not suppress a conflicting signature"
+        );
+    }
+}
+
+#[test]
+fn pq_single_observation_batch_resolution_is_atomic_and_source_aware() {
+    let identity = |validator_index, signed_root_byte, signed_ssz_byte| {
+        PqSingleObservationIdentity::new(
+            types::Epoch::new(0),
+            validator_index,
+            Slot::new(1),
+            types::SubnetId::new(3),
+            Hash256::repeat_byte(signed_root_byte),
+            [signed_ssz_byte; 32],
+        )
+    };
+    let local = TestingPqSingleObservationBatchInput::LocalWireSuccess;
+    let remote = TestingPqSingleObservationBatchInput::Remote;
+    let earliest_slot = Slot::new(0);
+
+    let mut local_cache = TestingPqAttestationObservationCache::default();
+    let local_identity = identity(1, 0x11, 0x21);
+    assert_eq!(
+        local_cache.resolve_exact_single_batch(&[local(local_identity)], earliest_slot),
+        Ok(vec![PqSingleObservationBatchResolution::LocalReserved]),
+    );
+    assert_eq!(
+        local_cache.exact_single_status(&local_identity),
+        PqSingleObservationStatus::ConsumptionPending,
+        "wire-success reservation must be non-rollbackable consumption ownership"
+    );
+
+    let mut remote_cache = TestingPqAttestationObservationCache::default();
+    let remote_pending = identity(2, 0x12, 0x22);
+    let pending_generation = remote_cache
+        .claim_exact_single(&remote_pending, earliest_slot)
+        .expect("existing remote proof claim");
+    assert_eq!(
+        remote_cache.resolve_exact_single_batch(&[remote(remote_pending)], earliest_slot),
+        Ok(vec![PqSingleObservationBatchResolution::WaitRemote(
+            PqSingleObservationStatus::Pending,
+        )]),
+    );
+    assert_eq!(
+        remote_cache.exact_single_status(&remote_pending),
+        PqSingleObservationStatus::Pending,
+        "batch resolution must preserve an existing remote Pending claim"
+    );
+    assert!(remote_cache.mark_exact_single_propagated(&remote_pending, pending_generation));
+    assert_eq!(
+        remote_cache.resolve_exact_single_batch(&[remote(remote_pending)], earliest_slot),
+        Ok(vec![PqSingleObservationBatchResolution::WaitRemote(
+            PqSingleObservationStatus::ConsumptionPending,
+        )]),
+    );
+
+    let remote_applied = identity(3, 0x13, 0x23);
+    let applied_generation = remote_cache
+        .claim_exact_single(&remote_applied, earliest_slot)
+        .expect("remote applied claim");
+    assert!(remote_cache.mark_exact_single_propagated(&remote_applied, applied_generation));
+    assert!(remote_cache.finalize_exact_single(
+        &remote_applied,
+        applied_generation,
+        PqSingleConsumptionResult::Applied,
+    ));
+    let remote_queued = identity(4, 0x14, 0x24);
+    let queued_generation = remote_cache
+        .claim_exact_single(&remote_queued, earliest_slot)
+        .expect("remote queued claim");
+    assert!(remote_cache.mark_exact_single_propagated(&remote_queued, queued_generation));
+    assert!(remote_cache.finalize_exact_single(
+        &remote_queued,
+        queued_generation,
+        PqSingleConsumptionResult::Queued,
+    ));
+    assert_eq!(
+        remote_cache.resolve_exact_single_batch(
+            &[remote(remote_applied), remote(remote_queued)],
+            earliest_slot,
+        ),
+        Ok(vec![
+            PqSingleObservationBatchResolution::Coalesced(PqSingleConsumptionResult::Applied,),
+            PqSingleObservationBatchResolution::Coalesced(PqSingleConsumptionResult::Queued,),
+        ]),
+    );
+
+    let remote_terminal = identity(5, 0x15, 0x25);
+    let terminal_generation = remote_cache
+        .claim_exact_single(&remote_terminal, earliest_slot)
+        .expect("remote terminal claim");
+    assert!(remote_cache.mark_exact_single_propagated(&remote_terminal, terminal_generation));
+    assert!(remote_cache.finalize_exact_single(
+        &remote_terminal,
+        terminal_generation,
+        PqSingleConsumptionResult::Terminal,
+    ));
+    let terminal_first = identity(6, 0x16, 0x26);
+    let terminal_len_before = remote_cache.len_singles();
+    assert_eq!(
+        remote_cache.resolve_exact_single_batch(
+            &[local(terminal_first), remote(remote_terminal)],
+            earliest_slot,
+        ),
+        Err(PqSingleObservationBatchError::Terminal),
+    );
+    assert_eq!(remote_cache.len_singles(), terminal_len_before);
+    assert_eq!(
+        remote_cache.exact_single_status(&terminal_first),
+        PqSingleObservationStatus::Unseen,
+        "a terminal second member must not reserve the first"
+    );
+
+    let mut conflict_cache = TestingPqAttestationObservationCache::default();
+    let known = identity(7, 0x17, 0x27);
+    conflict_cache
+        .claim_exact_single(&known, earliest_slot)
+        .expect("known remote identity");
+    let conflicting = identity(7, 0x17, 0x28);
+    let conflict_first = identity(8, 0x18, 0x28);
+    assert_eq!(
+        conflict_cache.resolve_exact_single_batch(
+            &[local(conflict_first), remote(conflicting)],
+            earliest_slot,
+        ),
+        Err(PqSingleObservationBatchError::Conflict),
+    );
+    assert_eq!(
+        conflict_cache.exact_single_status(&conflict_first),
+        PqSingleObservationStatus::Unseen,
+    );
+
+    let mut capacity_cache = TestingPqAttestationObservationCache::default();
+    for validator_index in 0..capacity_cache.capacity().saturating_sub(1) {
+        let validator_index = u64::try_from(validator_index).expect("bounded test index");
+        capacity_cache
+            .claim_exact_single(&identity(validator_index, 0x71, 0x81), earliest_slot)
+            .expect("fill to one below capacity");
+    }
+    let capacity_first = identity(100, 0x72, 0x82);
+    let capacity_second = identity(101, 0x73, 0x83);
+    let capacity_len_before = capacity_cache.len_singles();
+    assert_eq!(
+        capacity_cache.resolve_exact_single_batch(
+            &[local(capacity_first), local(capacity_second)],
+            earliest_slot,
+        ),
+        Err(PqSingleObservationBatchError::ObservationCapacity),
+    );
+    assert_eq!(capacity_cache.len_singles(), capacity_len_before);
+    assert_eq!(
+        capacity_cache.exact_single_status(&capacity_first),
+        PqSingleObservationStatus::Unseen,
+    );
+
+    let mut generation_cache = TestingPqAttestationObservationCache::default();
+    let generation_before = u64::MAX.saturating_sub(1);
+    generation_cache.set_next_generation(generation_before);
+    let generation_first = identity(110, 0x74, 0x84);
+    let generation_second = identity(111, 0x75, 0x85);
+    assert_eq!(
+        generation_cache.resolve_exact_single_batch(
+            &[local(generation_first), local(generation_second)],
+            earliest_slot,
+        ),
+        Err(PqSingleObservationBatchError::GenerationExhausted),
+    );
+    assert_eq!(generation_cache.len_singles(), 0);
+    assert_eq!(
+        generation_cache.next_generation(),
+        generation_before,
+        "failed batch generation allocation must not advance the global generation"
+    );
+    assert_eq!(
+        generation_cache.exact_single_status(&generation_first),
+        PqSingleObservationStatus::Unseen,
+    );
+
+    let mut oversized_cache = TestingPqAttestationObservationCache::default();
+    let oversized = [
+        identity(120, 0x76, 0x86),
+        identity(121, 0x77, 0x87),
+        identity(122, 0x78, 0x88),
+    ];
+    assert_eq!(
+        oversized_cache.resolve_exact_single_batch(&oversized.map(local), earliest_slot,),
+        Err(PqSingleObservationBatchError::BatchCapacity {
+            count: 3,
+            maximum: 2,
+        }),
+    );
+    assert_eq!(oversized_cache.len_singles(), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pq_single_observation_watch_is_exact_and_never_loses_completion() {
+    async fn wait_for_completion(
+        receipt: &mut PqSingleObservationWatchReceipt,
+    ) -> PqSingleObservationCompletion {
+        tokio::time::timeout(std::time::Duration::from_secs(1), receipt.wait())
+            .await
+            .expect("observation completion is bounded")
+            .expect("observation watch remains result-bearing")
+    }
+
+    let identity = |validator_index, signed_root_byte, signed_ssz_byte| {
+        PqSingleObservationIdentity::new(
+            types::Epoch::new(0),
+            validator_index,
+            Slot::new(1),
+            types::SubnetId::new(3),
+            Hash256::repeat_byte(signed_root_byte),
+            [signed_ssz_byte; 32],
+        )
+    };
+    let earliest_slot = Slot::new(0);
+
+    let mut rollback_cache = TestingPqAttestationObservationCache::default();
+    let rollback_identity = identity(1, 0x11, 0x21);
+    let rollback_generation = rollback_cache
+        .claim_exact_single(&rollback_identity, earliest_slot)
+        .expect("remote Pending claim");
+    let mut rollback_receipt = rollback_cache
+        .subscribe_exact_single(&rollback_identity)
+        .expect("subscribe to exact Pending identity under the cache lock");
+    assert!(rollback_cache.rollback_exact_single(&rollback_identity, rollback_generation,));
+    assert_eq!(
+        wait_for_completion(&mut rollback_receipt).await,
+        PqSingleObservationCompletion::Released,
+    );
+    assert_eq!(
+        rollback_cache.exact_single_status(&rollback_identity),
+        PqSingleObservationStatus::Unseen,
+    );
+
+    for (validator_index, result) in [
+        (2, PqSingleConsumptionResult::Applied),
+        (3, PqSingleConsumptionResult::Queued),
+        (4, PqSingleConsumptionResult::Terminal),
+    ] {
+        let mut cache = TestingPqAttestationObservationCache::default();
+        let observed = identity(
+            validator_index,
+            0x30_u8.saturating_add(validator_index as u8),
+            0x40_u8.saturating_add(validator_index as u8),
+        );
+        let generation = cache
+            .claim_exact_single(&observed, earliest_slot)
+            .expect("remote Pending claim");
+        assert!(cache.mark_exact_single_propagated(&observed, generation));
+        let mut receipt = cache
+            .subscribe_exact_single(&observed)
+            .expect("subscribe to exact ConsumptionPending identity");
+        assert!(cache.finalize_exact_single(&observed, generation, result));
+        assert_eq!(
+            wait_for_completion(&mut receipt).await,
+            PqSingleObservationCompletion::Consumed(result),
+        );
+
+        let mut completed_receipt = cache
+            .subscribe_exact_single(&observed)
+            .expect("already-consumed exact identity remains subscribable");
+        assert_eq!(
+            wait_for_completion(&mut completed_receipt).await,
+            PqSingleObservationCompletion::Consumed(result),
+            "a late subscriber must receive the retained result immediately"
+        );
+    }
+
+    let mut prune_cache = TestingPqAttestationObservationCache::default();
+    let pruned_pending = identity(5, 0x15, 0x25);
+    prune_cache
+        .claim_exact_single(&pruned_pending, earliest_slot)
+        .expect("old Pending claim");
+    let mut prune_receipt = prune_cache
+        .subscribe_exact_single(&pruned_pending)
+        .expect("subscribe before pruning old Pending");
+    let next_epoch = types::Epoch::new(1);
+    let next_epoch_start = next_epoch.start_slot(types::MinimalEthSpec::slots_per_epoch());
+    assert_eq!(
+        prune_cache.precheck_single(next_epoch, 15, next_epoch_start),
+        beacon_chain::PqAttestationGossipObservation::Unseen,
+    );
+    assert_eq!(
+        wait_for_completion(&mut prune_receipt).await,
+        PqSingleObservationCompletion::Released,
+    );
+
+    let retained_pending = identity(6, 0x16, 0x26);
+    let retained_generation = prune_cache
+        .claim_exact_single(&retained_pending, earliest_slot)
+        .expect("old propagated claim");
+    assert!(prune_cache.mark_exact_single_propagated(&retained_pending, retained_generation,));
+    let mut retained_receipt = prune_cache
+        .subscribe_exact_single(&retained_pending)
+        .expect("subscribe before attempted propagated prune");
+    assert_eq!(
+        prune_cache.precheck_single(next_epoch, 16, next_epoch_start),
+        beacon_chain::PqAttestationGossipObservation::Unseen,
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(1), retained_receipt.wait(),)
+            .await
+            .is_err(),
+        "pruning must not release or strand ConsumptionPending"
+    );
+    assert!(prune_cache.finalize_exact_single(
+        &retained_pending,
+        retained_generation,
+        PqSingleConsumptionResult::Queued,
+    ));
+    assert_eq!(
+        wait_for_completion(&mut retained_receipt).await,
+        PqSingleObservationCompletion::Consumed(PqSingleConsumptionResult::Queued),
+    );
+
+    let mut conflict_cache = TestingPqAttestationObservationCache::default();
+    let known = identity(7, 0x17, 0x27);
+    conflict_cache
+        .claim_exact_single(&known, earliest_slot)
+        .expect("known exact identity");
+    let conflicting = identity(7, 0x17, 0x28);
+    assert!(matches!(
+        conflict_cache.subscribe_exact_single(&conflicting),
+        Err(PqSingleObservationStatus::Conflict),
+    ));
+
+    let mut dropped_receipt = {
+        let mut dropped_cache = TestingPqAttestationObservationCache::default();
+        let dropped_identity = identity(8, 0x18, 0x28);
+        dropped_cache
+            .claim_exact_single(&dropped_identity, earliest_slot)
+            .expect("pending identity whose cache owner will drop");
+        dropped_cache
+            .subscribe_exact_single(&dropped_identity)
+            .expect("subscribe before cache owner drop")
+    };
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_receipt.wait(),)
+            .await
+            .expect("cache drop closes the watch promptly"),
+        Err(PqSingleObservationWatchError::Lost),
+        "channel closure must be typed loss, never silent Pending"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pq_single_observation_is_bound_to_the_exact_network_neutral_wire_message_id() {
+    assert!(PqSingleWireMessageId::try_from(&[0x11; 19][..]).is_err());
+    assert!(PqSingleWireMessageId::try_from(&[0x11; 21][..]).is_err());
+    let wire_a = PqSingleWireMessageId::try_from(&[0xa1; 20][..])
+        .expect("an exact 20-byte gossipsub MessageId converts once at ingress");
+    let wire_b = PqSingleWireMessageId::try_from(&[0xb2; 20][..])
+        .expect("a distinct exact 20-byte gossipsub MessageId is valid data");
+    assert_eq!(wire_a.as_bytes(), &[0xa1; 20]);
+
+    let identity = PqSingleObservationIdentity::new(
+        types::Epoch::new(2),
+        9,
+        Slot::new(17),
+        types::SubnetId::new(4),
+        Hash256::repeat_byte(0x31),
+        [0x41; 32],
+    );
+
+    for result in [
+        PqSingleConsumptionResult::Applied,
+        PqSingleConsumptionResult::Queued,
+        PqSingleConsumptionResult::Terminal,
+    ] {
+        let cache = TestingPqWireBoundObservationCache::default();
+        let generation = cache
+            .claim_exact_single(&identity, wire_a, Slot::new(0))
+            .expect("the original remote claim binds identity and wire ID atomically");
+        assert_eq!(
+            cache.exact_single_status(&identity, wire_a),
+            PqSingleObservationStatus::Pending,
+        );
+        assert_eq!(
+            cache.exact_single_status(&identity, wire_b),
+            PqSingleObservationStatus::Conflict,
+            "the same signed identity under a different wire ID is a conflict",
+        );
+
+        let mut receipt = cache
+            .subscribe_exact_single(&identity, wire_a)
+            .expect("subscription is acquired under the lock for the exact authority pair");
+        assert!(cache.mark_exact_single_propagated(&identity, wire_a, generation));
+        assert_eq!(
+            cache.exact_single_status(&identity, wire_a),
+            PqSingleObservationStatus::ConsumptionPending,
+        );
+        assert_eq!(
+            cache.exact_single_status(&identity, wire_b),
+            PqSingleObservationStatus::Conflict,
+        );
+
+        assert!(!cache.finalize_exact_single(&identity, wire_b, generation, result));
+        assert!(!cache.rollback_exact_single(&identity, wire_b, generation));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), receipt.wait())
+                .await
+                .is_err(),
+            "a different wire ID must neither finalize nor wake the exact subscriber",
+        );
+
+        assert!(cache.finalize_exact_single(&identity, wire_a, generation, result));
+        assert_eq!(
+            receipt.wait().await,
+            Ok(PqSingleObservationCompletion::Consumed(result)),
+        );
+        assert_eq!(
+            cache.exact_single_status(&identity, wire_a),
+            PqSingleObservationStatus::Consumed(result),
+        );
+        assert_eq!(
+            cache.exact_single_status(&identity, wire_b),
+            PqSingleObservationStatus::Conflict,
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pq_single_batch_resolution_owner_is_atomic_and_never_strands_reservations() {
+    async fn exact_completion(
+        owner: TestingPqSingleObservationResolutionReceipt,
+    ) -> PqSingleObservationCompletion {
+        let completions = tokio::time::timeout(std::time::Duration::from_secs(1), owner.wait_all())
+            .await
+            .expect("owned batch resolution remains bounded")
+            .expect("owned batch resolution remains result-bearing");
+        assert_eq!(completions.len(), 1);
+        completions[0]
+    }
+
+    let identity = |validator_index, root_byte, digest_byte| {
+        PqSingleObservationIdentity::new(
+            types::Epoch::new(0),
+            validator_index,
+            Slot::new(1),
+            types::SubnetId::new(3),
+            Hash256::repeat_byte(root_byte),
+            [digest_byte; 32],
+        )
+    };
+    let local = TestingPqSingleObservationBatchInput::LocalWireSuccess;
+    let remote = TestingPqSingleObservationBatchInput::Remote;
+    let earliest_slot = Slot::new(0);
+
+    for (validator_index, result) in [
+        (1, PqSingleConsumptionResult::Applied),
+        (2, PqSingleConsumptionResult::Queued),
+    ] {
+        let cache = TestingPqAttestationObservationOwnerCache::default();
+        let observed = identity(
+            validator_index,
+            0x20_u8.saturating_add(validator_index as u8),
+            0x30_u8.saturating_add(validator_index as u8),
+        );
+        let generation = cache
+            .claim_exact_single(&observed, earliest_slot)
+            .expect("remote Pending claim");
+        let owner = cache
+            .resolve_exact_single_batch_owned(&[remote(observed)], earliest_slot)
+            .expect("atomic remote resolution owner");
+        assert!(cache.mark_exact_single_propagated(&observed, generation));
+        assert!(cache.finalize_exact_single(&observed, generation, result));
+        assert_eq!(
+            exact_completion(owner).await,
+            PqSingleObservationCompletion::Consumed(result),
+            "finalization before the first wait must remain retained",
+        );
+    }
+
+    let released_cache = TestingPqAttestationObservationOwnerCache::default();
+    let released = identity(3, 0x23, 0x33);
+    released_cache
+        .claim_exact_single(&released, earliest_slot)
+        .expect("old remote Pending claim");
+    let released_owner = released_cache
+        .resolve_exact_single_batch_owned(&[remote(released)], earliest_slot)
+        .expect("remote Pending watch owner");
+    let next_epoch = types::Epoch::new(1);
+    let next_epoch_start = next_epoch.start_slot(types::MinimalEthSpec::slots_per_epoch());
+    assert_eq!(
+        released_cache.precheck_single(next_epoch, 13, next_epoch_start),
+        beacon_chain::PqAttestationGossipObservation::Unseen,
+    );
+    assert_eq!(
+        exact_completion(released_owner).await,
+        PqSingleObservationCompletion::Released,
+        "prune before the first wait must retain Released",
+    );
+
+    let local_cache = TestingPqAttestationObservationOwnerCache::default();
+    let local_reserved = identity(4, 0x24, 0x34);
+    let local_owner = local_cache
+        .resolve_exact_single_batch_owned(&[local(local_reserved)], earliest_slot)
+        .expect("local wire-success reservation owner");
+    assert_eq!(
+        local_cache.exact_single_status(&local_reserved),
+        PqSingleObservationStatus::ConsumptionPending,
+    );
+    drop(local_owner);
+    assert_eq!(
+        local_cache.exact_single_status(&local_reserved),
+        PqSingleObservationStatus::Consumed(PqSingleConsumptionResult::Terminal),
+        "dropping the sole local reservation owner must terminalize, never strand",
+    );
+
+    let atomic_cache = TestingPqAttestationObservationOwnerCache::default();
+    let generation_before = atomic_cache.next_generation();
+    let first_local = identity(5, 0x25, 0x35);
+    let second_remote_unseen = identity(6, 0x26, 0x36);
+    assert!(matches!(
+        atomic_cache.resolve_exact_single_batch_owned(
+            &[local(first_local), remote(second_remote_unseen)],
+            earliest_slot,
+        ),
+        Err(PqSingleObservationBatchError::RemoteUnseen),
+    ));
+    assert_eq!(atomic_cache.resolution_owner_count(), 0);
+    assert_eq!(atomic_cache.next_generation(), generation_before);
+    assert_eq!(
+        atomic_cache.exact_single_status(&first_local),
+        PqSingleObservationStatus::Unseen,
+        "a second-member error must create neither owner nor first reservation",
+    );
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn pq_published_local_batch_consumption_is_atomic_ordered_and_fail_closed() {
+    async fn compile_pin_whole_batch_api(
+        chain: Arc<beacon_chain::BeaconChain<TestWitness>>,
+        evidence: PqPublishedLocalAttestationEvidenceBatch<MinimalEthSpec>,
+    ) -> Result<
+        PqPublishedLocalAttestationBatchConsumptionOutcome,
+        PqPublishedLocalAttestationBatchConsumptionError,
+    > {
+        chain
+            .pq_published_local_attestation_batch_consumer()
+            .consume(evidence)
+            .await
+    }
+    let _ = compile_pin_whole_batch_api;
+
+    let identity = |validator_index, root_byte, digest_byte| {
+        PqSingleObservationIdentity::new(
+            types::Epoch::new(0),
+            validator_index,
+            Slot::new(1),
+            types::SubnetId::new(3),
+            Hash256::repeat_byte(root_byte),
+            [digest_byte; 32],
+        )
+    };
+    let first = identity(1, 0x11, 0x21);
+    let second = identity(2, 0x12, 0x22);
+    let identities = [first, second];
+
+    let success_cache = TestingPqAttestationObservationOwnerCache::default();
+    let success = success_cache
+        .consume_published_local_batch_for_testing(
+            &identities,
+            vec![
+                Ok(PqForkChoiceAttestationOutcome::Applied),
+                Ok(PqForkChoiceAttestationOutcome::Queued),
+            ],
+        )
+        .await;
+    assert_eq!(
+        success.result,
+        Ok(
+            PqPublishedLocalAttestationBatchConsumptionOutcome::Complete {
+                results: vec![
+                    PqSingleConsumptionResult::Applied,
+                    PqSingleConsumptionResult::Queued,
+                ],
+            }
+        ),
+    );
+    assert_eq!(
+        success.apply_attempt_order,
+        vec![0, 1],
+        "local wire-success members must reserve atomically and apply in sealed batch order",
+    );
+    assert_eq!(success.fail_closed_calls, 0);
+    assert_eq!(
+        success_cache.exact_single_status(&first),
+        PqSingleObservationStatus::Consumed(PqSingleConsumptionResult::Applied),
+    );
+    assert_eq!(
+        success_cache.exact_single_status(&second),
+        PqSingleObservationStatus::Consumed(PqSingleConsumptionResult::Queued),
+    );
+
+    let replay = success_cache
+        .consume_published_local_batch_for_testing(&identities, vec![])
+        .await;
+    assert_eq!(replay.result, success.result);
+    assert!(
+        replay.apply_attempt_order.is_empty(),
+        "an exact already-consumed replay must coalesce without a second fork-choice call",
+    );
+    assert_eq!(replay.fail_closed_calls, 0);
+
+    let failure_cache = TestingPqAttestationObservationOwnerCache::default();
+    let failure = failure_cache
+        .consume_published_local_batch_for_testing(
+            &identities,
+            vec![
+                Ok(PqForkChoiceAttestationOutcome::Applied),
+                Err(PqForkChoiceAttestationError::TaskUnavailable),
+            ],
+        )
+        .await;
+    assert_eq!(
+        failure.result,
+        Err(
+            PqPublishedLocalAttestationBatchConsumptionError::ApplyFailed {
+                applied_count: 1,
+                failed_index: 1,
+            },
+        ),
+    );
+    assert_eq!(failure.apply_attempt_order, vec![0, 1]);
+    assert_eq!(failure.fail_closed_calls, 1);
+    assert_eq!(
+        failure_cache.exact_single_status(&first),
+        PqSingleObservationStatus::Consumed(PqSingleConsumptionResult::Applied),
+    );
+    assert_eq!(
+        failure_cache.exact_single_status(&second),
+        PqSingleObservationStatus::Consumed(PqSingleConsumptionResult::Terminal),
+    );
+
+    let failure_replay = failure_cache
+        .consume_published_local_batch_for_testing(&identities, vec![])
+        .await;
+    assert_eq!(
+        failure_replay.result,
+        Err(
+            PqPublishedLocalAttestationBatchConsumptionError::Observation(
+                PqSingleObservationBatchError::Terminal,
+            )
+        ),
+    );
+    assert!(
+        failure_replay.apply_attempt_order.is_empty(),
+        "an irreversible partial result must never retry or reapply its successful prefix",
+    );
+    assert_eq!(failure_replay.fail_closed_calls, 0);
+
+    let dropped_cache = TestingPqAttestationObservationOwnerCache::default();
+    let fail_closed_calls = Arc::new(AtomicUsize::new(0));
+    let fail_closed_calls_for_owner = Arc::clone(&fail_closed_calls);
+    dropped_cache.drop_published_local_batch_owner_before_apply_for_testing(
+        &identities,
+        move || {
+            fail_closed_calls_for_owner.fetch_add(1, Ordering::SeqCst);
+        },
+    );
+    assert_eq!(fail_closed_calls.load(Ordering::SeqCst), 1);
+    for identity in identities {
+        assert_eq!(
+            dropped_cache.exact_single_status(&identity),
+            PqSingleObservationStatus::Consumed(PqSingleConsumptionResult::Terminal),
+            "dropping the post-wire owner must terminalize every local reservation",
+        );
+    }
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn pq_published_local_batch_rechecks_head_after_remote_settlement_before_apply() {
+    const WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
+    let signed_slot = Slot::new(1);
+    let advanced_slot = Slot::new(2);
+    let bound_head_root = Hash256::repeat_byte(0xa1);
+    let advanced_head_root = Hash256::repeat_byte(0xa2);
+
+    let lagging_hook = TestingPqBlockingHook::counting();
+    let lagging = TestingPqPublishedLocalLateApplyHarness::new(
+        signed_slot,
+        bound_head_root,
+        Arc::clone(&lagging_hook),
+    );
+    let lagging_receipt = lagging.start_mixed_local_and_remote();
+    tokio::time::timeout(WAIT_BOUND, lagging.wait_until_remote_settlement())
+        .await
+        .expect("mixed batch genuinely reaches its remote wait");
+    drop(
+        lagging
+            .try_hold_import_gate()
+            .expect("the import gate is not held across remote settlement"),
+    );
+    lagging.set_clock(advanced_slot);
+    lagging.finalize_remote(PqSingleConsumptionResult::Queued);
+    assert_eq!(
+        tokio::time::timeout(WAIT_BOUND, lagging_receipt.wait())
+            .await
+            .expect("late lagging-head failure is bounded"),
+        Err(PqPublishedLocalAttestationBatchConsumptionError::Preflight(
+            beacon_chain::PqLocalAttestationBatchPreflightError::HeadNotReady {
+                head: signed_slot,
+                current: advanced_slot,
+            },
+        )),
+    );
+    assert_eq!(lagging.fork_choice_attestation_calls(), 0);
+    assert_eq!(lagging.fail_closed_calls(), 1);
+    assert_eq!(
+        lagging.local_observation_status(),
+        PqSingleObservationStatus::Consumed(PqSingleConsumptionResult::Terminal),
+    );
+    assert_eq!(
+        lagging.available_local_proof_permits(),
+        PQ_LOCAL_ATTESTATION_PROOF_ADMISSION_CAPACITY,
+        "terminal post-settlement preflight releases the retained verified-batch guards",
+    );
+
+    let incompatible_hook = TestingPqBlockingHook::counting();
+    let incompatible = TestingPqPublishedLocalLateApplyHarness::new(
+        signed_slot,
+        bound_head_root,
+        Arc::clone(&incompatible_hook),
+    );
+    let incompatible_receipt = incompatible.start_mixed_local_and_remote();
+    tokio::time::timeout(WAIT_BOUND, incompatible.wait_until_remote_settlement())
+        .await
+        .expect("incompatible-head case reaches its remote wait");
+    incompatible.set_clock(advanced_slot);
+    incompatible.set_reconciled_head(advanced_slot, advanced_head_root, false);
+    incompatible.finalize_remote(PqSingleConsumptionResult::Queued);
+    assert_eq!(
+        tokio::time::timeout(WAIT_BOUND, incompatible_receipt.wait())
+            .await
+            .expect("late incompatible-head failure is bounded"),
+        Err(PqPublishedLocalAttestationBatchConsumptionError::Preflight(
+            beacon_chain::PqLocalAttestationBatchPreflightError::BoundHeadNotCanonical {
+                bound: bound_head_root,
+                current: advanced_head_root,
+            },
+        )),
+    );
+    assert_eq!(incompatible.fork_choice_attestation_calls(), 0);
+    assert_eq!(incompatible.fail_closed_calls(), 1);
+    assert_eq!(
+        incompatible.local_observation_status(),
+        PqSingleObservationStatus::Consumed(PqSingleConsumptionResult::Terminal),
+    );
+
+    let fork_choice_ahead_hook = TestingPqBlockingHook::counting();
+    let fork_choice_ahead = TestingPqPublishedLocalLateApplyHarness::new(
+        signed_slot,
+        bound_head_root,
+        Arc::clone(&fork_choice_ahead_hook),
+    );
+    let fork_choice_ahead_receipt = fork_choice_ahead.start_mixed_local_and_remote();
+    tokio::time::timeout(WAIT_BOUND, fork_choice_ahead.wait_until_remote_settlement())
+        .await
+        .expect("fork-choice-ahead case reaches its remote wait");
+    fork_choice_ahead.set_clock(advanced_slot);
+    fork_choice_ahead.set_reconciled_head(advanced_slot, advanced_head_root, true);
+    fork_choice_ahead.set_fork_choice_slot(Slot::new(3));
+    fork_choice_ahead.finalize_remote(PqSingleConsumptionResult::Queued);
+    assert_eq!(
+        tokio::time::timeout(WAIT_BOUND, fork_choice_ahead_receipt.wait())
+            .await
+            .expect("fork-choice-ahead failure is bounded"),
+        Err(PqPublishedLocalAttestationBatchConsumptionError::Preflight(
+            beacon_chain::PqLocalAttestationBatchPreflightError::ForkChoiceTimeAhead {
+                fork_choice: Slot::new(3),
+                current: advanced_slot,
+            },
+        )),
+    );
+    assert_eq!(fork_choice_ahead.fork_choice_attestation_calls(), 0);
+    assert_eq!(fork_choice_ahead.fail_closed_calls(), 1);
+
+    let far_current_slot = Slot::new(10);
+    let far_signed_slot = Slot::new(9);
+    let far_head_root = Hash256::repeat_byte(0xa3);
+    let fork_choice_behind_hook = TestingPqBlockingHook::counting();
+    let fork_choice_behind = TestingPqPublishedLocalLateApplyHarness::new(
+        far_signed_slot,
+        bound_head_root,
+        Arc::clone(&fork_choice_behind_hook),
+    );
+    let fork_choice_behind_receipt = fork_choice_behind.start_mixed_local_and_remote();
+    tokio::time::timeout(
+        WAIT_BOUND,
+        fork_choice_behind.wait_until_remote_settlement(),
+    )
+    .await
+    .expect("fork-choice-behind case reaches its remote wait");
+    fork_choice_behind.set_clock(far_current_slot);
+    fork_choice_behind.set_reconciled_head(far_current_slot, far_head_root, true);
+    fork_choice_behind.set_fork_choice_slot(signed_slot);
+    fork_choice_behind.finalize_remote(PqSingleConsumptionResult::Queued);
+    assert_eq!(
+        tokio::time::timeout(WAIT_BOUND, fork_choice_behind_receipt.wait())
+            .await
+            .expect("fork-choice-behind failure is bounded"),
+        Err(PqPublishedLocalAttestationBatchConsumptionError::Preflight(
+            beacon_chain::PqLocalAttestationBatchPreflightError::ForkChoiceTimeTooFarBehind {
+                fork_choice: signed_slot,
+                current: far_current_slot,
+                maximum: beacon_chain::PQ_FORK_CHOICE_TICK_MAX_ADVANCE,
+            },
+        )),
+    );
+    assert_eq!(fork_choice_behind.fork_choice_attestation_calls(), 0);
+    assert_eq!(fork_choice_behind.fail_closed_calls(), 1);
+
+    let compatible_hook = TestingPqBlockingHook::blocking();
+    let compatible = TestingPqPublishedLocalLateApplyHarness::new(
+        signed_slot,
+        bound_head_root,
+        Arc::clone(&compatible_hook),
+    );
+    let compatible_receipt = compatible.start_mixed_local_and_remote();
+    tokio::time::timeout(WAIT_BOUND, compatible.wait_until_remote_settlement())
+        .await
+        .expect("compatible-head case reaches its remote wait");
+    compatible.set_clock(advanced_slot);
+    compatible.set_reconciled_head(advanced_slot, advanced_head_root, true);
+    compatible.finalize_remote(PqSingleConsumptionResult::Queued);
+    let entered = tokio::time::timeout(WAIT_BOUND, async {
+        while compatible_hook.entered() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok();
+    let import_gate_held_during_apply = compatible.try_hold_import_gate().is_none();
+    compatible_hook.release();
+    assert_eq!(
+        entered, true,
+        "local apply reaches the real blocking boundary"
+    );
+    assert!(
+        import_gate_held_during_apply,
+        "the post-settlement import gate remains held through blocking fork-choice application",
+    );
+    assert_eq!(
+        tokio::time::timeout(WAIT_BOUND, compatible_receipt.wait())
+            .await
+            .expect("compatible local application is bounded"),
+        Ok(
+            PqPublishedLocalAttestationBatchConsumptionOutcome::Complete {
+                results: vec![
+                    PqSingleConsumptionResult::Applied,
+                    PqSingleConsumptionResult::Queued,
+                ],
+            }
+        ),
+    );
+    assert_eq!(
+        compatible.last_fork_choice_current_slot(),
+        Some(advanced_slot),
+        "fork choice receives the actual post-settlement current slot, not the attestation slot",
+    );
+    assert_eq!(compatible.fork_choice_attestation_calls(), 1);
+    assert_eq!(compatible.fail_closed_calls(), 0);
+    drop(
+        compatible
+            .try_hold_import_gate()
+            .expect("successful apply releases the short import-gate guard"),
+    );
+
+    let fc_entry_hook = TestingPqBlockingHook::blocking();
+    let stale_clock_apply_hook = TestingPqBlockingHook::counting();
+    let stale_clock = TestingPqPublishedLocalLateApplyHarness::new(
+        signed_slot,
+        bound_head_root,
+        Arc::clone(&stale_clock_apply_hook),
+    );
+    stale_clock.set_fork_choice_entry_hook(Arc::clone(&fc_entry_hook));
+    let stale_clock_receipt = stale_clock.start_mixed_local_and_remote();
+    tokio::time::timeout(WAIT_BOUND, stale_clock.wait_until_remote_settlement())
+        .await
+        .expect("stale-clock case reaches its remote wait");
+    stale_clock.set_clock(advanced_slot);
+    stale_clock.set_reconciled_head(advanced_slot, advanced_head_root, true);
+    stale_clock.finalize_remote(PqSingleConsumptionResult::Queued);
+    let entered = tokio::time::timeout(WAIT_BOUND, async {
+        while fc_entry_hook.entered() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok();
+    let gate_held_before_fc_lock = stale_clock.try_hold_import_gate().is_none();
+    let final_slot = Slot::new(3);
+    stale_clock.set_clock(final_slot);
+    fc_entry_hook.release();
+    assert!(
+        entered,
+        "the task blocks immediately before the FC critical section"
+    );
+    assert!(
+        gate_held_before_fc_lock,
+        "the import gate remains retained while FC entry is blocked",
+    );
+    assert_eq!(
+        tokio::time::timeout(WAIT_BOUND, stale_clock_receipt.wait())
+            .await
+            .expect("post-FC-wait clock rejection is bounded"),
+        Err(PqPublishedLocalAttestationBatchConsumptionError::Preflight(
+            beacon_chain::PqLocalAttestationBatchPreflightError::ClockChanged {
+                sampled: advanced_slot,
+                current: final_slot,
+            },
+        )),
+    );
+    assert_eq!(stale_clock.fork_choice_attestation_calls(), 0);
+    assert_eq!(stale_clock.fail_closed_calls(), 1);
+    assert_eq!(
+        stale_clock.local_observation_status(),
+        PqSingleObservationStatus::Consumed(PqSingleConsumptionResult::Terminal),
+    );
+    assert_eq!(
+        stale_clock.available_local_proof_permits(),
+        PQ_LOCAL_ATTESTATION_PROOF_ADMISSION_CAPACITY,
+    );
+    drop(
+        stale_clock
+            .try_hold_import_gate()
+            .expect("stale-clock terminal resolution releases the import gate"),
+    );
+
+    let production_route =
+        include_str!("../../../beacon_node/beacon_chain/src/pq_runtime/beacon_chain.rs");
+    let harness_route =
+        include_str!("../../../beacon_node/beacon_chain/src/pq_runtime/attestation_gossip.rs");
+    for source in [production_route, harness_route] {
+        assert!(
+            source.contains("consume_pq_published_local_attestation_batch_after_settlement"),
+            "the real continuation and cfg harness must call one full post-settlement route",
+        );
+    }
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn pq_post_wire_evidence_is_unforgeable_exact_and_checked_before_fork_choice() {
+    let identity = |validator_index, root_byte, digest_byte| {
+        PqSingleObservationIdentity::new(
+            types::Epoch::new(0),
+            validator_index,
+            Slot::new(1),
+            types::SubnetId::new(validator_index),
+            Hash256::repeat_byte(root_byte),
+            [digest_byte; 32],
+        )
+    };
+    let members = [identity(1, 0x41, 0x51), identity(2, 0x42, 0x52)];
+    let message_ids = [MessageId(vec![0x61; 20]), MessageId(vec![0x62; 20])];
+
+    for mutation in [
+        TestingPqPublishedLocalAttestationEvidenceMutation::SignedSszByte,
+        TestingPqPublishedLocalAttestationEvidenceMutation::Topic,
+        TestingPqPublishedLocalAttestationEvidenceMutation::MessageId,
+        TestingPqPublishedLocalAttestationEvidenceMutation::MemberIdentity,
+        TestingPqPublishedLocalAttestationEvidenceMutation::MemberOrder,
+        TestingPqPublishedLocalAttestationEvidenceMutation::MemberCount,
+    ] {
+        let harness =
+            TestingPqPublishedLocalAttestationEvidenceHarness::from_exact_lower_publications(
+                members,
+            )
+            .await
+            .expect("the harness obtains opaque tokens only through the exact lower publisher");
+        let trace = harness.consume_with_local_evidence_mutation(mutation).await;
+        assert!(matches!(
+            trace.result,
+            Err(PqPublishedLocalAttestationEvidenceError::Mismatch { .. })
+        ));
+        assert_eq!(trace.fork_choice_calls, 0);
+        assert_eq!(trace.fail_closed_calls, 1);
+    }
+
+    for remote_status in [
+        TestingPqRemotePublicationEvidenceStatus::Unseen,
+        TestingPqRemotePublicationEvidenceStatus::Conflict,
+        TestingPqRemotePublicationEvidenceStatus::Terminal,
+    ] {
+        let harness = TestingPqPublishedLocalAttestationEvidenceHarness::with_remote_observations(
+            [
+                (message_ids[0].clone(), members[0]),
+                (message_ids[1].clone(), members[1]),
+            ],
+            remote_status,
+        );
+        let trace = harness
+            .consume_claimed_remote([
+                (message_ids[0].clone(), PqSingleConsumptionResult::Applied),
+                (message_ids[1].clone(), PqSingleConsumptionResult::Queued),
+            ])
+            .await;
+        assert!(trace.result.is_err());
+        assert_eq!(trace.fork_choice_calls, 0);
+        assert_eq!(trace.fail_closed_calls, 1);
+    }
+
+    let swapped_message_id_harness =
+        TestingPqPublishedLocalAttestationEvidenceHarness::with_remote_consumed([
+            (
+                message_ids[0].clone(),
+                members[0],
+                PqSingleConsumptionResult::Applied,
+            ),
+            (
+                message_ids[1].clone(),
+                members[1],
+                PqSingleConsumptionResult::Queued,
+            ),
+        ]);
+    let swapped_message_id_trace = swapped_message_id_harness
+        .consume_claimed_remote([
+            (message_ids[1].clone(), PqSingleConsumptionResult::Applied),
+            (message_ids[0].clone(), PqSingleConsumptionResult::Queued),
+        ])
+        .await;
+    assert!(swapped_message_id_trace.result.is_err());
+    assert_eq!(swapped_message_id_trace.fork_choice_calls, 0);
+    assert_eq!(swapped_message_id_trace.fail_closed_calls, 1);
+
+    let harness = TestingPqPublishedLocalAttestationEvidenceHarness::with_remote_consumed([
+        (
+            message_ids[0].clone(),
+            members[0],
+            PqSingleConsumptionResult::Applied,
+        ),
+        (
+            message_ids[1].clone(),
+            members[1],
+            PqSingleConsumptionResult::Queued,
+        ),
+    ]);
+    let trace = harness
+        .consume_claimed_remote([
+            (message_ids[0].clone(), PqSingleConsumptionResult::Applied),
+            (message_ids[1].clone(), PqSingleConsumptionResult::Queued),
+        ])
+        .await;
+    assert_eq!(
+        trace.result,
+        Ok(
+            PqPublishedLocalAttestationBatchConsumptionOutcome::Complete {
+                results: vec![
+                    PqSingleConsumptionResult::Applied,
+                    PqSingleConsumptionResult::Queued,
+                ],
+            },
+        ),
+    );
+    assert_eq!(trace.fork_choice_calls, 0);
+    assert_eq!(trace.fail_closed_calls, 0);
+}
+
+#[test]
+fn pq_post_wire_evidence_dependency_is_proposer_only_and_one_way() {
+    let manifest = include_str!("../../../beacon_node/beacon_chain/Cargo.toml");
+    assert!(manifest.contains("pq-proposer = ["));
+    assert!(manifest.contains("dep:lighthouse_network"));
+    assert!(manifest.contains("lighthouse_network = {"));
+    assert!(manifest.contains("optional = true"));
+
+    let public_surface = include_str!("../../../beacon_node/beacon_chain/src/lib.rs");
+    assert!(public_surface.contains("PqPublishedLocalAttestationEvidenceBatch"));
+    assert!(!public_surface.contains("PqLocalSinglePublicationToken"));
+}
+
+#[test]
+fn pq_published_local_batch_consumption_keeps_raw_resolution_types_private() {
+    let public_surface = include_str!("../../../beacon_node/beacon_chain/src/lib.rs");
+    for forbidden in [
+        "PqSingleObservationBatchRequest",
+        "PqSingleObservationBatchSource",
+        "PqSingleObservationBatchResolutionOwner",
+    ] {
+        assert!(
+            !public_surface.contains(forbidden),
+            "raw observation batch type {forbidden} must not be exported by beacon_chain",
+        );
+    }
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn pq_published_local_batch_supervisor_is_uncancellable_and_fail_closed() {
+    async fn wait_until_entered(hook: &TestingPqBlockingHook) {
+        for _ in 0..1_000 {
+            if hook.entered() > 0 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("bounded Cycle W supervisor hook was never entered");
+    }
+
+    for failure in [
+        TestingPqPublishedLocalAttestationSupervisorFailure::Preflight,
+        TestingPqPublishedLocalAttestationSupervisorFailure::InvalidIndexed,
+        TestingPqPublishedLocalAttestationSupervisorFailure::Observation,
+        TestingPqPublishedLocalAttestationSupervisorFailure::Panic,
+    ] {
+        let hook = TestingPqBlockingHook::blocking();
+        let harness =
+            TestingPqPublishedLocalAttestationSupervisorHarness::new(failure, Arc::clone(&hook));
+        let receipt = harness.start_after_wire();
+        wait_until_entered(&hook).await;
+        drop(receipt);
+
+        let mut drain = Box::pin(harness.close_and_drain());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), &mut drain)
+                .await
+                .is_err(),
+            "caller drop must not release the after-wire supervisor/coordinator"
+        );
+        hook.release();
+        tokio::time::timeout(std::time::Duration::from_secs(1), drain)
+            .await
+            .expect("after-wire failure supervisor drains after bounded resolution");
+        assert_eq!(
+            harness.fail_closed_calls(),
+            1,
+            "{failure:?} must signal fail-closed exactly once inside the no-exit owner",
+        );
+        assert_eq!(harness.active_operations(), 0);
+    }
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn pq_published_local_batch_waits_and_reclaims_remote_observations_exactly() {
+    let identity = |validator_index, root_byte, digest_byte| {
+        PqSingleObservationIdentity::new(
+            types::Epoch::new(0),
+            validator_index,
+            Slot::new(1),
+            types::SubnetId::new(3),
+            Hash256::repeat_byte(root_byte),
+            [digest_byte; 32],
+        )
+    };
+    let earliest_slot = Slot::new(0);
+
+    for (validator_index, result) in [
+        (1, PqSingleConsumptionResult::Applied),
+        (2, PqSingleConsumptionResult::Queued),
+    ] {
+        let cache = TestingPqAttestationObservationOwnerCache::default();
+        let remote = identity(
+            validator_index,
+            0x10_u8.saturating_add(validator_index as u8),
+            0x20_u8.saturating_add(validator_index as u8),
+        );
+        let generation = cache
+            .claim_exact_single(&remote, earliest_slot)
+            .expect("remote Pending claim");
+        let receipt = cache.start_published_local_batch_wait_for_testing(
+            &[TestingPqSingleObservationBatchInput::LocalWireSuccess(
+                remote,
+            )],
+            vec![],
+        );
+        assert!(cache.mark_exact_single_propagated(&remote, generation));
+        assert!(cache.finalize_exact_single(&remote, generation, result));
+        let trace = receipt.wait().await;
+        assert_eq!(
+            trace.result,
+            Ok(
+                PqPublishedLocalAttestationBatchConsumptionOutcome::Complete {
+                    results: vec![result],
+                }
+            ),
+            "completion before the first poll must remain observable",
+        );
+        assert!(trace.apply_attempt_order.is_empty());
+        assert_eq!(trace.fail_closed_calls, 0);
+    }
+
+    let after_poll_cache = TestingPqAttestationObservationOwnerCache::default();
+    let after_poll = identity(3, 0x13, 0x23);
+    let after_poll_generation = after_poll_cache
+        .claim_exact_single(&after_poll, earliest_slot)
+        .expect("remote Pending claim");
+    assert!(after_poll_cache.mark_exact_single_propagated(&after_poll, after_poll_generation));
+    let after_poll_receipt = after_poll_cache.start_published_local_batch_wait_for_testing(
+        &[TestingPqSingleObservationBatchInput::LocalWireSuccess(
+            after_poll,
+        )],
+        vec![],
+    );
+    let after_poll_wait = tokio::spawn(async move { after_poll_receipt.wait().await });
+    tokio::task::yield_now().await;
+    assert!(after_poll_cache.finalize_exact_single(
+        &after_poll,
+        after_poll_generation,
+        PqSingleConsumptionResult::Queued,
+    ));
+    let after_poll_trace = tokio::time::timeout(std::time::Duration::from_secs(1), after_poll_wait)
+        .await
+        .expect("after-poll coalescing is bounded")
+        .expect("after-poll waiter remains monitored");
+    assert_eq!(
+        after_poll_trace.result,
+        Ok(
+            PqPublishedLocalAttestationBatchConsumptionOutcome::Complete {
+                results: vec![PqSingleConsumptionResult::Queued],
+            }
+        ),
+    );
+    assert!(after_poll_trace.apply_attempt_order.is_empty());
+    assert_eq!(after_poll_trace.fail_closed_calls, 0);
+
+    let released_cache = TestingPqAttestationObservationOwnerCache::default();
+    let released = identity(4, 0x14, 0x24);
+    let released_generation = released_cache
+        .claim_exact_single(&released, earliest_slot)
+        .expect("remote Pending claim");
+    let released_receipt = released_cache.start_published_local_batch_wait_for_testing(
+        &[TestingPqSingleObservationBatchInput::LocalWireSuccess(
+            released,
+        )],
+        vec![Ok(PqForkChoiceAttestationOutcome::Applied)],
+    );
+    assert!(released_cache.rollback_exact_single(&released, released_generation));
+    let released_trace = released_receipt.wait().await;
+    assert_eq!(
+        released_trace.result,
+        Ok(
+            PqPublishedLocalAttestationBatchConsumptionOutcome::Complete {
+                results: vec![PqSingleConsumptionResult::Applied],
+            }
+        ),
+    );
+    assert_eq!(released_trace.apply_attempt_order, vec![0]);
+    assert_eq!(released_trace.fail_closed_calls, 0);
+
+    let mixed_cache = TestingPqAttestationObservationOwnerCache::default();
+    let local = identity(5, 0x15, 0x25);
+    let remote = identity(6, 0x16, 0x26);
+    let remote_generation = mixed_cache
+        .claim_exact_single(&remote, earliest_slot)
+        .expect("remote Pending claim");
+    assert!(mixed_cache.mark_exact_single_propagated(&remote, remote_generation));
+    let mixed_receipt = mixed_cache.start_published_local_batch_wait_for_testing(
+        &[
+            TestingPqSingleObservationBatchInput::LocalWireSuccess(local),
+            TestingPqSingleObservationBatchInput::LocalWireSuccess(remote),
+        ],
+        vec![Ok(PqForkChoiceAttestationOutcome::Applied)],
+    );
+    let mixed_wait = tokio::spawn(async move { mixed_receipt.wait().await });
+    tokio::task::yield_now().await;
+    assert_eq!(
+        mixed_cache.exact_single_status(&local),
+        PqSingleObservationStatus::ConsumptionPending,
+        "local reservation must stay armed while the exact remote member is unresolved",
+    );
+    assert!(mixed_cache.finalize_exact_single(
+        &remote,
+        remote_generation,
+        PqSingleConsumptionResult::Applied,
+    ));
+    let mixed_trace = tokio::time::timeout(std::time::Duration::from_secs(1), mixed_wait)
+        .await
+        .expect("mixed resolution is bounded")
+        .expect("mixed resolution owner remains monitored");
+    assert_eq!(
+        mixed_trace.result,
+        Ok(
+            PqPublishedLocalAttestationBatchConsumptionOutcome::Complete {
+                results: vec![
+                    PqSingleConsumptionResult::Applied,
+                    PqSingleConsumptionResult::Applied,
+                ],
+            }
+        ),
+    );
+    assert_eq!(mixed_trace.apply_attempt_order, vec![0]);
+
+    for terminal_case in ["terminal", "lost", "conflict"] {
+        let cache = TestingPqAttestationObservationOwnerCache::default();
+        let known = identity(7, 0x17, 0x27);
+        let generation = cache
+            .claim_exact_single(&known, earliest_slot)
+            .expect("known remote claim");
+        let requested = if terminal_case == "conflict" {
+            identity(7, 0x17, 0x28)
+        } else {
+            known
+        };
+        let receipt = cache.start_published_local_batch_wait_for_testing(
+            &[TestingPqSingleObservationBatchInput::LocalWireSuccess(
+                requested,
+            )],
+            vec![],
+        );
+        match terminal_case {
+            "terminal" => {
+                assert!(cache.mark_exact_single_propagated(&known, generation));
+                assert!(cache.finalize_exact_single(
+                    &known,
+                    generation,
+                    PqSingleConsumptionResult::Terminal,
+                ));
+            }
+            "lost" => cache.lose_exact_single_completion_for_testing(&known),
+            "conflict" => {}
+            _ => unreachable!("fixed terminal case"),
+        }
+        let trace = receipt.wait().await;
+        assert!(trace.result.is_err(), "{terminal_case} must be terminal");
+        assert_eq!(
+            trace.fail_closed_calls, 1,
+            "{terminal_case} must signal fail-closed exactly once",
+        );
+        assert!(trace.apply_attempt_order.is_empty());
+    }
 }
 
 #[test]

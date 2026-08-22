@@ -58,8 +58,9 @@ pq-beacon-import-testing = [
     "dep:reqwest",
     "dep:slashing_protection",
     "dep:warp",
+    "beacon_chain/pq-proposer",
     "network/pq-startup-testing",
-    "lighthouse_network/pq-devnet",
+    "lighthouse_network/pq-proposer",
     "eth2/pq-wire",
 ]
 pq-randao-transport-testing = [

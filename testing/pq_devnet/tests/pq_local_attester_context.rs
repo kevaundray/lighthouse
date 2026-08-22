@@ -1,7 +1,12 @@
 #[cfg(target_feature = "avx2")]
 mod avx2 {
     use beacon_chain::{
-        BeaconChain, PqLocalAttesterIdentity, PqNewPayloadTransport, TestingPqBlockingHook,
+        BeaconChain, BeaconSnapshot, PqLocalAttestationBatchPreflightError,
+        PqLocalAttestationBatchPreflightOutcome, PqLocalAttesterIdentity, PqNewPayloadTransport,
+        PqVerifiedLocalAttestationBatch, TestingPqBlockingHook,
+        TestingPqLocalAttestationPreflightHarness, TestingPqLocalAttestationPreflightMember,
+        TestingPqLocalAttestationPreflightReconciliation,
+        TestingPqLocalAttestationPreflightRootAccessTrace,
         builder::{BeaconChainBuilder, Witness},
     };
     use consensus_signature::{AggregationService, IndividualSignature, PqPublicKey};
@@ -1161,6 +1166,227 @@ mod avx2 {
                 block_root,
             }) if block_root == head.beacon_block_root
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_batch_preflight_is_short_coherent_and_non_mutating() {
+        let _production_api: fn(
+            &BeaconChain<TestWitness>,
+            &PqVerifiedLocalAttestationBatch<MinimalEthSpec>,
+        ) -> Result<
+            PqLocalAttestationBatchPreflightOutcome,
+            PqLocalAttestationBatchPreflightError,
+        > = BeaconChain::<TestWitness>::preflight_pq_local_attestation_batch;
+        let _cached_state_root_api: fn(&BeaconSnapshot<MinimalEthSpec>) -> Hash256 =
+            BeaconSnapshot::<MinimalEthSpec>::validated_state_root;
+
+        let current_slot = Slot::new(17);
+        let current_head = Hash256::repeat_byte(0x51);
+        let ancestor = Hash256::repeat_byte(0x41);
+        let member = |slot, bound_head_root| {
+            TestingPqLocalAttestationPreflightMember::new(slot, bound_head_root)
+        };
+        let mut harness =
+            TestingPqLocalAttestationPreflightHarness::reconciled(current_slot, current_head);
+
+        assert_eq!(
+            harness.preflight(&[]),
+            Err(PqLocalAttestationBatchPreflightError::Empty),
+        );
+        assert_eq!(
+            harness.preflight(&[
+                member(current_slot, current_head),
+                member(current_slot, current_head),
+                member(current_slot, current_head),
+            ]),
+            Err(PqLocalAttestationBatchPreflightError::Capacity {
+                count: 3,
+                maximum: 2,
+            }),
+        );
+        assert_eq!(harness.fork_choice_attestation_calls(), 0);
+
+        let transition = harness.hold_import_gate().await;
+        let busy = harness
+            .preflight(&[member(current_slot, current_head)])
+            .expect_err("preflight never waits through a canonical transition");
+        assert_eq!(
+            busy,
+            PqLocalAttestationBatchPreflightError::HeadTransitionBusy
+        );
+        assert!(busy.is_retryable());
+        drop(transition);
+
+        harness.set_propagation_window(Slot::new(9), current_slot, Slot::new(18));
+        assert!(matches!(
+            harness.preflight(&[member(Slot::new(8), ancestor)]),
+            Err(PqLocalAttestationBatchPreflightError::BeforePropagationWindow {
+                slot,
+                earliest,
+            }) if slot == Slot::new(8) && earliest == Slot::new(9)
+        ));
+        assert!(matches!(
+            harness.preflight(&[member(Slot::new(19), current_head)]),
+            Err(PqLocalAttestationBatchPreflightError::AfterPropagationWindow {
+                slot,
+                latest,
+            }) if slot == Slot::new(19) && latest == Slot::new(18)
+        ));
+
+        harness.set_head_slots(Slot::new(16), current_slot);
+        assert_eq!(
+            harness.preflight(&[member(current_slot, current_head)]),
+            Err(PqLocalAttestationBatchPreflightError::HeadInconsistent {
+                state: Slot::new(16),
+                block: current_slot,
+            }),
+        );
+        let inconsistent = harness
+            .preflight(&[member(current_slot, current_head)])
+            .expect_err("different state/block slots are terminally incoherent");
+        assert!(!inconsistent.is_retryable());
+
+        harness.set_head_slots(Slot::new(16), Slot::new(16));
+        let lagging = harness
+            .preflight(&[member(current_slot, current_head)])
+            .expect_err("an equal but lagging state/block head is not ready");
+        assert_eq!(
+            lagging,
+            PqLocalAttestationBatchPreflightError::HeadNotReady {
+                head: Slot::new(16),
+                current: current_slot,
+            },
+        );
+        assert!(lagging.is_retryable());
+
+        harness.set_head_slots(Slot::new(18), Slot::new(18));
+        let leading = harness
+            .preflight(&[member(current_slot, current_head)])
+            .expect_err("an equal but future state/block head is terminal");
+        assert_eq!(
+            leading,
+            PqLocalAttestationBatchPreflightError::HeadAhead {
+                head: Slot::new(18),
+                current: current_slot,
+            },
+        );
+        assert!(!leading.is_retryable());
+        harness.set_head_slots(current_slot, current_slot);
+        harness.set_head_roots(
+            current_head,
+            Hash256::repeat_byte(0x52),
+            Hash256::repeat_byte(0x53),
+        );
+        assert!(matches!(
+            harness.preflight(&[member(current_slot, current_head)]),
+            Err(PqLocalAttestationBatchPreflightError::HeadRootInconsistent { .. })
+        ));
+        harness.set_coherent_head(current_slot, current_head);
+
+        harness.set_reconciliation(TestingPqLocalAttestationPreflightReconciliation::Pending(
+            current_head,
+        ));
+        let pending = harness
+            .preflight(&[member(current_slot, current_head)])
+            .expect_err("Pending execution reconciliation is not publication-ready");
+        assert!(matches!(
+            pending,
+            PqLocalAttestationBatchPreflightError::HeadReconciliationPending { block_root }
+                if block_root == current_head
+        ));
+        assert!(pending.is_retryable());
+
+        harness.set_reconciliation(TestingPqLocalAttestationPreflightReconciliation::Failed(
+            current_head,
+        ));
+        let failed = harness
+            .preflight(&[member(current_slot, current_head)])
+            .expect_err("Failed execution reconciliation is terminal");
+        assert!(matches!(
+            failed,
+            PqLocalAttestationBatchPreflightError::HeadReconciliationFailed { block_root }
+                if block_root == current_head
+        ));
+        assert!(!failed.is_retryable());
+
+        let other_head = Hash256::repeat_byte(0x54);
+        harness.set_reconciliation(
+            TestingPqLocalAttestationPreflightReconciliation::Reconciled(other_head),
+        );
+        let mismatch = harness
+            .preflight(&[member(current_slot, current_head)])
+            .expect_err("cross-head execution reconciliation is terminal");
+        assert!(matches!(
+            mismatch,
+            PqLocalAttestationBatchPreflightError::HeadReconciliationInconsistent {
+                head,
+                reconciliation,
+            } if head == current_head && reconciliation == other_head
+        ));
+        assert!(!mismatch.is_retryable());
+
+        harness.set_reconciliation(
+            TestingPqLocalAttestationPreflightReconciliation::Reconciled(current_head),
+        );
+        harness.set_descendant(ancestor, current_head, true);
+        assert_eq!(
+            harness.preflight(&[member(Slot::new(16), ancestor)]),
+            Ok(PqLocalAttestationBatchPreflightOutcome::Ready {
+                count: 1,
+                slot: Slot::new(16),
+                current_head_root: current_head,
+            }),
+            "a still-canonical ancestor remains publication eligible",
+        );
+        harness.set_descendant(ancestor, current_head, false);
+        assert_eq!(
+            harness.preflight(&[member(Slot::new(16), ancestor)]),
+            Err(
+                PqLocalAttestationBatchPreflightError::BoundHeadNotCanonical {
+                    bound: ancestor,
+                    current: current_head,
+                }
+            ),
+        );
+
+        harness.set_descendant(ancestor, current_head, true);
+        let retained_batch = [member(Slot::new(16), ancestor)];
+        let ready = harness
+            .preflight(&retained_batch)
+            .expect("coherent batch is publication-ready");
+        let post_preflight_gate = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            harness.hold_import_gate(),
+        )
+        .await
+        .expect("preflight releases the import gate before network wait");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("async runtime remains live while batch and gate receipt are retained");
+        assert_eq!(
+            ready,
+            PqLocalAttestationBatchPreflightOutcome::Ready {
+                count: 1,
+                slot: Slot::new(16),
+                current_head_root: current_head,
+            },
+        );
+        assert_eq!(harness.fork_choice_attestation_calls(), 0);
+        assert_eq!(
+            harness.root_access_trace(),
+            TestingPqLocalAttestationPreflightRootAccessTrace {
+                cached_block_root_reads: 1,
+                cached_state_root_reads: 1,
+                block_canonical_root_calls: 0,
+                state_tree_hash_cache_updates: 0,
+            },
+            "gate-held preflight reads only roots validated when the snapshot was constructed",
+        );
+        drop(post_preflight_gate);
     }
 
     #[tokio::test(flavor = "current_thread")]

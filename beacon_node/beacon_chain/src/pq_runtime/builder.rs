@@ -135,6 +135,7 @@ pub(crate) fn persist_pq_imported_transition<T: BeaconChainTypes>(
         beacon_block: block,
         beacon_block_root: block_root,
         beacon_state: state,
+        validated_state_root: state_root,
     };
     let store_ops = vec![
         StoreOp::PutState(state_root, &snapshot.beacon_state),
@@ -285,6 +286,7 @@ where
             beacon_block: Arc::new(block.clone()),
             beacon_block_root: block_root,
             beacon_state: state,
+            validated_state_root: state_root,
         };
         let store = self
             .store
@@ -403,6 +405,7 @@ where
             beacon_block: Arc::new(block),
             beacon_block_root: persisted.block_root,
             beacon_state: state,
+            validated_state_root: computed_state_root,
         });
         self.key_cache = Some(key_cache);
         Ok(self)

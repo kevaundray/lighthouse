@@ -683,36 +683,13 @@ pub fn gossipsub_config(
         return Err("PQ gossipsub requires an exact 300-second slot".to_owned());
     }
 
-    fn prefix(
-        prefix: [u8; 4],
-        message: &gossipsub::Message,
-        fork_context: Arc<ForkContext>,
-    ) -> Vec<u8> {
-        let topic_bytes = message.topic.as_str().as_bytes();
-
-        if fork_context.current_fork_name().altair_enabled() {
-            let topic_len_bytes = topic_bytes.len().to_le_bytes();
-            let mut vec = Vec::with_capacity(
-                prefix.len() + topic_len_bytes.len() + topic_bytes.len() + message.data.len(),
-            );
-            vec.extend_from_slice(&prefix);
-            vec.extend_from_slice(&topic_len_bytes);
-            vec.extend_from_slice(topic_bytes);
-            vec.extend_from_slice(&message.data);
-            vec
-        } else {
-            let mut vec = Vec::with_capacity(prefix.len() + message.data.len());
-            vec.extend_from_slice(&prefix);
-            vec.extend_from_slice(&message.data);
-            vec
-        }
-    }
     let message_domain_valid_snappy = gossipsub_config_params.message_domain_valid_snappy;
     let gossip_message_id = move |message: &gossipsub::Message| {
-        gossipsub::MessageId::from(
-            &Sha256::digest(
-                prefix(message_domain_valid_snappy, message, fork_context.clone()).as_slice(),
-            )[..20],
+        gossip_message_id_from_parts(
+            message_domain_valid_snappy,
+            &message.topic,
+            &message.data,
+            fork_context.current_fork_name().altair_enabled(),
         )
     };
 
@@ -787,6 +764,40 @@ pub fn gossipsub_config(
     }
 
     builder.build().map_err(|error| error.to_string())
+}
+
+fn gossip_message_id_from_parts(
+    prefix: [u8; 4],
+    topic: &gossipsub::TopicHash,
+    data: &[u8],
+    altair_enabled: bool,
+) -> gossipsub::MessageId {
+    let topic_bytes = topic.as_str().as_bytes();
+    let mut prefixed = if altair_enabled {
+        Vec::with_capacity(
+            prefix.len() + std::mem::size_of::<usize>() + topic_bytes.len() + data.len(),
+        )
+    } else {
+        Vec::with_capacity(prefix.len() + data.len())
+    };
+    prefixed.extend_from_slice(&prefix);
+    if altair_enabled {
+        prefixed.extend_from_slice(&topic_bytes.len().to_le_bytes());
+        prefixed.extend_from_slice(topic_bytes);
+    }
+    prefixed.extend_from_slice(data);
+    gossipsub::MessageId::from(&Sha256::digest(&prefixed)[..20])
+}
+
+/// Recomputes the anonymous Lighthouse gossipsub message ID for exact PQ publication evidence.
+#[cfg(feature = "pq-proposer")]
+pub fn pq_anonymous_message_id(
+    topic: &gossipsub::TopicHash,
+    data: &[u8],
+    message_domain_valid_snappy: [u8; 4],
+    altair_enabled: bool,
+) -> gossipsub::MessageId {
+    gossip_message_id_from_parts(message_domain_valid_snappy, topic, data, altair_enabled)
 }
 
 #[cfg(all(test, feature = "pq-devnet"))]

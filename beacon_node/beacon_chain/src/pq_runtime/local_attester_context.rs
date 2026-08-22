@@ -1,5 +1,7 @@
 use crate::{BeaconChain, BeaconChainTypes};
 use consensus_signature::{ValidatorPublicKeyBytes, is_individual_same_message_evidence};
+#[cfg(feature = "pq-proposer")]
+use lighthouse_network::{MessageId, PqLocalSinglePublicationToken};
 use sha2::{Digest, Sha256};
 use slot_clock::SlotClock;
 use std::error::Error;
@@ -13,6 +15,601 @@ use types::{
 
 pub const PQ_LOCAL_ATTESTER_IDENTITY_CAPACITY: usize = 16;
 pub const PQ_LOCAL_ATTESTATION_CONTEXT_ADMISSION_CAPACITY: usize = 2;
+pub const PQ_LOCAL_ATTESTATION_PREFLIGHT_CAPACITY: usize = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PqLocalAttestationBatchPreflightOutcome {
+    Ready {
+        count: usize,
+        slot: Slot,
+        current_head_root: Hash256,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PqLocalAttestationBatchPreflightError {
+    Empty,
+    Capacity {
+        count: usize,
+        maximum: usize,
+    },
+    BatchSlotInconsistent {
+        expected: Slot,
+        actual: Slot,
+    },
+    HeadTransitionBusy,
+    ClockUnavailable,
+    HeadInconsistent {
+        state: Slot,
+        block: Slot,
+    },
+    HeadNotReady {
+        head: Slot,
+        current: Slot,
+    },
+    HeadAhead {
+        head: Slot,
+        current: Slot,
+    },
+    BeforePropagationWindow {
+        slot: Slot,
+        earliest: Slot,
+    },
+    AfterPropagationWindow {
+        slot: Slot,
+        latest: Slot,
+    },
+    HeadRootInconsistent {
+        block_state_root: Hash256,
+        validated_state_root: Hash256,
+    },
+    HeadReconciliationPending {
+        block_root: Hash256,
+    },
+    HeadReconciliationFailed {
+        block_root: Hash256,
+    },
+    HeadReconciliationInconsistent {
+        head: Hash256,
+        reconciliation: Hash256,
+    },
+    ForkChoiceBusy,
+    ForkChoiceUnavailable,
+    ClockChanged {
+        sampled: Slot,
+        current: Slot,
+    },
+    ForkChoiceTimeAhead {
+        fork_choice: Slot,
+        current: Slot,
+    },
+    ForkChoiceTimeTooFarBehind {
+        fork_choice: Slot,
+        current: Slot,
+        maximum: u64,
+    },
+    BoundHeadNotCanonical {
+        bound: Hash256,
+        current: Hash256,
+    },
+}
+
+impl PqLocalAttestationBatchPreflightError {
+    pub const fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::HeadTransitionBusy
+                | Self::ClockUnavailable
+                | Self::HeadNotReady { .. }
+                | Self::AfterPropagationWindow { .. }
+                | Self::HeadReconciliationPending { .. }
+                | Self::ForkChoiceBusy
+                | Self::ClockChanged { .. }
+                | Self::ForkChoiceTimeTooFarBehind { .. }
+        )
+    }
+}
+
+impl std::fmt::Display for PqLocalAttestationBatchPreflightError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "PQ local attestation preflight failed: {self:?}")
+    }
+}
+
+impl Error for PqLocalAttestationBatchPreflightError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PqLocalAttestationPreflightMember {
+    slot: Slot,
+    bound_head_root: Hash256,
+}
+
+#[cfg(feature = "pq-proposer")]
+pub(crate) struct PqLocalAttestationLateApplyContext {
+    _import_gate: OwnedSemaphorePermit,
+    members: Vec<PqLocalAttestationPreflightMember>,
+    current_slot: Slot,
+    current_head_root: Hash256,
+}
+
+#[derive(Clone, Copy)]
+enum PqLocalAttestationPreflightReconciliation {
+    Pending(Hash256),
+    Reconciled(Hash256),
+    Failed(Hash256),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_pq_local_attestation_batch_preflight(
+    members: &[PqLocalAttestationPreflightMember],
+    current_slot: Slot,
+    earliest_slot: Slot,
+    latest_slot: Slot,
+    state_slot: Slot,
+    block_slot: Slot,
+    current_head_root: Hash256,
+    block_state_root: Hash256,
+    validated_state_root: Hash256,
+    reconciliation: PqLocalAttestationPreflightReconciliation,
+    descendants: impl FnOnce(
+        &[PqLocalAttestationPreflightMember],
+        Hash256,
+    ) -> Result<Vec<bool>, PqLocalAttestationBatchPreflightError>,
+) -> Result<PqLocalAttestationBatchPreflightOutcome, PqLocalAttestationBatchPreflightError> {
+    let outcome = validate_pq_local_attestation_batch_preflight_head(
+        members,
+        current_slot,
+        earliest_slot,
+        latest_slot,
+        state_slot,
+        block_slot,
+        current_head_root,
+        block_state_root,
+        validated_state_root,
+        reconciliation,
+    )?;
+    validate_pq_local_attestation_bound_roots(members, current_head_root, descendants)?;
+    Ok(outcome)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_pq_local_attestation_batch_preflight_head(
+    members: &[PqLocalAttestationPreflightMember],
+    current_slot: Slot,
+    earliest_slot: Slot,
+    latest_slot: Slot,
+    state_slot: Slot,
+    block_slot: Slot,
+    current_head_root: Hash256,
+    block_state_root: Hash256,
+    validated_state_root: Hash256,
+    reconciliation: PqLocalAttestationPreflightReconciliation,
+) -> Result<PqLocalAttestationBatchPreflightOutcome, PqLocalAttestationBatchPreflightError> {
+    let slot = validate_pq_local_attestation_preflight_shape(members)?;
+    if state_slot != block_slot {
+        return Err(PqLocalAttestationBatchPreflightError::HeadInconsistent {
+            state: state_slot,
+            block: block_slot,
+        });
+    }
+    if state_slot < current_slot {
+        return Err(PqLocalAttestationBatchPreflightError::HeadNotReady {
+            head: state_slot,
+            current: current_slot,
+        });
+    }
+    if state_slot > current_slot {
+        return Err(PqLocalAttestationBatchPreflightError::HeadAhead {
+            head: state_slot,
+            current: current_slot,
+        });
+    }
+    if slot < earliest_slot {
+        return Err(
+            PqLocalAttestationBatchPreflightError::BeforePropagationWindow {
+                slot,
+                earliest: earliest_slot,
+            },
+        );
+    }
+    if slot > latest_slot {
+        return Err(
+            PqLocalAttestationBatchPreflightError::AfterPropagationWindow {
+                slot,
+                latest: latest_slot,
+            },
+        );
+    }
+    if block_state_root != validated_state_root {
+        return Err(
+            PqLocalAttestationBatchPreflightError::HeadRootInconsistent {
+                block_state_root,
+                validated_state_root,
+            },
+        );
+    }
+    match reconciliation {
+        PqLocalAttestationPreflightReconciliation::Pending(block_root) => {
+            return Err(
+                PqLocalAttestationBatchPreflightError::HeadReconciliationPending { block_root },
+            );
+        }
+        PqLocalAttestationPreflightReconciliation::Failed(block_root) => {
+            return Err(
+                PqLocalAttestationBatchPreflightError::HeadReconciliationFailed { block_root },
+            );
+        }
+        PqLocalAttestationPreflightReconciliation::Reconciled(block_root)
+            if block_root != current_head_root =>
+        {
+            return Err(
+                PqLocalAttestationBatchPreflightError::HeadReconciliationInconsistent {
+                    head: current_head_root,
+                    reconciliation: block_root,
+                },
+            );
+        }
+        PqLocalAttestationPreflightReconciliation::Reconciled(_) => {}
+    }
+    Ok(PqLocalAttestationBatchPreflightOutcome::Ready {
+        count: members.len(),
+        slot,
+        current_head_root,
+    })
+}
+
+fn validate_pq_local_attestation_bound_roots(
+    members: &[PqLocalAttestationPreflightMember],
+    current_head_root: Hash256,
+    descendants: impl FnOnce(
+        &[PqLocalAttestationPreflightMember],
+        Hash256,
+    ) -> Result<Vec<bool>, PqLocalAttestationBatchPreflightError>,
+) -> Result<(), PqLocalAttestationBatchPreflightError> {
+    let descendant_results = descendants(members, current_head_root)?;
+    if descendant_results.len() != members.len() {
+        return Err(PqLocalAttestationBatchPreflightError::ForkChoiceUnavailable);
+    }
+    for (member, is_descendant) in members.iter().zip(descendant_results) {
+        if !is_descendant {
+            return Err(
+                PqLocalAttestationBatchPreflightError::BoundHeadNotCanonical {
+                    bound: member.bound_head_root,
+                    current: current_head_root,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "pq-proposer")]
+pub(crate) fn consume_pq_published_local_attestation_batch_after_settlement<State, ResultValue>(
+    context: PqLocalAttestationLateApplyContext,
+    state: &mut State,
+    current_clock_slot: impl FnOnce() -> Option<Slot>,
+    fork_choice_slot: impl FnOnce(&State) -> Slot,
+    mut descendants: impl FnMut(&State, Hash256, Hash256) -> bool,
+    apply: impl FnOnce(&mut State, Slot) -> ResultValue,
+) -> Result<ResultValue, PqLocalAttestationBatchPreflightError> {
+    let current_clock_slot =
+        current_clock_slot().ok_or(PqLocalAttestationBatchPreflightError::ClockUnavailable)?;
+    if current_clock_slot != context.current_slot {
+        return Err(PqLocalAttestationBatchPreflightError::ClockChanged {
+            sampled: context.current_slot,
+            current: current_clock_slot,
+        });
+    }
+    let fork_choice_slot = fork_choice_slot(state);
+    let Some(advance) = context
+        .current_slot
+        .as_u64()
+        .checked_sub(fork_choice_slot.as_u64())
+    else {
+        return Err(PqLocalAttestationBatchPreflightError::ForkChoiceTimeAhead {
+            fork_choice: fork_choice_slot,
+            current: context.current_slot,
+        });
+    };
+    if advance > crate::PQ_FORK_CHOICE_TICK_MAX_ADVANCE {
+        return Err(
+            PqLocalAttestationBatchPreflightError::ForkChoiceTimeTooFarBehind {
+                fork_choice: fork_choice_slot,
+                current: context.current_slot,
+                maximum: crate::PQ_FORK_CHOICE_TICK_MAX_ADVANCE,
+            },
+        );
+    }
+    validate_pq_local_attestation_bound_roots(
+        &context.members,
+        context.current_head_root,
+        |members, current| {
+            Ok(members
+                .iter()
+                .map(|member| descendants(state, member.bound_head_root, current))
+                .collect())
+        },
+    )?;
+    Ok(apply(state, context.current_slot))
+}
+
+fn validate_pq_local_attestation_preflight_shape(
+    members: &[PqLocalAttestationPreflightMember],
+) -> Result<Slot, PqLocalAttestationBatchPreflightError> {
+    let Some(first) = members.first() else {
+        return Err(PqLocalAttestationBatchPreflightError::Empty);
+    };
+    if members.len() > PQ_LOCAL_ATTESTATION_PREFLIGHT_CAPACITY {
+        return Err(PqLocalAttestationBatchPreflightError::Capacity {
+            count: members.len(),
+            maximum: PQ_LOCAL_ATTESTATION_PREFLIGHT_CAPACITY,
+        });
+    }
+    for member in members.iter().skip(1) {
+        if member.slot != first.slot {
+            return Err(
+                PqLocalAttestationBatchPreflightError::BatchSlotInconsistent {
+                    expected: first.slot,
+                    actual: member.slot,
+                },
+            );
+        }
+    }
+    Ok(first.slot)
+}
+
+fn pq_local_attestation_preflight_clock<E: EthSpec, S: SlotClock>(
+    clock: &S,
+    spec: &ChainSpec,
+) -> Result<(Slot, Slot, Slot), PqLocalAttestationBatchPreflightError> {
+    let latest = clock
+        .now_with_future_tolerance(spec.maximum_gossip_clock_disparity())
+        .ok_or(PqLocalAttestationBatchPreflightError::ClockUnavailable)?;
+    let now_past = clock
+        .now_with_past_tolerance(spec.maximum_gossip_clock_disparity())
+        .ok_or(PqLocalAttestationBatchPreflightError::ClockUnavailable)?;
+    let current = clock
+        .now()
+        .ok_or(PqLocalAttestationBatchPreflightError::ClockUnavailable)?;
+    let one_epoch_prior = now_past - E::slots_per_epoch();
+    let earliest = if spec.fork_name_at_slot::<E>(current).deneb_enabled() {
+        one_epoch_prior
+            .epoch(E::slots_per_epoch())
+            .start_slot(E::slots_per_epoch())
+    } else {
+        one_epoch_prior
+    };
+    Ok((current, earliest, latest))
+}
+
+#[cfg(feature = "pq-proposer")]
+#[allow(clippy::too_many_arguments)]
+fn prepare_pq_local_attestation_late_apply_context(
+    import_gate: OwnedSemaphorePermit,
+    members: Vec<PqLocalAttestationPreflightMember>,
+    current_slot: Slot,
+    earliest_slot: Slot,
+    latest_slot: Slot,
+    state_slot: Slot,
+    block_slot: Slot,
+    current_head_root: Hash256,
+    block_state_root: Hash256,
+    validated_state_root: Hash256,
+    reconciliation: PqLocalAttestationPreflightReconciliation,
+    final_current_slot: Slot,
+) -> Result<PqLocalAttestationLateApplyContext, PqLocalAttestationBatchPreflightError> {
+    validate_pq_local_attestation_batch_preflight_head(
+        &members,
+        current_slot,
+        earliest_slot,
+        latest_slot,
+        state_slot,
+        block_slot,
+        current_head_root,
+        block_state_root,
+        validated_state_root,
+        reconciliation,
+    )?;
+    if final_current_slot != current_slot {
+        return Err(PqLocalAttestationBatchPreflightError::ClockChanged {
+            sampled: current_slot,
+            current: final_current_slot,
+        });
+    }
+    Ok(PqLocalAttestationLateApplyContext {
+        _import_gate: import_gate,
+        members,
+        current_slot,
+        current_head_root,
+    })
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct TestingPqLocalAttestationPreflightMember(PqLocalAttestationPreflightMember);
+
+#[cfg(feature = "pq-startup-testing")]
+impl TestingPqLocalAttestationPreflightMember {
+    pub const fn new(slot: Slot, bound_head_root: Hash256) -> Self {
+        Self(PqLocalAttestationPreflightMember {
+            slot,
+            bound_head_root,
+        })
+    }
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum TestingPqLocalAttestationPreflightReconciliation {
+    Pending(Hash256),
+    Reconciled(Hash256),
+    Failed(Hash256),
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct TestingPqLocalAttestationPreflightRootAccessTrace {
+    pub cached_block_root_reads: usize,
+    pub cached_state_root_reads: usize,
+    pub block_canonical_root_calls: usize,
+    pub state_tree_hash_cache_updates: usize,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub struct TestingPqLocalAttestationPreflightHarness {
+    import_gate: Arc<tokio::sync::Semaphore>,
+    current_slot: Slot,
+    earliest_slot: Slot,
+    latest_slot: Slot,
+    state_slot: Slot,
+    block_slot: Slot,
+    current_head_root: Hash256,
+    block_state_root: Hash256,
+    validated_state_root: Hash256,
+    reconciliation: TestingPqLocalAttestationPreflightReconciliation,
+    descendants: std::collections::HashMap<(Hash256, Hash256), bool>,
+    root_access_trace: parking_lot::Mutex<TestingPqLocalAttestationPreflightRootAccessTrace>,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+impl TestingPqLocalAttestationPreflightHarness {
+    pub fn reconciled(current_slot: Slot, current_head_root: Hash256) -> Self {
+        let state_root = Hash256::repeat_byte(0x61);
+        Self {
+            import_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            current_slot,
+            earliest_slot: current_slot - MinimalEthSpec::slots_per_epoch(),
+            latest_slot: current_slot + 1,
+            state_slot: current_slot,
+            block_slot: current_slot,
+            current_head_root,
+            block_state_root: state_root,
+            validated_state_root: state_root,
+            reconciliation: TestingPqLocalAttestationPreflightReconciliation::Reconciled(
+                current_head_root,
+            ),
+            descendants: std::collections::HashMap::new(),
+            root_access_trace: parking_lot::Mutex::new(
+                TestingPqLocalAttestationPreflightRootAccessTrace::default(),
+            ),
+        }
+    }
+
+    pub async fn hold_import_gate(&self) -> OwnedSemaphorePermit {
+        Arc::clone(&self.import_gate)
+            .acquire_owned()
+            .await
+            .expect("testing preflight import gate remains open")
+    }
+
+    pub fn preflight(
+        &self,
+        members: &[TestingPqLocalAttestationPreflightMember],
+    ) -> Result<PqLocalAttestationBatchPreflightOutcome, PqLocalAttestationBatchPreflightError>
+    {
+        let members = members.iter().map(|member| member.0).collect::<Vec<_>>();
+        validate_pq_local_attestation_preflight_shape(&members)?;
+        let _gate = Arc::clone(&self.import_gate)
+            .try_acquire_owned()
+            .map_err(|_| PqLocalAttestationBatchPreflightError::HeadTransitionBusy)?;
+        *self.root_access_trace.lock() = TestingPqLocalAttestationPreflightRootAccessTrace {
+            cached_block_root_reads: 1,
+            cached_state_root_reads: 1,
+            block_canonical_root_calls: 0,
+            state_tree_hash_cache_updates: 0,
+        };
+        let reconciliation = match self.reconciliation {
+            TestingPqLocalAttestationPreflightReconciliation::Pending(root) => {
+                PqLocalAttestationPreflightReconciliation::Pending(root)
+            }
+            TestingPqLocalAttestationPreflightReconciliation::Reconciled(root) => {
+                PqLocalAttestationPreflightReconciliation::Reconciled(root)
+            }
+            TestingPqLocalAttestationPreflightReconciliation::Failed(root) => {
+                PqLocalAttestationPreflightReconciliation::Failed(root)
+            }
+        };
+        validate_pq_local_attestation_batch_preflight(
+            &members,
+            self.current_slot,
+            self.earliest_slot,
+            self.latest_slot,
+            self.state_slot,
+            self.block_slot,
+            self.current_head_root,
+            self.block_state_root,
+            self.validated_state_root,
+            reconciliation,
+            |members, current| {
+                Ok(members
+                    .iter()
+                    .map(|member| {
+                        member.bound_head_root == current
+                            || self
+                                .descendants
+                                .get(&(member.bound_head_root, current))
+                                .copied()
+                                .unwrap_or(false)
+                    })
+                    .collect())
+            },
+        )
+    }
+
+    pub fn set_propagation_window(&mut self, earliest: Slot, current: Slot, latest: Slot) {
+        self.earliest_slot = earliest;
+        self.current_slot = current;
+        self.latest_slot = latest;
+    }
+
+    pub fn set_head_slots(&mut self, state: Slot, block: Slot) {
+        self.state_slot = state;
+        self.block_slot = block;
+    }
+
+    pub fn set_head_roots(
+        &mut self,
+        current_head_root: Hash256,
+        block_state_root: Hash256,
+        validated_state_root: Hash256,
+    ) {
+        self.current_head_root = current_head_root;
+        self.block_state_root = block_state_root;
+        self.validated_state_root = validated_state_root;
+    }
+
+    pub fn set_coherent_head(&mut self, slot: Slot, current_head_root: Hash256) {
+        self.state_slot = slot;
+        self.block_slot = slot;
+        self.current_head_root = current_head_root;
+        let state_root = Hash256::repeat_byte(0x61);
+        self.block_state_root = state_root;
+        self.validated_state_root = state_root;
+    }
+
+    pub fn set_reconciliation(
+        &mut self,
+        reconciliation: TestingPqLocalAttestationPreflightReconciliation,
+    ) {
+        self.reconciliation = reconciliation;
+    }
+
+    pub fn set_descendant(&mut self, bound: Hash256, current: Hash256, is_descendant: bool) {
+        self.descendants.insert((bound, current), is_descendant);
+    }
+
+    pub const fn fork_choice_attestation_calls(&self) -> usize {
+        0
+    }
+
+    pub fn root_access_trace(&self) -> TestingPqLocalAttestationPreflightRootAccessTrace {
+        *self.root_access_trace.lock()
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PqLocalAttesterIdentity {
@@ -454,7 +1051,122 @@ impl<E: EthSpec> PqVerifiedLocalAttestationBatch<E> {
     pub fn verified(&self) -> &[crate::PqVerifiedLocalSingle<E>] {
         &self.verified
     }
+
+    /// Binds this whole non-clone verified batch to the exact per-member wire evidence. Validation
+    /// occurs inside the chain-owned post-wire continuation before any observation or fork-choice
+    /// mutation.
+    #[cfg(feature = "pq-proposer")]
+    pub fn bind_publication_evidence(
+        self,
+        members: Vec<PqPublishedLocalAttestationMemberEvidence>,
+    ) -> PqPublishedLocalAttestationEvidenceBatch<E> {
+        PqPublishedLocalAttestationEvidenceBatch {
+            verified: self,
+            members,
+        }
+    }
 }
+
+/// Exact post-wire evidence for one sealed local-attestation member.
+#[cfg(feature = "pq-proposer")]
+pub enum PqPublishedLocalAttestationMemberEvidence {
+    Local(PqLocalSinglePublicationToken),
+    Remote {
+        message_id: MessageId,
+        result: crate::PqSingleConsumptionResult,
+    },
+}
+
+/// Whole-batch post-wire authority. It cannot be cloned or constructed without consuming the
+/// original verified batch.
+#[cfg(feature = "pq-proposer")]
+pub struct PqPublishedLocalAttestationEvidenceBatch<E: EthSpec> {
+    verified: PqVerifiedLocalAttestationBatch<E>,
+    members: Vec<PqPublishedLocalAttestationMemberEvidence>,
+}
+
+#[cfg(feature = "pq-proposer")]
+impl<E: EthSpec> PqPublishedLocalAttestationEvidenceBatch<E> {
+    pub(crate) fn verified(&self) -> &PqVerifiedLocalAttestationBatch<E> {
+        &self.verified
+    }
+
+    pub(crate) fn members(&self) -> &[PqPublishedLocalAttestationMemberEvidence] {
+        &self.members
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        PqVerifiedLocalAttestationBatch<E>,
+        Vec<PqPublishedLocalAttestationMemberEvidence>,
+    ) {
+        (self.verified, self.members)
+    }
+
+    /// Fast network state-machine fixture entry: consumes the same opaque evidence envelope while
+    /// a genuine empty verified batch retains its production guards. Local evidence must contain a
+    /// real lower-minted token; remote results are taken only from the sealed evidence member.
+    #[cfg(feature = "pq-startup-testing")]
+    #[doc(hidden)]
+    pub fn testing_only_consume_mixed_empty_guard(
+        self,
+    ) -> Result<
+        crate::PqPublishedLocalAttestationBatchConsumptionOutcome,
+        crate::PqPublishedLocalAttestationBatchConsumptionError,
+    > {
+        let (verified, members) = self.into_parts();
+        if !verified.is_empty() {
+            return Err(
+                crate::PqPublishedLocalAttestationBatchConsumptionError::Evidence(
+                    PqPublishedLocalAttestationEvidenceError::CountMismatch {
+                        expected: 0,
+                        actual: verified.len(),
+                    },
+                ),
+            );
+        }
+        let results = members
+            .into_iter()
+            .enumerate()
+            .map(|(member, evidence)| match evidence {
+                PqPublishedLocalAttestationMemberEvidence::Local(_publication) => {
+                    Ok(crate::PqSingleConsumptionResult::Applied)
+                }
+                PqPublishedLocalAttestationMemberEvidence::Remote {
+                    result:
+                        result @ (crate::PqSingleConsumptionResult::Applied
+                        | crate::PqSingleConsumptionResult::Queued),
+                    ..
+                } => Ok(result),
+                PqPublishedLocalAttestationMemberEvidence::Remote { .. } => Err(
+                    crate::PqPublishedLocalAttestationBatchConsumptionError::Evidence(
+                        PqPublishedLocalAttestationEvidenceError::RemoteResult { member },
+                    ),
+                ),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(crate::PqPublishedLocalAttestationBatchConsumptionOutcome::Complete { results })
+    }
+}
+
+#[cfg(feature = "pq-proposer")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PqPublishedLocalAttestationEvidenceError {
+    CountMismatch { expected: usize, actual: usize },
+    Mismatch { member: usize, field: &'static str },
+    RemoteResult { member: usize },
+}
+
+#[cfg(feature = "pq-proposer")]
+impl std::fmt::Display for PqPublishedLocalAttestationEvidenceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "PQ local publication evidence failed: {self:?}")
+    }
+}
+
+#[cfg(feature = "pq-proposer")]
+impl Error for PqPublishedLocalAttestationEvidenceError {}
 
 #[derive(Debug)]
 pub enum PqLocalAttestationBatchSealError {
@@ -645,6 +1357,135 @@ pub fn testing_only_validate_pq_local_attester_profile<E: EthSpec>(
 }
 
 impl<T: BeaconChainTypes> BeaconChain<T> {
+    /// Performs a short, non-mutating publication preflight for a sealed local batch.
+    ///
+    /// The import gate is held only while sampling the clock, cached canonical snapshot,
+    /// reconciliation state, and one bounded nonwaiting fork-choice ancestry read. It is released
+    /// before this method returns and is never held across network or blocking work.
+    pub fn preflight_pq_local_attestation_batch(
+        &self,
+        batch: &PqVerifiedLocalAttestationBatch<T::EthSpec>,
+    ) -> Result<PqLocalAttestationBatchPreflightOutcome, PqLocalAttestationBatchPreflightError>
+    {
+        let members = batch
+            .verified()
+            .iter()
+            .map(|verified| PqLocalAttestationPreflightMember {
+                slot: verified.slot(),
+                bound_head_root: verified.bound_head_root(),
+            })
+            .collect::<Vec<_>>();
+        validate_pq_local_attestation_preflight_shape(&members)?;
+        let gate = Arc::clone(&self.pq_import_gate)
+            .try_acquire_owned()
+            .map_err(|_| PqLocalAttestationBatchPreflightError::HeadTransitionBusy)?;
+        let (current_slot, earliest_slot, latest_slot) =
+            pq_local_attestation_preflight_clock::<T::EthSpec, _>(&self.slot_clock, &self.spec)?;
+        let snapshot = self.head_snapshot();
+        let current_head_root = snapshot.beacon_block_root;
+        let state_slot = snapshot.beacon_state.slot();
+        let block_slot = snapshot.beacon_block.slot();
+        let block_state_root = snapshot.beacon_state_root();
+        let validated_state_root = snapshot.validated_state_root();
+        let reconciliation = match self.pq_execution_reconciliation.current() {
+            crate::beacon_chain::PqExecutionReconciliationState::Pending { block_root } => {
+                PqLocalAttestationPreflightReconciliation::Pending(block_root)
+            }
+            crate::beacon_chain::PqExecutionReconciliationState::Reconciled { block_root } => {
+                PqLocalAttestationPreflightReconciliation::Reconciled(block_root)
+            }
+            crate::beacon_chain::PqExecutionReconciliationState::Failed { block_root } => {
+                PqLocalAttestationPreflightReconciliation::Failed(block_root)
+            }
+        };
+        let result = validate_pq_local_attestation_batch_preflight(
+            &members,
+            current_slot,
+            earliest_slot,
+            latest_slot,
+            state_slot,
+            block_slot,
+            current_head_root,
+            block_state_root,
+            validated_state_root,
+            reconciliation,
+            |members, current| {
+                let bound_roots = members
+                    .iter()
+                    .map(|member| member.bound_head_root)
+                    .collect::<Vec<_>>();
+                self.try_pq_fork_choice_descendants(&bound_roots, current)
+                    .map_err(|error| match error {
+                        crate::beacon_chain::PqForkChoiceAncestryQueryError::Busy => {
+                            PqLocalAttestationBatchPreflightError::ForkChoiceBusy
+                        }
+                        crate::beacon_chain::PqForkChoiceAncestryQueryError::Unavailable => {
+                            PqLocalAttestationBatchPreflightError::ForkChoiceUnavailable
+                        }
+                    })
+            },
+        );
+        drop(gate);
+        result
+    }
+
+    #[cfg(feature = "pq-proposer")]
+    pub(crate) async fn acquire_pq_local_attestation_late_apply_context(
+        &self,
+        batch: &PqVerifiedLocalAttestationBatch<T::EthSpec>,
+    ) -> Result<PqLocalAttestationLateApplyContext, PqLocalAttestationBatchPreflightError> {
+        let members = batch
+            .verified()
+            .iter()
+            .map(|verified| PqLocalAttestationPreflightMember {
+                slot: verified.slot(),
+                bound_head_root: verified.bound_head_root(),
+            })
+            .collect::<Vec<_>>();
+        validate_pq_local_attestation_preflight_shape(&members)?;
+        let import_gate = Arc::clone(&self.pq_import_gate)
+            .acquire_owned()
+            .await
+            .map_err(|_| PqLocalAttestationBatchPreflightError::HeadTransitionBusy)?;
+        let (current_slot, earliest_slot, latest_slot) =
+            pq_local_attestation_preflight_clock::<T::EthSpec, _>(&self.slot_clock, &self.spec)?;
+        let snapshot = self.head_snapshot();
+        let current_head_root = snapshot.beacon_block_root;
+        let state_slot = snapshot.beacon_state.slot();
+        let block_slot = snapshot.beacon_block.slot();
+        let block_state_root = snapshot.beacon_state_root();
+        let validated_state_root = snapshot.validated_state_root();
+        let reconciliation = match self.pq_execution_reconciliation.current() {
+            crate::beacon_chain::PqExecutionReconciliationState::Pending { block_root } => {
+                PqLocalAttestationPreflightReconciliation::Pending(block_root)
+            }
+            crate::beacon_chain::PqExecutionReconciliationState::Reconciled { block_root } => {
+                PqLocalAttestationPreflightReconciliation::Reconciled(block_root)
+            }
+            crate::beacon_chain::PqExecutionReconciliationState::Failed { block_root } => {
+                PqLocalAttestationPreflightReconciliation::Failed(block_root)
+            }
+        };
+        let final_current_slot = self
+            .slot_clock
+            .now()
+            .ok_or(PqLocalAttestationBatchPreflightError::ClockUnavailable)?;
+        prepare_pq_local_attestation_late_apply_context(
+            import_gate,
+            members,
+            current_slot,
+            earliest_slot,
+            latest_slot,
+            state_slot,
+            block_slot,
+            current_head_root,
+            block_state_root,
+            validated_state_root,
+            reconciliation,
+            final_current_slot,
+        )
+    }
+
     fn require_pq_local_attester_reconciled_head(
         &self,
         bound_head_root: Hash256,
@@ -975,6 +1816,49 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
     pub fn testing_only_pq_local_attestation_context_available_permits(&self) -> usize {
         self.pq_local_attester_context_admission.available_permits()
     }
+}
+
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn testing_prepare_pq_local_attestation_late_apply_context(
+    import_gate: OwnedSemaphorePermit,
+    members: &[TestingPqLocalAttestationPreflightMember],
+    current_slot: Slot,
+    earliest_slot: Slot,
+    latest_slot: Slot,
+    state_slot: Slot,
+    block_slot: Slot,
+    current_head_root: Hash256,
+    block_state_root: Hash256,
+    validated_state_root: Hash256,
+    reconciliation: TestingPqLocalAttestationPreflightReconciliation,
+    final_current_slot: Slot,
+) -> Result<PqLocalAttestationLateApplyContext, PqLocalAttestationBatchPreflightError> {
+    let reconciliation = match reconciliation {
+        TestingPqLocalAttestationPreflightReconciliation::Pending(root) => {
+            PqLocalAttestationPreflightReconciliation::Pending(root)
+        }
+        TestingPqLocalAttestationPreflightReconciliation::Reconciled(root) => {
+            PqLocalAttestationPreflightReconciliation::Reconciled(root)
+        }
+        TestingPqLocalAttestationPreflightReconciliation::Failed(root) => {
+            PqLocalAttestationPreflightReconciliation::Failed(root)
+        }
+    };
+    prepare_pq_local_attestation_late_apply_context(
+        import_gate,
+        members.iter().map(|member| member.0).collect(),
+        current_slot,
+        earliest_slot,
+        latest_slot,
+        state_slot,
+        block_slot,
+        current_head_root,
+        block_state_root,
+        validated_state_root,
+        reconciliation,
+        final_current_slot,
+    )
 }
 
 #[cfg(feature = "pq-startup-testing")]

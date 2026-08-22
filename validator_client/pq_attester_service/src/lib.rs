@@ -34,7 +34,8 @@ pub const PQ_LOCAL_ATTESTATION_SIGNING_BATCH_CAPACITY: usize = 16;
 
 /// Maximum number of local Minimal attestations proven concurrently by the direct service.
 #[cfg(feature = "pq-devnet")]
-pub const PQ_LOCAL_ATTESTATION_PROOF_CAPACITY: usize = 2;
+pub const PQ_LOCAL_ATTESTATION_PROOF_CAPACITY: usize =
+    beacon_chain::PQ_LOCAL_ATTESTATION_PROOF_ADMISSION_CAPACITY;
 
 /// A bounded local-attestation signing decision which retains the Slice-A candidate guards.
 #[cfg(feature = "pq-devnet")]
@@ -514,6 +515,7 @@ struct PqAttesterControl {
     closed: bool,
     active: usize,
     no_duty_watermark: Option<Slot>,
+    transferred_watermark: Option<Slot>,
     state: PqAttesterState,
 }
 
@@ -532,6 +534,7 @@ impl PqAttesterShared {
                 closed: false,
                 active: 0,
                 no_duty_watermark: None,
+                transferred_watermark: None,
                 state: PqAttesterState::Idle,
             }),
             active,
@@ -553,6 +556,22 @@ impl PqAttesterShared {
             .map_err(|_| PqAttesterServiceError::StatePoisoned)?;
         if control.closed {
             return Err(PqAttesterServiceError::Closed);
+        }
+        if matches!(control.state, PqAttesterState::Idle)
+            && let Some(transferred) = control.transferred_watermark
+        {
+            if slot == transferred {
+                return Err(PqAttesterServiceError::PreviouslyTransferred {
+                    transferred,
+                    requested: slot,
+                });
+            }
+            if slot < transferred {
+                return Err(PqAttesterServiceError::SlotRollback {
+                    completed: transferred,
+                    requested: slot,
+                });
+            }
         }
         if matches!(control.state, PqAttesterState::Idle)
             && let Some(completed) = control.no_duty_watermark
@@ -597,6 +616,21 @@ impl PqAttesterShared {
             } if slot > *completed_slot => {}
             PqAttesterState::CompletedNoDuty {
                 slot: completed_slot,
+            } if slot < *completed_slot => {
+                return Err(PqAttesterServiceError::SlotRollback {
+                    completed: *completed_slot,
+                    requested: slot,
+                });
+            }
+            PqAttesterState::CompletedVerified {
+                slot: completed_slot,
+                owned: None,
+                ..
+            } if slot > *completed_slot => {}
+            PqAttesterState::CompletedVerified {
+                slot: completed_slot,
+                owned: None,
+                ..
             } if slot < *completed_slot => {
                 return Err(PqAttesterServiceError::SlotRollback {
                     completed: *completed_slot,
@@ -1020,6 +1054,19 @@ where
         close_and_drain_pq_attester(&self.shared).await
     }
 
+    /// Atomically transfers the retained verified batch into the bounded production publisher.
+    /// A non-admitted send restores the exact opaque batch before releasing service state.
+    #[cfg(feature = "pq-proposer")]
+    pub fn try_publish_owned_verified_batch(
+        &self,
+        sender: &network::PqLocalAttestationBatchPublishSender<MinimalEthSpec>,
+    ) -> Result<
+        network::PqLocalAttestationBatchPublishReceipt<MinimalEthSpec>,
+        PqAttesterPublicationError,
+    > {
+        try_publish_pq_attester_owned_batch(&self.shared, sender)
+    }
+
     #[cfg(feature = "pq-startup-testing")]
     #[doc(hidden)]
     pub fn testing_only_completed_verified_metadata(
@@ -1044,6 +1091,36 @@ where
         }
     }
 
+    #[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+    #[doc(hidden)]
+    pub fn testing_only_completed_verified_wire_trace(
+        &self,
+    ) -> Option<Vec<(Vec<u8>, [u8; 32], types::SubnetId, Slot)>> {
+        use ssz::Encode;
+
+        let control = self.shared.control.lock().ok()?;
+        let PqAttesterState::CompletedVerified {
+            owned: Some(owned), ..
+        } = &control.state
+        else {
+            return None;
+        };
+        Some(
+            owned
+                .verified()
+                .iter()
+                .map(|verified| {
+                    (
+                        verified.single().as_ssz_bytes(),
+                        verified.signed_ssz_digest(),
+                        verified.subnet(),
+                        verified.slot(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
     #[cfg(feature = "pq-startup-testing")]
     #[doc(hidden)]
     pub fn testing_only_take_owned_verified_batch(
@@ -1053,6 +1130,71 @@ where
         match &mut control.state {
             PqAttesterState::CompletedVerified { owned, .. } => owned.take(),
             _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "pq-proposer")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PqAttesterPublicationError {
+    StatePoisoned,
+    NoVerifiedBatch,
+    Capacity,
+    Closed,
+}
+
+#[cfg(feature = "pq-proposer")]
+impl std::fmt::Display for PqAttesterPublicationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "PQ attester publication handoff failed: {self:?}"
+        )
+    }
+}
+
+#[cfg(feature = "pq-proposer")]
+impl std::error::Error for PqAttesterPublicationError {}
+
+#[cfg(feature = "pq-proposer")]
+fn try_publish_pq_attester_owned_batch(
+    shared: &PqAttesterShared,
+    sender: &network::PqLocalAttestationBatchPublishSender<MinimalEthSpec>,
+) -> Result<
+    network::PqLocalAttestationBatchPublishReceipt<MinimalEthSpec>,
+    PqAttesterPublicationError,
+> {
+    let mut control = shared
+        .control
+        .lock()
+        .map_err(|_| PqAttesterPublicationError::StatePoisoned)?;
+    let PqAttesterControl {
+        transferred_watermark,
+        state,
+        ..
+    } = &mut *control;
+    let PqAttesterState::CompletedVerified { slot, owned, .. } = state else {
+        return Err(PqAttesterPublicationError::NoVerifiedBatch);
+    };
+    let transferred_slot = *slot;
+    let batch = owned
+        .take()
+        .ok_or(PqAttesterPublicationError::NoVerifiedBatch)?;
+    match sender.try_publish(batch) {
+        Ok(receipt) => {
+            *transferred_watermark =
+                Some(transferred_watermark.map_or(transferred_slot, |watermark| {
+                    watermark.max(transferred_slot)
+                }));
+            Ok(receipt)
+        }
+        Err(network::PqLocalAttestationBatchPublishSendError::Capacity(batch)) => {
+            *owned = Some(batch);
+            Err(PqAttesterPublicationError::Capacity)
+        }
+        Err(network::PqLocalAttestationBatchPublishSendError::Closed(batch)) => {
+            *owned = Some(batch);
+            Err(PqAttesterPublicationError::Closed)
         }
     }
 }
@@ -1115,6 +1257,7 @@ pub enum PqAttesterServiceError {
     Closed,
     Busy { active: Slot, requested: Slot },
     PreviousUnconsumed { previous: Slot, requested: Slot },
+    PreviouslyTransferred { transferred: Slot, requested: Slot },
     SlotRollback { completed: Slot, requested: Slot },
     StatePoisoned,
     ActivityOverflow,
@@ -1173,6 +1316,7 @@ impl std::error::Error for PqAttesterServiceError {
             | Self::Closed
             | Self::Busy { .. }
             | Self::PreviousUnconsumed { .. }
+            | Self::PreviouslyTransferred { .. }
             | Self::SlotRollback { .. }
             | Self::StatePoisoned
             | Self::ActivityOverflow
@@ -1190,6 +1334,130 @@ mod service_state_tests {
     use super::*;
     use beacon_chain::testing_only_pq_local_candidate_batch_fixture;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[cfg(feature = "pq-proposer")]
+    fn empty_verified_batch() -> PqVerifiedLocalAttestationBatch<MinimalEthSpec> {
+        let (candidates, signed, spec) = testing_only_pq_local_candidate_batch_fixture(0);
+        let returned = candidates
+            .candidates()
+            .iter()
+            .map(|candidate| candidate.validator_index())
+            .zip(signed)
+            .collect();
+        candidates
+            .seal_exact_ordered(returned, &spec)
+            .expect("empty handoff batch seals exactly")
+            .testing_only_into_empty_verified_batch()
+    }
+
+    #[cfg(feature = "pq-proposer")]
+    fn completed_verified_shared() -> Arc<PqAttesterShared> {
+        let shared = Arc::new(PqAttesterShared::new());
+        shared.control.lock().expect("state lock").state = PqAttesterState::CompletedVerified {
+            slot: Slot::new(1),
+            attempts: Arc::from([]),
+            metadata: PqVerifiedAttestationBatchMetadata {
+                slot: Slot::new(1),
+                members: Arc::from([]),
+            },
+            owned: Some(empty_verified_batch()),
+        };
+        shared
+    }
+
+    #[cfg(feature = "pq-proposer")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn sealed_publication_handoff_restores_exact_owner_on_capacity_and_closed() {
+        let shared = completed_verified_shared();
+        let (full_sender, _full_receiver) =
+            network::testing_only_pq_local_attestation_batch_publish_channel();
+        let _occupied = full_sender
+            .try_publish(empty_verified_batch())
+            .expect("first exact cap-one command admitted");
+        assert!(matches!(
+            try_publish_pq_attester_owned_batch(&shared, &full_sender),
+            Err(PqAttesterPublicationError::Capacity),
+        ));
+        assert!(matches!(
+            shared.control.lock().expect("state lock").state,
+            PqAttesterState::CompletedVerified { owned: Some(_), .. }
+        ));
+
+        let (closed_sender, closed_receiver) =
+            network::testing_only_pq_local_attestation_batch_publish_channel();
+        drop(closed_receiver);
+        assert!(matches!(
+            try_publish_pq_attester_owned_batch(&shared, &closed_sender),
+            Err(PqAttesterPublicationError::Closed),
+        ));
+        assert!(matches!(
+            shared.control.lock().expect("state lock").state,
+            PqAttesterState::CompletedVerified { owned: Some(_), .. }
+        ));
+
+        let (ready_sender, _ready_receiver) =
+            network::testing_only_pq_local_attestation_batch_publish_channel();
+        let _receipt = try_publish_pq_attester_owned_batch(&shared, &ready_sender)
+            .expect("exact restored owner is admitted once");
+        assert!(matches!(
+            shared.control.lock().expect("state lock").state,
+            PqAttesterState::CompletedVerified { owned: None, .. }
+        ));
+
+        let (same_slot, started) = shared
+            .try_admit(Slot::new(1))
+            .expect("published same-slot metadata remains cached");
+        assert!(!started, "cached same-slot metadata never starts new work");
+        assert_eq!(
+            same_slot.wait().await.expect("cached metadata receipt"),
+            PqAttestationCompletion::Verified(PqVerifiedAttestationBatchMetadata {
+                slot: Slot::new(1),
+                members: Arc::from([]),
+            }),
+        );
+
+        let lower_slot = shared.try_admit(Slot::new(0));
+        let next_slot = shared.try_admit(Slot::new(2));
+        let (_receipt, started) = next_slot.expect(
+            "a strictly greater slot is admitted after the published batch leaves no owner",
+        );
+        assert!(started, "the strictly greater slot starts new work");
+        assert!(matches!(
+            lower_slot,
+            Err(PqAttesterServiceError::SlotRollback {
+                completed,
+                requested,
+            }) if completed == Slot::new(1) && requested == Slot::new(0)
+        ));
+
+        shared.finish(
+            Slot::new(2),
+            Err(PqAttesterServiceError::Context(Arc::new(
+                PqLocalAttestationContextError::IngressCapacity,
+            ))),
+        );
+        match shared.try_admit(Slot::new(1)) {
+            Err(PqAttesterServiceError::PreviouslyTransferred {
+                transferred,
+                requested,
+            }) if transferred == Slot::new(1) && requested == Slot::new(1) => {}
+            Err(error) => panic!("slot N rejection mismatch: {error:?}"),
+            Ok((_receipt, started)) => {
+                panic!("transferred slot N was admitted again: started={started}")
+            }
+        }
+        assert!(matches!(
+            shared.try_admit(Slot::new(0)),
+            Err(PqAttesterServiceError::SlotRollback {
+                completed,
+                requested,
+            }) if completed == Slot::new(1) && requested == Slot::new(0)
+        ));
+        let (_retry, started) = shared
+            .try_admit(Slot::new(2))
+            .expect("the retryable next slot may start again");
+        assert!(started, "the retry starts one new operation");
+    }
 
     fn two_exact_keys() -> [consensus_signature::ValidatorPublicKeyBytes; 2] {
         let (batch, _, _) = testing_only_pq_local_candidate_batch_fixture(2);
@@ -1627,9 +1895,11 @@ mod service_state_tests {
     async fn chain_atomic_batch_cap_precedes_proof_and_failure_drops_siblings() {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_in_verifier = Arc::clone(&calls);
+        let local_capacity = beacon_chain::PQ_LOCAL_ATTESTATION_PROOF_ADMISSION_CAPACITY;
+        assert_eq!(PQ_LOCAL_ATTESTATION_PROOF_CAPACITY, local_capacity);
         assert!(matches!(
             beacon_chain::testing_only_collect_pq_local_batch_atomically(
-                vec![0, 1, 2],
+                (0..=local_capacity).collect(),
                 move |_| {
                     calls_in_verifier.fetch_add(1, Ordering::SeqCst);
                     std::future::ready(Ok::<(), ()>(()))
@@ -1637,9 +1907,9 @@ mod service_state_tests {
             )
             .await,
             Err(beacon_chain::TestingPqAtomicLocalBatchError::Capacity {
-                count: 3,
-                maximum: 2,
-            })
+                count,
+                maximum,
+            }) if count == local_capacity + 1 && maximum == local_capacity
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 

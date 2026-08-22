@@ -137,6 +137,97 @@ pub enum NetworkEvent<E: EthSpec> {
 #[cfg(all(test, feature = "pq-proposer"))]
 mod pq_single_publish_outcome_tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+
+    trait AmbiguousIfClone<A> {
+        fn assert_not_clone() {}
+    }
+
+    impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+    impl<T: ?Sized + Clone> AmbiguousIfClone<u8> for T {}
+
+    #[test]
+    fn exact_local_single_publication_yields_unforgeable_evidence_only_for_local_success() {
+        let _: fn(
+            &mut Network<types::MinimalEthSpec>,
+            GossipTopic,
+            Vec<u8>,
+        ) -> PqSingleAttestationPublishOutcome =
+            Network::<types::MinimalEthSpec>::publish_pq_local_single_attestation_exact;
+        let _ = <PqLocalSinglePublicationToken as AmbiguousIfClone<_>>::assert_not_clone;
+
+        let fork_digest = [0x42; 4];
+        let subnet = SubnetId::new(3);
+        let topic = GossipTopic::new(
+            GossipKind::Attestation(subnet),
+            GossipEncoding::default(),
+            fork_digest,
+        );
+        let topic_hash = Topic::from(topic.clone()).hash();
+        let signed_ssz = vec![1, 3, 3, 7, 9];
+        let signed_ssz_digest: [u8; 32] = Sha256::digest(&signed_ssz).into();
+        let message_id = MessageId(vec![0xa5; 20]);
+
+        for result in [Ok(message_id.clone()), Err(PublishError::DuplicateLocal)] {
+            let outcome = classify_pq_local_single_publication(
+                &topic,
+                &signed_ssz,
+                message_id.clone(),
+                result,
+            );
+            let token = outcome
+                .publication_token()
+                .expect("Published and DuplicateLocal carry exact publication evidence");
+            assert_eq!(token.message_id(), &message_id);
+            assert_eq!(token.topic_hash(), &topic_hash);
+            assert_eq!(token.fork_digest(), fork_digest);
+            assert_eq!(token.subnet(), subnet);
+            assert_eq!(token.signed_ssz_digest(), signed_ssz_digest);
+        }
+
+        for result in [
+            Err(PublishError::NoPeersSubscribedToTopic),
+            Err(PublishError::AllQueuesFull(1)),
+            Err(PublishError::ValidationAdmissionFull),
+            Err(PublishError::PendingValidation),
+            Err(PublishError::DuplicateRemote),
+            Err(PublishError::Duplicate),
+            Err(PublishError::MessageTooLarge),
+        ] {
+            assert!(
+                classify_pq_local_single_publication(
+                    &topic,
+                    &signed_ssz,
+                    message_id.clone(),
+                    result,
+                )
+                .publication_token()
+                .is_none(),
+                "retryable, remote, terminal, and unknown outcomes must not mint local evidence",
+            );
+        }
+
+        for outcome in [
+            PqSingleAttestationPublishOutcome::Transform {
+                message_id: message_id.clone(),
+                error_kind: std::io::ErrorKind::InvalidData,
+            },
+            PqSingleAttestationPublishOutcome::NonAnonymousPublisher,
+        ] {
+            assert!(
+                outcome.publication_token().is_none(),
+                "transform and non-anonymous publisher failures must not mint local evidence",
+            );
+        }
+
+        let mismatched = classify_pq_local_single_publication(
+            &topic,
+            &signed_ssz,
+            message_id.clone(),
+            Ok(MessageId(vec![0xff; 20])),
+        );
+        assert!(mismatched.publication_token().is_none());
+    }
 
     #[test]
     fn every_lower_publish_result_has_an_exact_typed_outcome() {
@@ -146,6 +237,7 @@ mod pq_single_publish_outcome_tests {
             classify_pq_single_publish_result(id.clone(), Ok(id.clone())),
             PqSingleAttestationPublishOutcome::Published {
                 message_id: id.clone(),
+                publication: None,
             },
         );
         let actual_published_id = MessageId(vec![0x6b; 20]);
@@ -181,6 +273,7 @@ mod pq_single_publish_outcome_tests {
             classify_pq_single_publish_result(id.clone(), Err(PublishError::DuplicateLocal),),
             PqSingleAttestationPublishOutcome::DuplicateLocal {
                 message_id: id.clone(),
+                publication: None,
             },
         );
         assert_eq!(
@@ -258,13 +351,15 @@ pub enum PqTestingAttestationLowerPublishError {
 
 /// Result of one exact, anonymous PQ single-attestation gossipsub publication.
 #[cfg(feature = "pq-proposer")]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum PqSingleAttestationPublishOutcome {
     Published {
         message_id: MessageId,
+        publication: Option<PqLocalSinglePublicationToken>,
     },
     DuplicateLocal {
         message_id: MessageId,
+        publication: Option<PqLocalSinglePublicationToken>,
     },
     PendingRemote {
         message_id: MessageId,
@@ -299,15 +394,71 @@ pub enum PqSingleAttestationPublishOutcome {
     NonAnonymousPublisher,
 }
 
+/// Unforgeable evidence that one exact local single-attestation message reached gossipsub's
+/// irreversible local history.
+///
+/// The fields are private and the capability is deliberately non-`Clone`. Only the exact lower
+/// publication method can mint it after `Published` or `DuplicateLocal`.
+#[cfg(feature = "pq-proposer")]
+#[derive(Debug, PartialEq, Eq)]
+pub struct PqLocalSinglePublicationToken {
+    message_id: MessageId,
+    topic_hash: TopicHash,
+    fork_digest: [u8; 4],
+    subnet: SubnetId,
+    signed_ssz_digest: [u8; 32],
+}
+
+#[cfg(feature = "pq-proposer")]
+impl PqLocalSinglePublicationToken {
+    pub const fn message_id(&self) -> &MessageId {
+        &self.message_id
+    }
+
+    pub const fn topic_hash(&self) -> &TopicHash {
+        &self.topic_hash
+    }
+
+    pub const fn fork_digest(&self) -> [u8; 4] {
+        self.fork_digest
+    }
+
+    pub const fn subnet(&self) -> SubnetId {
+        self.subnet
+    }
+
+    pub const fn signed_ssz_digest(&self) -> [u8; 32] {
+        self.signed_ssz_digest
+    }
+}
+
+#[cfg(feature = "pq-proposer")]
+impl PqSingleAttestationPublishOutcome {
+    pub const fn publication_token(&self) -> Option<&PqLocalSinglePublicationToken> {
+        match self {
+            Self::Published {
+                publication: Some(publication),
+                ..
+            }
+            | Self::DuplicateLocal {
+                publication: Some(publication),
+                ..
+            } => Some(publication),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(feature = "pq-proposer")]
 pub fn classify_pq_single_publish_result(
     message_id: MessageId,
     result: Result<MessageId, PublishError>,
 ) -> PqSingleAttestationPublishOutcome {
     match result {
-        Ok(actual) if actual == message_id => {
-            PqSingleAttestationPublishOutcome::Published { message_id }
-        }
+        Ok(actual) if actual == message_id => PqSingleAttestationPublishOutcome::Published {
+            message_id,
+            publication: None,
+        },
         Ok(actual) => PqSingleAttestationPublishOutcome::MessageIdMismatch {
             expected: message_id,
             actual,
@@ -321,9 +472,10 @@ pub fn classify_pq_single_publish_result(
         Err(PublishError::Duplicate) => {
             PqSingleAttestationPublishOutcome::DuplicateUnknown { message_id }
         }
-        Err(PublishError::DuplicateLocal) => {
-            PqSingleAttestationPublishOutcome::DuplicateLocal { message_id }
-        }
+        Err(PublishError::DuplicateLocal) => PqSingleAttestationPublishOutcome::DuplicateLocal {
+            message_id,
+            publication: None,
+        },
         Err(PublishError::DuplicateRemote) => {
             PqSingleAttestationPublishOutcome::DuplicateRemote { message_id }
         }
@@ -351,6 +503,62 @@ pub fn classify_pq_single_publish_result(
             error_kind: std::io::ErrorKind::InvalidData,
         },
     }
+}
+
+#[cfg(feature = "pq-proposer")]
+fn classify_pq_local_single_publication(
+    topic: &GossipTopic,
+    data: &[u8],
+    message_id: MessageId,
+    result: Result<MessageId, PublishError>,
+) -> PqSingleAttestationPublishOutcome {
+    let outcome = classify_pq_single_publish_result(message_id, result);
+    let (message_id, duplicate) = match outcome {
+        PqSingleAttestationPublishOutcome::Published { message_id, .. } => (message_id, false),
+        PqSingleAttestationPublishOutcome::DuplicateLocal { message_id, .. } => (message_id, true),
+        other => return other,
+    };
+    let GossipKind::Attestation(subnet) = topic.kind() else {
+        return PqSingleAttestationPublishOutcome::Transform {
+            message_id,
+            error_kind: std::io::ErrorKind::InvalidInput,
+        };
+    };
+    let publication = PqLocalSinglePublicationToken {
+        message_id: message_id.clone(),
+        topic_hash: Topic::from(topic.clone()).hash(),
+        fork_digest: topic.fork_digest,
+        subnet: *subnet,
+        signed_ssz_digest: <sha2::Sha256 as sha2::Digest>::digest(data).into(),
+    };
+    if duplicate {
+        PqSingleAttestationPublishOutcome::DuplicateLocal {
+            message_id,
+            publication: Some(publication),
+        }
+    } else {
+        PqSingleAttestationPublishOutcome::Published {
+            message_id,
+            publication: Some(publication),
+        }
+    }
+}
+
+/// Exercises the exact production publication classifier without exposing a token constructor.
+#[cfg(all(feature = "pq-proposer", feature = "pq-startup-testing"))]
+#[doc(hidden)]
+pub fn testing_only_classify_pq_local_single_publication(
+    topic: &GossipTopic,
+    data: &[u8],
+    message_id: MessageId,
+    duplicate_local: bool,
+) -> PqSingleAttestationPublishOutcome {
+    let result = if duplicate_local {
+        Err(PublishError::DuplicateLocal)
+    } else {
+        Ok(message_id.clone())
+    };
+    classify_pq_local_single_publication(topic, data, message_id, result)
 }
 
 /// Exact topic and SSZ bytes prepared for a PQ beacon-block publication.
@@ -1272,6 +1480,25 @@ impl<E: EthSpec> Network<E> {
             }
             Err(_) => Err(PqBeaconBlockPublishError::Rejected),
         }
+    }
+
+    /// Publishes one exact, pre-encoded PQ single attestation and returns irreversible local
+    /// publication evidence only when gossipsub reports `Published` or `DuplicateLocal`.
+    #[cfg(feature = "pq-proposer")]
+    pub fn publish_pq_local_single_attestation_exact(
+        &mut self,
+        topic: GossipTopic,
+        data: Vec<u8>,
+    ) -> PqSingleAttestationPublishOutcome {
+        let libp2p_topic = Topic::from(topic.clone());
+        let Some(message_id) = self
+            .gossipsub()
+            .anonymous_message_id(libp2p_topic.hash(), &data)
+        else {
+            return PqSingleAttestationPublishOutcome::NonAnonymousPublisher;
+        };
+        let result = self.gossipsub_mut().publish(libp2p_topic, data.clone());
+        classify_pq_local_single_publication(&topic, &data, message_id, result)
     }
 
     #[cfg(feature = "pq-startup-testing")]

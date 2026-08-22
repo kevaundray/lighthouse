@@ -2620,7 +2620,9 @@ slot, bound and dependent roots, signing root, exact attestation data and bitfie
 signature framing, and SHA-256 of the complete signed single-attestation SSZ bytes. The returned
 locally verified token is likewise private and non-`Clone` and retains the original proof admission
 and PQ import activity through late-lineage blocking work, caller cancellation, and its own
-lifetime.
+lifetime. Local verification uses an independent cap-two proof-admission domain; inbound single and
+aggregate gossip retain the existing remote cap-two domain. The bounded combined proof ownership
+is therefore two local plus two remote, not one global cap-two semaphore.
 
 Preparation, proof, and late-lineage validation are shared production stages for remote and local
 singles without an `is_local` mode. The remote route preserves its original single-snapshot
@@ -2692,7 +2694,7 @@ Removing the service-owned batch failed with `AtomicBatchMissing` in 459.80 seco
 GREEN run recorded clone/authentication/RANDAO/import/complete phases at 0.172/279.315/306.991/
 459.396/460.382 seconds.
 
-**Publication admission prerequisite checkpoint (implemented, publisher still absent):** the PQ
+**Publication admission prerequisite checkpoint (historical lower prerequisite):** the PQ
 gossipsub admission profile now checked-derives six retained local IDs and six retained remote IDs
 per peer from two phase-intersecting slots of one block plus two singles. With the hard 16-peer
 compatibility cap, remote global retained capacity is 96. Pending work remains exactly two globally
@@ -2704,11 +2706,11 @@ Tests pin local 6/7, sequential per-peer 6/7 after pending resolution, global 96
 peer churn without history release, retryable decrement versus terminal retention, exact N rather
 than N+1 rollover, and the full 1,734-entry inventory. The expiry test fills five terminal IDs,
 expires a sixth pending exact ID at 300 seconds, and requires identical redelivery; removing exact
-history release fails. The ordinary no-admission path is unchanged. This checkpoint does not expose
-or implement a production publisher, consume the service-owned verified batch, apply local fork
-choice, or add scheduler, pool, persistence, justification, or finalization behavior.
+history release fails. The ordinary no-admission path is unchanged. At this prerequisite boundary,
+the production publisher, service-owned batch consumption, and local fork-choice application had
+not yet landed; the completed convergence checkpoint below supersedes those limitations.
 
-**Source-aware lower publication checkpoint (implemented, upper handoff still absent):** the
+**Source-aware lower publication checkpoint (historical lower boundary):** the
 signer-only `lighthouse_network/pq-proposer` graph now owns a sealed, private-field, non-`Clone`
 preencoded single-attestation request. Its synchronous lower publish method requires a unique
 mutable borrow, preserving the same capability across retryable `NoPeers`, `AllQueuesFull`,
@@ -2727,11 +2729,12 @@ and successful publication remains retained.
 
 Compile and behavioral mutations pin the unique-borrow API, same-object retry, ID mismatch,
 unknown duplicate, source collapse, admission and transform mapping, anonymous-ID eligibility, and
-reservation rollback. This checkpoint adds no upper network command, attester-service batch
-handoff, local consume/apply coalescer, scheduler, HTTP route, pools, aggregation, persistence,
-justification, or finalization behavior.
+reservation rollback. At this lower-only boundary, no upper network command, attester-service
+batch handoff, or local consume/apply coalescer existed; the completed convergence checkpoint below
+supersedes those limitations. Scheduler, HTTP, pools, aggregation, persistence, justification, and
+finalization remain separate work.
 
-**Network whole-batch command checkpoint (implemented, service handoff/apply still absent):** the
+**Network whole-batch command checkpoint (historical command boundary):** the
 signer-only `network/pq-proposer` graph now owns one cap-one, result-bearing command whose only
 production input is the complete non-`Clone` verified local batch. The command and its opaque
 progress owner retain all candidate guards and real proof tokens; no raw single, encoded request,
@@ -2756,17 +2759,84 @@ two-member encoding, subnet/fork topics, no truncation, cursor retry, remote pro
 failure, receipt cancellation, and all three close races. The final authentic warning-denied AVX2
 run passed in 461.00 seconds through real journal signing, whole-batch local proof, and actual
 no-peer `PqNetworkService`, independently matching both encoded members and member-zero's exact
-topic/anonymous ID. It did not apply a vote. Production attester-service handoff, remote outcome
-coalescing, local apply, a two-node upper wire proof, scheduling, pools, persistence, justification,
-and finalization remain future slices.
+topic/anonymous ID. That command-only tracer did not apply a vote; its missing service handoff,
+remote-outcome coalescence, local application, and two-worker upper wire proof are completed below.
 
-This checkpoint is not completion of Task 5.2b. The fork-choice receiver remains in-memory Fresh
-evidence, and the local-context Resume evidence is limited to rebuilding ephemeral committee caches
-from the selected canonical snapshot. There is no live aggregate-and-proof routing, operation-pool
-or naive-aggregation-pool insertion, production publication, scheduler, HTTP route, local
-fork-choice application, service/fork-choice persistence, justification, or finalization claim.
-The finalized checkpoint remains genesis. Those remain the subsequent vertical slices described
-below.
+**Publication/coalescing convergence checkpoint (completed):** the production lower result carries
+non-forgeable evidence for every locally published member, and an irreversible published prefix
+remains owned by the network service across retry, remote wait, shutdown, and caller loss. Remote
+observations are keyed by exact signed identity plus canonical anonymous wire `MessageId`; a
+bounded active admission bridge covers only the interval before the chain claim exists. Local
+application starts only after every member is either locally published or authoritatively consumed
+by the remote chain. Watch loss, bridge loss, identity conflict, and already-signalled terminal
+consumption remain distinct typed outcomes, with exactly one process-failure owner.
+
+The last authentic blocker proved to be source coupling in proof admission. The real two-member
+local verified batch retained both permits from the remote gossip semaphore, so inbound member one
+necessarily returned `IngressCapacity`, the active bridge emitted `Released`, and publication
+retried it locally. The correction did not raise that cap: remote single/aggregate gossip keeps its
+existing capacity two, while local attestation proof verification has a separate private capacity
+two. Thus retained proof work is explicitly bounded at two local plus two remote, with the
+whole-batch publisher still cap one. The local atomic collector and attester service both consume
+the chain-owned local constant. Production-sensitive tests pin local and remote cap-plus-one
+independently; mutating the local verifier back onto the remote semaphore leaves zero remote permits
+instead of two and fails, while changing the remote constant no longer changes the local collector
+bound. The restored imported-slot local-context regression passed 1/1 in 131.90 seconds with remote
+capacity intact and local proof/activity ownership retained through drop.
+
+The completed acceptance tracer uses two independent `BeaconChain`, validator-store, fork-choice,
+and network instances with identical genesis and execution-VALID slot-1 heads; the intentionally
+process-singleton aggregation service is shared. A real two-member batch is journal-signed and
+whole-batch verified once by the direct attester service, transferred through its sealed bounded
+production handoff, and published by `PqNetworkService`. The independent peer supplies member one
+as the external source while member zero follows the local publication path. Exact signed-SSZ
+digests, subnet/fork topics, and anonymous message IDs are checked independently, and neither member
+is re-signed, re-proved, re-encoded, or re-applied.
+
+A commit-blocking review found that the first publication preflight could become stale while a
+mixed batch awaited its remote member. The final post-wire route first settles every remote member
+without holding the import gate. It then acquires the import gate, coherently rechecks the current
+clock, canonical head/state slots, cached validated state root, and execution reconciliation, and
+retains that gate into the blocking fork-choice continuation. The continuation acquires the
+fork-choice mutex exactly once, resamples the actual clock while holding that mutex, validates
+fork-choice time and bound-root ancestry under the same guard, and applies each local member with
+that freshly sampled current slot. No import gate or fork-choice lock crosses the remote wait or a
+network operation. Mutating application back to the signed slot made the focused test observe slot
+1 instead of the advanced current slot 2. Removing the under-fork-choice resample made the clock
+advance from slot 2 to slot 3 while waiting for the mutex incorrectly complete as
+`[Applied, Queued]` instead of the typed
+`ClockChanged { sampled: Slot(2), current: Slot(3) }`; restoring the shared production/harness route
+returned the exact typed error with zero local fork-choice calls and one fail-close.
+
+The exact warning-denied AVX2 command was
+`RUSTFLAGS='-D warnings -C target-feature=+avx2' cargo +1.88 test -p lighthouse
+--no-default-features --features pq-proposer,pq-startup-testing --test pq_e4f_launch
+direct_pq_attester_service_converges_two_independent_workers_exactly_once -- --exact --nocapture`.
+The final rerun passed 1/1 in 460.39 seconds, with cache preparation at 0.241 seconds, authority
+preparation at 279.806 seconds, RANDAO at 307.448 seconds, concurrent imports at 459.274 seconds,
+service completion at 460.233 seconds, and complete drain at 460.383 seconds. The chain task
+executor failure receiver and both independent network task-executor failure receivers were all
+retained, live, and empty immediately before explicit service/network stop and chain drain.
+
+Before the inbound barrier is released, sender progress is exactly member zero
+`Published { duplicate: false }` and member one `WaitingRemote { retained: false }`. The false
+provenance is deliberate: lower admission still reports pending-not-yet-retained while the bounded
+active bridge covers the chain-claim gap. Final sender progress is exact and ordered: member zero is
+`Consumed { duplicate: false, result: Queued }`, and member one is
+`Consumed { duplicate: true, result: Queued }`, each bound to its independently derived exact
+`MessageId`. The sender makes exactly two fork-choice calls, once per identity across the local and
+remote sources; the receiver makes one call for wire-delivered member zero. The sender observation
+cache intentionally retains two source-neutral exact-once records: locally published member zero
+transitions through `LocalWireSuccess` and `ConsumptionPending` to `Consumed(Queued)`, while remote
+member one is already `Consumed(Queued)` and coalesces without a second sender application. Exact
+epoch/index queries return `Queued` for both identities. Receipt, batch guards, proof admissions,
+and observation ownership remain live through remote waiting and clean drain.
+
+This closes Task 5.2b's direct signing, sealed production handoff, real two-worker publication,
+cross-source coalescence, and exact-once local fork-choice application boundary. It does not claim
+operation-pool or naive-aggregation-pool insertion, aggregation or block inclusion, or
+justification/finality beyond genesis. A monitored duty scheduler and persisted attester,
+pool/fork-choice, and finality recovery across restart also remain subsequent vertical slices.
 
 **Files:**
 

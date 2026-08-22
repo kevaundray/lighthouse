@@ -21,7 +21,11 @@ pq-devnet = [
     "operation_pool/pq-devnet",
     "types/pq-devnet",
 ]
-pq-proposer = ["pq-devnet", "lighthouse_network/pq-proposer"]
+pq-proposer = [
+    "pq-devnet",
+    "beacon_chain/pq-proposer",
+    "lighthouse_network/pq-proposer",
+]
 pq-startup-testing = [
     "pq-devnet",
     "beacon_chain/pq-startup-testing",

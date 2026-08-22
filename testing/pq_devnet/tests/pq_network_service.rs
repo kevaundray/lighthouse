@@ -1,29 +1,42 @@
 #[cfg(target_feature = "avx2")]
 use beacon_chain::testing_only_running_pq_operational_event_sink;
 use beacon_chain::{
-    PqOperationalEventError, PqOperationalEventRole, PqStatusRejectionCode,
+    PqForkChoiceAttestationOutcome, PqOperationalEventError, PqOperationalEventRole,
+    PqSingleConsumptionResult, PqSingleObservationIdentity, PqSingleObservationStatus,
+    PqSingleWireMessageId, PqStatusRejectionCode,
     testing_only_pq_extended_operational_event_contract,
     testing_only_pq_operational_event_acknowledgement,
     testing_only_pq_operational_event_nonblocking_writer, testing_only_pq_operational_event_sink,
     testing_only_pq_operational_event_stdout_kinds,
 };
 use consensus_signature::IndividualSignature;
+use lighthouse_network::MessageId;
 use network::{
     PQ_NETWORK_BLOCK_COMMIT_CAPACITY, PQ_NETWORK_BLOCK_ENCODING_CAPACITY,
     PQ_NETWORK_BLOCK_PROOF_CAPACITY, PqBlockBroadcastError, PqCommitCompletionQueueTestTrace,
     PqCommitResolutionTestCase, PqCompletionQueueTestScenario, PqCompletionQueueTestTrace,
     PqCompletionTestDisposition, PqCompletionTestEvent, PqEncodingShutdownTestTrace,
     PqNetworkAttestationCompletionTestDisposition, PqNetworkAttestationCompletionTestEvent,
-    PqNetworkAttestationConsumptionTestCase, PqNetworkAttestationConsumptionTestTrace,
-    PqNetworkAttestationDetachedTestTrace, PqNetworkAttestationIgnoreTestCase,
-    PqNetworkAttestationIgnoreTestTrace, PqNetworkAttestationInFlightTestTrace,
-    PqNetworkAttestationRouteTestCase, PqNetworkAttestationRouteTestTrace, PqNetworkServiceError,
-    PqProofAdmissionTestTrace, PqStatusTestEvent, PqStatusTestScenario, PqStatusTestTrace,
-    pq_block_broadcast_channel, testing_only_pq_attestation_completion_lifecycle,
+    PqNetworkAttestationConsumptionMetadataRetentionTrace, PqNetworkAttestationConsumptionTestCase,
+    PqNetworkAttestationConsumptionTestTrace, PqNetworkAttestationDetachedTestTrace,
+    PqNetworkAttestationIdentityCompletionTestTrace, PqNetworkAttestationIdentityIngressTestCase,
+    PqNetworkAttestationIdentityIngressTestEvent, PqNetworkAttestationIdentityIngressTestTrace,
+    PqNetworkAttestationIgnoreTestCase, PqNetworkAttestationIgnoreTestTrace,
+    PqNetworkAttestationInFlightTestTrace, PqNetworkAttestationRouteTestCase,
+    PqNetworkAttestationRouteTestTrace, PqNetworkAttestationWireIdIngressTestEvent,
+    PqNetworkAttestationWireIdIngressTestMutation, PqNetworkAttestationWireIdIngressTestTrace,
+    PqNetworkAttestationWireProvenanceError, PqNetworkServiceError, PqProofAdmissionTestTrace,
+    PqStatusTestEvent, PqStatusTestScenario, PqStatusTestTrace, pq_block_broadcast_channel,
+    testing_only_pq_attestation_completion_lifecycle,
+    testing_only_pq_attestation_consumption_metadata_retention,
     testing_only_pq_attestation_consumption_resolution,
     testing_only_pq_attestation_detached_lifecycle,
+    testing_only_pq_attestation_identity_completion_trace,
+    testing_only_pq_attestation_identity_ingress_actual_path,
     testing_only_pq_attestation_ignore_classification,
     testing_only_pq_attestation_in_flight_lifecycle, testing_only_pq_attestation_route,
+    testing_only_pq_attestation_wire_id_ingress_actual_path,
+    testing_only_pq_attestation_wire_provenance_actual_path,
     testing_only_pq_commit_completion_queue, testing_only_pq_commit_resolution,
     testing_only_pq_completion_lifecycle, testing_only_pq_completion_queue,
     testing_only_pq_encoding_shutdown, testing_only_pq_gossip_imported_event_gate,
@@ -239,6 +252,269 @@ fn post_accept_attestation_failures_retain_history_and_signal_shutdown() {
             },
         );
     }
+}
+
+#[test]
+fn inbound_attestation_completion_retains_exact_wire_identity_and_fork_choice_outcome() {
+    let identity = |signed_root_byte, signed_ssz_byte| {
+        PqSingleObservationIdentity::new(
+            types::Epoch::new(2),
+            9,
+            types::Slot::new(17),
+            types::SubnetId::new(4),
+            Hash256::repeat_byte(signed_root_byte),
+            [signed_ssz_byte; 32],
+        )
+    };
+    for (message_id, wire_identity, outcome, observation_status) in [
+        (
+            MessageId(vec![0x11; 20]),
+            identity(0x21, 0x31),
+            PqForkChoiceAttestationOutcome::Applied,
+            PqSingleObservationStatus::Consumed(PqSingleConsumptionResult::Applied),
+        ),
+        (
+            MessageId(vec![0x41; 20]),
+            identity(0x22, 0x31),
+            PqForkChoiceAttestationOutcome::Queued,
+            PqSingleObservationStatus::Consumed(PqSingleConsumptionResult::Queued),
+        ),
+        (
+            MessageId(vec![0x51; 20]),
+            identity(0x21, 0x32),
+            PqForkChoiceAttestationOutcome::Applied,
+            PqSingleObservationStatus::Consumed(PqSingleConsumptionResult::Applied),
+        ),
+    ] {
+        assert_eq!(
+            testing_only_pq_attestation_identity_completion_trace(
+                message_id.clone(),
+                wire_identity,
+                outcome,
+            ),
+            PqNetworkAttestationIdentityCompletionTestTrace {
+                verification_message_id: message_id.clone(),
+                verification_identity: wire_identity,
+                consumption_message_id: message_id,
+                consumption_identity: wire_identity,
+                observation_status,
+            },
+        );
+    }
+}
+
+#[test]
+fn inbound_consumption_handler_retains_metadata_for_future_cross_source_coalescing() {
+    let message_id = MessageId(vec![0x61; 20]);
+    let identity = PqSingleObservationIdentity::new(
+        types::Epoch::new(2),
+        9,
+        types::Slot::new(17),
+        types::SubnetId::new(4),
+        Hash256::repeat_byte(0x71),
+        [0x81; 32],
+    );
+    assert_eq!(
+        testing_only_pq_attestation_consumption_metadata_retention(
+            message_id.clone(),
+            identity,
+            PqForkChoiceAttestationOutcome::Queued,
+        ),
+        PqNetworkAttestationConsumptionMetadataRetentionTrace {
+            message_id,
+            identity,
+            result: PqSingleConsumptionResult::Queued,
+            retained_for_coalescer: false,
+            coordinator_wired: true,
+        },
+        "the completion handler must defer to chain authority without retaining network history",
+    );
+}
+
+#[test]
+fn attestation_ingress_admits_before_deriving_identity_from_the_sealed_token() {
+    let identity = |root_byte, digest_byte| {
+        PqSingleObservationIdentity::new(
+            types::Epoch::new(2),
+            9,
+            types::Slot::new(17),
+            types::SubnetId::new(4),
+            Hash256::repeat_byte(root_byte),
+            [digest_byte; 32],
+        )
+    };
+    let decoded_network_identity = identity(0x31, 0x41);
+    let sealed_token_identity = identity(0x32, 0x42);
+    let message_id = MessageId(vec![0x51; 20]);
+
+    assert_eq!(
+        testing_only_pq_attestation_identity_ingress_actual_path(
+            PqNetworkAttestationIdentityIngressTestCase::CapacityExhausted,
+            message_id.clone(),
+            decoded_network_identity,
+            sealed_token_identity,
+        ),
+        PqNetworkAttestationIdentityIngressTestTrace {
+            events: vec![PqNetworkAttestationIdentityIngressTestEvent::AdmissionAttempted],
+            identity_derivations_before_admission: 0,
+            verification_message_id: None,
+            verification_identity: None,
+        },
+        "a cap2 miss must not hash or derive any observation identity",
+    );
+
+    assert_eq!(
+        testing_only_pq_attestation_identity_ingress_actual_path(
+            PqNetworkAttestationIdentityIngressTestCase::Accepted,
+            message_id.clone(),
+            decoded_network_identity,
+            sealed_token_identity,
+        ),
+        PqNetworkAttestationIdentityIngressTestTrace {
+            events: vec![
+                PqNetworkAttestationIdentityIngressTestEvent::AdmissionAttempted,
+                PqNetworkAttestationIdentityIngressTestEvent::AdmissionAcquired,
+                PqNetworkAttestationIdentityIngressTestEvent::SealedTokenIdentityTransferred,
+                PqNetworkAttestationIdentityIngressTestEvent::CompletionQueued,
+            ],
+            identity_derivations_before_admission: 0,
+            verification_message_id: Some(message_id),
+            verification_identity: Some(sealed_token_identity),
+        },
+        "accepted completion identity must come from the sealed verifier result, never decoded input",
+    );
+}
+
+#[test]
+fn attestation_ingress_converts_and_transfers_the_exact_wire_id_once() {
+    let message_id = MessageId(vec![0x51; 20]);
+    let expected_wire_id = PqSingleWireMessageId::try_from(message_id.0.as_slice())
+        .expect("the real gossipsub MessageId has the exact chain wire-ID length");
+
+    assert_eq!(
+        testing_only_pq_attestation_wire_id_ingress_actual_path(
+            message_id.clone(),
+            PqNetworkAttestationWireIdIngressTestMutation::None,
+        )
+        .expect("the actual admitted verification path retains exact wire authority"),
+        PqNetworkAttestationWireIdIngressTestTrace {
+            events: vec![
+                PqNetworkAttestationWireIdIngressTestEvent::Converted,
+                PqNetworkAttestationWireIdIngressTestEvent::Claimed,
+                PqNetworkAttestationWireIdIngressTestEvent::SealedTokenTransferred,
+                PqNetworkAttestationWireIdIngressTestEvent::MarkedPropagated,
+                PqNetworkAttestationWireIdIngressTestEvent::CompletionQueued,
+            ],
+            conversion_count: 1,
+            claim_wire_id: expected_wire_id,
+            sealed_token_wire_id: expected_wire_id,
+            completion_wire_id: expected_wire_id,
+        },
+        "the MessageId must be converted once and moved through claim, sealed token, and completion",
+    );
+
+    assert!(
+        testing_only_pq_attestation_wire_id_ingress_actual_path(
+            message_id.clone(),
+            PqNetworkAttestationWireIdIngressTestMutation::DropBeforeClaim,
+        )
+        .is_err(),
+        "claiming without the converted wire authority must fail",
+    );
+    assert!(
+        testing_only_pq_attestation_wire_id_ingress_actual_path(
+            message_id,
+            PqNetworkAttestationWireIdIngressTestMutation::ReplaceAfterClaim,
+        )
+        .is_err(),
+        "the authority bound by initial preparation cannot be replaced after propagation",
+    );
+}
+
+#[cfg(target_feature = "avx2")]
+#[tokio::test(flavor = "current_thread")]
+async fn fabricated_wire_id_cannot_claim_an_otherwise_valid_single_observation() {
+    let runtime = task_executor::test_utils::TestRuntime::default();
+    let fixture = live_single_attestation_fixture(&runtime).await;
+    let (single, subnet) = slot_one_single_attestation(&fixture);
+    let fork_digest = fixture
+        .spec
+        .enr_fork_id::<MinimalEthSpec>(
+            single.data.slot,
+            fixture.post_state.genesis_validators_root(),
+        )
+        .fork_digest;
+    let topic = lighthouse_network::Topic::from(GossipTopic::new(
+        GossipKind::Attestation(subnet),
+        GossipEncoding::default(),
+        fork_digest,
+    ));
+    let expected_message_id = lighthouse_network::pq_anonymous_message_id(
+        &topic.hash(),
+        &single.as_ssz_bytes(),
+        fixture.spec.message_domain_valid_snappy,
+        true,
+    );
+
+    let accepted = testing_only_pq_attestation_wire_provenance_actual_path(
+        expected_message_id.clone(),
+        topic.hash(),
+        single.clone(),
+        subnet,
+        fixture.post_state.genesis_validators_root(),
+        Arc::clone(&fixture.spec),
+    )
+    .expect("the exact deterministic anonymous wire ID authorizes the observation claim");
+    assert_eq!(accepted.expected_message_id, expected_message_id);
+    assert_eq!(accepted.observation_claim_count, 1);
+    assert_eq!(
+        accepted.observation_status,
+        PqSingleObservationStatus::Pending
+    );
+
+    let fabricated = MessageId(vec![0xa5; 20]);
+    let rejected = testing_only_pq_attestation_wire_provenance_actual_path(
+        fabricated.clone(),
+        topic.hash(),
+        single.clone(),
+        subnet,
+        fixture.post_state.genesis_validators_root(),
+        Arc::clone(&fixture.spec),
+    )
+    .expect_err("a length-valid fabricated ID carries no observation authority");
+    assert!(matches!(
+        rejected,
+        PqNetworkAttestationWireProvenanceError::MessageIdMismatch {
+            expected,
+            actual,
+            observation_claim_count: 0,
+            observation_status: PqSingleObservationStatus::Unseen,
+        } if expected == expected_message_id && actual == fabricated
+    ));
+
+    let fabricated_wire_id = PqSingleWireMessageId::try_from(fabricated.0.as_slice())
+        .expect("the fabricated ID is deliberately length-valid");
+    assert!(matches!(
+        fixture
+            .chain
+            .verify_pq_single_attestation_for_gossip_with_wire_id(
+                single.clone(),
+                subnet,
+                fabricated_wire_id,
+            )
+            .await,
+        Err(beacon_chain::PqAttestationGossipError::Local(
+            beacon_chain::PqAttestationGossipLocalError::WireMessageIdMismatch { .. }
+        ))
+    ));
+    let identity = PqSingleObservationIdentity::from_signed_attestation(&single, subnet);
+    assert_eq!(
+        fixture
+            .chain
+            .pq_attestation_consumption_status(&identity, fabricated_wire_id),
+        PqSingleObservationStatus::Unseen,
+        "the independent public chain boundary rejects before observation mutation",
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

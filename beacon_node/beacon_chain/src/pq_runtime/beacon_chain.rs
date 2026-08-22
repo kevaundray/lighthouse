@@ -1,6 +1,13 @@
 use consensus_signature::AggregationService;
 use fork_choice::ForkChoiceStore as _;
+#[cfg(feature = "pq-proposer")]
+use lighthouse_network::{
+    GossipTopic, IdentTopic, PqLocalSinglePublicationToken, pq_anonymous_message_id,
+    types::{GossipEncoding, GossipKind},
+};
 use parking_lot::{Mutex, RwLock};
+#[cfg(feature = "pq-proposer")]
+use sha2::{Digest, Sha256};
 use slot_clock::SlotClock;
 use state_processing::PqValidatorKeyCache;
 use std::marker::PhantomData;
@@ -19,7 +26,44 @@ type PqForkChoice<T> = fork_choice::ForkChoice<
     <T as BeaconChainTypes>::EthSpec,
 >;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PqForkChoiceAncestryQueryError {
+    Busy,
+    Unavailable,
+}
+
 pub const PQ_FORK_CHOICE_TICK_MAX_ADVANCE: u64 = 8;
+
+#[cfg(feature = "pq-proposer")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_pq_local_single_publication_token(
+    member: usize,
+    token: &PqLocalSinglePublicationToken,
+    message_id: &lighthouse_network::MessageId,
+    topic_hash: &lighthouse_network::TopicHash,
+    fork_digest: [u8; 4],
+    subnet: types::SubnetId,
+    signed_ssz_digest: [u8; 32],
+) -> Result<(), crate::PqPublishedLocalAttestationEvidenceError> {
+    for (matches, field) in [
+        (token.message_id() == message_id, "message-id"),
+        (token.topic_hash() == topic_hash, "topic"),
+        (token.fork_digest() == fork_digest, "fork-digest"),
+        (token.subnet() == subnet, "subnet"),
+        (
+            token.signed_ssz_digest() == signed_ssz_digest,
+            "signed-ssz-digest",
+        ),
+    ] {
+        if !matches {
+            return Err(crate::PqPublishedLocalAttestationEvidenceError::Mismatch {
+                member,
+                field,
+            });
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PqForkChoiceAttestationOutcome {
@@ -247,6 +291,145 @@ impl Drop for PqImportPanicGuard {
     }
 }
 
+#[cfg(any(feature = "pq-proposer", feature = "pq-startup-testing"))]
+struct PqPostWireFailClosedGuard {
+    fail_closed: Option<Box<dyn FnOnce() + Send>>,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TestingPqPublishedLocalAttestationSupervisorFailure {
+    Preflight,
+    InvalidIndexed,
+    Observation,
+    Panic,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub struct TestingPqPublishedLocalAttestationSupervisorReceipt(tokio::sync::oneshot::Receiver<()>);
+
+#[cfg(feature = "pq-startup-testing")]
+impl TestingPqPublishedLocalAttestationSupervisorReceipt {
+    pub async fn wait(self) {
+        let _ = self.0.await;
+    }
+}
+
+#[cfg(feature = "pq-startup-testing")]
+#[doc(hidden)]
+pub struct TestingPqPublishedLocalAttestationSupervisorHarness {
+    failure: TestingPqPublishedLocalAttestationSupervisorFailure,
+    hook: Arc<crate::TestingPqBlockingHook>,
+    coordinator: Arc<PqImportCoordinator>,
+    fail_closed_calls: Arc<std::sync::atomic::AtomicUsize>,
+    active_operations: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(feature = "pq-startup-testing")]
+impl TestingPqPublishedLocalAttestationSupervisorHarness {
+    pub fn new(
+        failure: TestingPqPublishedLocalAttestationSupervisorFailure,
+        hook: Arc<crate::TestingPqBlockingHook>,
+    ) -> Self {
+        Self {
+            failure,
+            hook,
+            coordinator: Arc::new(PqImportCoordinator::default()),
+            fail_closed_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            active_operations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn start_after_wire(&self) -> TestingPqPublishedLocalAttestationSupervisorReceipt {
+        struct ActiveGuard(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for ActiveGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        }
+
+        let activity = self
+            .coordinator
+            .try_start()
+            .expect("fresh Cycle W supervisor harness admits one operation");
+        self.active_operations
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let active_guard = ActiveGuard(Arc::clone(&self.active_operations));
+        let hook = Arc::clone(&self.hook);
+        let failure = self.failure;
+        let fail_closed_calls = Arc::clone(&self.fail_closed_calls);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _activity = activity;
+            let _active_guard = active_guard;
+            let mut fail_closed = PqPostWireFailClosedGuard::new(move || {
+                fail_closed_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            });
+            let blocking = tokio::task::spawn_blocking(move || hook.run()).await;
+            if blocking.is_err()
+                || matches!(
+                    failure,
+                    TestingPqPublishedLocalAttestationSupervisorFailure::Panic
+                )
+            {
+                panic!("injected Cycle W post-wire supervisor panic");
+            }
+            let _ = sender.send(());
+            let _semantic_error = match failure {
+                TestingPqPublishedLocalAttestationSupervisorFailure::Preflight => "preflight",
+                TestingPqPublishedLocalAttestationSupervisorFailure::InvalidIndexed => {
+                    "invalid-indexed"
+                }
+                TestingPqPublishedLocalAttestationSupervisorFailure::Observation => "observation",
+                TestingPqPublishedLocalAttestationSupervisorFailure::Panic => unreachable!(),
+            };
+            // Every harness case represents an after-wire terminal failure, so the same
+            // production guard remains armed.
+            let _ = &mut fail_closed;
+        });
+        TestingPqPublishedLocalAttestationSupervisorReceipt(receiver)
+    }
+
+    pub async fn close_and_drain(&self) {
+        self.coordinator.close_and_drain().await;
+    }
+
+    pub fn fail_closed_calls(&self) -> usize {
+        self.fail_closed_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn active_operations(&self) -> usize {
+        self.active_operations
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(any(feature = "pq-proposer", feature = "pq-startup-testing"))]
+impl PqPostWireFailClosedGuard {
+    fn new(fail_closed: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            fail_closed: Some(Box::new(fail_closed)),
+        }
+    }
+
+    #[cfg(feature = "pq-proposer")]
+    fn disarm(&mut self) {
+        self.fail_closed.take();
+    }
+}
+
+#[cfg(any(feature = "pq-proposer", feature = "pq-startup-testing"))]
+impl Drop for PqPostWireFailClosedGuard {
+    fn drop(&mut self) {
+        if let Some(fail_closed) = self.fail_closed.take() {
+            fail_closed();
+        }
+    }
+}
+
 pub(crate) struct PqImportActivity {
     coordinator: Arc<PqImportCoordinator>,
 }
@@ -301,12 +484,20 @@ pub struct BeaconSnapshot<E: EthSpec> {
     pub beacon_block: Arc<SignedBeaconBlock<E>>,
     pub beacon_block_root: Hash256,
     pub beacon_state: BeaconState<E>,
+    pub(crate) validated_state_root: Hash256,
 }
 
 impl<E: EthSpec> BeaconSnapshot<E> {
     /// Returns the exact state root committed by the snapshot block.
     pub fn beacon_state_root(&self) -> Hash256 {
         self.beacon_block.message().state_root()
+    }
+
+    /// Returns the state root independently computed when this snapshot was admitted.
+    ///
+    /// This accessor is a cached read and never hashes or mutates the retained state.
+    pub const fn validated_state_root(&self) -> Hash256 {
+        self.validated_state_root
     }
 }
 
@@ -409,6 +600,7 @@ pub struct BeaconChain<T: BeaconChainTypes> {
     pub(crate) pq_proposer_duty_admission: Arc<tokio::sync::Semaphore>,
     pub(crate) pq_local_attester_context_admission: Arc<tokio::sync::Semaphore>,
     pub(crate) pq_attestation_gossip_admission: Arc<tokio::sync::Semaphore>,
+    pq_local_attestation_proof_admission: Arc<tokio::sync::Semaphore>,
     pub(crate) pq_attestation_gossip_observations:
         Arc<Mutex<crate::pq_attestation_gossip::PqAttestationGossipObservationCache<T::EthSpec>>>,
     pub(crate) pq_execution_notifier: crate::pq_import::PqExecutionNotifier<T::EthSpec>,
@@ -447,6 +639,42 @@ pub struct BeaconChain<T: BeaconChainTypes> {
 }
 
 impl<T: BeaconChainTypes> BeaconChain<T> {
+    pub(crate) fn try_reserve_pq_attestation_gossip_admission(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
+        Arc::clone(&self.pq_attestation_gossip_admission).try_acquire_owned()
+    }
+
+    pub(crate) fn try_reserve_pq_local_attestation_proof_admission(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
+        Arc::clone(&self.pq_local_attestation_proof_admission).try_acquire_owned()
+    }
+
+    #[cfg(feature = "pq-startup-testing")]
+    pub(crate) fn pq_local_attestation_proof_available_permits(&self) -> usize {
+        self.pq_local_attestation_proof_admission
+            .available_permits()
+    }
+
+    pub(crate) fn try_pq_fork_choice_descendants(
+        &self,
+        ancestors: &[Hash256],
+        descendant: Hash256,
+    ) -> Result<Vec<bool>, PqForkChoiceAncestryQueryError> {
+        let fork_choice = self
+            .pq_fork_choice
+            .as_ref()
+            .ok_or(PqForkChoiceAncestryQueryError::Unavailable)?;
+        let fork_choice = fork_choice
+            .try_lock()
+            .ok_or(PqForkChoiceAncestryQueryError::Busy)?;
+        Ok(ancestors
+            .iter()
+            .map(|ancestor| fork_choice.is_descendant(*ancestor, descendant))
+            .collect())
+    }
+
     pub(crate) fn emit_pq_operational_event(
         &self,
         event: crate::PqOperationalEvent,
@@ -580,6 +808,9 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             )),
             pq_attestation_gossip_admission: Arc::new(tokio::sync::Semaphore::new(
                 crate::PQ_ATTESTATION_GOSSIP_ADMISSION_CAPACITY,
+            )),
+            pq_local_attestation_proof_admission: Arc::new(tokio::sync::Semaphore::new(
+                crate::PQ_LOCAL_ATTESTATION_PROOF_ADMISSION_CAPACITY,
             )),
             pq_attestation_gossip_observations: Arc::new(Mutex::new(
                 crate::pq_attestation_gossip::PqAttestationGossipObservationCache::default(),
@@ -751,6 +982,9 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                     .consume_pq_verified_gossip_single_continuation(verified)
                     .await;
                 panic_guard.disarm();
+                if result.is_err() {
+                    chain.fail_pq_fork_choice_task();
+                }
                 result
             },
             "pq-attestation-fork-choice-consume",
@@ -760,6 +994,11 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         };
         match task.await {
             Ok(Ok(result)) => result,
+            Ok(Err(error)) if error.is_panic() => {
+                // `spawn_handle_without_exit` monitors panics and is the sole process-failure
+                // signal owner. `PqImportPanicGuard` has already closed ingress while unwinding.
+                Err(PqForkChoiceAttestationError::TaskUnavailable)
+            }
             Ok(Err(_)) | Err(_) => {
                 self.fail_pq_fork_choice_task();
                 Err(PqForkChoiceAttestationError::TaskUnavailable)
@@ -778,6 +1017,308 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
     /// Fail closed after an already-propagated PQ attestation cannot be consumed locally.
     pub fn fail_pq_attestation_after_propagation(&self) {
         self.fail_pq_fork_choice_task();
+    }
+
+    /// Binds the sole post-publication consumption authority to this chain instance.
+    #[cfg(feature = "pq-proposer")]
+    pub fn pq_published_local_attestation_batch_consumer(
+        self: &Arc<Self>,
+    ) -> PqPublishedLocalAttestationBatchConsumer<T> {
+        PqPublishedLocalAttestationBatchConsumer {
+            chain: Arc::clone(self),
+        }
+    }
+
+    /// Consumes one complete, already-published local PQ attestation batch.
+    ///
+    /// The sealed batch is the sole authority: exact observation identities and deterministic
+    /// member order are inferred internally. The monitored continuation retains every proof,
+    /// admission and activity guard until all local fork-choice results are finalized.
+    #[cfg(feature = "pq-proposer")]
+    async fn consume_pq_published_local_attestation_batch(
+        self: &Arc<Self>,
+        evidence: crate::PqPublishedLocalAttestationEvidenceBatch<T::EthSpec>,
+    ) -> Result<
+        crate::PqPublishedLocalAttestationBatchConsumptionOutcome,
+        crate::PqPublishedLocalAttestationBatchConsumptionError,
+    > {
+        let failure_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let chain = Arc::clone(self);
+        let task_failure_sent = Arc::clone(&failure_sent);
+        let Some(task) = self.task_executor.spawn_handle_without_exit(
+            async move {
+                chain
+                    .consume_pq_published_local_attestation_batch_continuation(
+                        evidence,
+                        task_failure_sent,
+                    )
+                    .await
+            },
+            "pq-published-local-attestation-batch-consume",
+        ) else {
+            self.fail_pq_fork_choice_task_once(&failure_sent);
+            return Err(crate::PqPublishedLocalAttestationBatchConsumptionError::TaskUnavailable);
+        };
+        match task.await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) | Err(_) => {
+                self.fail_pq_fork_choice_task_once(&failure_sent);
+                Err(crate::PqPublishedLocalAttestationBatchConsumptionError::TaskUnavailable)
+            }
+        }
+    }
+
+    #[cfg(feature = "pq-proposer")]
+    async fn consume_pq_published_local_attestation_batch_continuation(
+        self: &Arc<Self>,
+        evidence: crate::PqPublishedLocalAttestationEvidenceBatch<T::EthSpec>,
+        failure_sent: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<
+        crate::PqPublishedLocalAttestationBatchConsumptionOutcome,
+        crate::PqPublishedLocalAttestationBatchConsumptionError,
+    > {
+        let fail_chain = Arc::clone(self);
+        let guard_failure_sent = Arc::clone(&failure_sent);
+        let mut fail_closed = PqPostWireFailClosedGuard::new(move || {
+            fail_chain.fail_pq_fork_choice_task_once(&guard_failure_sent);
+        });
+        let result = self
+            .consume_pq_published_local_attestation_batch_inner(evidence, failure_sent)
+            .await;
+        if result.is_ok() {
+            fail_closed.disarm();
+        }
+        result
+    }
+
+    #[cfg(feature = "pq-proposer")]
+    async fn consume_pq_published_local_attestation_batch_inner(
+        self: &Arc<Self>,
+        evidence: crate::PqPublishedLocalAttestationEvidenceBatch<T::EthSpec>,
+        failure_sent: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<
+        crate::PqPublishedLocalAttestationBatchConsumptionOutcome,
+        crate::PqPublishedLocalAttestationBatchConsumptionError,
+    > {
+        let crate::PqLocalAttestationBatchPreflightOutcome::Ready { slot, .. } = self
+            .preflight_pq_local_attestation_batch(evidence.verified())
+            .map_err(crate::PqPublishedLocalAttestationBatchConsumptionError::Preflight)?;
+        let publication_members = self
+            .validate_pq_local_attestation_publication_evidence(&evidence)
+            .map_err(crate::PqPublishedLocalAttestationBatchConsumptionError::Evidence)?;
+        let (batch, _evidence) = evidence.into_parts();
+        let indexed = batch
+            .verified()
+            .iter()
+            .enumerate()
+            .map(|(index, verified)| {
+                verified
+                    .single()
+                    .to_indexed::<T::EthSpec>(types::ForkName::Electra)
+                    .map_err(|_| {
+                        crate::PqPublishedLocalAttestationBatchConsumptionError::InvalidIndexedAttestation {
+                            index,
+                        }
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let earliest_slot = (slot - T::EthSpec::slots_per_epoch())
+            .epoch(T::EthSpec::slots_per_epoch())
+            .start_slot(T::EthSpec::slots_per_epoch());
+        let fail_chain = Arc::clone(self);
+        let owner_failure_sent = Arc::clone(&failure_sent);
+        let owner = crate::pq_attestation_gossip::PqSingleObservationBatchResolutionOwner::resolve_publication_evidence(
+            Arc::clone(&self.pq_attestation_gossip_observations),
+            &publication_members,
+            earliest_slot,
+            Some(Box::new(move || {
+                fail_chain.fail_pq_fork_choice_task_once(&owner_failure_sent);
+            })),
+        )
+        .map_err(crate::PqPublishedLocalAttestationBatchConsumptionError::Observation)?;
+        let owner = owner.settle_remote_members().await?;
+        let late_apply = self
+            .acquire_pq_local_attestation_late_apply_context(&batch)
+            .await
+            .map_err(crate::PqPublishedLocalAttestationBatchConsumptionError::Preflight)?;
+        let fork_choice = self
+            .pq_fork_choice
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or(crate::PqPublishedLocalAttestationBatchConsumptionError::TaskUnavailable)?;
+        let spec = Arc::clone(&self.spec);
+        let slot_clock = self.slot_clock.clone();
+        #[cfg(feature = "pq-startup-testing")]
+        let call_chain = Arc::clone(self);
+        let Some(blocking) = self.task_executor.spawn_blocking_handle_without_exit(
+            move || {
+                let mut fork_choice = fork_choice.lock();
+                let result = crate::pq_local_attester_context::consume_pq_published_local_attestation_batch_after_settlement(
+                    late_apply,
+                    &mut *fork_choice,
+                    || slot_clock.now(),
+                    |fork_choice| fork_choice.fc_store().get_current_slot(),
+                    |fork_choice, bound, current| fork_choice.is_descendant(bound, current),
+                    |fork_choice, current_slot| {
+                        owner.consume_all_local(|index| {
+                            let indexed = indexed.get(index).ok_or(())?;
+                            let queued_before = fork_choice.queued_attestations().len();
+                            fork_choice
+                                .on_attestation(
+                                    current_slot,
+                                    indexed.to_ref(),
+                                    fork_choice::AttestationFromBlock::False,
+                                    &spec,
+                                )
+                                .map_err(|_| ())?;
+                            #[cfg(feature = "pq-startup-testing")]
+                            call_chain
+                                .pq_fork_choice_attestation_calls
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            if fork_choice.queued_attestations().len() > queued_before {
+                                Ok::<PqForkChoiceAttestationOutcome, ()>(
+                                    PqForkChoiceAttestationOutcome::Queued,
+                                )
+                            } else {
+                                Ok::<PqForkChoiceAttestationOutcome, ()>(
+                                    PqForkChoiceAttestationOutcome::Applied,
+                                )
+                            }
+                        })
+                    },
+                )
+                .map_err(crate::PqPublishedLocalAttestationBatchConsumptionError::Preflight)
+                .and_then(std::convert::identity);
+                drop(batch);
+                result
+            },
+            "pq-published-local-attestation-batch-fork-choice",
+        ) else {
+            self.fail_pq_fork_choice_task_once(&failure_sent);
+            return Err(crate::PqPublishedLocalAttestationBatchConsumptionError::TaskUnavailable);
+        };
+        match blocking.await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) | Err(_) => {
+                self.fail_pq_fork_choice_task_once(&failure_sent);
+                Err(crate::PqPublishedLocalAttestationBatchConsumptionError::TaskUnavailable)
+            }
+        }
+    }
+
+    #[cfg(feature = "pq-proposer")]
+    fn validate_pq_local_attestation_publication_evidence(
+        &self,
+        evidence: &crate::PqPublishedLocalAttestationEvidenceBatch<T::EthSpec>,
+    ) -> Result<
+        Vec<(
+            crate::PqSingleObservationIdentity,
+            crate::PqSingleWireMessageId,
+            Option<crate::PqSingleConsumptionResult>,
+        )>,
+        crate::PqPublishedLocalAttestationEvidenceError,
+    > {
+        let verified = evidence.verified().verified();
+        if verified.len() != evidence.members().len() {
+            return Err(
+                crate::PqPublishedLocalAttestationEvidenceError::CountMismatch {
+                    expected: verified.len(),
+                    actual: evidence.members().len(),
+                },
+            );
+        }
+        verified
+            .iter()
+            .zip(evidence.members())
+            .enumerate()
+            .map(|(member, (verified, publication))| {
+                let signed_ssz = ssz::Encode::as_ssz_bytes(verified.single());
+                let signed_ssz_digest: [u8; 32] = Sha256::digest(&signed_ssz).into();
+                if signed_ssz_digest != verified.signed_ssz_digest() {
+                    return Err(crate::PqPublishedLocalAttestationEvidenceError::Mismatch {
+                        member,
+                        field: "verified-signed-ssz-digest",
+                    });
+                }
+                let fork_digest = self
+                    .spec
+                    .enr_fork_id::<T::EthSpec>(
+                        verified.slot(),
+                        self.head_snapshot().beacon_state.genesis_validators_root(),
+                    )
+                    .fork_digest;
+                let gossip_topic = GossipTopic::new(
+                    GossipKind::Attestation(verified.subnet()),
+                    GossipEncoding::default(),
+                    fork_digest,
+                );
+                let topic = IdentTopic::from(gossip_topic);
+                let topic_hash = topic.hash();
+                let message_id = pq_anonymous_message_id(
+                    &topic_hash,
+                    &signed_ssz,
+                    self.spec.message_domain_valid_snappy,
+                    self.spec
+                        .fork_name_at_slot::<T::EthSpec>(verified.slot())
+                        .altair_enabled(),
+                );
+                let remote_result = match publication {
+                    crate::PqPublishedLocalAttestationMemberEvidence::Local(token) => {
+                        validate_pq_local_single_publication_token(
+                            member,
+                            token,
+                            &message_id,
+                            &topic_hash,
+                            fork_digest,
+                            verified.subnet(),
+                            signed_ssz_digest,
+                        )?;
+                        None
+                    }
+                    crate::PqPublishedLocalAttestationMemberEvidence::Remote {
+                        message_id: claimed_message_id,
+                        result,
+                    } => {
+                        if claimed_message_id != &message_id {
+                            return Err(
+                                crate::PqPublishedLocalAttestationEvidenceError::Mismatch {
+                                    member,
+                                    field: "remote-message-id",
+                                },
+                            );
+                        }
+                        if !matches!(
+                            result,
+                            crate::PqSingleConsumptionResult::Applied
+                                | crate::PqSingleConsumptionResult::Queued
+                        ) {
+                            return Err(
+                                crate::PqPublishedLocalAttestationEvidenceError::RemoteResult {
+                                    member,
+                                },
+                            );
+                        }
+                        Some(*result)
+                    }
+                };
+                let wire_id = crate::PqSingleWireMessageId::try_from(message_id.0.as_slice())
+                    .map_err(
+                        |_| crate::PqPublishedLocalAttestationEvidenceError::Mismatch {
+                            member,
+                            field: "message-id-length",
+                        },
+                    )?;
+                Ok((verified.observation_identity(), wire_id, remote_result))
+            })
+            .collect()
+    }
+
+    #[cfg(any(feature = "pq-proposer", feature = "pq-startup-testing"))]
+    #[cfg(feature = "pq-proposer")]
+    fn fail_pq_fork_choice_task_once(&self, failure_sent: &std::sync::atomic::AtomicBool) {
+        if !failure_sent.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            self.fail_pq_fork_choice_task();
+        }
     }
 
     async fn consume_pq_verified_gossip_single_continuation(
@@ -841,7 +1382,6 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             },
             "pq-attestation-fork-choice-blocking",
         ) else {
-            self.fail_pq_fork_choice_task();
             let _ = consumption.finalize_terminal();
             return Err(PqForkChoiceAttestationError::TaskUnavailable);
         };
@@ -852,7 +1392,6 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 return Err(error);
             }
             Ok(Err(_)) | Err(_) => {
-                self.fail_pq_fork_choice_task();
                 let _ = consumption.finalize_terminal();
                 return Err(PqForkChoiceAttestationError::TaskUnavailable);
             }
@@ -861,7 +1400,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         self.pq_fork_choice_attestation_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         consumption
-            .finalize_applied()
+            .finalize_fork_choice(outcome)
             .map_err(|_| PqForkChoiceAttestationError::ObservationLost)?;
         Ok(outcome)
     }
@@ -1009,6 +1548,21 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             .single_consumption_result((epoch, validator_index))
     }
 
+    /// Reads the exact chain-authoritative lifecycle state for an already verified single.
+    ///
+    /// This grants no claim, subscription, publication or fork-choice authority. The network
+    /// completion coordinator uses it only to confirm that an inbound consumption completion
+    /// agrees with the state finalized by the chain-owned continuation.
+    pub fn pq_attestation_consumption_status(
+        &self,
+        identity: &crate::PqSingleObservationIdentity,
+        wire_id: crate::PqSingleWireMessageId,
+    ) -> crate::PqSingleObservationStatus {
+        self.pq_attestation_gossip_observations
+            .lock()
+            .exact_single_wire_status(identity, wire_id)
+    }
+
     #[cfg(feature = "pq-startup-testing")]
     #[doc(hidden)]
     pub fn testing_only_try_start_pq_fork_choice_ingress(
@@ -1086,5 +1640,90 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             .acquire_owned()
             .await
             .expect("PQ import gate remains open for the chain lifetime")
+    }
+}
+
+/// Opaque authority for consuming a whole locally-published PQ attestation batch on its bound
+/// chain. The network service owns this capability and never exposes the batch's proof tokens.
+#[cfg(feature = "pq-proposer")]
+pub struct PqPublishedLocalAttestationBatchConsumer<T: BeaconChainTypes> {
+    chain: Arc<BeaconChain<T>>,
+}
+
+#[cfg(feature = "pq-proposer")]
+impl<T: BeaconChainTypes> PqPublishedLocalAttestationBatchConsumer<T> {
+    /// Resolves one exact lower publication outcome against the chain-owned observation state.
+    /// The caller supplies only the retained sealed batch, its member index and the actual lower
+    /// message ID; identity and wire metadata are derived from the sealed member.
+    pub fn resolve_member(
+        &self,
+        batch: &crate::PqVerifiedLocalAttestationBatch<T::EthSpec>,
+        member: usize,
+        message_id: &lighthouse_network::MessageId,
+    ) -> Result<crate::PqPublishedLocalMemberResolution, crate::PqPublishedLocalMemberResolutionError>
+    {
+        let verified = batch
+            .verified()
+            .get(member)
+            .ok_or(crate::PqPublishedLocalMemberResolutionError::Member)?;
+        let signed_ssz = ssz::Encode::as_ssz_bytes(verified.single());
+        let recomputed_identity = crate::PqSingleObservationIdentity::from_signed_attestation(
+            verified.single(),
+            verified.subnet(),
+        );
+        if recomputed_identity != verified.observation_identity() {
+            return Err(crate::PqPublishedLocalMemberResolutionError::Identity);
+        }
+        let fork_digest = self
+            .chain
+            .spec
+            .enr_fork_id::<T::EthSpec>(
+                verified.slot(),
+                self.chain
+                    .head_snapshot()
+                    .beacon_state
+                    .genesis_validators_root(),
+            )
+            .fork_digest;
+        let topic = IdentTopic::from(GossipTopic::new(
+            GossipKind::Attestation(verified.subnet()),
+            GossipEncoding::default(),
+            fork_digest,
+        ));
+        let expected_message_id = pq_anonymous_message_id(
+            &topic.hash(),
+            &signed_ssz,
+            self.chain.spec.message_domain_valid_snappy,
+            self.chain
+                .spec
+                .fork_name_at_slot::<T::EthSpec>(verified.slot())
+                .altair_enabled(),
+        );
+        crate::pq_attestation_gossip::resolve_pq_published_local_member(
+            &self.chain.pq_attestation_gossip_observations,
+            recomputed_identity,
+            &signed_ssz,
+            verified.signed_ssz_digest(),
+            &expected_message_id,
+            message_id,
+        )
+    }
+
+    pub async fn consume(
+        &self,
+        evidence: crate::PqPublishedLocalAttestationEvidenceBatch<T::EthSpec>,
+    ) -> Result<
+        crate::PqPublishedLocalAttestationBatchConsumptionOutcome,
+        crate::PqPublishedLocalAttestationBatchConsumptionError,
+    > {
+        self.chain
+            .consume_pq_published_local_attestation_batch(evidence)
+            .await
+    }
+
+    /// Closes PQ ingress after the outer monitored network task already emitted the sole process
+    /// failure signal for a panic.
+    pub fn close_ingress_after_monitored_task_failure(&self) {
+        self.chain.pq_import_coordinator.close();
     }
 }
