@@ -525,6 +525,25 @@ mod simulation {
                 "nodes failed bounded head/finality/execution recovery, including the late joining node; peer counts: {peers:?}"
             ));
         }
+        let finalized_slot = expected
+            .finalized
+            .epoch
+            .start_slot(<MinimalEthSpec as types::EthSpec>::slots_per_epoch());
+        for node in network.beacon_nodes.read().iter() {
+            let chain = node
+                .client
+                .beacon_chain()
+                .ok_or("node has no beacon chain")?;
+            let head = chain.head();
+            let ancestor = head
+                .snapshot
+                .beacon_state
+                .get_block_root(finalized_slot)
+                .map_err(|error| format!("finalized ancestry lookup: {error:?}"))?;
+            if *ancestor != expected.finalized.root {
+                return Err("finalized checkpoint is not in the canonical head ancestry".into());
+            }
+        }
         // Exercise the actual HTTP observation path as well as local safety state.
         for remote in network.remote_nodes()? {
             let block = remote
