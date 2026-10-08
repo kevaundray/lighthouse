@@ -158,7 +158,6 @@ pub struct ExecutionBlockGenerator<E: EthSpec> {
     /*
      * PoS block parameters
      */
-    pub pending_payloads: HashMap<ExecutionBlockHash, ExecutionPayload<E>>,
     pub next_payload_id: u64,
     pub payload_ids: HashMap<PayloadId, ExecutionPayload<E>>,
     min_blobs_count: usize,
@@ -221,7 +220,6 @@ impl<E: EthSpec> ExecutionBlockGenerator<E> {
             terminal_total_difficulty: Default::default(),
             terminal_block_number: 0,
             terminal_block_hash: Default::default(),
-            pending_payloads: <_>::default(),
             next_payload_id: 0,
             payload_ids: <_>::default(),
             min_blobs_count: 0,
@@ -575,6 +573,10 @@ impl<E: EthSpec> ExecutionBlockGenerator<E> {
         Some((cells, proofs))
     }
 
+    /// Store validated payloads independently of canonical head selection.
+    ///
+    /// A child can arrive during range sync before any forkchoice update selects
+    /// its parent. Only `forkchoice_updated` changes the canonical head.
     pub fn new_payload(&mut self, payload: ExecutionPayload<E>) -> PayloadStatusV1 {
         let Some(parent) = self.blocks.get(&payload.parent_hash()) else {
             return PayloadStatusV1 {
@@ -595,7 +597,9 @@ impl<E: EthSpec> ExecutionBlockGenerator<E> {
         }
 
         let valid_hash = payload.block_hash();
-        self.pending_payloads.insert(payload.block_hash(), payload);
+        if !self.blocks.contains_key(&valid_hash) {
+            self.insert_block_without_checks(Block::PoS(payload));
+        }
 
         PayloadStatusV1 {
             status: PayloadStatusV1Status::Valid,
@@ -619,10 +623,6 @@ impl<E: EthSpec> ExecutionBlockGenerator<E> {
             && genesis_pow_block.block_hash() == head_block_hash
         {
             self.terminal_block_hash = head_block_hash;
-        }
-
-        if let Some(payload) = self.pending_payloads.remove(&head_block_hash) {
-            self.insert_block(Block::PoS(payload))?;
         }
 
         // If Gloas was enabled from genesis, the justified and finalized block hashes must be
