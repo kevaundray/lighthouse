@@ -8,3 +8,6 @@ madsim = { git = "https://github.com/madsim-rs/madsim", rev = "519950efb4711464f
 tokio = { package = "madsim-tokio", git = "https://github.com/madsim-rs/madsim", rev = "519950efb4711464f300ed7edf2967ed62d5f502", features = ["full"] }
 
 [workspace]
+
+[patch."https://github.com/madsim-rs/madsim"]
+madsim = { path = "../simulation/deps/madsim-0.2.34" }

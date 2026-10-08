@@ -299,7 +299,6 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 [[package]]
 name = "madsim"
 version = "0.2.34"
-source = "git+https://github.com/madsim-rs/madsim?rev=519950efb4711464f300ed7edf2967ed62d5f502#519950efb4711464f300ed7edf2967ed62d5f502"
 dependencies = [
  "ahash",
  "async-channel",
