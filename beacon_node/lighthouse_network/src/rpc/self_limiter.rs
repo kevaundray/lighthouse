@@ -13,7 +13,7 @@ use std::{
     collections::{HashMap, VecDeque, hash_map::Entry},
     sync::Arc,
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio_util::time::DelayQueue;
 use tracing::debug;
@@ -100,6 +100,7 @@ impl<Id: ReqId, E: EthSpec> SelfRateLimiter<Id, E> {
         match Self::try_send_request(
             &mut self.active_requests,
             &mut self.rate_limiter,
+            Instant::now(),
             peer_id,
             request_id,
             req,
@@ -125,6 +126,7 @@ impl<Id: ReqId, E: EthSpec> SelfRateLimiter<Id, E> {
     fn try_send_request(
         active_requests: &mut HashMap<PeerId, HashMap<Protocol, usize>>,
         rate_limiter: &mut Option<RateLimiter>,
+        now: Instant,
         peer_id: PeerId,
         request_id: Id,
         req: RequestType<E>,
@@ -149,7 +151,7 @@ impl<Id: ReqId, E: EthSpec> SelfRateLimiter<Id, E> {
         }
 
         if let Some(limiter) = rate_limiter.as_mut() {
-            match limiter.allows(&peer_id, &req) {
+            match limiter.allows_at(now, &peer_id, &req) {
                 Ok(()) => {}
                 Err(e) => {
                     let protocol = req.versioned_protocol();
@@ -190,6 +192,13 @@ impl<Id: ReqId, E: EthSpec> SelfRateLimiter<Id, E> {
     /// When a peer and protocol are allowed to send a next request, this function checks the
     /// queued requests and attempts marking as ready as many as the limiter allows.
     fn next_peer_request_ready(&mut self, peer_id: PeerId, protocol: Protocol) {
+        self.next_peer_request_ready_at(Instant::now(), peer_id, protocol)
+    }
+
+    /// As [`SelfRateLimiter::next_peer_request_ready`], but uses the supplied `now` to drive the
+    /// inner rate limiter. The production path passes `Instant::now()`; tests can advance logical
+    /// time deterministically.
+    fn next_peer_request_ready_at(&mut self, now: Instant, peer_id: PeerId, protocol: Protocol) {
         if let Entry::Occupied(mut entry) = self.delayed_requests.entry((peer_id, protocol)) {
             let queued_requests = entry.get_mut();
             while let Some(QueuedRequest {
@@ -201,6 +210,7 @@ impl<Id: ReqId, E: EthSpec> SelfRateLimiter<Id, E> {
                 match Self::try_send_request(
                     &mut self.active_requests,
                     &mut self.rate_limiter,
+                    now,
                     peer_id,
                     request_id,
                     req.clone(),
@@ -273,6 +283,13 @@ impl<Id: ReqId, E: EthSpec> SelfRateLimiter<Id, E> {
             });
 
         failed_requests
+    }
+
+    /// The `init_time` of the inner rate limiter, against which logical time offsets are measured.
+    /// Exposed for deterministic tests.
+    #[cfg(test)]
+    pub(crate) fn rate_limiter_init_time(&self) -> Option<Instant> {
+        self.rate_limiter.as_ref().map(|rl| rl.init_time())
     }
 
     /// Informs the limiter that a response has been received.
@@ -568,6 +585,94 @@ mod tests {
                 .delayed_requests
                 .contains_key(&(peer2, Protocol::Ping))
         );
+    }
+
+    /// Deterministic version of the "requests become ready after the tokens regenerate" scenario.
+    ///
+    /// Unlike `test_next_peer_request_ready`, this advances *logical* time via
+    /// `next_peer_request_ready_at(now)` instead of sleeping. It asserts that:
+    ///   - before enough logical time has passed, no queued request becomes ready;
+    ///   - after advancing logical time past the replenish interval, exactly one queued request
+    ///     becomes ready (1 token / interval), matching the quota.
+    #[tokio::test]
+    async fn test_next_peer_request_ready_deterministic() {
+        use std::time::{Duration, Instant};
+
+        // 1 ping token per 2 seconds.
+        let config = OutboundRateLimiterConfig(RateLimiterConfig {
+            ping_quota: Quota::n_every(NonZeroU64::new(1).unwrap(), 2),
+            ..Default::default()
+        });
+        let fork_context = std::sync::Arc::new(ForkContext::new::<MainnetEthSpec>(
+            Slot::new(0),
+            Hash256::ZERO,
+            &MainnetEthSpec::default_spec(),
+        ));
+        let mut limiter: SelfRateLimiter<AppRequestId, MainnetEthSpec> =
+            SelfRateLimiter::new(Some(config), fork_context).unwrap();
+        let peer_id = PeerId::random();
+        let lookup_id = 0;
+
+        // The first request is allowed (consumes the single token); the next four are queued.
+        for i in 1..=5u32 {
+            let _ = limiter.allows(
+                peer_id,
+                AppRequestId::Sync(SyncRequestId::SingleBlock {
+                    id: SingleLookupReqId {
+                        lookup_id,
+                        req_id: i,
+                    },
+                }),
+                RequestType::Ping(Ping { data: i as u64 }),
+            );
+        }
+
+        let init_time = limiter
+            .rate_limiter_init_time()
+            .expect("rate limiter is configured");
+        assert_eq!(
+            limiter
+                .delayed_requests
+                .get(&(peer_id, Protocol::Ping))
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(limiter.ready_requests.len(), 0);
+
+        // Advancing logical time only a little (well under the 2s replenish interval) does not make
+        // any queued request ready. We measure from `init_time` so the offset is comparable to the
+        // real instant the requests were enqueued.
+        let too_soon = init_time + Duration::from_millis(100);
+        // Guard: `too_soon` must not actually be in the past relative to wall clock (it won't be,
+        // since the requests above ran in well under 100ms), keeping the test deterministic.
+        assert!(too_soon <= Instant::now() + Duration::from_secs(2));
+        limiter.next_peer_request_ready_at(too_soon, peer_id, Protocol::Ping);
+        assert_eq!(
+            limiter
+                .delayed_requests
+                .get(&(peer_id, Protocol::Ping))
+                .unwrap()
+                .len(),
+            4,
+            "no request should be ready before the replenish interval elapses"
+        );
+        assert_eq!(limiter.ready_requests.len(), 0);
+
+        // Advance logical time past the 2s replenish interval: exactly one token regenerates, so
+        // exactly one queued request becomes ready.
+        let after_refill = init_time + Duration::from_secs(3);
+        limiter.next_peer_request_ready_at(after_refill, peer_id, Protocol::Ping);
+        assert_eq!(
+            limiter
+                .delayed_requests
+                .get(&(peer_id, Protocol::Ping))
+                .unwrap()
+                .len(),
+            3,
+            "exactly one request should become ready after one token regenerates"
+        );
+        assert_eq!(limiter.ready_requests.len(), 1);
     }
 
     /// Test that `peer_disconnected` returns the IDs of pending requests.

@@ -472,7 +472,11 @@ impl<E: EthSpec> PeerDB<E> {
     /// NOTE: Peer scores cannot be penalized during the update, they can only increase. Therefore
     /// it not possible to ban peers when updating scores.
     #[must_use = "The unbanned peers must be sent to libp2p"]
-    pub(super) fn update_scores(&mut self) -> Vec<(PeerId, ScoreUpdateResult)> {
+    /// Applies score decay and ban-expiry to all peers using the supplied `now`.
+    ///
+    /// The production path (the peer manager heartbeat) passes `Instant::now()`; tests can advance
+    /// logical time deterministically by supplying their own `now`.
+    pub(super) fn update_scores_at(&mut self, now: Instant) -> Vec<(PeerId, ScoreUpdateResult)> {
         // Peer can be unbanned in this process.
         // We return the result, such that the peer manager can inform the swarm to lift the libp2p
         // ban on these peers.
@@ -482,7 +486,7 @@ impl<E: EthSpec> PeerDB<E> {
         for (peer_id, info) in self.peers.iter_mut() {
             let previous_state = info.score_state();
             // Update scores
-            info.score_update();
+            info.score_update_at(now);
 
             match Self::handle_score_transition(previous_state, peer_id, info) {
                 // A peer should not be able to be banned from a score update.
