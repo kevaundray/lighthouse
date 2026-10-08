@@ -1,0 +1,10 @@
+[package]
+name = "lighthouse-madsim-lifecycle-probe"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+madsim = { git = "https://github.com/madsim-rs/madsim", rev = "519950efb4711464f300ed7edf2967ed62d5f502" }
+tokio = { package = "madsim-tokio", git = "https://github.com/madsim-rs/madsim", rev = "519950efb4711464f300ed7edf2967ed62d5f502", features = ["full"] }
+
+[workspace]

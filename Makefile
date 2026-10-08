@@ -396,3 +396,12 @@ install-hooks:
 	@ln -sf ../../.githooks/pre-commit .git/hooks/pre-commit
 	@chmod +x .githooks/pre-commit
 	@echo "Git hooks installed. Pre-commit hook runs 'cargo fmt --check'."
+
+.PHONY: test-simulation-tcp-lifecycle test-simulation-tcp-listener test-simulation-tcp-half-close
+test-simulation-tcp-lifecycle: test-simulation-tcp-listener test-simulation-tcp-half-close
+
+test-simulation-tcp-listener:
+	RUSTFLAGS="--cfg madsim --check-cfg=cfg(madsim)" cargo run --locked --manifest-path testing/simulation_tcp_lifecycle/Cargo.toml -- listener
+
+test-simulation-tcp-half-close:
+	RUSTFLAGS="--cfg madsim --check-cfg=cfg(madsim)" cargo run --locked --manifest-path testing/simulation_tcp_lifecycle/Cargo.toml -- half-close
