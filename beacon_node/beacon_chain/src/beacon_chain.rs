@@ -1219,31 +1219,51 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         launch_payload_envelope_stream(self.clone(), block_roots, request_source)
     }
 
+    /// Return requested columns from caches, filling missing indices from the store.
+    ///
+    /// Cache presence does not imply completeness: range import can persist all custody
+    /// columns while retaining an empty or partial pre-execution DA-cache entry.
     pub fn get_data_columns_checking_all_caches(
         &self,
         block_root: Hash256,
         indices: &[ColumnIndex],
     ) -> Result<DataColumnSidecarList<T::EthSpec>, Error> {
-        let all_cached_columns_opt = self
-            .data_availability_checker
-            .get_data_columns(block_root)
-            .or_else(|| self.pending_payload_cache.get_data_columns(block_root))
-            .or_else(|| self.early_attester_cache.get_data_columns(block_root));
-
-        if let Some(mut all_cached_columns) = all_cached_columns_opt {
-            all_cached_columns.retain(|col| indices.contains(col.index()));
-            Ok(all_cached_columns)
-        } else if let Some(block) = self.get_blinded_block(&block_root)? {
+        let mut columns: DataColumnSidecarList<T::EthSpec> = vec![];
+        let mut add_cached = |cached: Option<DataColumnSidecarList<T::EthSpec>>| {
+            if let Some(mut cached) = cached {
+                cached.retain(|column| {
+                    indices.contains(column.index())
+                        && !columns.iter().any(|known| known.index() == column.index())
+                });
+                if columns.is_empty() {
+                    columns = cached;
+                } else {
+                    columns.extend(cached);
+                }
+            }
             indices
                 .iter()
-                .filter_map(|index| {
-                    self.get_data_column(&block_root, index, block.fork_name_unchecked())
-                        .transpose()
-                })
-                .collect::<Result<_, _>>()
-        } else {
-            Ok(vec![])
+                .all(|index| columns.iter().any(|column| column.index() == index))
+        };
+
+        // Keep the complete-cache fast path and do not clone lower-priority caches
+        // once every requested index is present.
+        if !add_cached(self.data_availability_checker.get_data_columns(block_root))
+            && !add_cached(self.pending_payload_cache.get_data_columns(block_root))
+            && !add_cached(self.early_attester_cache.get_data_columns(block_root))
+            && let Some(block) = self.get_blinded_block(&block_root)?
+        {
+            columns.reserve(indices.len().saturating_sub(columns.len()));
+            for index in indices {
+                if !columns.iter().any(|column| column.index() == index)
+                    && let Some(column) =
+                        self.get_data_column(&block_root, index, block.fork_name_unchecked())?
+                {
+                    columns.push(column);
+                }
+            }
         }
+        Ok(columns)
     }
 
     pub fn cached_data_column_indexes(
