@@ -1198,6 +1198,109 @@ mod test {
     use kzg::{CellRef, KzgBlobRef, trusted_setup::get_trusted_setup};
     use types::{MainnetEthSpec, MinimalEthSpec};
 
+    fn payload_chain() -> (
+        ExecutionBlockGenerator<MinimalEthSpec>,
+        Vec<ExecutionPayload<MinimalEthSpec>>,
+    ) {
+        let receiver = ExecutionBlockGenerator::new(None, None, None, None, None, None, None);
+        let mut producer = receiver.clone();
+        let genesis = producer.latest_block().unwrap().block_hash();
+        let mut parent = genesis;
+        let mut payloads = Vec::new();
+        for timestamp in 1..=3 {
+            let response = producer
+                .forkchoice_updated(
+                    ForkchoiceState {
+                        head_block_hash: parent,
+                        safe_block_hash: genesis,
+                        finalized_block_hash: genesis,
+                    },
+                    Some(payload_attributes(timestamp)),
+                )
+                .unwrap();
+            let payload = producer
+                .get_payload(&response.payload_id.unwrap().into())
+                .unwrap();
+            parent = payload.block_hash();
+            assert_eq!(
+                producer.new_payload(payload.clone()).status,
+                PayloadStatusV1Status::Valid
+            );
+            payloads.push(payload);
+        }
+        (receiver, payloads)
+    }
+
+    fn payload_attributes(timestamp: u64) -> PayloadAttributes {
+        PayloadAttributes::V1(crate::engine_api::PayloadAttributesV1 {
+            timestamp,
+            prev_randao: Hash256::zero(),
+            suggested_fee_recipient: Default::default(),
+        })
+    }
+
+    #[test]
+    fn new_payload_chain_without_intermediate_forkchoice_updates() {
+        let (mut receiver, payloads) = payload_chain();
+        let genesis = receiver.latest_block().unwrap().block_hash();
+        // Range sync and side branches may deliver several newPayload calls
+        // before the CL selects any of their blocks as the canonical head.
+        for payload in &payloads {
+            let status = receiver.new_payload(payload.clone());
+            assert_eq!(status.status, PayloadStatusV1Status::Valid);
+            assert_eq!(status.latest_valid_hash, Some(payload.block_hash()));
+        }
+        assert_eq!(receiver.latest_block().unwrap().block_hash(), genesis);
+        assert!(receiver.block_by_number(1).is_none());
+
+        let response = receiver
+            .forkchoice_updated(
+                ForkchoiceState {
+                    head_block_hash: payloads[2].block_hash(),
+                    safe_block_hash: payloads[1].block_hash(),
+                    finalized_block_hash: payloads[0].block_hash(),
+                },
+                Some(payload_attributes(4)),
+            )
+            .unwrap();
+        assert_eq!(
+            response.payload_status.status,
+            JsonPayloadStatusV1Status::Valid
+        );
+        let next = receiver
+            .get_payload(
+                &response
+                    .payload_id
+                    .expect("recovered engine must build")
+                    .into(),
+            )
+            .unwrap();
+        assert_eq!(next.parent_hash(), payloads[2].block_hash());
+        for payload in payloads {
+            assert_eq!(
+                receiver
+                    .block_by_number(payload.block_number())
+                    .unwrap()
+                    .block_hash(),
+                payload.block_hash()
+            );
+        }
+    }
+
+    #[test]
+    fn new_payload_preserves_parent_validation() {
+        let (mut receiver, payloads) = payload_chain();
+        let unknown_parent = receiver.new_payload(payloads[1].clone());
+        assert_eq!(unknown_parent.status, PayloadStatusV1Status::Syncing);
+        assert_eq!(unknown_parent.latest_valid_hash, None);
+
+        let mut invalid = payloads[0].clone();
+        *invalid.block_number_mut() += 1;
+        let status = receiver.new_payload(invalid);
+        assert_eq!(status.status, PayloadStatusV1Status::Invalid);
+        assert_eq!(status.latest_valid_hash, Some(payloads[0].parent_hash()));
+    }
+
     #[test]
     fn valid_test_blobs_bundle_v1() {
         assert!(
