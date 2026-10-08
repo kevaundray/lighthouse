@@ -883,6 +883,26 @@ where
     }
 }
 
+impl<TSlotClock, E> ClientBuilder<Witness<TSlotClock, E, store::MemoryStore, store::MemoryStore>>
+where
+    TSlotClock: SlotClock + 'static,
+    E: EthSpec + 'static,
+{
+    /// Uses an ephemeral store while retaining the production chain and services.
+    ///
+    /// This does not model persistence across a process crash.
+    pub fn memory_store(mut self, config: StoreConfig) -> Result<Self, String> {
+        let spec = self
+            .chain_spec
+            .clone()
+            .ok_or("memory_store requires a chain spec")?;
+        let store = HotColdDB::open_ephemeral(config, spec)
+            .map_err(|error| format!("Unable to open memory database: {error:?}"))?;
+        self.store = Some(Arc::new(store));
+        Ok(self)
+    }
+}
+
 impl<TSlotClock, E> ClientBuilder<Witness<TSlotClock, E, BeaconNodeBackend, BeaconNodeBackend>>
 where
     TSlotClock: SlotClock + 'static,

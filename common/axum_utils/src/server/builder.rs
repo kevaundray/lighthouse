@@ -27,6 +27,14 @@ impl ServerBuilder {
     }
 
     pub async fn build(self) -> Result<Server, BuilderError> {
+        #[cfg(madsim)]
+        if self.tls_config.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "TLS HTTP servers are not supported in simulation",
+            )
+            .into());
+        }
         let rustls_config = if let Some(tls) = self.tls_config {
             Some(RustlsConfig::from_pem_file(&tls.cert, &tls.key).await?)
         } else {

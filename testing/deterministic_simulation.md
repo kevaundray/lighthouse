@@ -2,7 +2,7 @@
 
 ## Scope and decision
 
-Implement deterministic RPC flow-control and consensus fork-choice simulations. These are real Lighthouse component tests, not whole-node simulation. The existing `testing/simulator` remains a real-time integration network.
+Implement deterministic RPC flow-control and consensus fork-choice simulations. These are real Lighthouse component tests, not whole-node simulation. The native `testing/simulator` commands remain a real-time integration network; the separate [whole-node simulation](whole_node_simulation.md) now runs production node services under a controlled runtime.
 
 Determinism means identical ordered semantic results for the same seed, scenario, code and locked dependencies. It does not mean identical wall-clock metrics, logs, cryptographic execution timing or portability of seeds across code/dependency changes. Failures must identify the seed and event context. Record the expanded event/observation trace when replaying a failure.
 
@@ -25,7 +25,7 @@ Use Tokio virtual time for asynchronous RPC limiters and a synchronous logical e
 | Beacon chain harness | Seeded keys, manual slot clock, memory store, real block generation | Fixture preparation uses runtime/worker machinery. Keep it outside the deterministic replay boundary and document that distinction. |
 | Existing simulator | Real nodes and validator clients | Uses wall-clock genesis, real ports and asynchronous workers; not a deterministic runtime. |
 | Sync test rig | Real sync manager and event queues | Production randomness, unordered peer selection, standard clocks and bypassed maintenance timers prevent a full determinism claim. |
-| Whole node | Tokio task executor and libp2p transport construction | Would require controlled transport/discovery/DNS/QUIC, execution-layer HTTP, clocks, entropy, storage and blocking/Rayon scheduling. Out of this implementation scope. |
+| Whole node | Tokio task executor and libp2p transport construction | Controlled transport, execution-layer HTTP, clocks, entropy and worker scheduling are implemented separately in [whole_node_simulation.md](whole_node_simulation.md), with explicit optional-service and storage-model limits. |
 
 ## Implementation plan
 

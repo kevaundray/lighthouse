@@ -131,11 +131,48 @@ impl<E: EthSpec> MockServer<E> {
         )
     }
 
+    /// Starts a fixture for ordinary synchronous test harnesses.
+    ///
+    /// Simulation requires `new_with_config_async`: binding a virtual socket
+    /// must yield to the simulator, never block its executor or create a host FD.
     pub fn new_with_config(
         handle: &runtime::Handle,
         config: MockExecutionConfig,
         kzg: Option<Arc<Kzg>>,
     ) -> Self {
+        #[cfg(madsim)]
+        {
+            let _ = (handle, config, kzg);
+            panic!(
+                "synchronous mock execution servers are unsupported in simulation; use new_with_config_async"
+            );
+        }
+        #[cfg(not(madsim))]
+        {
+            let ctx = Self::make_context(config, kzg);
+            // Register the native listener with this handle even when called
+            // from outside an async runtime.
+            let _guard = handle.enter();
+            let listener = bind_listener(&ctx.config).expect("bind mock execution listener");
+            Self::start_with_listener(handle, ctx, listener).expect("start mock execution server")
+        }
+    }
+
+    /// Binds a real Tokio (or simulated virtual TCP) listener before returning.
+    pub async fn new_with_config_async(
+        handle: &runtime::Handle,
+        config: MockExecutionConfig,
+        kzg: Option<Arc<Kzg>>,
+    ) -> Result<Self, Error> {
+        let listener = tokio::net::TcpListener::bind(SocketAddrV4::new(
+            config.server_config.listen_addr,
+            config.server_config.listen_port,
+        ))
+        .await?;
+        Self::start_with_listener(handle, Self::make_context(config, kzg), listener)
+    }
+
+    fn make_context(config: MockExecutionConfig, kzg: Option<Arc<Kzg>>) -> Arc<Context<E>> {
         create_test_tracing_subscriber();
         let MockExecutionConfig {
             jwt_key,
@@ -159,10 +196,10 @@ impl<E: EthSpec> MockServer<E> {
             kzg,
         );
 
-        let ctx: Arc<Context<E>> = Arc::new(Context {
+        Arc::new(Context {
             config: server_config,
             jwt_key,
-            last_echo_request: last_echo_request.clone(),
+            last_echo_request,
             execution_block_generator: RwLock::new(execution_block_generator),
             previous_request: <_>::default(),
             preloaded_responses,
@@ -174,8 +211,14 @@ impl<E: EthSpec> MockServer<E> {
             syncing_response: Arc::new(Mutex::new(Ok(false))),
             engine_capabilities: Arc::new(RwLock::new(DEFAULT_ENGINE_CAPABILITIES)),
             _phantom: PhantomData,
-        });
+        })
+    }
 
+    fn start_with_listener(
+        handle: &runtime::Handle,
+        ctx: Arc<Context<E>>,
+        listener: tokio::net::TcpListener,
+    ) -> Result<Self, Error> {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
         let shutdown_future = async {
@@ -183,24 +226,17 @@ impl<E: EthSpec> MockServer<E> {
             let _ = shutdown_rx.await;
         };
 
-        // The `serve` function will panic unless it's run inside a tokio runtime, so use `block_on`
-        // if we're not in a runtime. However, we can't *always* use `block_on` since tokio will
-        // panic if we try to block inside an async context.
-        let serve = || serve(ctx.clone(), shutdown_future).unwrap();
-        let (listen_socket_addr, server_future) = if runtime::Handle::try_current().is_err() {
-            handle.block_on(async { serve() })
-        } else {
-            serve()
-        };
+        let (listen_socket_addr, server_future) =
+            serve_with_listener(ctx.clone(), shutdown_future, listener)?;
 
         handle.spawn(server_future);
 
-        Self {
+        Ok(Self {
             _shutdown_tx: shutdown_tx,
             listen_socket_addr,
-            last_echo_request,
+            last_echo_request: ctx.last_echo_request.clone(),
             ctx,
-        }
+        })
     }
 
     pub fn set_engine_capabilities(&self, engine_capabilities: EngineCapabilities) {
@@ -665,8 +701,32 @@ pub fn serve<E: EthSpec>(
     ctx: Arc<Context<E>>,
     shutdown: impl Future<Output = ()> + Send + Sync + 'static,
 ) -> Result<(SocketAddr, impl Future<Output = ()>), Error> {
-    let config = &ctx.config;
+    let listener = bind_listener(&ctx.config)?;
+    serve_with_listener(ctx, shutdown, listener)
+}
 
+fn bind_listener(config: &Config) -> Result<tokio::net::TcpListener, Error> {
+    #[cfg(madsim)]
+    {
+        let _ = config;
+        Err(Error::Other(
+            "synchronous mock execution listener binding is unsupported in simulation; use new_with_config_async".into(),
+        ))
+    }
+    #[cfg(not(madsim))]
+    {
+        let listener =
+            std::net::TcpListener::bind(SocketAddrV4::new(config.listen_addr, config.listen_port))?;
+        listener.set_nonblocking(true)?;
+        Ok(tokio::net::TcpListener::from_std(listener)?)
+    }
+}
+
+fn serve_with_listener<E: EthSpec>(
+    ctx: Arc<Context<E>>,
+    shutdown: impl Future<Output = ()> + Send + Sync + 'static,
+    listener: tokio::net::TcpListener,
+) -> Result<(SocketAddr, impl Future<Output = ()>), Error> {
     let inner_ctx = ctx.clone();
     let ctx_filter = warp::any().map(move || inner_ctx.clone());
 
@@ -737,10 +797,6 @@ pub fn serve<E: EthSpec>(
         // Add a `Server` header.
         .map(|reply| warp::reply::with_header(reply, "Server", "lighthouse-mock-execution-client"));
 
-    let std_listener =
-        std::net::TcpListener::bind(SocketAddrV4::new(config.listen_addr, config.listen_port))?;
-    std_listener.set_nonblocking(true)?;
-    let listener = tokio::net::TcpListener::from_std(std_listener)?;
     let listening_socket = listener.local_addr()?;
 
     let server = warp::serve(routes)

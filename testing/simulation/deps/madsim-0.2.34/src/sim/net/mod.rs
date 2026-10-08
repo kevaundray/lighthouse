@@ -36,13 +36,14 @@
 //! ```
 
 use bytes::Bytes;
-use futures_util::{stream::BoxStream, StreamExt};
+use futures_util::{Stream, StreamExt};
 use spin::Mutex;
 use std::{
     any::Any,
     collections::HashMap,
     io,
     net::{IpAddr, SocketAddr},
+    pin::Pin,
     sync::Arc,
     time::Instant,
 };
@@ -404,9 +405,8 @@ impl NetSim {
                 sleep_until(arrive_time).await;
                 yield value;
             }
-        }
-        .boxed();
-        (sender, recver)
+        };
+        (sender, Box::pin(recver))
     }
 }
 
@@ -435,7 +435,7 @@ impl PayloadSender {
 }
 
 #[doc(hidden)]
-pub type PayloadReceiver = BoxStream<'static, Payload>;
+pub type PayloadReceiver = Pin<Box<dyn Stream<Item = Payload> + Send + Sync>>;
 
 /// An RAII structure used to release the bound port.
 pub(crate) struct BindGuard {

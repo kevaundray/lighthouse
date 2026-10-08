@@ -4,13 +4,30 @@ pub mod test_utils;
 
 use futures::channel::mpsc::Sender;
 use futures::prelude::*;
-use std::sync::{Arc, Weak};
+#[cfg(not(madsim))]
+use std::sync::Arc;
+use std::sync::Weak;
 use tokio::runtime::{Handle, Runtime};
 use tracing::{Span, debug};
 
+#[cfg(not(madsim))]
 use crate::rayon_pool_provider::RayonPoolProvider;
 pub use crate::rayon_pool_provider::RayonPoolType;
 pub use tokio::task::JoinHandle;
+
+/// Install the single-thread Rayon registry before starting a simulation.
+///
+/// Call exactly once on the OS thread that will drive MadSim, before any Rayon
+/// computation. Parallel iterators and scoped joins execute their real work on
+/// this thread. Detached Rayon jobs must instead be submitted via `TaskExecutor`
+/// so that completion is scheduled by the simulator.
+#[cfg(madsim)]
+pub fn initialize_simulation_rayon() -> Result<(), rayon::ThreadPoolBuildError> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .use_current_thread()
+        .build_global()
+}
 
 /// Provides a reason when Lighthouse is shut down.
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -83,6 +100,7 @@ pub struct TaskExecutor {
     /// The task must provide a reason for shutting down.
     signal_tx: Sender<ShutdownReason>,
 
+    #[cfg(not(madsim))]
     rayon_pool_provider: Arc<RayonPoolProvider>,
 }
 
@@ -103,6 +121,7 @@ impl TaskExecutor {
             handle_provider: handle.into(),
             exit,
             signal_tx,
+            #[cfg(not(madsim))]
             rayon_pool_provider: Arc::new(RayonPoolProvider::default()),
         }
     }
@@ -224,17 +243,27 @@ impl TaskExecutor {
     ) where
         F: FnOnce() + Send + 'static,
     {
-        let thread_pool = self.rayon_pool_provider.get_thread_pool(rayon_pool_type);
-        let span = Span::current();
-        self.spawn_blocking(
-            move || {
-                thread_pool.install(|| {
-                    let _guard = span.enter();
-                    task();
-                });
-            },
-            name,
-        )
+        #[cfg(not(madsim))]
+        {
+            let thread_pool = self.rayon_pool_provider.get_thread_pool(rayon_pool_type);
+            let span = Span::current();
+            self.spawn_blocking(
+                move || {
+                    thread_pool.install(|| {
+                        let _guard = span.enter();
+                        task();
+                    });
+                },
+                name,
+            )
+        }
+        #[cfg(madsim)]
+        {
+            let _ = rayon_pool_type;
+            // Synchronous Rayon joins run on the process-entry current-thread pool.
+            // Completion is still a simulated task, not an eager call at submission.
+            self.spawn_blocking(task, name)
+        }
     }
 
     /// Spawns a blocking computation on a rayon thread pool and awaits the result.
@@ -247,15 +276,22 @@ impl TaskExecutor {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
+        #[cfg(not(madsim))]
         let thread_pool = self.rayon_pool_provider.get_thread_pool(rayon_pool_type);
         let (tx, rx) = tokio::sync::oneshot::channel();
         let span = Span::current();
-
-        thread_pool.spawn(move || {
+        let task = move || {
             let _guard = span.enter();
             let result = task();
             let _ = tx.send(result);
-        });
+        };
+        #[cfg(not(madsim))]
+        thread_pool.spawn(task);
+        #[cfg(madsim)]
+        {
+            let _ = rayon_pool_type;
+            self.spawn_blocking(task, "rayon_computation");
+        }
 
         rx.await
     }
@@ -364,6 +400,7 @@ impl TaskExecutor {
     /// a `tokio` context present in the thread-local storage due to some `rayon` funkiness. Talk to
     /// @paulhauner if you plan to use this function in production. He has put metrics in here to
     /// track any use of it, so don't think you can pull a sneaky one on him.
+    #[cfg(not(madsim))]
     pub fn block_on_dangerous<F: Future>(
         &self,
         future: F,
@@ -396,6 +433,16 @@ impl TaskExecutor {
             drop(timer);
             output
         })
+    }
+
+    /// Nested blocking would deadlock the simulated node; await the future instead.
+    #[cfg(madsim)]
+    pub fn block_on_dangerous<F: Future>(
+        &self,
+        _future: F,
+        name: &'static str,
+    ) -> Option<F::Output> {
+        panic!("block_on_dangerous ({name}) is unsupported in simulation; await the future")
     }
 
     /// Returns a `Handle` to the current runtime.

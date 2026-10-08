@@ -21,7 +21,7 @@ use types::{
 /// Converts a blob ssz FixedVector to a reference to a fixed-size array
 /// to be used with `rust_eth_kzg`.
 fn ssz_blob_to_kzg_blob_ref<E: EthSpec>(blob: &Blob<E>) -> Result<KzgBlobRef<'_>, KzgError> {
-    blob.as_ref().try_into().map_err(|e| {
+    (&blob[..]).try_into().map_err(|e| {
         KzgError::InconsistentArrayLength(format!(
             "blob should have a guaranteed size due to FixedVector: {e:?}"
         ))
@@ -344,11 +344,7 @@ pub fn blobs_to_data_column_sidecars_gloas<E: EthSpec>(
     let blob_cells_and_proofs_vec = blobs
         .into_par_iter()
         .map(|blob| {
-            let blob = blob.as_ref().try_into().map_err(|e| {
-                KzgError::InconsistentArrayLength(format!(
-                    "blob should have a guaranteed size due to FixedVector: {e:?}"
-                ))
-            })?;
+            let blob = ssz_blob_to_kzg_blob_ref::<E>(blob)?;
 
             kzg.compute_cells_and_proofs(blob)
         })
@@ -401,11 +397,7 @@ fn compute_cells_with_provided_proofs<E: EthSpec>(
     let blob_cells_and_proofs_vec = zipped
         .into_par_iter()
         .map(|(blob, proofs)| {
-            let blob = blob.as_ref().try_into().map_err(|e| {
-                KzgError::InconsistentArrayLength(format!(
-                    "blob should have a guaranteed size due to FixedVector: {e:?}"
-                ))
-            })?;
+            let blob = ssz_blob_to_kzg_blob_ref::<E>(blob)?;
 
             kzg.compute_cells(blob).and_then(|cells| {
                 let proofs = proofs.try_into().map_err(|e| {
@@ -441,11 +433,7 @@ pub fn blobs_to_partial_data_columns<E: EthSpec>(
                 return Ok(None);
             };
 
-            let blob = blob.as_ref().try_into().map_err(|e| {
-                KzgError::InconsistentArrayLength(format!(
-                    "blob should have a guaranteed size due to FixedVector: {e:?}"
-                ))
-            })?;
+            let blob = ssz_blob_to_kzg_blob_ref::<E>(blob)?;
 
             kzg.compute_cells(blob).and_then(|cells| {
                 let proofs = proofs.try_into().map_err(|e| {
@@ -477,11 +465,7 @@ pub fn compute_cells<E: EthSpec>(blobs: &[&Blob<E>], kzg: &Kzg) -> Result<Vec<Kz
     let cells_vec = blobs
         .into_par_iter()
         .map(|blob| {
-            let blob: KzgBlobRef<'_> = blob.as_ref().try_into().map_err(|e| {
-                KzgError::InconsistentArrayLength(format!(
-                    "blob should have a guaranteed size due to FixedVector: {e:?}",
-                ))
-            })?;
+            let blob = ssz_blob_to_kzg_blob_ref::<E>(blob)?;
 
             kzg.compute_cells(blob)
         })

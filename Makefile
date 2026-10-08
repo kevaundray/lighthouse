@@ -238,6 +238,12 @@ test-deterministic-simulation:
 		--features "$(TEST_FEATURES)" \
 		-E 'binary(deterministic_simulation) | test(deterministic_simulation)'
 
+# Build and replay whole-node scenarios, retaining evidence in a new directory.
+WHOLE_NODE_REPLAY_OUTPUT ?= target/whole-node-replay
+.PHONY: test-whole-node-simulation
+test-whole-node-simulation:
+	python3 testing/simulation/whole_node_replay.py --output "$(WHOLE_NODE_REPLAY_OUTPUT)"
+
 # Run the tests in the `http_api` crate for recent forks.
 test-http-api: $(patsubst %,test-http-api-%,$(RECENT_FORKS))
 

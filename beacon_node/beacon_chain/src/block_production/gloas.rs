@@ -128,6 +128,8 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
     ) -> Result<BlockProductionResult<T::EthSpec>, BlockProductionError> {
         metrics::inc_counter(&metrics::BLOCK_PRODUCTION_REQUESTS);
         let _complete_timer = metrics::start_timer(&metrics::BLOCK_PRODUCTION_TIMES);
+        self.wait_for_fork_choice_before_block_production(slot)
+            .await?;
         // Part 1/2 (blocking)
         //
         // Load the parent state from disk.

@@ -57,6 +57,8 @@ pub mod api_types;
 mod gossip_cache;
 pub mod gossipsub_scoring_parameters;
 mod partial_column_header_tracker;
+#[cfg(madsim)]
+mod simulated_tcp;
 pub mod utils;
 
 /// The number of peers we target per subnet for discovery queries.
@@ -194,6 +196,22 @@ impl<E: EthSpec> Network<E> {
         local_keypair: Keypair,
     ) -> Result<(Self, Arc<NetworkGlobals<E>>), String> {
         let config = ctx.config.clone();
+        #[cfg(madsim)]
+        {
+            if !config.disable_discovery
+                || !config.disable_quic_support
+                || config.upnp_enabled
+                || config.metrics_enabled
+                || config.enable_mplex
+                || ctx.libp2p_registry.is_some()
+            {
+                return Err(
+                    "whole-node simulation requires discovery, QUIC, UPnP, metrics and mplex disabled"
+                        .into(),
+                );
+            }
+            simulated_tcp::validate_config(&config)?;
+        }
         trace!("Libp2p Service starting");
 
         // Trusted peers will also be marked as explicit in GossipSub.

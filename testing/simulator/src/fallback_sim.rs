@@ -1,6 +1,6 @@
-use crate::local_network::LocalNetworkParams;
-use crate::{LocalNetwork, checks};
 use clap::ArgMatches;
+use simulator::checks;
+use simulator::local_network::{LocalNetwork, LocalNetworkParams};
 
 use crate::retry::with_retry;
 use environment::tracing_common;

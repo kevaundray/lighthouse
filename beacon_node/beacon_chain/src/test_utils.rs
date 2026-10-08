@@ -870,7 +870,7 @@ where
         }
     }
 
-    pub fn set_mock_builder(
+    pub async fn set_mock_builder(
         &mut self,
         beacon_url: SensitiveUrl,
         strict_registrations: bool,
@@ -891,7 +891,8 @@ where
             apply_operations,
             self.spec.clone(),
             self.runtime.task_executor.clone(),
-        );
+        )
+        .await;
 
         // Set the builder URL in the execution layer now that its port is known.
         let port = addr.port();

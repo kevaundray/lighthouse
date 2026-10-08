@@ -91,6 +91,7 @@ members = [
     "validator_client/validator_services",
     "validator_manager",
 ]
+exclude = ["testing/simulation/deps/*"]
 resolver = "2"
 
 [workspace.package]
@@ -183,6 +184,7 @@ logging = { path = "common/logging" }
 logroller = "0.1.8"
 lru = "0.16"
 lru_cache = { path = "common/lru_cache" }
+madsim = { git = "https://github.com/madsim-rs/madsim", rev = "519950efb4711464f300ed7edf2967ed62d5f502" }
 malloc_utils = { path = "common/malloc_utils" }
 maplit = "1"
 merkle_proof = { path = "consensus/merkle_proof" }
@@ -243,7 +245,7 @@ system_health = { path = "common/system_health" }
 task_executor = { path = "common/task_executor" }
 tempfile = "3"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "signal", "macros"] }
+tokio = { package = "madsim-tokio", git = "https://github.com/madsim-rs/madsim", rev = "519950efb4711464f300ed7edf2967ed62d5f502", features = ["rt-multi-thread", "sync", "signal", "macros"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["codec", "compat", "time"] }
 tower = "0.5"
@@ -288,6 +290,16 @@ inherits = "release"
 debug = true
 
 [patch.crates-io]
+delay_map = { path = "testing/simulation/deps/delay_map-0.4.1" }
+# The simulation branch uses libc entropy interception; ordinary builds retain
+# the locked getrandom backend unchanged.
+getrandom = { path = "testing/simulation/deps/getrandom-0.2.17" }
+futures-timer = { path = "testing/simulation/deps/futures-timer-3.0.3" }
+hyper-util = { path = "testing/simulation/deps/hyper-util-0.1.21" }
+reqwest = { path = "testing/simulation/deps/reqwest-0.12.28" }
+tokio-stream = { path = "testing/simulation/deps/tokio-stream-0.1.19" }
+tokio-util = { path = "testing/simulation/deps/tokio-util-0.7.19" }
+tower = { path = "testing/simulation/deps/tower-0.5.3" }
 # FIXME(eip-7688): EIP-7688 development patches
 ssz_types = { git = "https://github.com/sigp/ssz_types", rev = "8955d22edc7633f26fe3b5ac933facb5121d717a" }
 milhouse = { git = "https://github.com/sigp/milhouse", rev = "d67aabd2a7c405b3c16f4aaff159b137dc5b5e38" }
@@ -296,4 +308,7 @@ ethereum_ssz_derive = { git = "https://github.com/sigp/ethereum_ssz", rev = "974
 tree_hash = { git = "https://github.com/sigp/tree_hash", rev = "e5ea1875edddf12438506c3751cbb313f9c52d08" }
 tree_hash_derive = { git = "https://github.com/sigp/tree_hash", rev = "e5ea1875edddf12438506c3751cbb313f9c52d08" }
 # Temporary patch until the axum migration is complete
-warp = { git = "https://github.com/macladson/warp", rev = "6f5f21beab6a240e59470caaab56afd46d46b709" }
+warp = { path = "testing/simulation/deps/warp-0.4.2" }
+
+[patch."https://github.com/madsim-rs/madsim"]
+madsim = { path = "testing/simulation/deps/madsim-0.2.34" }

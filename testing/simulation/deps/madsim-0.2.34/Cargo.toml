@@ -57,7 +57,8 @@ tokio = { version = "1", features = [
     "sync",
     "signal",
 ] }
-tokio-util = { version = "0.7", features = ["codec"] }
+# Keep native RPC utilities outside the simulator -> facade -> utility cycle.
+tokio-util = { package = "madsim-native-tokio-util", path = "../madsim-native-tokio-util-0.7.19", features = ["codec"] }
 # mad_rpc = { git = "https://github.com/madsys-dev/madrpc", rev = "2be4b02", optional = true }
 
 [dev-dependencies]

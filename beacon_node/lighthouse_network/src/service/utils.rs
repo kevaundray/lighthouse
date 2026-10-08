@@ -2,6 +2,7 @@ use crate::multiaddr::Protocol;
 use crate::rpc::{MetaData, MetaDataV2, MetaDataV3};
 use crate::types::{EnrAttestationBitfield, EnrSyncCommitteeBitfield, GossipEncoding, GossipKind};
 use crate::{GossipTopic, NetworkConfig};
+#[cfg(not(madsim))]
 use futures::future::Either;
 use libp2p::core::{multiaddr::Multiaddr, muxing::StreamMuxerBox, transport::Boxed};
 use libp2p::identity::{Keypair, secp256k1};
@@ -35,6 +36,7 @@ type BoxedTransport = Boxed<(PeerId, StreamMuxerBox)>;
 
 /// The implementation supports TCP/IP, QUIC (experimental) over UDP, noise as the encryption layer, and
 /// yamux as the multiplexing layer (when using TCP). Mplex can be optionally enabled.
+#[cfg(not(madsim))]
 pub fn build_transport(
     local_private_key: Keypair,
     quic_support: bool,
@@ -87,6 +89,27 @@ pub fn build_transport(
     let transport = libp2p::dns::tokio::Transport::system(transport)?.boxed();
 
     Ok(transport)
+}
+
+/// Keep production encryption and multiplexing over simulator-owned TCP sockets.
+#[cfg(madsim)]
+pub fn build_transport(
+    local_private_key: Keypair,
+    quic_support: bool,
+    enable_mplex: bool,
+) -> std::io::Result<BoxedTransport> {
+    if quic_support || enable_mplex {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "whole-node simulation supports TCP/Noise/Yamux only; disable QUIC and mplex",
+        ));
+    }
+    Ok(super::simulated_tcp::SimulatedTcp::default()
+        .upgrade(core::upgrade::Version::V1)
+        .authenticate(generate_noise_config(&local_private_key))
+        .multiplex(yamux::Config::default())
+        .timeout(Duration::from_secs(10))
+        .boxed())
 }
 
 fn keypair_from_hex(hex_bytes: &str) -> Result<Keypair, String> {

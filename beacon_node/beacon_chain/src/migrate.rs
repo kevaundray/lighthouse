@@ -3,8 +3,16 @@ use crate::summaries_dag::{DAGStateSummary, Error as SummariesDagError, StateSum
 use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::mem;
-use std::sync::{Arc, mpsc};
-use std::thread;
+use std::sync::Arc;
+#[cfg(not(madsim))]
+use std::{sync::mpsc, thread};
+#[cfg(madsim)]
+use tokio::task as thread;
+
+#[cfg(madsim)]
+mod mpsc {
+    pub use tokio::sync::mpsc::{UnboundedSender as Sender, unbounded_channel as channel};
+}
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use store::hot_cold_store::{HotColdDBError, migrate_database};
 use store::{Error, ItemStore, Split, StoreOp};
@@ -272,12 +280,22 @@ impl<E: EthSpec, Hot: ItemStore, Cold: ItemStore> BackgroundMigrator<E, Hot, Col
 
                 // Join the old thread, which will probably have panicked, or may have
                 // halted normally just now as a result of us dropping the old `mpsc::Sender`.
+                #[cfg(not(madsim))]
                 if let Err(thread_err) = old_thread.join() {
                     warn!(
                         reason = ?thread_err,
                         "Migration thread died, so it was restarted"
                     );
                 }
+                #[cfg(madsim)]
+                tokio::spawn(async move {
+                    if let Err(thread_err) = old_thread.await {
+                        warn!(
+                            reason = ?thread_err,
+                            "Migration task died, so it was restarted"
+                        );
+                    }
+                });
 
                 // Retry at most once, we could recurse but that would risk overflowing the stack.
                 let _ = tx.send(tx_err.0);
@@ -428,79 +446,105 @@ impl<E: EthSpec, Hot: ItemStore, Cold: ItemStore> BackgroundMigrator<E, Hot, Col
         }
     }
 
-    /// Spawn a new child thread to run the migration process.
-    ///
-    /// Return a channel handle for sending requests to the thread.
+    /// Spawn the migration worker, using a simulator-controlled task under MadSim.
     fn spawn_thread(
         db: Arc<HotColdDB<E, Hot, Cold>>,
     ) -> (mpsc::Sender<Notification>, thread::JoinHandle<()>) {
         let (tx, rx) = mpsc::channel();
         let inner_tx = tx.clone();
+        #[cfg(not(madsim))]
         let thread = thread::spawn(move || {
             while let Ok(notif) = rx.recv() {
-                let mut reconstruction_notif = None;
-                let mut finalization_notif = None;
-                let mut manual_finalization_notif = None;
-                let mut manual_compaction_notif = None;
-                let mut prune_blobs_notif = None;
-                match notif {
-                    Notification::Reconstruction => reconstruction_notif = Some(notif),
-                    Notification::Finalization(fin) => finalization_notif = Some(fin),
-                    Notification::ManualFinalization(fin) => manual_finalization_notif = Some(fin),
-                    Notification::PruneBlobs(dab) => prune_blobs_notif = Some(dab),
-                    Notification::ManualCompaction => manual_compaction_notif = Some(notif),
-                }
-                // Read the rest of the messages in the channel, taking the best of each type.
-                for notif in rx.try_iter() {
-                    match notif {
-                        Notification::Reconstruction => reconstruction_notif = Some(notif),
-                        Notification::ManualCompaction => manual_compaction_notif = Some(notif),
-                        Notification::ManualFinalization(fin) => {
-                            if let Some(current) = manual_finalization_notif.as_mut() {
-                                if fin.checkpoint.epoch > current.checkpoint.epoch {
-                                    *current = fin;
-                                }
-                            } else {
-                                manual_finalization_notif = Some(fin);
-                            }
-                        }
-                        Notification::Finalization(fin) => {
-                            if let Some(current) = finalization_notif.as_mut() {
-                                if fin.finalized_checkpoint.epoch
-                                    > current.finalized_checkpoint.epoch
-                                {
-                                    *current = fin;
-                                }
-                            } else {
-                                finalization_notif = Some(fin);
-                            }
-                        }
-                        Notification::PruneBlobs(dab) => {
-                            prune_blobs_notif = std::cmp::max(prune_blobs_notif, Some(dab));
-                        }
-                    }
-                }
-                // Run finalization and blob pruning migrations first, then a reconstruction batch.
-                // This prevents finalization from being starved while reconstruciton runs (a
-                // problem in previous LH versions).
-                if let Some(fin) = finalization_notif {
-                    Self::run_migration(db.clone(), fin);
-                }
-                if let Some(fin) = manual_finalization_notif {
-                    Self::run_manual_migration(db.clone(), fin);
-                }
-                if let Some(dab) = prune_blobs_notif {
-                    Self::run_prune_blobs(db.clone(), dab);
-                }
-                if reconstruction_notif.is_some() {
-                    Self::run_reconstruction(db.clone(), Some(inner_tx.clone()));
-                }
-                if manual_compaction_notif.is_some() {
-                    Self::run_manual_compaction(db.clone());
-                }
+                Self::run_notifications(
+                    &db,
+                    &inner_tx,
+                    notif,
+                    std::iter::from_fn(|| rx.try_recv().ok()),
+                );
+            }
+        });
+        #[cfg(madsim)]
+        let thread = tokio::spawn(async move {
+            let mut rx = rx;
+            while let Some(notif) = rx.recv().await {
+                Self::run_notifications(
+                    &db,
+                    &inner_tx,
+                    notif,
+                    std::iter::from_fn(|| rx.try_recv().ok()),
+                );
+                // Reconstruction can requeue itself. Yield between batches so
+                // node services and new finalization notifications can run.
+                tokio::task::yield_now().await;
             }
         });
         (tx, thread)
+    }
+
+    fn run_notifications(
+        db: &Arc<HotColdDB<E, Hot, Cold>>,
+        inner_tx: &mpsc::Sender<Notification>,
+        notif: Notification,
+        pending: impl Iterator<Item = Notification>,
+    ) {
+        let mut reconstruction_notif = None;
+        let mut finalization_notif = None;
+        let mut manual_finalization_notif = None;
+        let mut manual_compaction_notif = None;
+        let mut prune_blobs_notif = None;
+        match notif {
+            Notification::Reconstruction => reconstruction_notif = Some(notif),
+            Notification::Finalization(fin) => finalization_notif = Some(fin),
+            Notification::ManualFinalization(fin) => manual_finalization_notif = Some(fin),
+            Notification::PruneBlobs(dab) => prune_blobs_notif = Some(dab),
+            Notification::ManualCompaction => manual_compaction_notif = Some(notif),
+        }
+        // Read the rest of the messages in the channel, taking the best of each type.
+        for notif in pending {
+            match notif {
+                Notification::Reconstruction => reconstruction_notif = Some(notif),
+                Notification::ManualCompaction => manual_compaction_notif = Some(notif),
+                Notification::ManualFinalization(fin) => {
+                    if let Some(current) = manual_finalization_notif.as_mut() {
+                        if fin.checkpoint.epoch > current.checkpoint.epoch {
+                            *current = fin;
+                        }
+                    } else {
+                        manual_finalization_notif = Some(fin);
+                    }
+                }
+                Notification::Finalization(fin) => {
+                    if let Some(current) = finalization_notif.as_mut() {
+                        if fin.finalized_checkpoint.epoch > current.finalized_checkpoint.epoch {
+                            *current = fin;
+                        }
+                    } else {
+                        finalization_notif = Some(fin);
+                    }
+                }
+                Notification::PruneBlobs(dab) => {
+                    prune_blobs_notif = std::cmp::max(prune_blobs_notif, Some(dab));
+                }
+            }
+        }
+        // Run finalization and blob pruning migrations first, then a reconstruction batch.
+        // This prevents finalization from being starved while reconstruction runs (a
+        // problem in previous LH versions).
+        if let Some(fin) = finalization_notif {
+            Self::run_migration(db.clone(), fin);
+        }
+        if let Some(fin) = manual_finalization_notif {
+            Self::run_manual_migration(db.clone(), fin);
+        }
+        if let Some(dab) = prune_blobs_notif {
+            Self::run_prune_blobs(db.clone(), dab);
+        }
+        if reconstruction_notif.is_some() {
+            Self::run_reconstruction(db.clone(), Some(inner_tx.clone()));
+        }
+        if manual_compaction_notif.is_some() {
+            Self::run_manual_compaction(db.clone());
+        }
     }
 
     /// Traverses live heads and prunes blocks and states of chains that we know can't be built
