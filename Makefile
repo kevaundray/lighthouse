@@ -405,3 +405,7 @@ test-simulation-tcp-listener:
 
 test-simulation-tcp-half-close:
 	RUSTFLAGS="--cfg madsim --check-cfg=cfg(madsim)" cargo run --locked --manifest-path testing/simulation_tcp_lifecycle/Cargo.toml -- half-close
+
+.PHONY: test-simulation-unbounded-timers
+test-simulation-unbounded-timers:
+	RUSTFLAGS="--cfg madsim --check-cfg=cfg(madsim)" cargo run --locked --manifest-path testing/simulation_timer/Cargo.toml

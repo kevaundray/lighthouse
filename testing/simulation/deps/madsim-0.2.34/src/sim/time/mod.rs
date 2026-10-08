@@ -109,7 +109,13 @@ impl TimeHandle {
     ///
     /// It will sleep for at least 1ms to be consistent with the behavior of `tokio::time::sleep`.
     pub fn sleep(&self, duration: Duration) -> Sleep {
-        self.sleep_until(self.clock.now_instant() + duration)
+        let now = self.clock.now_instant();
+        // Match Tokio's far-future deadline when the requested duration cannot
+        // be represented by Instant (e.g. an unbounded HTTP request timeout).
+        let deadline = now
+            .checked_add(duration)
+            .unwrap_or_else(|| now + Duration::from_secs(86400 * 365 * 30));
+        self.sleep_until(deadline)
     }
 
     /// Waits until `deadline` is reached.
