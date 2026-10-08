@@ -231,6 +231,13 @@ test-fork-choice: $(patsubst %,test-fork-choice-%,$(RECENT_FORKS))
 test-fork-choice-%:
 	env FORK_NAME=$* cargo nextest run --release --features "beacon_chain/fork_from_env,$(TEST_FEATURES)" -p fork_choice --no-fail-fast
 
+# Replay seeded RPC flow-control and consensus component simulations.
+.PHONY: test-deterministic-simulation
+test-deterministic-simulation:
+	cargo nextest run --cargo-profile "$(PROFILE)" -p lighthouse_network -p fork_choice \
+		--features "$(TEST_FEATURES)" \
+		-E 'binary(deterministic_simulation) | test(deterministic_simulation)'
+
 # Run the tests in the `http_api` crate for recent forks.
 test-http-api: $(patsubst %,test-http-api-%,$(RECENT_FORKS))
 
