@@ -3,12 +3,15 @@
 //! This module creates a libp2p dummy-behaviour built around the discv5 protocol. It handles
 //! queries and manages access to the discovery routing table.
 
+mod backend;
 pub(crate) mod enr;
+use backend::DiscoveryBackend;
 
 // Allow external use of the lighthouse ENR builder
 use crate::service::TARGET_SUBNET_PEERS;
 use crate::{ClearDialError, metrics};
 use crate::{Enr, NetworkConfig, NetworkGlobals, Subnet, SubnetDiscovery};
+#[cfg(not(madsim))]
 use discv5::Discv5;
 pub use enr::{CombinedKey, Eth2Enr, NodeId, build_enr, load_enr_from_disk, use_or_load_enr};
 pub use libp2p::identity::{Keypair, PublicKey};
@@ -163,11 +166,8 @@ pub struct Discovery<E: EthSpec> {
     /// The directory where the ENR is stored.
     enr_dir: String,
 
-    /// The handle for the underlying discv5 Server.
-    ///
-    /// This is behind a Reference counter to allow for futures to be spawned and polled with a
-    /// static lifetime.
-    discv5: Discv5,
+    /// Owns either a discovery server or only the signed ENR in static-topology simulation.
+    discv5: DiscoveryBackend,
 
     /// A collection of network constants that can be read from other threads.
     network_globals: Arc<NetworkGlobals<E>>,
@@ -209,6 +209,7 @@ impl<E: EthSpec> Discovery<E> {
         };
 
         let local_enr = network_globals.local_enr.read().clone();
+        #[cfg(not(madsim))]
         let local_node_id = local_enr.node_id();
 
         info!(
@@ -221,106 +222,127 @@ impl<E: EthSpec> Discovery<E> {
         // convert the keypair into an ENR key
         let enr_key: CombinedKey = CombinedKey::from_libp2p(local_key)?;
 
-        let mut discv5 = Discv5::new(local_enr, enr_key, config.discv5_config.clone())
-            .map_err(|e| format!("Discv5 service failed. Error: {:?}", e))?;
-
-        // Add bootnodes to routing table
-        for bootnode_enr in config.boot_nodes_enr.clone() {
-            if bootnode_enr.node_id() == local_node_id {
-                // If we are a boot node, ignore adding it to the routing table
-                continue;
+        #[cfg(madsim)]
+        let (discv5, event_stream) = {
+            if !config.disable_discovery {
+                return Err("discovery is not supported by whole-node simulation".into());
             }
-            debug!(
-                node_id = %bootnode_enr.node_id(),
-                peer_id = %bootnode_enr.peer_id(),
-                ip = ?bootnode_enr.ip4(),
-                udp = ?bootnode_enr.udp4(),
-                tcp = ?bootnode_enr.tcp4(),
-                quic = bootnode_enr.quic4(),
-                "Adding node to routing table"
-            );
-            let repr = bootnode_enr.to_string();
-            let _ = discv5.add_enr(bootnode_enr).map_err(|e| {
-                error!(
-                    addr = repr,
-                    error = e.to_string(),
-                    "Could not add peer to the local routing table"
-                )
-            });
-        }
-
-        // Start the discv5 service and obtain an event stream
-        let event_stream = if !config.disable_discovery {
-            discv5.start().map_err(|e| e.to_string()).await?;
-            debug!("Discovery service started");
-            EventStream::Awaiting(Box::pin(discv5.event_stream()))
-        } else {
-            EventStream::InActive
+            use ::enr::EnrKey;
+            if local_enr.public_key() != enr_key.public() {
+                return Err("Provided keypair does not match the provided ENR".into());
+            }
+            (
+                DiscoveryBackend::Local {
+                    enr: Arc::new(parking_lot::RwLock::new(local_enr)),
+                    key: enr_key,
+                },
+                EventStream::InActive,
+            )
         };
+        #[cfg(not(madsim))]
+        let (discv5, event_stream) = {
+            let mut discv5 = Discv5::new(local_enr, enr_key, config.discv5_config.clone())
+                .map_err(|e| format!("Discv5 service failed. Error: {:?}", e))?;
 
-        if !config.boot_nodes_multiaddr.is_empty() {
-            info!("Contacting Multiaddr boot-nodes for their ENR");
-        }
-
-        // get futures for requesting the ENRs associated to these multiaddr and wait for their
-        // completion
-        let discv5_eligible_addrs = config
-            .boot_nodes_multiaddr
-            .iter()
-            // Filter out multiaddrs without UDP or P2P protocols required for discv5 ENR requests
-            .filter(|addr| {
-                addr.iter().any(|proto| matches!(proto, Protocol::Udp(_)))
-                    && addr.iter().any(|proto| matches!(proto, Protocol::P2p(_)))
-            });
-
-        if config.disable_discovery {
-            if discv5_eligible_addrs.count() > 0 {
-                warn!(
-                    "Boot node multiaddrs requiring discv5 ENR lookup will be ignored because discovery is disabled"
+            // Add bootnodes to routing table
+            for bootnode_enr in config.boot_nodes_enr.clone() {
+                if bootnode_enr.node_id() == local_node_id {
+                    // If we are a boot node, ignore adding it to the routing table
+                    continue;
+                }
+                debug!(
+                    node_id = %bootnode_enr.node_id(),
+                    peer_id = %bootnode_enr.peer_id(),
+                    ip = ?bootnode_enr.ip4(),
+                    udp = ?bootnode_enr.udp4(),
+                    tcp = ?bootnode_enr.tcp4(),
+                    quic = bootnode_enr.quic4(),
+                    "Adding node to routing table"
                 );
-            }
-        } else {
-            let mut fut_coll = discv5_eligible_addrs
-                .map(|addr| addr.to_string())
-                // request the ENR for this multiaddr and keep the original for logging
-                .map(|addr| {
-                    futures::future::join(
-                        discv5.request_enr(addr.clone()),
-                        futures::future::ready(addr),
+                let repr = bootnode_enr.to_string();
+                let _ = discv5.add_enr(bootnode_enr).map_err(|e| {
+                    error!(
+                        addr = repr,
+                        error = e.to_string(),
+                        "Could not add peer to the local routing table"
                     )
-                })
-                .collect::<FuturesUnordered<_>>();
+                });
+            }
 
-            while let Some((result, original_addr)) = fut_coll.next().await {
-                match result {
-                    Ok(enr) => {
-                        debug!(
-                            node_id = %enr.node_id(),
-                            peer_id = %enr.peer_id(),
-                            ip4 = ?enr.ip4(),
-                            udp4 = ?enr.udp4(),
-                            tcp4 = ?enr.tcp4(),
-                            quic4 = ?enr.quic4(),
-                            "Adding node to routing table"
-                        );
-                        let _ = discv5.add_enr(enr).map_err(|e| {
-                            error!(
-                                addr = original_addr.to_string(),
-                                error = e.to_string(),
-                                "Could not add peer to the local routing table"
-                            )
-                        });
-                    }
-                    Err(e) => {
-                        error!(
-                            multiaddr = original_addr.to_string(),
-                            error = e.to_string(),
-                            "Error getting mapping to ENR"
+            // Start the discv5 service and obtain an event stream
+            let event_stream = if !config.disable_discovery {
+                discv5.start().map_err(|e| e.to_string()).await?;
+                debug!("Discovery service started");
+                EventStream::Awaiting(Box::pin(discv5.event_stream()))
+            } else {
+                EventStream::InActive
+            };
+
+            if !config.boot_nodes_multiaddr.is_empty() {
+                info!("Contacting Multiaddr boot-nodes for their ENR");
+            }
+
+            // get futures for requesting the ENRs associated to these multiaddr and wait for their
+            // completion
+            let discv5_eligible_addrs = config
+                .boot_nodes_multiaddr
+                .iter()
+                // Filter out multiaddrs without UDP or P2P protocols required for discv5 ENR requests
+                .filter(|addr| {
+                    addr.iter().any(|proto| matches!(proto, Protocol::Udp(_)))
+                        && addr.iter().any(|proto| matches!(proto, Protocol::P2p(_)))
+                });
+
+            if config.disable_discovery {
+                if discv5_eligible_addrs.count() > 0 {
+                    warn!(
+                        "Boot node multiaddrs requiring discv5 ENR lookup will be ignored because discovery is disabled"
+                    );
+                }
+            } else {
+                let mut fut_coll = discv5_eligible_addrs
+                    .map(|addr| addr.to_string())
+                    // request the ENR for this multiaddr and keep the original for logging
+                    .map(|addr| {
+                        futures::future::join(
+                            discv5.request_enr(addr.clone()),
+                            futures::future::ready(addr),
                         )
+                    })
+                    .collect::<FuturesUnordered<_>>();
+
+                while let Some((result, original_addr)) = fut_coll.next().await {
+                    match result {
+                        Ok(enr) => {
+                            debug!(
+                                node_id = %enr.node_id(),
+                                peer_id = %enr.peer_id(),
+                                ip4 = ?enr.ip4(),
+                                udp4 = ?enr.udp4(),
+                                tcp4 = ?enr.tcp4(),
+                                quic4 = ?enr.quic4(),
+                                "Adding node to routing table"
+                            );
+                            let _ = discv5.add_enr(enr).map_err(|e| {
+                                error!(
+                                    addr = original_addr.to_string(),
+                                    error = e.to_string(),
+                                    "Could not add peer to the local routing table"
+                                )
+                            });
+                        }
+                        Err(e) => {
+                            error!(
+                                multiaddr = original_addr.to_string(),
+                                error = e.to_string(),
+                                "Error getting mapping to ENR"
+                            )
+                        }
                     }
                 }
             }
-        }
+            (DiscoveryBackend::Discv5(discv5), event_stream)
+        };
 
         let update_ports = UpdatePorts {
             tcp4: config.enr_tcp4_port.is_none(),
@@ -394,7 +416,10 @@ impl<E: EthSpec> Discovery<E> {
         // add the enr to seen caches
         self.cached_enrs.insert(enr.peer_id(), enr.clone());
 
-        if let Err(e) = self.discv5.add_enr(enr) {
+        let Some(discv5) = self.discv5.server() else {
+            return;
+        };
+        if let Err(e) = discv5.add_enr(enr) {
             debug!(
                 error = %e,
                 "Could not add peer to the local routing table"
@@ -404,7 +429,10 @@ impl<E: EthSpec> Discovery<E> {
 
     /// Returns an iterator over all enr entries in the DHT.
     pub fn table_entries_enr(&self) -> Vec<Enr> {
-        self.discv5.table_entries_enr()
+        self.discv5
+            .server()
+            .map(|server| server.table_entries_enr())
+            .unwrap_or_default()
     }
 
     /// Updates the local ENR TCP port.
@@ -632,34 +660,42 @@ impl<E: EthSpec> Discovery<E> {
 
     // Bans a peer and it's associated seen IP addresses.
     pub fn ban_peer(&mut self, peer_id: &PeerId, ip_addresses: Vec<IpAddr>) {
+        let Some(discv5) = self.discv5.server() else {
+            return;
+        };
         // first try and convert the peer_id to a node_id.
         if let Ok(node_id) = peer_id_to_node_id(peer_id) {
             // If we could convert this peer id, remove it from the DHT and ban it from discovery.
-            self.discv5.ban_node(&node_id, None);
+            discv5.ban_node(&node_id, None);
         }
 
         for ip_address in ip_addresses {
-            self.discv5.ban_ip(ip_address, None);
+            discv5.ban_ip(ip_address, None);
         }
     }
 
     /// Unbans the peer in discovery.
     pub fn unban_peer(&mut self, peer_id: &PeerId, ip_addresses: Vec<IpAddr>) {
+        let Some(discv5) = self.discv5.server() else {
+            return;
+        };
         // first try and convert the peer_id to a node_id.
         if let Ok(node_id) = peer_id_to_node_id(peer_id) {
-            self.discv5.ban_node_remove(&node_id);
+            discv5.ban_node_remove(&node_id);
         }
 
         for ip_address in ip_addresses {
-            self.discv5.ban_ip_remove(&ip_address);
+            discv5.ban_ip_remove(&ip_address);
         }
     }
 
     ///  Marks node as disconnected in the DHT, freeing up space for other nodes, this also removes
     ///  nodes from the cached ENR list.
     pub fn disconnect_peer(&mut self, peer_id: &PeerId) {
-        if let Ok(node_id) = peer_id_to_node_id(peer_id) {
-            self.discv5.disconnect_node(&node_id);
+        if let Some(discv5) = self.discv5.server() {
+            if let Ok(node_id) = peer_id_to_node_id(peer_id) {
+                discv5.disconnect_node(&node_id);
+            }
         }
         // Remove the peer from the cached list, to prevent redialing disconnected
         // peers.
@@ -821,6 +857,9 @@ impl<E: EthSpec> Discovery<E> {
         target_peers: usize,
         additional_predicate: impl Fn(&Enr) -> bool + Send + 'static,
     ) {
+        let Some(discv5) = self.discv5.server() else {
+            return;
+        };
         let enr_fork_id = match self.local_enr().eth2() {
             Ok(v) => v,
             Err(e) => {
@@ -844,8 +883,7 @@ impl<E: EthSpec> Discovery<E> {
             Box::new(move |enr: &Enr| eth2_fork_predicate(enr) && additional_predicate(enr));
 
         // Build the future
-        let query_future = self
-            .discv5
+        let query_future = discv5
             // Generate a random target node id.
             .find_node_predicate(NodeId::random(), predicate, target_peers)
             .map(|v| QueryResult {

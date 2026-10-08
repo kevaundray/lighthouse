@@ -12,3 +12,6 @@ CXX = "clang++"
 # See: https://github.com/sigp/lighthouse/issues/9618
 [future-incompat-report]
 frequency = "never"
+
+[build]
+rustflags = ["--check-cfg=cfg(madsim)"]

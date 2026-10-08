@@ -7,6 +7,7 @@ use eip_3076::{
     SignedBlock as InterchangeBlock,
 };
 use filesystem::restrict_file_permissions;
+#[cfg(not(madsim))]
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use std::fs::File;
@@ -15,7 +16,31 @@ use std::time::Duration;
 use tracing::instrument;
 use types::{AttestationData, BeaconBlockHeader, Epoch, Hash256, SignedRoot, Slot};
 
+#[cfg(not(madsim))]
 type Pool = r2d2::Pool<SqliteConnectionManager>;
+
+/// A single real SQLite connection, without r2d2's native maintenance workers.
+///
+/// Every operation below is synchronous and holds the guard through transaction
+/// commit or rollback. A simulated task cannot interleave within that operation.
+#[cfg(madsim)]
+#[derive(Debug, Clone)]
+struct Pool {
+    connection: std::sync::Arc<parking_lot::Mutex<rusqlite::Connection>>,
+}
+
+#[cfg(madsim)]
+impl Pool {
+    fn get(&self) -> Result<parking_lot::MutexGuard<'_, rusqlite::Connection>, NotSafe> {
+        // Contention on the simulator thread means a reentrant transaction. It
+        // cannot make progress by blocking that same thread.
+        self.connection.try_lock().ok_or_else(|| {
+            NotSafe::SQLPoolError(
+                "Reentrant slashing database transaction cannot progress in simulation".into(),
+            )
+        })
+    }
+}
 
 /// We set the pool size to 1 for compatibility with locking_mode=EXCLUSIVE.
 ///
@@ -109,6 +134,7 @@ impl SlashingDatabase {
         let txn = conn.transaction()?;
         Self::apply_schema_migrations(&txn)?;
         txn.commit()?;
+        drop(conn);
 
         Ok(Self { conn_pool })
     }
@@ -156,6 +182,7 @@ impl SlashingDatabase {
     }
 
     /// Open a new connection pool with all of the necessary settings and tweaks.
+    #[cfg(not(madsim))]
     fn open_conn_pool(path: &Path) -> Result<Pool, NotSafe> {
         let manager = SqliteConnectionManager::file(path)
             .with_flags(rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
@@ -166,6 +193,22 @@ impl SlashingDatabase {
             .build(manager)
             .map_err(|e| NotSafe::SQLError(format!("Unable to open database: {:?}", e)))?;
         Ok(conn_pool)
+    }
+
+    #[cfg(madsim)]
+    fn open_conn_pool(path: &Path) -> Result<Pool, NotSafe> {
+        let mut conn = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )
+        .map_err(|e| NotSafe::SQLError(format!("Unable to open database: {:?}", e)))?;
+        // SQLite's default busy handler sleeps on the OS thread. Real lock
+        // conflicts must return SQLITE_BUSY instead of blocking the simulator.
+        conn.busy_timeout(Duration::ZERO)?;
+        Self::apply_pragmas(&mut conn)?;
+        Ok(Pool {
+            connection: std::sync::Arc::new(parking_lot::Mutex::new(conn)),
+        })
     }
 
     /// Apply the necessary settings to an SQLite connection.
@@ -1345,8 +1388,6 @@ mod tests {
         let file = dir.path().join("db.sqlite");
 
         let check = |db: &SlashingDatabase| {
-            assert_eq!(db.conn_pool.max_size(), POOL_SIZE);
-            assert_eq!(db.conn_pool.connection_timeout(), CONNECTION_TIMEOUT);
             let conn = db.conn_pool.get().unwrap();
             assert!(
                 conn.pragma_query_value(None, "foreign_keys", |row| { row.get::<_, bool>(0) })

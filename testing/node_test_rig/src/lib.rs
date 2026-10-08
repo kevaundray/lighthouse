@@ -240,7 +240,7 @@ pub struct LocalExecutionNode<E: EthSpec> {
 }
 
 impl<E: EthSpec> LocalExecutionNode<E> {
-    pub fn new(context: RuntimeContext<E>, config: MockExecutionConfig) -> Self {
+    pub async fn new(context: RuntimeContext<E>, config: MockExecutionConfig) -> Self {
         let datadir = TempBuilder::new()
             .prefix("lighthouse_node_test_rig_el")
             .tempdir()
@@ -250,7 +250,13 @@ impl<E: EthSpec> LocalExecutionNode<E> {
             panic!("Failed to write jwt file {}", e);
         }
         Self {
-            server: MockServer::new_with_config(&context.executor.handle().unwrap(), config, None),
+            server: MockServer::new_with_config_async(
+                &context.executor.handle().unwrap(),
+                config,
+                None,
+            )
+            .await
+            .expect("start mock execution server"),
             datadir,
         }
     }

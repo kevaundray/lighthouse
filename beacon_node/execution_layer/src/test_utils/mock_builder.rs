@@ -318,7 +318,7 @@ pub struct MockBuilder<E: EthSpec> {
 }
 
 impl<E: EthSpec> MockBuilder<E> {
-    pub fn new_for_testing(
+    pub async fn new_for_testing(
         mock_el_url: SensitiveUrl,
         beacon_url: SensitiveUrl,
         validate_pubkey: bool,
@@ -353,7 +353,9 @@ impl<E: EthSpec> MockBuilder<E> {
         );
         let host: Ipv4Addr = Ipv4Addr::LOCALHOST;
         let port = 0;
-        let server = serve(host, port, builder.clone()).expect("mock builder server should start");
+        let server = serve(host, port, builder.clone())
+            .await
+            .expect("mock builder server should start");
         (builder, server)
     }
 
@@ -1005,7 +1007,7 @@ impl<E: EthSpec> MockBuilder<E> {
 /// the requests.
 ///
 /// We should eventually move this to axum when we move everything else.
-pub fn serve<E: EthSpec>(
+pub async fn serve<E: EthSpec>(
     listen_addr: Ipv4Addr,
     listen_port: u16,
     builder: MockBuilder<E>,
@@ -1142,16 +1144,9 @@ pub fn serve<E: EthSpec>(
         .or(warp::get().and(status).or(header))
         .map(|reply| warp::reply::with_header(reply, "Server", "lighthouse-mock-builder-server"));
 
-    // Use a `std::net::TcpListener` here which keeps the parent `serve` function from needing to be async.
-    // Once the mock_builder server has been migrated to Axum, we can use the tokio listener directly
-    // since we will require async anyway.
-    let std_listener = std::net::TcpListener::bind(SocketAddrV4::new(listen_addr, listen_port))
+    let listener = tokio::net::TcpListener::bind(SocketAddrV4::new(listen_addr, listen_port))
+        .await
         .expect("mock builder server should start");
-    std_listener
-        .set_nonblocking(true)
-        .expect("mock builder server should set nonblocking");
-    let listener = tokio::net::TcpListener::from_std(std_listener)
-        .expect("mock builder server should convert to tokio listener");
     let listening_socket = listener
         .local_addr()
         .expect("mock builder server should have a local address");

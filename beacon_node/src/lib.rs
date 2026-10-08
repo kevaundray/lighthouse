@@ -14,6 +14,9 @@ use network_utils::enr_ext::peer_id_to_node_id;
 use slasher::{DatabaseBackendOverride, Slasher};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
+#[cfg(madsim)]
+use store::MemoryStore as BeaconNodeBackend;
+#[cfg(not(madsim))]
 use store::database::interface::BeaconNodeBackend;
 use tracing::{info, warn};
 use types::{ChainSpec, Epoch, EthSpec, ForkName};
@@ -48,6 +51,16 @@ impl<E: EthSpec> ProductionBeaconNode<E> {
         context: RuntimeContext<E>,
         mut client_config: ClientConfig,
     ) -> Result<Self, String> {
+        #[cfg(madsim)]
+        if client_config.slasher.is_some()
+            || client_config.monitoring_api.is_some()
+            || client_config.http_metrics.enabled
+        {
+            return Err(
+                "in-process simulation requires slasher, monitoring and HTTP metrics disabled"
+                    .into(),
+            );
+        }
         let spec = context.eth2_config().spec.clone();
         let client_genesis = client_config.genesis.clone();
         let store_config = client_config.store.clone();
@@ -78,8 +91,17 @@ impl<E: EthSpec> ProductionBeaconNode<E> {
             .runtime_context(context)
             .chain_spec(spec.clone())
             .beacon_processor(client_config.beacon_processor.clone())
-            .http_api_config(client_config.http_api.clone())
-            .disk_store(&db_path, &freezer_db_path, &blobs_db_path, store_config)?;
+            .http_api_config(client_config.http_api.clone());
+        #[cfg(not(madsim))]
+        let builder =
+            builder.disk_store(&db_path, &freezer_db_path, &blobs_db_path, store_config)?;
+        #[cfg(madsim)]
+        let builder = {
+            // The simulation models live storage operations, not native database
+            // background workers or crash durability.
+            let _ = &blobs_db_path;
+            builder.memory_store(store_config)?
+        };
 
         let builder = if let Some(mut slasher_config) = client_config.slasher.clone() {
             match slasher_config.override_backend() {

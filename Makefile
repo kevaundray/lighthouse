@@ -238,6 +238,12 @@ test-deterministic-simulation:
 		--features "$(TEST_FEATURES)" \
 		-E 'binary(deterministic_simulation) | test(deterministic_simulation)'
 
+# Build and replay whole-node scenarios, retaining evidence in a new directory.
+WHOLE_NODE_REPLAY_OUTPUT ?= target/whole-node-replay
+.PHONY: test-whole-node-simulation
+test-whole-node-simulation:
+	python3 testing/simulation/whole_node_replay.py --output "$(WHOLE_NODE_REPLAY_OUTPUT)"
+
 # Run the tests in the `http_api` crate for recent forks.
 test-http-api: $(patsubst %,test-http-api-%,$(RECENT_FORKS))
 
@@ -403,3 +409,16 @@ install-hooks:
 	@ln -sf ../../.githooks/pre-commit .git/hooks/pre-commit
 	@chmod +x .githooks/pre-commit
 	@echo "Git hooks installed. Pre-commit hook runs 'cargo fmt --check'."
+
+.PHONY: test-simulation-tcp-lifecycle test-simulation-tcp-listener test-simulation-tcp-half-close
+test-simulation-tcp-lifecycle: test-simulation-tcp-listener test-simulation-tcp-half-close
+
+test-simulation-tcp-listener:
+	RUSTFLAGS="--cfg madsim --check-cfg=cfg(madsim)" cargo run --locked --manifest-path testing/simulation_tcp_lifecycle/Cargo.toml -- listener
+
+test-simulation-tcp-half-close:
+	RUSTFLAGS="--cfg madsim --check-cfg=cfg(madsim)" cargo run --locked --manifest-path testing/simulation_tcp_lifecycle/Cargo.toml -- half-close
+
+.PHONY: test-simulation-unbounded-timers
+test-simulation-unbounded-timers:
+	RUSTFLAGS="--cfg madsim --check-cfg=cfg(madsim)" cargo run --locked --manifest-path testing/simulation_timer/Cargo.toml

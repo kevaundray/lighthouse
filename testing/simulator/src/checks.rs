@@ -275,7 +275,7 @@ pub async fn verify_transition_block_finalized<E: EthSpec>(
     }
 }
 
-pub(crate) async fn verify_light_client_updates<E: EthSpec>(
+pub async fn verify_light_client_updates<E: EthSpec>(
     network: LocalNetwork<E>,
     start_slot: Slot,
     end_slot: Slot,

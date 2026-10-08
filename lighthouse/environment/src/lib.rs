@@ -23,14 +23,14 @@ use tracing::{error, info, warn};
 use tracing_subscriber::filter::LevelFilter;
 use types::{EthSpec, GnosisEthSpec, MainnetEthSpec, MinimalEthSpec};
 
-#[cfg(target_family = "unix")]
+#[cfg(all(target_family = "unix", not(madsim)))]
 use {
     futures::Future,
     std::{pin::Pin, task::Context, task::Poll},
     tokio::signal::unix::{Signal, SignalKind, signal},
 };
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(all(not(target_family = "unix"), not(madsim)))]
 use {futures::channel::oneshot, std::cell::RefCell};
 
 pub mod tracing_common;
@@ -167,6 +167,8 @@ impl<E: EthSpec> EnvironmentBuilder<E> {
     /// Specifies that a multi-threaded tokio runtime should be used. Ideal for production uses.
     ///
     /// The `Runtime` used is just the standard tokio runtime.
+    /// Under MadSim this attaches to the active simulated node, without creating
+    /// OS threads. The simulator, not this environment, drives the runtime.
     pub fn multi_threaded_tokio_runtime(mut self) -> Result<Self, String> {
         self.runtime = Some(Arc::new(
             RuntimeBuilder::new_multi_thread()
@@ -195,6 +197,10 @@ impl<E: EthSpec> EnvironmentBuilder<E> {
         Option<LoggingLayer>,
         Option<SSELoggingComponents>,
     ) {
+        assert!(
+            !cfg!(madsim),
+            "Environment tracing uses native writer threads; configure a synchronous simulator subscriber instead"
+        );
         let filename_prefix = match logfile_prefix {
             "beacon_node" => "beacon",
             "validator_client" => "validator",
@@ -347,7 +353,7 @@ impl<E: EthSpec> Environment<E> {
     /// Block the current thread until a shutdown signal is received.
     ///
     /// This can be either the user Ctrl-C'ing or a task requesting to shutdown.
-    #[cfg(target_family = "unix")]
+    #[cfg(all(target_family = "unix", not(madsim)))]
     pub fn block_until_shutdown_requested(&mut self) -> Result<ShutdownReason, String> {
         // future of a task requesting to shutdown
         let mut rx = self
@@ -406,7 +412,7 @@ impl<E: EthSpec> Environment<E> {
     /// Block the current thread until a shutdown signal is received.
     ///
     /// This can be either the user Ctrl-C'ing or a task requesting to shutdown.
-    #[cfg(not(target_family = "unix"))]
+    #[cfg(all(not(target_family = "unix"), not(madsim)))]
     pub fn block_until_shutdown_requested(&mut self) -> Result<ShutdownReason, String> {
         // future of a task requesting to shutdown
         let mut rx = self
@@ -448,8 +454,29 @@ impl<E: EthSpec> Environment<E> {
         }
     }
 
+    /// Await a node's internal shutdown request without registering host signals.
+    #[cfg(madsim)]
+    pub async fn shutdown_requested(&mut self) -> Result<ShutdownReason, String> {
+        let mut rx = self
+            .signal_rx
+            .take()
+            .ok_or("Inner shutdown already received")?;
+        rx.next()
+            .await
+            .ok_or_else(|| "Internal shutdown channel exhausted".to_string())
+    }
+
+    /// The simulator owns the event loop; nested blocking is not supported.
+    #[cfg(madsim)]
+    pub fn block_until_shutdown_requested(&mut self) -> Result<ShutdownReason, String> {
+        Err("Await shutdown_requested inside the simulated node instead".to_string())
+    }
+
     /// Shutdown the `tokio` runtime when all tasks are idle.
     pub fn shutdown_on_idle(self) {
+        #[cfg(madsim)]
+        drop(self.runtime);
+        #[cfg(not(madsim))]
         match Arc::try_unwrap(self.runtime) {
             Ok(runtime) => {
                 runtime.shutdown_timeout(std::time::Duration::from_secs(MAXIMUM_SHUTDOWN_TIME))
@@ -477,20 +504,20 @@ impl<E: EthSpec> Environment<E> {
     }
 }
 
-#[cfg(target_family = "unix")]
+#[cfg(all(target_family = "unix", not(madsim)))]
 struct SignalFuture {
     signal: Signal,
     message: &'static str,
 }
 
-#[cfg(target_family = "unix")]
+#[cfg(all(target_family = "unix", not(madsim)))]
 impl SignalFuture {
     pub fn new(signal: Signal, message: &'static str) -> SignalFuture {
         SignalFuture { signal, message }
     }
 }
 
-#[cfg(target_family = "unix")]
+#[cfg(all(target_family = "unix", not(madsim)))]
 impl Future for SignalFuture {
     type Output = Option<ShutdownReason>;
 

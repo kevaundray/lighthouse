@@ -11,14 +11,11 @@
 //! easy-to-find files and stdout only contained info from the simulation.
 //!
 mod basic_sim;
-mod checks;
 mod cli;
 mod fallback_sim;
-mod local_network;
 mod retry;
 
 use cli::cli_app;
-use local_network::LocalNetwork;
 use types::MinimalEthSpec;
 
 pub type E = MinimalEthSpec;
