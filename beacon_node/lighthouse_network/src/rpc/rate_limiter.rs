@@ -11,8 +11,8 @@ use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
-use tokio::time::Interval;
+use std::time::Duration;
+use tokio::time::{Instant, Interval};
 use types::{ChainSpec, Epoch, EthSpec, ForkContext};
 
 /// Nanoseconds since a given time.
