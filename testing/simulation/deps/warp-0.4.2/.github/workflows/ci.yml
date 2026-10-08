@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+env:
+  RUST_BACKTRACE: 1
+
+jobs:
+  ci-pass:
+    name: CI is green
+    runs-on: ubuntu-latest
+    needs:
+      - style
+      - test
+      - doc
+    steps:
+      - run: exit 0
+
+  style:
+    name: Check Style
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - run: cargo fmt --all --check
+
+  test:
+    name: Test
+    needs: [style]
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        build: [stable, beta, nightly, without-test, multipart, websocket, compression]
+
+        include:
+          - build: stable
+            features: "--features test"
+          - build: beta
+            rust: beta
+            features: "--features server"
+          - build: nightly
+            rust: nightly
+            benches: true
+            features: "--features test"
+          - build: compression
+            features: "--features compression,test"
+          - build: multipart
+            features: "--features multipart,test"
+          - build: websocket
+            features: "--features websocket,test"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust || 'stable' }}
+
+      - name: Test
+        run: cargo test ${{ matrix.features }}
+
+      - name: Test all benches
+        if: matrix.benches
+        run: cargo test --benches ${{ matrix.features }}
+
+  doc:
+    name: Build docs
+    needs: [style, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      # check for missing docs
+      - name: cargo check
+        run: cargo check --all-features
+        env:
+          RUSTFLAGS: "--cfg docsrs"
+
+      - name: cargo doc
+        run: cargo rustdoc --all-features -- -D 'rustdoc::broken_intra_doc_links'
+        env:
+          RUSTFLAGS: "--cfg docsrs"

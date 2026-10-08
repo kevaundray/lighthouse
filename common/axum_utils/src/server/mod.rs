@@ -1,5 +1,7 @@
 mod builder;
 mod error;
+#[cfg(madsim)]
+mod simulated;
 
 pub use builder::ServerBuilder;
 pub use error::{BuilderError, ServerError};
@@ -42,12 +44,13 @@ impl Server {
 
     /// Serve the application until the shutdown signal is received.
     /// Returns the actual address the server is listening on.
+    #[cfg(not(madsim))]
     pub async fn serve_with_shutdown<F>(
         self,
         shutdown_signal: F,
     ) -> Result<(SocketAddr, impl Future<Output = Result<(), ServerError>>), ServerError>
     where
-        F: std::future::Future<Output = ()> + Send + 'static,
+        F: Future<Output = ()> + Send + 'static,
     {
         let tokio_listener = tokio::net::TcpListener::bind(self.address).await?;
 
@@ -91,6 +94,17 @@ impl Server {
         };
 
         Ok((actual_addr, server_future))
+    }
+
+    #[cfg(madsim)]
+    pub async fn serve_with_shutdown<F>(
+        self,
+        shutdown_signal: F,
+    ) -> Result<(SocketAddr, impl Future<Output = Result<(), ServerError>>), ServerError>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        simulated::serve(self, shutdown_signal).await
     }
 }
 

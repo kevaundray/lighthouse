@@ -25,6 +25,9 @@ tempfile = { workspace = true }
 tracing = { workspace = true }
 types = { workspace = true, features = ["sqlite"] }
 
+[target.'cfg(madsim)'.dependencies]
+parking_lot = { workspace = true }
+
 [dev-dependencies]
 rayon = { workspace = true }
 

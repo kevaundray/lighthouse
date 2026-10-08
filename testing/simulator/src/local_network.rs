@@ -216,6 +216,7 @@ impl<E: EthSpec> LocalNetwork<E> {
         mut beacon_config: ClientConfig,
         mock_execution_config: MockExecutionConfig,
     ) -> Result<(LocalBeaconNode<E>, LocalExecutionNode<E>), String> {
+        #[cfg(not(madsim))]
         beacon_config.network.set_ipv4_listening_address(
             std::net::Ipv4Addr::UNSPECIFIED,
             BOOTNODE_PORT,
@@ -227,7 +228,8 @@ impl<E: EthSpec> LocalNetwork<E> {
         beacon_config.network.enr_tcp4_port = Some(BOOTNODE_PORT.try_into().expect("non zero"));
         beacon_config.network.discv5_config.table_filter = |_| true;
 
-        let execution_node = LocalExecutionNode::new(self.context.clone(), mock_execution_config);
+        let execution_node =
+            LocalExecutionNode::new(self.context.clone(), mock_execution_config).await;
 
         beacon_config.execution_layer = Some(execution_layer::Config {
             execution_endpoint: Some(SensitiveUrl::parse(&execution_node.server.url()).unwrap()),
@@ -252,6 +254,7 @@ impl<E: EthSpec> LocalNetwork<E> {
         // Set config.
         let libp2p_tcp_port = BOOTNODE_PORT + count;
         let discv5_port = BOOTNODE_PORT + count;
+        #[cfg(not(madsim))]
         beacon_config.network.set_ipv4_listening_address(
             std::net::Ipv4Addr::UNSPECIFIED,
             libp2p_tcp_port,
@@ -266,7 +269,8 @@ impl<E: EthSpec> LocalNetwork<E> {
         mock_execution_config.server_config.listen_port = EXECUTION_PORT + count;
 
         // Construct execution node.
-        let execution_node = LocalExecutionNode::new(self.context.clone(), mock_execution_config);
+        let execution_node =
+            LocalExecutionNode::new(self.context.clone(), mock_execution_config).await;
 
         // Pair the beacon node and execution node.
         beacon_config.execution_layer = Some(execution_layer::Config {
@@ -282,7 +286,7 @@ impl<E: EthSpec> LocalNetwork<E> {
         Ok((beacon_node, execution_node))
     }
 
-    /// Adds a beacon node to the network, connecting to the 0'th beacon node via ENR.
+    /// Adds a beacon node, connecting to node zero through discovery or a static simulation peer.
     pub async fn add_beacon_node(
         &self,
         mut beacon_config: ClientConfig,
@@ -297,12 +301,25 @@ impl<E: EthSpec> LocalNetwork<E> {
 
             if let Some(boot_node) = boot_node {
                 // Modify beacon_config to add boot node details.
+                #[cfg(not(madsim))]
                 beacon_config.network.boot_nodes_enr.push(
                     boot_node
                         .client
                         .enr()
                         .expect("Bootnode must have a network."),
                 );
+                #[cfg(madsim)]
+                {
+                    let enr = boot_node.client.enr().ok_or("boot node has no ENR")?;
+                    let ip = enr
+                        .ip4()
+                        .ok_or("simulation boot node has no IPv4 address")?;
+                    let port = enr.tcp4().ok_or("simulation boot node has no TCP port")?;
+                    let address = format!("/ip4/{ip}/tcp/{port}")
+                        .parse()
+                        .map_err(|error| format!("invalid static simulation peer: {error}"))?;
+                    beacon_config.network.boot_nodes_multiaddr.push(address);
+                }
             }
         }
         let (beacon_node, execution_node) = if first_bn_exists {

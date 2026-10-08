@@ -1,0 +1,5 @@
+# An explicit target keeps build scripts and their HTTP clients on the native
+# runtime. Only the program under simulation receives the effect substitutions.
+[build]
+target = "x86_64-unknown-linux-gnu"
+rustflags = ["--cfg", "madsim", "--check-cfg=cfg(madsim)"]

@@ -1,7 +1,6 @@
-use crate::local_network::LocalNetworkParams;
-use crate::local_network::TERMINAL_BLOCK;
-use crate::{LocalNetwork, checks};
 use clap::ArgMatches;
+use simulator::checks;
+use simulator::local_network::{LocalNetwork, LocalNetworkParams, TERMINAL_BLOCK};
 
 use crate::retry::with_retry;
 use futures::prelude::*;

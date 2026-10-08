@@ -1519,9 +1519,7 @@ fn build_data_columns_from_blobs<E: EthSpec>(
     let blob_cells_and_proofs_vec = blobs
         .into_par_iter()
         .map(|blob_sidecar| {
-            let kzg_blob_ref = blob_sidecar
-                .blob
-                .as_ref()
+            let kzg_blob_ref = (&blob_sidecar.blob[..])
                 .try_into()
                 .map_err(|e| format!("Failed to convert blob to kzg blob: {e:?}"))?;
             let cells_and_proofs = kzg

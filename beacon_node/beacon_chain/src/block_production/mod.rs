@@ -44,10 +44,6 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         self: &Arc<Self>,
         slot: Slot,
     ) -> Result<BlockProductionState<T::EthSpec>, BlockProductionError> {
-        let fork_choice_timer = metrics::start_timer(&metrics::BLOCK_PRODUCTION_FORK_CHOICE_TIMES);
-        self.wait_for_fork_choice_before_block_production(slot)?;
-        drop(fork_choice_timer);
-
         let state_load_timer = metrics::start_timer(&metrics::BLOCK_PRODUCTION_STATE_LOAD_TIMES);
 
         // Atomically read some values from the head whilst avoiding holding cached head `Arc` any
@@ -127,10 +123,11 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
 
     /// If configured, wait for the fork choice run at the start of the slot to complete.
     #[instrument(level = "debug", skip_all)]
-    fn wait_for_fork_choice_before_block_production(
+    pub(crate) async fn wait_for_fork_choice_before_block_production(
         self: &Arc<Self>,
         slot: Slot,
     ) -> Result<(), BlockProductionError> {
+        let _timer = metrics::start_timer(&metrics::BLOCK_PRODUCTION_FORK_CHOICE_TIMES);
         if let Some(rx) = &self.fork_choice_signal_rx {
             let current_slot = self
                 .slot()
@@ -139,7 +136,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             let timeout = Duration::from_millis(self.config.fork_choice_before_proposal_timeout_ms);
 
             if slot == current_slot || slot == current_slot + 1 {
-                match rx.wait_for_fork_choice(slot, timeout) {
+                match rx.wait_for_fork_choice(slot, timeout).await {
                     ForkChoiceWaitResult::Success(fc_slot) => {
                         debug!(
                             %slot,

@@ -111,6 +111,12 @@ impl<E: EthSpec> CacheItem<E> {
         matches!(self, CacheItem::Promise(_))
     }
 
+    /// Wait for another CPU job's shuffling computation.
+    ///
+    /// In the single-thread simulator, `with_cached_shuffling` creates and
+    /// resolves its promise in one synchronous job (before invoking `map_fn`).
+    /// No simulated task can observe that promise pending. Keep that producer
+    /// synchronous: moving it across an await requires making this wait async too.
     pub fn wait(self) -> Result<CachedShuffling<E>, BeaconChainError> {
         match self {
             CacheItem::Committee(cache) => Ok(cache),

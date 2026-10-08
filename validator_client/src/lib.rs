@@ -40,6 +40,7 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 use types::{EthSpec, Hash256};
+#[cfg(not(madsim))]
 use validator_http_api::ApiSecret;
 use validator_services::notifier_service::spawn_notifier;
 use validator_services::{
@@ -121,10 +122,24 @@ impl<E: EthSpec> ProductionValidatorClient<E> {
     /// Instantiates the validator client, _without_ starting the timers to trigger block
     /// and attestation production.
     pub async fn new(context: RuntimeContext<E>, config: Config) -> Result<Self, String> {
+        #[cfg(madsim)]
+        if config.http_api.enabled {
+            return Err(
+                "Validator management HTTP API is unsupported in whole-node simulation; disable --http"
+                    .into(),
+            );
+        }
+        #[cfg(madsim)]
+        if config.http_metrics.enabled || config.monitoring_api.is_some() {
+            return Err(
+                "Host metrics and monitoring are unsupported in whole-node simulation".into(),
+            );
+        }
         // Attempt to raise soft fd limit. The behavior is OS specific:
         // `linux` - raise soft fd limit to hard
         // `macos` - raise soft fd limit to `min(kernel limit, hard fd limit)`
         // `windows` & rest - noop
+        #[cfg(not(madsim))]
         match fdlimit::raise_fd_limit().map_err(|e| format!("Unable to raise fd limit: {}", e))? {
             fdlimit::Outcome::LimitRaised { from, to } => {
                 debug!(
@@ -643,41 +658,46 @@ impl<E: EthSpec> ProductionValidatorClient<E> {
         let channel_capacity = E::slots_per_epoch() as usize;
         let (block_service_tx, block_service_rx) = mpsc::channel(channel_capacity);
 
-        let api_secret = ApiSecret::create_or_open(&self.config.http_api.http_token_path)?;
+        #[cfg(not(madsim))]
+        {
+            let api_secret = ApiSecret::create_or_open(&self.config.http_api.http_token_path)?;
 
-        self.http_api_listen_addr = if self.config.http_api.enabled {
-            let ctx = Arc::new(validator_http_api::Context {
-                task_executor: self.context.executor.clone(),
-                api_secret,
-                block_service: Some(self.block_service.clone()),
-                validator_store: Some(self.validator_store.clone()),
-                validator_dir: Some(self.config.validator_dir.clone()),
-                configured_builders: self.configured_builders.clone(),
-                secrets_dir: Some(self.config.secrets_dir.clone()),
-                graffiti_file: self.config.graffiti_file.clone(),
-                graffiti_flag: self.config.graffiti,
-                spec: self.context.eth2_config.spec.clone(),
-                config: self.config.http_api.clone(),
-                sse_logging_components: self.context.sse_logging_components.clone(),
-                slot_clock: self.slot_clock.clone(),
-            });
+            self.http_api_listen_addr = if self.config.http_api.enabled {
+                let ctx = Arc::new(validator_http_api::Context {
+                    task_executor: self.context.executor.clone(),
+                    api_secret,
+                    block_service: Some(self.block_service.clone()),
+                    validator_store: Some(self.validator_store.clone()),
+                    validator_dir: Some(self.config.validator_dir.clone()),
+                    configured_builders: self.configured_builders.clone(),
+                    secrets_dir: Some(self.config.secrets_dir.clone()),
+                    graffiti_file: self.config.graffiti_file.clone(),
+                    graffiti_flag: self.config.graffiti,
+                    spec: self.context.eth2_config.spec.clone(),
+                    config: self.config.http_api.clone(),
+                    sse_logging_components: self.context.sse_logging_components.clone(),
+                    slot_clock: self.slot_clock.clone(),
+                });
 
-            let exit = self.context.executor.exit();
+                let exit = self.context.executor.exit();
 
-            let (listen_addr, server) = validator_http_api::serve::<_, E>(ctx, exit)
-                .await
-                .map_err(|e| format!("Unable to start HTTP API server: {:?}", e))?;
+                let (listen_addr, server) = validator_http_api::serve::<_, E>(ctx, exit)
+                    .await
+                    .map_err(|e| format!("Unable to start HTTP API server: {:?}", e))?;
 
-            self.context
-                .clone()
-                .executor
-                .spawn_without_exit(server, "http-api");
+                self.context
+                    .clone()
+                    .executor
+                    .spawn_without_exit(server, "http-api");
 
-            Some(listen_addr)
-        } else {
-            info!("HTTP API server is disabled");
-            None
-        };
+                Some(listen_addr)
+            } else {
+                info!("HTTP API server is disabled");
+                None
+            };
+        }
+        #[cfg(madsim)]
+        info!("HTTP API server is disabled");
 
         // Wait until genesis has occurred.
         wait_for_genesis(self.genesis_time).await?;

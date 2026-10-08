@@ -146,11 +146,9 @@ impl<E: EthSpec> InteractiveTester<E> {
         let strict_registrations = false;
 
         if use_mock_builder {
-            let mock_builder_server = harness.set_mock_builder(
-                beacon_url.clone(),
-                strict_registrations,
-                apply_operations,
-            );
+            let mock_builder_server = harness
+                .set_mock_builder(beacon_url.clone(), strict_registrations, apply_operations)
+                .await;
 
             tokio::spawn(mock_builder_server);
         }

@@ -1,8 +1,13 @@
+#[cfg(not(madsim))]
 use rayon::{ThreadPool, ThreadPoolBuilder};
+#[cfg(not(madsim))]
 use std::sync::Arc;
 
+#[cfg(not(madsim))]
 const DEFAULT_LOW_PRIORITY_CPU_PERCENTAGE: usize = 25;
+#[cfg(not(madsim))]
 const DEFAULT_HIGH_PRIORITY_CPU_PERCENTAGE: usize = 80;
+#[cfg(not(madsim))]
 const MINIMUM_THREAD_COUNT: usize = 1;
 
 pub enum RayonPoolType {
@@ -10,6 +15,7 @@ pub enum RayonPoolType {
     LowPriority,
 }
 
+#[cfg(not(madsim))]
 pub struct RayonPoolProvider {
     /// Smaller rayon thread pool for lower-priority, compute-intensive tasks.
     /// By default ~25% of CPUs or a minimum of 1 thread.
@@ -20,6 +26,7 @@ pub struct RayonPoolProvider {
     high_priority_thread_pool: Arc<ThreadPool>,
 }
 
+#[cfg(not(madsim))]
 impl Default for RayonPoolProvider {
     fn default() -> Self {
         let low_prio_threads =
@@ -46,6 +53,7 @@ impl Default for RayonPoolProvider {
     }
 }
 
+#[cfg(not(madsim))]
 impl RayonPoolProvider {
     /// Get a scoped thread pool by priority level.
     /// For critical/highest priority tasks, use the global pool instead.

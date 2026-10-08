@@ -26,3 +26,7 @@ safe_arith = { workspace = true }
 serde = { workspace = true }
 tree_hash = { workspace = true }
 zeroize = { workspace = true }
+
+[target.'cfg(madsim)'.dependencies]
+# Keep the real BLS implementation, but execute it on the simulator's thread.
+blst = { version = "0.3.3", optional = true, features = ["no-threads"] }
