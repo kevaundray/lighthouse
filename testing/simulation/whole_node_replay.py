@@ -22,9 +22,7 @@ ROOT = Path(__file__).resolve().parents[2]
 BUILD = ["cargo", "build", "--config", ".cargo/config-simulation.toml", "--release",
          "-p", "simulator", "--features", "spec-minimal", "--bin", "deterministic-simulation"]
 BINARY = ROOT / "target/x86_64-unknown-linux-gnu/release/deterministic-simulation"
-RUNS = [("baseline42-a", 42, "baseline"), ("baseline42-b", 42, "baseline"),
-        ("faults42-a", 42, "faults"), ("faults42-b", 42, "faults"),
-        ("faults7", 7, "faults")]
+SCENARIOS = ("baseline", "faults", "discovery", "restart", "storage", "forks")
 FAULTS = ("partition", "heal", "execution_syncing", "execution_valid")
 
 
@@ -154,13 +152,46 @@ def inspect_trace(path, seed, scenario):
              for key in (*FAULTS, "late_join", "end")):
         errors.append("manifest schedule fields must be nonnegative integers")
     else:
+        expected = ([(action, manifest[action]) for action in FAULTS]
+                    if scenario in ("faults", "discovery", "forks") else [])
+        expected.append(("late_join", manifest["late_join"]))
+        for action, enabled in (("process_crash", scenario == "restart"),
+                                ("storage_failure", scenario == "storage")):
+            value = manifest.get(action)
+            if enabled:
+                if type(value) is not int or value < 0:
+                    errors.append(action + " must be a nonnegative integer")
+                else:
+                    expected.append((action, value))
+            elif value is not None:
+                errors.append(action + " must be null for this scenario")
+        expected.sort(key=lambda item: item[1])
         actual = [(event.get("action"), event.get("slot")) for event in events
-                  if event["event"] == "fault" and event.get("action") in FAULTS]
-        expected = [(action, manifest[action]) for action in FAULTS] if scenario == "faults" else []
+                  if event["event"] == "fault"]
         if any(type(slot) is not int for _, slot in actual) or actual != expected:
             errors.append("actual fault events do not match the expanded manifest schedule")
         else:
             schedule = actual
+        if manifest.get("fork_slots") != ([96] if scenario == "forks" else [0]):
+            errors.append("unexpected fork-transition schedule")
+    if names.count("passed") == 1:
+        passed = next(event for event in events if event["event"] == "passed")
+        if passed.get("restarted") is not (scenario in ("restart", "storage")):
+            errors.append("restart invariant was not established for this scenario")
+        if passed.get("storage_failure_observed") is not (scenario == "storage"):
+            errors.append("storage-failure invariant was not established for this scenario")
+    crashes = [event for event in events if event["event"] == "crash"]
+    restarts = [event for event in events if event["event"] == "restarted"]
+    if scenario in ("restart", "storage"):
+        if len(crashes) != 1 or len(restarts) != 1:
+            errors.append("expected exactly one crash and one fresh restart")
+        elif (crashes[0].get("mode") != ("process" if scenario == "restart" else "power_loss")
+              or restarts[0].get("slot") != crashes[0].get("slot", -2) + 2
+              or not 0 < restarts[0].get("head_slot", 0) <= crashes[0].get("head_slot", 0)
+              or (scenario == "storage" and crashes[0].get("observed_storage_faults", 0) < 1)):
+            errors.append("crash/restart evidence violates the storage recovery contract")
+    elif crashes or restarts:
+        errors.append("unexpected crash/restart events")
     # Full event stream: only insignificant whitespace and object key order are ignored.
     semantic = [json.dumps(event, sort_keys=True, separators=(",", ":"), allow_nan=False)
                 for event in events]
@@ -169,11 +200,11 @@ def inspect_trace(path, seed, scenario):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Build and replay five independent whole-node simulations: baseline42 twice, "
-                    "faults42 twice, and faults7 once. Validate full semantic JSONL replay, "
-                    "successful completion, and seed-dependent actual fault schedules. "
-                    "The binary remains responsible for consensus and recovery invariants.",
-        epilog="Evidence is never deleted or overwritten. On any failure all five runs are still "
+        description="Build and replay independent whole-node simulations: each selected scenario "
+                    "at seed42 twice, and each non-baseline scenario at seed7 once. "
+                    "Validate full semantic JSONL replay, successful completion, and seed-dependent "
+                    "actual fault schedules. The binary checks consensus and recovery invariants.",
+        epilog="Evidence is never deleted or overwritten. On failure all selected runs are still "
                "collected (unless building fails or the runner is interrupted). "
                "Example: python3 testing/simulation/whole_node_replay.py --output /tmp/replay-001")
     parser.add_argument("--output", required=True, type=Path,
@@ -182,6 +213,8 @@ def main():
                         help="driver executable (default: repository target/x86_64-unknown-linux-gnu/"
                              "release/deterministic-simulation); custom paths require --skip-build")
     parser.add_argument("--skip-build", action="store_true", help="use the existing executable without rebuilding")
+    parser.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=SCENARIOS,
+                        help="scenarios to qualify (default: all six)")
     parser.add_argument("--jobs", type=int, choices=(1, 2), default=1,
                         help="maximum concurrent processes (default: 1; capped at 2)")
     parser.add_argument("--timeout", type=positive_seconds, default=1800,
@@ -194,6 +227,12 @@ def main():
     binary = args.binary.resolve()
     if binary != BINARY and not args.skip_build:
         parser.error("a custom --binary requires --skip-build")
+    scenarios = list(dict.fromkeys(args.scenarios))
+    runs = []
+    for scenario in scenarios:
+        runs.extend([(scenario + "42-a", 42, scenario), (scenario + "42-b", 42, scenario)])
+        if scenario != "baseline":
+            runs.append((scenario + "7", 7, scenario))
     output = args.output.resolve()
     try:
         output.mkdir(parents=True, exist_ok=False)
@@ -210,10 +249,11 @@ def main():
     metadata = {"started_utc": datetime.now(timezone.utc).isoformat(), "cwd": str(ROOT),
                 "runner_command": [sys.executable, *sys.argv], "platform": platform.platform(),
                 "python": sys.version, "git": git_metadata(), "binary": str(binary),
+                "rust_log": os.environ.get("RUST_LOG"),
                 "jobs": args.jobs, "timeout_seconds": args.timeout,
                 "build_timeout_seconds": args.build_timeout, "build_command": BUILD,
                 "build_skipped": args.skip_build,
-                "commands": [[str(binary), str(seed), scenario] for _, seed, scenario in RUNS]}
+                "commands": [[str(binary), str(seed), scenario] for _, seed, scenario in runs]}
     errors = []
     results = {}
     try:
@@ -239,7 +279,7 @@ def main():
 
             traces = {}
             with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-                futures = [(spec[0], pool.submit(run, spec)) for spec in RUNS]
+                futures = [(spec[0], pool.submit(run, spec)) for spec in runs]
                 for label, future in futures:
                     try:
                         _, result, traces[label] = future.result()
@@ -247,7 +287,8 @@ def main():
                         errors.extend(label + ": " + error for error in result["errors"])
                     except Exception as error:
                         errors.append(label + ": " + str(error))
-            for scenario in ("baseline42", "faults42"):
+            for name in scenarios:
+                scenario = name + "42"
                 left, right = traces.get(scenario + "-a"), traces.get(scenario + "-b")
                 if left is None or right is None:
                     errors.append(scenario + ": full semantic replay comparison unavailable")
@@ -255,12 +296,15 @@ def main():
                     mismatch = next((index + 1 for index, pair in enumerate(zip(left, right))
                                      if pair[0] != pair[1]), min(len(left), len(right)) + 1)
                     errors.append(scenario + ": full semantic replay differs at event " + str(mismatch))
-            schedule42 = results.get("faults42-a", {}).get("actual_fault_schedule")
-            schedule7 = results.get("faults7", {}).get("actual_fault_schedule")
-            if not schedule42 or not schedule7:
-                errors.append("cross-seed actual fault schedule comparison unavailable")
-            elif schedule42 == schedule7:
-                errors.append("expanded actual fault schedule is unchanged between seeds 42 and 7")
+            for scenario in scenarios:
+                if scenario == "baseline":
+                    continue
+                schedule42 = results.get(scenario + "42-a", {}).get("actual_fault_schedule")
+                schedule7 = results.get(scenario + "7", {}).get("actual_fault_schedule")
+                if not schedule42 or not schedule7:
+                    errors.append(scenario + ": cross-seed actual fault schedule comparison unavailable")
+                elif schedule42 == schedule7:
+                    errors.append(scenario + ": actual fault schedule unchanged between seeds 42 and 7")
     except (OSError, ValueError) as error:
         errors.append(str(error))
         if not (output / "metadata.json").exists():

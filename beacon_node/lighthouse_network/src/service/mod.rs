@@ -198,16 +198,14 @@ impl<E: EthSpec> Network<E> {
         let config = ctx.config.clone();
         #[cfg(madsim)]
         {
-            if !config.disable_discovery
-                || !config.disable_quic_support
+            if !config.disable_quic_support
                 || config.upnp_enabled
                 || config.metrics_enabled
                 || config.enable_mplex
                 || ctx.libp2p_registry.is_some()
             {
                 return Err(
-                    "whole-node simulation requires discovery, QUIC, UPnP, metrics and mplex disabled"
-                        .into(),
+                    "whole-node simulation requires QUIC, UPnP, metrics and mplex disabled".into(),
                 );
             }
             simulated_tcp::validate_config(&config)?;

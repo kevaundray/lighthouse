@@ -33,10 +33,17 @@ typenum = { workspace = true }
 types = { workspace = true }
 
 [target.'cfg(madsim)'.dependencies]
+async-channel = { workspace = true }
+discv5 = { workspace = true }
 libc = "0.2"
 madsim = { workspace = true }
 rand = { workspace = true }
+reqwest = { workspace = true }
 seccompiler = "0.5"
 serde = { workspace = true, features = ["derive"] }
+store = { workspace = true }
 task_executor = { workspace = true }
 tempfile = { workspace = true }
+
+[target.'cfg(madsim)'.dev-dependencies]
+enr = "0.14"

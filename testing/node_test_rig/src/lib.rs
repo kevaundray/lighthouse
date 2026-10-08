@@ -3,11 +3,15 @@
 //! Intended to be used for testing and simulation purposes. Not for production.
 
 use beacon_node::ProductionBeaconNode;
+#[cfg(madsim)]
+use beacon_node::beacon_chain::store::SimulationStorage;
 use environment::RuntimeContext;
 use eth2::{BeaconNodeHttpClient, Timeouts};
 use reqwest::ClientBuilder;
 use sensitive_url::SensitiveUrl;
 use std::path::PathBuf;
+#[cfg(madsim)]
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::{Builder as TempBuilder, TempDir};
@@ -36,7 +40,12 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 /// Intended for use in testing and simulation. Not for production.
 pub struct LocalBeaconNode<E: EthSpec> {
     pub client: ProductionClient<E>,
+    #[cfg(not(madsim))]
     pub datadir: TempDir,
+    #[cfg(madsim)]
+    pub datadir: Arc<TempDir>,
+    #[cfg(madsim)]
+    pub simulation_storage: SimulationStorage,
 }
 
 impl<E: EthSpec> LocalBeaconNode<E> {
@@ -45,14 +54,35 @@ impl<E: EthSpec> LocalBeaconNode<E> {
     /// The node created is using the same types as the node we use in production.
     pub async fn production(
         context: RuntimeContext<E>,
-        mut client_config: ClientConfig,
+        client_config: ClientConfig,
     ) -> Result<Self, String> {
         // Creates a temporary directory that will be deleted once this `TempDir` is dropped.
         let datadir = TempBuilder::new()
             .prefix("lighthouse_node_test_rig")
             .tempdir()
             .expect("should create temp directory for client datadir");
+        #[cfg(madsim)]
+        {
+            Self::production_with_simulation_storage(
+                context,
+                client_config,
+                Arc::new(datadir),
+                SimulationStorage::default(),
+            )
+            .await
+        }
+        #[cfg(not(madsim))]
+        {
+            Self::production_with_datadir(context, client_config, datadir).await
+        }
+    }
 
+    #[cfg(not(madsim))]
+    async fn production_with_datadir(
+        context: RuntimeContext<E>,
+        mut client_config: ClientConfig,
+        datadir: TempDir,
+    ) -> Result<Self, String> {
         client_config.set_data_dir(datadir.path().into());
         client_config.network.network_dir = PathBuf::from(datadir.path()).join("network");
 
@@ -65,6 +95,35 @@ impl<E: EthSpec> LocalBeaconNode<E> {
         .map(move |client| Self {
             client: client.into_inner(),
             datadir,
+        })
+    }
+
+    /// Construct a NEW production client over a retained datadir and modeled storage.
+    /// The caller supplies a new per-node runtime context after fencing the old generation.
+    /// Retaining the network directory preserves the node's on-disk peer identity.
+    #[cfg(madsim)]
+    pub async fn production_with_simulation_storage(
+        context: RuntimeContext<E>,
+        mut client_config: ClientConfig,
+        datadir: Arc<TempDir>,
+        simulation_storage: SimulationStorage,
+    ) -> Result<Self, String> {
+        client_config.set_data_dir(datadir.path().into());
+        client_config.network.network_dir = PathBuf::from(datadir.path()).join("network");
+        timeout(
+            STARTUP_TIMEOUT,
+            ProductionBeaconNode::new_with_simulation_storage(
+                context,
+                client_config,
+                simulation_storage.clone(),
+            ),
+        )
+        .await
+        .map_err(|_| format!("Beacon node startup timed out after {:?}", STARTUP_TIMEOUT))?
+        .map(move |client| Self {
+            client: client.into_inner(),
+            datadir,
+            simulation_storage,
         })
     }
 }

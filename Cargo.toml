@@ -291,6 +291,7 @@ debug = true
 
 [patch.crates-io]
 delay_map = { path = "testing/simulation/deps/delay_map-0.4.1" }
+discv5 = { path = "testing/simulation/deps/discv5-0.12.0" }
 # The simulation branch uses libc entropy interception; ordinary builds retain
 # the locked getrandom backend unchanged.
 getrandom = { path = "testing/simulation/deps/getrandom-0.2.17" }
