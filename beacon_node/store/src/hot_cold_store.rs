@@ -258,6 +258,90 @@ impl<E: EthSpec> HotColdDB<E, MemoryStore, MemoryStore> {
     }
 }
 
+#[cfg(madsim)]
+impl<E: EthSpec> HotColdDB<E, crate::SimulationStore, crate::SimulationStore> {
+    /// Rebuild all caches and metadata from modeled storage bytes, never a retained chain.
+    /// The model only creates current-schema databases; native migrations are unchanged.
+    pub fn open_simulated(
+        storage: &crate::SimulationStorage,
+        config: StoreConfig,
+        spec: Arc<ChainSpec>,
+    ) -> Result<Arc<Self>, Error> {
+        config.verify::<E>()?;
+        let hierarchy = config.hierarchy_config.to_moduli()?;
+        let (hot_db, cold_db, blobs_db) = storage.reopen();
+        let anchor_info = RwLock::new(Self::load_anchor_info(&hot_db)?);
+        let db = Self {
+            split: RwLock::new(Split::default()),
+            anchor_info,
+            blob_info: RwLock::new(BlobInfo::default()),
+            data_column_info: RwLock::new(DataColumnInfo::default()),
+            hot_db,
+            cold_db,
+            blobs_db,
+            block_cache: (config.block_cache_size > 0)
+                .then(|| Mutex::new(BlockCache::new(config.block_cache_size))),
+            state_cache: Mutex::new(StateCache::new(
+                config.state_cache_size,
+                config.state_cache_headroom,
+                config.hot_hdiff_buffer_cache_size,
+            )),
+            historic_state_cache: Mutex::new(HistoricStateCache::new(
+                config.cold_hdiff_buffer_cache_size.get(),
+                config.historic_state_cache_size.get(),
+            )),
+            config,
+            hierarchy,
+            spec,
+            _phantom: PhantomData,
+        };
+        if let Some(version) = db.load_schema_version()? {
+            if version != CURRENT_SCHEMA_VERSION {
+                return Err(HotColdDBError::UnsupportedSchemaVersion {
+                    target_version: CURRENT_SCHEMA_VERSION,
+                    current_version: version,
+                }
+                .into());
+            }
+        } else {
+            db.store_schema_version(CURRENT_SCHEMA_VERSION)?;
+        }
+        if let Some(config) = db.load_config()? {
+            db.config.check_compatibility(&config)?;
+        }
+        db.store_config()?;
+        if let Some(split) = db.load_split()? {
+            *db.split.write() = split;
+        }
+        let mut blob_info = db.load_blob_info()?.unwrap_or_else(|| BlobInfo {
+            oldest_blob_slot: None,
+            blobs_db: true,
+        });
+        if blob_info.oldest_blob_slot.is_some() && !blob_info.blobs_db {
+            return Err(HotColdDBError::BlobsPreviouslyInDefaultStore.into());
+        }
+        blob_info.oldest_blob_slot = blob_info.oldest_blob_slot.or_else(|| {
+            db.spec
+                .deneb_fork_epoch
+                .map(|epoch| epoch.start_slot(E::slots_per_epoch()))
+        });
+        blob_info.blobs_db = true;
+        db.compare_and_set_blob_info_with_write(Default::default(), blob_info)?;
+        let mut data_column_info = db.load_data_column_info()?.unwrap_or_default();
+        data_column_info.oldest_data_column_slot =
+            data_column_info.oldest_data_column_slot.or_else(|| {
+                db.spec
+                    .fulu_fork_epoch
+                    .map(|epoch| epoch.start_slot(E::slots_per_epoch()))
+            });
+        db.compare_and_set_data_column_info_with_write(Default::default(), data_column_info)?;
+        if db.config.compact_on_init {
+            db.compact()?;
+        }
+        Ok(Arc::new(db))
+    }
+}
+
 impl<E: EthSpec> HotColdDB<E, BeaconNodeBackend, BeaconNodeBackend> {
     /// Open a new or existing database, with the given paths to the hot and cold DBs.
     ///

@@ -46,11 +46,30 @@ pub(super) fn validate_config(config: &crate::NetworkConfig) -> Result<(), Strin
             ));
         }
     }
-    if !config.boot_nodes_enr.is_empty() {
+    if !config.disable_discovery
+        && !matches!(
+            &config.discv5_config.listen_config,
+            discv5::ListenConfig::Ipv4 { ip, port }
+                if !ip.is_unspecified() && *port != 0
+        )
+    {
         return Err(
-            "whole-node simulation uses static IPv4/TCP peer multiaddrs, not discovery boot ENRs"
-                .into(),
+            "whole-node simulation requires an explicit IPv4/UDP discovery listen address".into(),
         );
+    }
+    for enr in &config.boot_nodes_enr {
+        if enr.ip6().is_some()
+            || enr.udp6().is_some()
+            || enr.tcp6().is_some()
+            || enr
+                .udp4_socket()
+                .is_none_or(|socket| socket.ip().is_unspecified() || socket.port() == 0)
+            || enr.tcp4().is_some_and(|port| port == 0)
+        {
+            return Err(
+                "whole-node simulation requires boot ENRs with explicit IPv4 UDP sockets and no IPv6 sockets".into(),
+            );
+        }
     }
     for address in config
         .libp2p_nodes

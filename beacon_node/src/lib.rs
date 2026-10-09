@@ -15,7 +15,7 @@ use slasher::{DatabaseBackendOverride, Slasher};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 #[cfg(madsim)]
-use store::MemoryStore as BeaconNodeBackend;
+use store::SimulationStore as BeaconNodeBackend;
 #[cfg(not(madsim))]
 use store::database::interface::BeaconNodeBackend;
 use tracing::{info, warn};
@@ -49,7 +49,31 @@ impl<E: EthSpec> ProductionBeaconNode<E> {
     /// Client behaviour is defined by the given `client_config`.
     pub async fn new(
         context: RuntimeContext<E>,
+        client_config: ClientConfig,
+    ) -> Result<Self, String> {
+        Self::new_inner(
+            context,
+            client_config,
+            #[cfg(madsim)]
+            store::SimulationStorage::default(),
+        )
+        .await
+    }
+
+    /// Starts a new client and chain over retained modeled storage after a simulation restart.
+    #[cfg(madsim)]
+    pub async fn new_with_simulation_storage(
+        context: RuntimeContext<E>,
+        client_config: ClientConfig,
+        storage: store::SimulationStorage,
+    ) -> Result<Self, String> {
+        Self::new_inner(context, client_config, storage).await
+    }
+
+    async fn new_inner(
+        context: RuntimeContext<E>,
         mut client_config: ClientConfig,
+        #[cfg(madsim)] storage: store::SimulationStorage,
     ) -> Result<Self, String> {
         #[cfg(madsim)]
         if client_config.slasher.is_some()
@@ -97,10 +121,8 @@ impl<E: EthSpec> ProductionBeaconNode<E> {
             builder.disk_store(&db_path, &freezer_db_path, &blobs_db_path, store_config)?;
         #[cfg(madsim)]
         let builder = {
-            // The simulation models live storage operations, not native database
-            // background workers or crash durability.
             let _ = &blobs_db_path;
-            builder.memory_store(store_config)?
+            builder.simulation_store(&storage, store_config)?
         };
 
         let builder = if let Some(mut slasher_config) = client_config.slasher.clone() {

@@ -3,15 +3,12 @@
 //! This module creates a libp2p dummy-behaviour built around the discv5 protocol. It handles
 //! queries and manages access to the discovery routing table.
 
-mod backend;
 pub(crate) mod enr;
-use backend::DiscoveryBackend;
 
 // Allow external use of the lighthouse ENR builder
 use crate::service::TARGET_SUBNET_PEERS;
 use crate::{ClearDialError, metrics};
 use crate::{Enr, NetworkConfig, NetworkGlobals, Subnet, SubnetDiscovery};
-#[cfg(not(madsim))]
 use discv5::Discv5;
 pub use enr::{CombinedKey, Eth2Enr, NodeId, build_enr, load_enr_from_disk, use_or_load_enr};
 pub use libp2p::identity::{Keypair, PublicKey};
@@ -166,8 +163,8 @@ pub struct Discovery<E: EthSpec> {
     /// The directory where the ENR is stored.
     enr_dir: String,
 
-    /// Owns either a discovery server or only the signed ENR in static-topology simulation.
-    discv5: DiscoveryBackend,
+    /// The production discovery server, including when transport is simulated.
+    discv5: Discv5,
 
     /// A collection of network constants that can be read from other threads.
     network_globals: Arc<NetworkGlobals<E>>,
@@ -209,7 +206,6 @@ impl<E: EthSpec> Discovery<E> {
         };
 
         let local_enr = network_globals.local_enr.read().clone();
-        #[cfg(not(madsim))]
         let local_node_id = local_enr.node_id();
 
         info!(
@@ -222,24 +218,6 @@ impl<E: EthSpec> Discovery<E> {
         // convert the keypair into an ENR key
         let enr_key: CombinedKey = CombinedKey::from_libp2p(local_key)?;
 
-        #[cfg(madsim)]
-        let (discv5, event_stream) = {
-            if !config.disable_discovery {
-                return Err("discovery is not supported by whole-node simulation".into());
-            }
-            use ::enr::EnrKey;
-            if local_enr.public_key() != enr_key.public() {
-                return Err("Provided keypair does not match the provided ENR".into());
-            }
-            (
-                DiscoveryBackend::Local {
-                    enr: Arc::new(parking_lot::RwLock::new(local_enr)),
-                    key: enr_key,
-                },
-                EventStream::InActive,
-            )
-        };
-        #[cfg(not(madsim))]
         let (discv5, event_stream) = {
             let mut discv5 = Discv5::new(local_enr, enr_key, config.discv5_config.clone())
                 .map_err(|e| format!("Discv5 service failed. Error: {:?}", e))?;
@@ -341,7 +319,7 @@ impl<E: EthSpec> Discovery<E> {
                     }
                 }
             }
-            (DiscoveryBackend::Discv5(discv5), event_stream)
+            (discv5, event_stream)
         };
 
         let update_ports = UpdatePorts {
@@ -416,9 +394,7 @@ impl<E: EthSpec> Discovery<E> {
         // add the enr to seen caches
         self.cached_enrs.insert(enr.peer_id(), enr.clone());
 
-        let Some(discv5) = self.discv5.server() else {
-            return;
-        };
+        let discv5 = &self.discv5;
         if let Err(e) = discv5.add_enr(enr) {
             debug!(
                 error = %e,
@@ -429,10 +405,7 @@ impl<E: EthSpec> Discovery<E> {
 
     /// Returns an iterator over all enr entries in the DHT.
     pub fn table_entries_enr(&self) -> Vec<Enr> {
-        self.discv5
-            .server()
-            .map(|server| server.table_entries_enr())
-            .unwrap_or_default()
+        self.discv5.table_entries_enr()
     }
 
     /// Updates the local ENR TCP port.
@@ -660,9 +633,7 @@ impl<E: EthSpec> Discovery<E> {
 
     // Bans a peer and it's associated seen IP addresses.
     pub fn ban_peer(&mut self, peer_id: &PeerId, ip_addresses: Vec<IpAddr>) {
-        let Some(discv5) = self.discv5.server() else {
-            return;
-        };
+        let discv5 = &self.discv5;
         // first try and convert the peer_id to a node_id.
         if let Ok(node_id) = peer_id_to_node_id(peer_id) {
             // If we could convert this peer id, remove it from the DHT and ban it from discovery.
@@ -676,9 +647,7 @@ impl<E: EthSpec> Discovery<E> {
 
     /// Unbans the peer in discovery.
     pub fn unban_peer(&mut self, peer_id: &PeerId, ip_addresses: Vec<IpAddr>) {
-        let Some(discv5) = self.discv5.server() else {
-            return;
-        };
+        let discv5 = &self.discv5;
         // first try and convert the peer_id to a node_id.
         if let Ok(node_id) = peer_id_to_node_id(peer_id) {
             discv5.ban_node_remove(&node_id);
@@ -692,10 +661,8 @@ impl<E: EthSpec> Discovery<E> {
     ///  Marks node as disconnected in the DHT, freeing up space for other nodes, this also removes
     ///  nodes from the cached ENR list.
     pub fn disconnect_peer(&mut self, peer_id: &PeerId) {
-        if let Some(discv5) = self.discv5.server() {
-            if let Ok(node_id) = peer_id_to_node_id(peer_id) {
-                discv5.disconnect_node(&node_id);
-            }
+        if let Ok(node_id) = peer_id_to_node_id(peer_id) {
+            self.discv5.disconnect_node(&node_id);
         }
         // Remove the peer from the cached list, to prevent redialing disconnected
         // peers.
@@ -857,9 +824,7 @@ impl<E: EthSpec> Discovery<E> {
         target_peers: usize,
         additional_predicate: impl Fn(&Enr) -> bool + Send + 'static,
     ) {
-        let Some(discv5) = self.discv5.server() else {
-            return;
-        };
+        let discv5 = &self.discv5;
         let enr_fork_id = match self.local_enr().eth2() {
             Ok(v) => v,
             Err(e) => {

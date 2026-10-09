@@ -20,6 +20,8 @@ mod memory_store;
 pub mod metadata;
 pub mod metrics;
 pub mod reconstruct;
+#[cfg(madsim)]
+mod simulation_store;
 pub mod state_cache;
 
 pub mod database;
@@ -29,6 +31,8 @@ pub use self::blob_sidecar_list_from_root::BlobSidecarListFromRoot;
 pub use self::config::StoreConfig;
 pub use self::hot_cold_store::{HotColdDB, HotStateSummary, Split};
 pub use self::memory_store::MemoryStore;
+#[cfg(madsim)]
+pub use self::simulation_store::{SimulationCrash, SimulationStorage, SimulationStore};
 pub use crate::metadata::BlobInfo;
 pub use errors::Error;
 pub use metadata::AnchorInfo;

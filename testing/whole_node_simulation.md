@@ -4,12 +4,12 @@
 
 Run actual Lighthouse beacon-node services together under a controlled execution environment, inject seeded failures, and reproduce the same semantic execution from the same inputs. Component tests and a repeatable final head alone do not meet this goal.
 
-This extends the component work in [deterministic_simulation.md](deterministic_simulation.md). The guarded whole-node baseline and partition/execution-recovery workloads have passed with byte-identical independent-process replay.
+This extends the component work in [deterministic_simulation.md](deterministic_simulation.md). Six guarded whole-node scenarios now pass: baseline, partition/execution recovery, untrusted discovery, process restart, storage failure/power loss, and Fulu→Gloas transition. All repeated seed-42 runs produced byte-identical independent-process traces.
 
 ## Running and replaying
 
 ```sh
-# Build, run five independent processes, compare complete semantic traces.
+# Build, run 17 independent processes, compare complete semantic traces.
 # The output directory must be new; failures retain all evidence.
 python3 testing/simulation/whole_node_replay.py \
   --output /tmp/lighthouse-whole-node-replay --jobs 2
@@ -23,6 +23,20 @@ cargo build --config .cargo/config-simulation.toml --release \
   -p simulator --features spec-minimal --bin deterministic-simulation
 target/x86_64-unknown-linux-gnu/release/deterministic-simulation 42 faults
 target/x86_64-unknown-linux-gnu/release/deterministic-simulation 42 baseline
+target/x86_64-unknown-linux-gnu/release/deterministic-simulation 42 discovery
+target/x86_64-unknown-linux-gnu/release/deterministic-simulation 42 restart
+target/x86_64-unknown-linux-gnu/release/deterministic-simulation 42 storage
+target/x86_64-unknown-linux-gnu/release/deterministic-simulation 42 forks
+
+# Qualify only selected scenarios, with the same replay and invariant checks.
+python3 testing/simulation/whole_node_replay.py \
+  --output /tmp/lighthouse-restarts --scenarios restart storage --jobs 2
+
+# Persistent-store boundaries and actual encrypted discovery PING/PONG/ban isolation.
+cargo test --config .cargo/config-simulation.toml --release \
+  -p store --lib simulation_store::tests
+cargo test --config .cargo/config-simulation.toml --release \
+  -p simulator --features spec-minimal --test discovery_simulation
 
 # Prove unsupported native effects terminate the child with SIGSYS.
 cargo test --config .cargo/config-simulation.toml --release \
@@ -30,11 +44,46 @@ cargo test --config .cargo/config-simulation.toml --release \
   simulation_guard::tests::rejects_uncontrolled_effects
 ```
 
-The replay command runs baseline/42 twice, faults/42 twice, and faults/7 once. It requires successful process exits and terminal `passed`/`stopped` events, compares the complete ordered semantic JSONL records, and checks that different seeds change actual injected fault events. It retains separate stdout/stderr, per-run status and trace hashes, executable/lock/config hashes, exact commands and source revision/dirty status. Runtime children have isolated temporary fixture directories. A wall-clock timeout kills the complete process group; the driver also has a virtual-time bound.
+The replay command runs each of `baseline`, `faults`, `discovery`, `restart`, `storage`, and `forks` at seed 42 twice, and each non-baseline scenario at seed 7 once. It requires successful process exits and terminal `passed`/`stopped` events, compares the complete ordered semantic JSONL records, and checks that different seeds change actual injected fault events. It validates crash/restart evidence against the manifest and retains separate stdout/stderr, per-run status and trace hashes, executable/lock/config hashes, exact commands, `RUST_LOG`, and source revision/dirty status. Runtime children have isolated temporary fixture directories. A wall-clock timeout kills the complete process group; the driver also has a virtual-time bound. `RUST_LOG` can select diagnostic targets; comparisons must use the same logging configuration because enabled tracing can change the simulated execution schedule.
 
-The scenario partitions the initial pair for 16 slots, restores connectivity, reports Engine API `SYNCING` for eight slots while the execution model learns payloads, restores `VALID`, and starts a third node at slot 80. The partition start is seeded independently of runtime scheduling. The driver requires actual head divergence and execution optimism, monotonic and non-conflicting finality, convergence of all three nodes by slot 128, finalized epoch at least 12, no remaining optimism, and resumed proposals from **both** validator clients. Each final checkpoint must match its canonical head state's historical block root at the checkpoint slot; actual Beacon HTTP heads must agree with the local safety observations. It never injects beacon blocks, votes, head state or finalized checkpoints directly.
+The `faults` scenario partitions the initial pair for 16 slots, restores connectivity, reports Engine API `SYNCING` for eight slots while the execution model learns payloads, restores `VALID`, and starts a third node at slot 80. Fault timing is seeded independently of runtime scheduling. The driver requires actual head divergence and execution optimism, monotonic per-process and non-conflicting global finality, accepted post-recovery head proposals from **both** validator groups, and eventual convergence of all three nodes with fresh heads and finality and no remaining optimism. Each final checkpoint must match its canonical head state's historical block root at the checkpoint slot; actual Beacon HTTP heads must agree with local observations. It never injects beacon blocks, votes, head state or finalized checkpoints directly.
 
-Observed qualification with this workload:
+Additional scenarios:
+
+- `discovery`: real Discv5 protocol over simulated IPv4 UDP, ENR bootstrap, ordinary untrusted peer scoring, and the same partition/Engine faults. No trusted-peer admin calls. The trace records real UDP sessions and HTTP peer scores/status and rejects any trusted peer. Recovery has a separate slot-512 bound because the production score half-life is 600 seconds, independent of the accelerated three-second slots. Production score thresholds are unchanged.
+- `restart`: the third node first syncs, then crashes at seeded slot 94–96 and restarts two slots later. Its execution service stays alive on a separate virtual host. A fresh production client opens retained storage and network identity; the first restored head must be a non-genesis root in the pre-crash canonical ancestry, before network catch-up.
+- `storage`: the third node's next real block batch fails. The driver requires an actually returned storage error, poisoned fork choice, and the production database-failure shutdown reason, then models power loss and fresh startup two slots later. The model never syncs on crash or reopen. A recovered checkpoint may be older than the lost process's last observation; the trace records that transition, resets only that process's monotonicity baseline, and preserves the global conflicting-finality oracle.
+- `forks`: Fulu at genesis, Gloas at epoch 12/slot 96, after the partition/Engine recovery and late join. Actual head blocks **and states** must match the scheduled fork; the trace must observe Fulu then Gloas, accepted post-transition head proposals from both validator groups, finalized ancestry and all-node convergence. This is a current live-operation transition, not a claim to run historical Bellatrix/Capella/Deneb networks: current production attestation/blob services deliberately no longer support parts of those old live paths.
+
+Non-discovery scenarios finish at slot 128. Every scenario requires a head at least `end - 1` and finalized epoch at least `end / 8 - 4`.
+
+### Expanded qualification
+
+All 17 processes passed from clean source commit `9f95bc49cde28b4f28a63c39f5b935442a259cf7`, with `RUST_LOG` unset (the default error filter). Evidence is retained locally at `/tmp/lighthouse-expanded-node-qualified-replay`. Executable SHA256: `ea55f68004aea545e29506840f55ddf1b29a87e38f18834c749ae830c41cd6c5`. The six seed-42 pairs matched byte-for-byte; every non-baseline seed-7 run changed its actual fault schedule.
+
+| Scenario / seed | Final head slot / finalized epoch | Full stdout SHA256 |
+| --- | --- | --- |
+| baseline / 42, twice | 128 / 14 | `39057f1d626474e1ee0545686cea2c536e41df52323048aaee4e0cd3e359151a` |
+| faults / 42, twice | 128 / 14 | `e51b343346ee98464ee88d337485341b7b87823b6cb4aa3ddd5ba6a9ecf05ed3` |
+| faults / 7 | 128 / 14 | `972976bc7c03ed110d246b58b49b8eac7694867387d0de0dfbdccea4ec893c9e` |
+| discovery / 42, twice | 512 / 62 | `77c76f49bda29f9c039f2565e426e563377116200f9677cab5a2d845cc96c80b` |
+| discovery / 7 | 512 / 62 | `9994e6ba18036abff7e001a44cc0e4029dc6af3aa8b960f6dbeaf64742cf5b8b` |
+| restart / 42, twice | 128 / 14 | `1e3971f6af175149744f77234919faeb19970569ce4f8e95f3a94178224fa624` |
+| restart / 7 | 128 / 14 | `69f00fc9afb603dfe5047dc3fee61e94575de0ad3ecb7e09cdc37ad4c32d8e5c` |
+| storage / 42, twice | 128 / 14 | `7ee2e60cadef50d7499a8a9e5d3342f48f9d3758e30aab54b1f2bee1093f1732` |
+| storage / 7 | 128 / 14 | `d2ae45e5385570f26227644fd4db3906b8b17743ff320eb3c4f0e094dc771575` |
+| forks / 42, twice | 128 / 14 | `7972ef1fb70bfb10065f00b00b12ebf81174499ff098bd00ff3772f09b8aef8c` |
+| forks / 7 | 128 / 14 | `221ea2c66398bf68d3e965d76fd88c43db9b7e22692fd5c139bf6b3e70061333` |
+
+At seed 42, the process crash occurred at slot 95 and fresh startup at 97 restored head 88. The storage case returned two actual storage errors, crashed at 96 and restarted at 98 with head 95; no crash-time sync was inserted. Both cases subsequently converged and accepted proposals from both validator groups after their restart window. Discovery ended with two active UDP sessions per node, real sent/received traffic, and no trusted peers.
+
+Discovery exposed the production column-serving defect in [PR #29](https://github.com/kevaundray/lighthouse/pull/29). Before the fix, native range imports persisted all 128 columns but an empty or partial DA-cache entry caused serving to return zero or one. Honest peers then accumulated incomplete-response penalties; extending discovery to slot 512 alone still failed. Filling missing indices from later caches and storage resolved the workload without changing peer scoring. The two native regressions failed first; all five column-verification tests and the native beacon-chain check passed after the fix.
+
+The expanded native `basic-sim` also completed successfully with two initial nodes, two validator clients and a late third node (`--nodes 2 --proposer-nodes 0 --validators-per-node 32 --speed-up-factor 2 --log-dir /tmp/lighthouse-native-expanded-dst`). Native and simulation `cargo check -p simulator --features spec-minimal --all-targets` passed, as did six storage-model boundary tests, the encrypted discovery/ban-isolation integration test, the guard test's five forbidden-effect subprocess probes, formatting and workspace dependency ordering. Existing dependency/cfg warnings remain visible.
+
+### Earlier qualification
+
+Original PR #28 qualification at commit `227051605d9931152616a154abb83d86273d94f6`:
 
 | Run | Partition / heal / SYNCING / VALID | Result | Full stdout SHA256 |
 | --- | --- | --- | --- |
@@ -75,9 +124,11 @@ After the native-runner qualification below, the user selected in-process simula
 
 An independent-process probe now reproduces identical standard-library clock values, hash iteration, rand 0.8/0.9 output, getrandom 0.3/0.4 output and virtual TCP round trips for seed 42; seed 7 changes the trace. The initially unpatched rand 0.8 path escaped through getrandom 0.2's raw Linux syscall. The pinned 0.2.17 adaptation selects its existing libc backend only under `cfg(madsim)`, allowing MadSim interception without changing ordinary builds.
  
-`ClientBuilder::memory_store` assembles the real node services over ephemeral storage. `SystemTimeSlotClock` remains the production implementation; its standard-library clock is controlled by the simulator. Rayon and BLS execute real computation without native worker pools. Fork-choice notifications are awaitable; migration and CPU jobs run through controlled tasks. The actual baseline ran two beacon nodes and two validator clients through slot 128, with a third beacon node joining at slot 80. All three reached the same slot-128 head and finalized epoch 14, their real Beacon HTTP responses agreed, and the process shut down explicitly.
+`ClientBuilder::simulation_store` assembles the real node services over `SimulationStore`. `SystemTimeSlotClock` remains the production implementation; its standard-library clock is controlled by the simulator. Rayon and BLS execute real computation without native worker pools. Fork-choice notifications are awaitable; migration and CPU jobs run through controlled tasks. Each beacon node has an independent shutdown channel so a storage failure stops the affected process rather than silently terminating or being ignored by the entire harness.
 
-The supported configuration is Linux x86-64, minimal spec, 64 real signing validators, forks through Fulu, static IPv4/TCP Noise/Yamux peers and plaintext Engine/Beacon HTTP. Discovery, QUIC, UPnP, host metrics/monitoring, slasher, native TLS, kernel TCP tuning and the optional validator-management HTTP API are explicitly outside this configuration. The initial pair uses the production `POST /lighthouse/add_peer` API for persistent peering before genesis: bootstrap addresses alone are one-shot dials, not a reconnection policy when discovery is disabled. Trusted peers bypass peer scoring, so the partition scenario does not qualify untrusted-peer scoring or discovery recovery. The late-joining node uses ordinary bootstrap peering. Storage is a live-state model, not a disk-crash/durability model. CPU jobs execute atomically; instruction-level races and parallel Rayon execution are not modeled.
+The configuration is Linux x86-64, minimal spec, 64 real signing validators, Fulu plus a scheduled Gloas transition, IPv4/TCP Noise/Yamux peers, IPv4 UDP discovery, and plaintext Engine/Beacon HTTP. QUIC, IPv6 discovery, UPnP, host metrics/monitoring, slasher, native TLS, kernel TCP tuning and the optional validator-management HTTP API remain outside this configuration. Discovery-disabled scenarios use the production `POST /lighthouse/add_peer` API for the initial pair: bootstrap addresses alone are one-shot dials, not a reconnection policy. Those scenarios do not qualify untrusted scoring; `discovery` does not use that trust bypass. CPU jobs execute atomically; instruction-level races and parallel Rayon execution are not modeled.
+
+The persistent KV model separates accepted bytes from durable bytes for hot, cold and blob stores. Atomic batches either apply completely or return the injected failure without mutation. A process crash retains accepted bytes; modeled power loss restores each database's last sync image. Generation fencing precedes task cancellation and destructor execution, preventing old handles from writing a graceful-shutdown checkpoint after a crash. `HotColdDB::open_simulated` reloads metadata into new caches, and normal startup uses the persisted chain/fork choice. Boundary tests cover atomic failure, independent durability including deletion, write/sync failure, stale handles/iterators, and retry. This does **not** qualify LevelDB/Redb/WAL/filesystem crash consistency, torn physical sectors, or validator-client/SQLite restart durability.
 
 The dedicated simulation process installs a seccomp guard that traps unexpected native network, reactor, clock, timer, entropy, thread-creation and blocking-futex syscalls. Subprocess regression probes for native TCP, contended `parking_lot` locks, worker threads, raw entropy and raw clocks all terminate with `SIGSYS`; the actual whole-node workload completes under the same guard. Host build tools remain native: `.cargo/config-simulation.toml` uses an explicit target so simulation cfg flags do not change build-script HTTP clients. Standard-library clock interception and each entropy generation are separately qualified; seccomp is not a claim to virtualize arbitrary C-library or vDSO behavior.
 
@@ -101,7 +152,7 @@ The existing real-node `basic-sim` workload was also exercised without a determi
 
 ## Acceptance gates
 
-1. **Backend qualification:** repeated execution of clock, entropy, controlled-worker, timer and selected-transport probes; precise runner/version/config and environmental assumptions recorded. The selected in-process workload supports TCP, not UDP discovery or QUIC. No unsupported path silently falls back to native uncontrolled execution.
+1. **Backend qualification:** repeated execution of clock, entropy, controlled-worker, timer and selected-transport probes; precise runner/version/config and environmental assumptions recorded. The selected workload supports TCP and IPv4 UDP discovery, not QUIC. No unsupported path silently falls back to native uncontrolled execution.
 2. **Whole-node baseline:** at least two actual beacon nodes and production validator duties, deterministic genesis/config/keys, controlled post-Merge execution service, real block gossip/import and RPC sync. Verify exact heads and checkpoints, accepted block ancestry and explicit shutdown.
 3. **Fault and recovery workload:** seeded finite partitions or connection failures, delayed traffic/completions, a late joining node, execution-layer unavailability/recovery and bounded progress after healing. The fault must occur at the tested boundary, not be simulated by directly replacing final state.
 4. **Replay:** compare ordered semantic inputs and observations across independent processes, including heads, payload status, checkpoints and failure/recovery outcomes. Keep executable revision, dependency lock, runner version/config and expanded schedule. Different seeds must alter actual fault/scheduling decisions, not just labels.
@@ -115,5 +166,7 @@ The existing real-node `basic-sim` workload was also exercised without a determi
 - [PR #25](https://github.com/kevaundray/lighthouse/pull/25): MadSim TCP listener ownership and half-close defects. Reproducer `e93e4ad02`, next-commit fix `7eb87c1a0`; executable listener-drop/rebind and request-half-close cases.
 - [PR #26](https://github.com/kevaundray/lighthouse/pull/26): MadSim overflow on the unbounded sleep used by the real event-source HTTP client. Reproducer `3d0c91682`, next-commit fix `0098d1143`; executable pending/reset and finite-timeout cases. Stacked on #25. These are simulator compatibility defects, not production Lighthouse protocol bugs.
 - [PR #27](https://github.com/kevaundray/lighthouse/pull/27): Lighthouse's execution test model discarded usable ancestry until each parent became canonical. Reproducer `de91c84c6`, next-commit fix `1b3fd21c0`. The regression sends a valid payload chain without intermediate forkchoice updates and requires subsequent payload production; all 42 execution-layer library tests passed after the fix. This is a test-model bug, not a production consensus bug.
+- [PR #28](https://github.com/kevaundray/lighthouse/pull/28): guarded whole-node baseline and partition/execution recovery with production validator clients, canonical checkpoint ancestry, native compatibility and independent-process replay.
+- [PR #29](https://github.com/kevaundray/lighthouse/pull/29): production range-imported custody columns hidden by incomplete caches. Native failing regressions `425528fe6`, immediately followed by fix `e5bcd3f2d`; integrated untrusted discovery recovers without score changes.
 
 The user's fork `unstable` was fast-forwarded to the existing checkout base `03ce8c89c` with explicit approval; no upstream branch was modified.

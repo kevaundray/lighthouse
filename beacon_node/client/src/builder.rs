@@ -903,6 +903,31 @@ where
     }
 }
 
+#[cfg(madsim)]
+impl<TSlotClock, E>
+    ClientBuilder<Witness<TSlotClock, E, store::SimulationStore, store::SimulationStore>>
+where
+    TSlotClock: SlotClock + 'static,
+    E: EthSpec + 'static,
+{
+    /// Opens a fresh HotColdDB over retained simulation bytes and persisted metadata.
+    pub fn simulation_store(
+        mut self,
+        storage: &store::SimulationStorage,
+        config: StoreConfig,
+    ) -> Result<Self, String> {
+        let spec = self
+            .chain_spec
+            .clone()
+            .ok_or("simulation_store requires a chain spec")?;
+        self.store = Some(
+            HotColdDB::open_simulated(storage, config, spec)
+                .map_err(|error| format!("Unable to open simulated database: {error:?}"))?,
+        );
+        Ok(self)
+    }
+}
+
 impl<TSlotClock, E> ClientBuilder<Witness<TSlotClock, E, BeaconNodeBackend, BeaconNodeBackend>>
 where
     TSlotClock: SlotClock + 'static,

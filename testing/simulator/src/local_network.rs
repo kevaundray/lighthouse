@@ -124,6 +124,18 @@ pub struct Inner<E: EthSpec> {
     pub proposer_nodes: RwLock<Vec<LocalBeaconNode<E>>>,
     pub validator_clients: RwLock<Vec<LocalValidatorClient<E>>>,
     pub execution_nodes: RwLock<Vec<LocalExecutionNode<E>>>,
+    #[cfg(madsim)]
+    pub execution_hosts: RwLock<Vec<madsim::runtime::NodeHandle>>,
+    #[cfg(madsim)]
+    pub beacon_configs: RwLock<Vec<ClientConfig>>,
+    #[cfg(madsim)]
+    node_controls: RwLock<Vec<SimulationNodeControl>>,
+}
+
+#[cfg(madsim)]
+struct SimulationNodeControl {
+    exit: async_channel::Sender<()>,
+    shutdown: futures::channel::mpsc::Receiver<task_executor::ShutdownReason>,
 }
 
 /// Represents a set of interconnected `LocalBeaconNode` and `LocalValidatorClient`.
@@ -181,6 +193,12 @@ impl<E: EthSpec> LocalNetwork<E> {
                 proposer_nodes: RwLock::new(vec![]),
                 execution_nodes: RwLock::new(vec![]),
                 validator_clients: RwLock::new(vec![]),
+                #[cfg(madsim)]
+                execution_hosts: RwLock::new(vec![]),
+                #[cfg(madsim)]
+                beacon_configs: RwLock::new(vec![]),
+                #[cfg(madsim)]
+                node_controls: RwLock::new(vec![]),
             }),
         };
 
@@ -211,6 +229,70 @@ impl<E: EthSpec> LocalNetwork<E> {
         self.validator_clients.read().len()
     }
 
+    #[cfg(madsim)]
+    pub fn fresh_beacon_context(&self, index: usize) -> RuntimeContext<E> {
+        let (exit, exit_rx) = async_channel::bounded(1);
+        let (shutdown_tx, shutdown) = futures::channel::mpsc::channel(16);
+        let mut context = self.context.clone();
+        context.executor = task_executor::TaskExecutor::new(
+            tokio::runtime::Handle::current(),
+            exit_rx,
+            shutdown_tx,
+        );
+        let control = SimulationNodeControl { exit, shutdown };
+        let mut controls = self.node_controls.write();
+        if index == controls.len() {
+            controls.push(control);
+        } else {
+            controls[index] = control;
+        }
+        context
+    }
+
+    #[cfg(madsim)]
+    pub fn node_shutdown(&self, index: usize) -> Option<task_executor::ShutdownReason> {
+        self.node_controls.write()[index].shutdown.try_recv().ok()
+    }
+
+    #[cfg(madsim)]
+    pub fn stop_beacon_nodes(&self) {
+        for control in self.node_controls.read().iter() {
+            control.exit.close();
+        }
+    }
+
+    #[cfg(madsim)]
+    async fn simulated_execution_node(
+        &self,
+        config: MockExecutionConfig,
+        index: usize,
+    ) -> Result<LocalExecutionNode<E>, String> {
+        let host = self.execution_hosts.read().get(index).cloned();
+        let context = self.context.clone();
+        if let Some(host) = host {
+            host.spawn(async move { LocalExecutionNode::new(context, config).await })
+                .await
+                .map_err(|error| format!("execution node {index} startup: {error}"))
+        } else {
+            Ok(LocalExecutionNode::new(context, config).await)
+        }
+    }
+
+    async fn configured_beacon_node(
+        &self,
+        config: ClientConfig,
+    ) -> Result<LocalBeaconNode<E>, String> {
+        #[cfg(not(madsim))]
+        let context = self.context.clone();
+        #[cfg(madsim)]
+        let context = {
+            let index = self.beacon_node_count() + self.proposer_node_count();
+            self.beacon_configs.write().push(config.clone());
+            self.fresh_beacon_context(index)
+        };
+        LocalBeaconNode::production(context, config).await
+    }
+
     async fn construct_boot_node(
         &self,
         mut beacon_config: ClientConfig,
@@ -228,6 +310,11 @@ impl<E: EthSpec> LocalNetwork<E> {
         beacon_config.network.enr_tcp4_port = Some(BOOTNODE_PORT.try_into().expect("non zero"));
         beacon_config.network.discv5_config.table_filter = |_| true;
 
+        #[cfg(madsim)]
+        let execution_node = self
+            .simulated_execution_node(mock_execution_config, 0)
+            .await?;
+        #[cfg(not(madsim))]
         let execution_node =
             LocalExecutionNode::new(self.context.clone(), mock_execution_config).await;
 
@@ -238,7 +325,7 @@ impl<E: EthSpec> LocalNetwork<E> {
             ..Default::default()
         });
 
-        let beacon_node = LocalBeaconNode::production(self.context.clone(), beacon_config).await?;
+        let beacon_node = self.configured_beacon_node(beacon_config).await?;
 
         Ok((beacon_node, execution_node))
     }
@@ -269,6 +356,11 @@ impl<E: EthSpec> LocalNetwork<E> {
         mock_execution_config.server_config.listen_port = EXECUTION_PORT + count;
 
         // Construct execution node.
+        #[cfg(madsim)]
+        let execution_node = self
+            .simulated_execution_node(mock_execution_config, count as usize)
+            .await?;
+        #[cfg(not(madsim))]
         let execution_node =
             LocalExecutionNode::new(self.context.clone(), mock_execution_config).await;
 
@@ -281,7 +373,7 @@ impl<E: EthSpec> LocalNetwork<E> {
         });
 
         // Construct beacon node using the config,
-        let beacon_node = LocalBeaconNode::production(self.context.clone(), beacon_config).await?;
+        let beacon_node = self.configured_beacon_node(beacon_config).await?;
 
         Ok((beacon_node, execution_node))
     }
@@ -311,14 +403,18 @@ impl<E: EthSpec> LocalNetwork<E> {
                 #[cfg(madsim)]
                 {
                     let enr = boot_node.client.enr().ok_or("boot node has no ENR")?;
-                    let ip = enr
-                        .ip4()
-                        .ok_or("simulation boot node has no IPv4 address")?;
-                    let port = enr.tcp4().ok_or("simulation boot node has no TCP port")?;
-                    let address = format!("/ip4/{ip}/tcp/{port}")
-                        .parse()
-                        .map_err(|error| format!("invalid static simulation peer: {error}"))?;
-                    beacon_config.network.boot_nodes_multiaddr.push(address);
+                    if !beacon_config.network.disable_discovery {
+                        beacon_config.network.boot_nodes_enr.push(enr);
+                    } else {
+                        let ip = enr
+                            .ip4()
+                            .ok_or("simulation boot node has no IPv4 address")?;
+                        let port = enr.tcp4().ok_or("simulation boot node has no TCP port")?;
+                        let address = format!("/ip4/{ip}/tcp/{port}")
+                            .parse()
+                            .map_err(|error| format!("invalid static simulation peer: {error}"))?;
+                        beacon_config.network.boot_nodes_multiaddr.push(address);
+                    }
                 }
             }
         }
