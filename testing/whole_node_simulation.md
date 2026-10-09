@@ -4,7 +4,7 @@
 
 Run actual Lighthouse beacon-node services together under a controlled execution environment, inject seeded failures, and reproduce the same semantic execution from the same inputs. Component tests and a repeatable final head alone do not meet this goal.
 
-This extends the component work in [deterministic_simulation.md](deterministic_simulation.md). The guarded whole-node baseline and partition/execution-recovery workloads have passed with byte-identical independent-process replay.
+This extends the component work in [deterministic_simulation.md](deterministic_simulation.md). Six guarded whole-node scenarios now pass: baseline, partition/execution recovery, untrusted discovery, process restart, storage failure/power loss, and Fulu→Gloas transition. All repeated seed-42 runs produced byte-identical independent-process traces.
 
 ## Running and replaying
 
@@ -44,18 +44,44 @@ cargo test --config .cargo/config-simulation.toml --release \
   simulation_guard::tests::rejects_uncontrolled_effects
 ```
 
-The replay command runs each of `baseline`, `faults`, `discovery`, `restart`, `storage`, and `forks` at seed 42 twice, and each non-baseline scenario at seed 7 once. It requires successful process exits and terminal `passed`/`stopped` events, compares the complete ordered semantic JSONL records, and checks that different seeds change actual injected fault events. It validates crash/restart evidence against the manifest and retains separate stdout/stderr, per-run status and trace hashes, executable/lock/config hashes, exact commands and source revision/dirty status. Runtime children have isolated temporary fixture directories. A wall-clock timeout kills the complete process group; the driver also has a virtual-time bound. `RUST_LOG` can select diagnostic targets; comparisons must use the same logging configuration because enabled tracing can change the simulated execution schedule.
+The replay command runs each of `baseline`, `faults`, `discovery`, `restart`, `storage`, and `forks` at seed 42 twice, and each non-baseline scenario at seed 7 once. It requires successful process exits and terminal `passed`/`stopped` events, compares the complete ordered semantic JSONL records, and checks that different seeds change actual injected fault events. It validates crash/restart evidence against the manifest and retains separate stdout/stderr, per-run status and trace hashes, executable/lock/config hashes, exact commands, `RUST_LOG`, and source revision/dirty status. Runtime children have isolated temporary fixture directories. A wall-clock timeout kills the complete process group; the driver also has a virtual-time bound. `RUST_LOG` can select diagnostic targets; comparisons must use the same logging configuration because enabled tracing can change the simulated execution schedule.
 
-The `faults` scenario partitions the initial pair for 16 slots, restores connectivity, reports Engine API `SYNCING` for eight slots while the execution model learns payloads, restores `VALID`, and starts a third node at slot 80. Fault timing is seeded independently of runtime scheduling. The driver requires actual head divergence and execution optimism, monotonic per-process and non-conflicting global finality, convergence of all three nodes, fresh heads and finality, no remaining optimism, and accepted post-recovery proposals from **both** validator groups on the converged chain. Each final checkpoint must match its canonical head state's historical block root at the checkpoint slot; actual Beacon HTTP heads must agree with local observations. It never injects beacon blocks, votes, head state or finalized checkpoints directly.
+The `faults` scenario partitions the initial pair for 16 slots, restores connectivity, reports Engine API `SYNCING` for eight slots while the execution model learns payloads, restores `VALID`, and starts a third node at slot 80. Fault timing is seeded independently of runtime scheduling. The driver requires actual head divergence and execution optimism, monotonic per-process and non-conflicting global finality, accepted post-recovery head proposals from **both** validator groups, and eventual convergence of all three nodes with fresh heads and finality and no remaining optimism. Each final checkpoint must match its canonical head state's historical block root at the checkpoint slot; actual Beacon HTTP heads must agree with local observations. It never injects beacon blocks, votes, head state or finalized checkpoints directly.
 
 Additional scenarios:
 
 - `discovery`: real Discv5 protocol over simulated IPv4 UDP, ENR bootstrap, ordinary untrusted peer scoring, and the same partition/Engine faults. No trusted-peer admin calls. The trace records real UDP sessions and HTTP peer scores/status and rejects any trusted peer. Recovery has a separate slot-512 bound because the production score half-life is 600 seconds, independent of the accelerated three-second slots. Production score thresholds are unchanged.
 - `restart`: the third node first syncs, then crashes at seeded slot 94–96 and restarts two slots later. Its execution service stays alive on a separate virtual host. A fresh production client opens retained storage and network identity; the first restored head must be a non-genesis root in the pre-crash canonical ancestry, before network catch-up.
 - `storage`: the third node's next real block batch fails. The driver requires an actually returned storage error, poisoned fork choice, and the production database-failure shutdown reason, then models power loss and fresh startup two slots later. The model never syncs on crash or reopen. A recovered checkpoint may be older than the lost process's last observation; the trace records that transition, resets only that process's monotonicity baseline, and preserves the global conflicting-finality oracle.
-- `forks`: Fulu at genesis, Gloas at epoch 12/slot 96, after the partition/Engine recovery and late join. Actual head blocks **and states** must match the scheduled fork; the trace must observe Fulu then Gloas, continued proposals, finalized ancestry and all-node convergence. This is a current live-operation transition, not a claim to run historical Bellatrix/Capella/Deneb networks: current production attestation/blob services deliberately no longer support parts of those old live paths.
+- `forks`: Fulu at genesis, Gloas at epoch 12/slot 96, after the partition/Engine recovery and late join. Actual head blocks **and states** must match the scheduled fork; the trace must observe Fulu then Gloas, accepted post-transition head proposals from both validator groups, finalized ancestry and all-node convergence. This is a current live-operation transition, not a claim to run historical Bellatrix/Capella/Deneb networks: current production attestation/blob services deliberately no longer support parts of those old live paths.
 
 Non-discovery scenarios finish at slot 128. Every scenario requires a head at least `end - 1` and finalized epoch at least `end / 8 - 4`.
+
+### Expanded qualification
+
+All 17 processes passed from clean source commit `9f95bc49cde28b4f28a63c39f5b935442a259cf7`, with `RUST_LOG` unset (the default error filter). Evidence is retained locally at `/tmp/lighthouse-expanded-node-qualified-replay`. Executable SHA256: `ea55f68004aea545e29506840f55ddf1b29a87e38f18834c749ae830c41cd6c5`. The six seed-42 pairs matched byte-for-byte; every non-baseline seed-7 run changed its actual fault schedule.
+
+| Scenario / seed | Final head slot / finalized epoch | Full stdout SHA256 |
+| --- | --- | --- |
+| baseline / 42, twice | 128 / 14 | `39057f1d626474e1ee0545686cea2c536e41df52323048aaee4e0cd3e359151a` |
+| faults / 42, twice | 128 / 14 | `e51b343346ee98464ee88d337485341b7b87823b6cb4aa3ddd5ba6a9ecf05ed3` |
+| faults / 7 | 128 / 14 | `972976bc7c03ed110d246b58b49b8eac7694867387d0de0dfbdccea4ec893c9e` |
+| discovery / 42, twice | 512 / 62 | `77c76f49bda29f9c039f2565e426e563377116200f9677cab5a2d845cc96c80b` |
+| discovery / 7 | 512 / 62 | `9994e6ba18036abff7e001a44cc0e4029dc6af3aa8b960f6dbeaf64742cf5b8b` |
+| restart / 42, twice | 128 / 14 | `1e3971f6af175149744f77234919faeb19970569ce4f8e95f3a94178224fa624` |
+| restart / 7 | 128 / 14 | `69f00fc9afb603dfe5047dc3fee61e94575de0ad3ecb7e09cdc37ad4c32d8e5c` |
+| storage / 42, twice | 128 / 14 | `7ee2e60cadef50d7499a8a9e5d3342f48f9d3758e30aab54b1f2bee1093f1732` |
+| storage / 7 | 128 / 14 | `d2ae45e5385570f26227644fd4db3906b8b17743ff320eb3c4f0e094dc771575` |
+| forks / 42, twice | 128 / 14 | `7972ef1fb70bfb10065f00b00b12ebf81174499ff098bd00ff3772f09b8aef8c` |
+| forks / 7 | 128 / 14 | `221ea2c66398bf68d3e965d76fd88c43db9b7e22692fd5c139bf6b3e70061333` |
+
+At seed 42, the process crash occurred at slot 95 and fresh startup at 97 restored head 88. The storage case returned two actual storage errors, crashed at 96 and restarted at 98 with head 95; no crash-time sync was inserted. Both cases subsequently converged and accepted proposals from both validator groups after their restart window. Discovery ended with two active UDP sessions per node, real sent/received traffic, and no trusted peers.
+
+Discovery exposed the production column-serving defect in [PR #29](https://github.com/kevaundray/lighthouse/pull/29). Before the fix, native range imports persisted all 128 columns but an empty or partial DA-cache entry caused serving to return zero or one. Honest peers then accumulated incomplete-response penalties; extending discovery to slot 512 alone still failed. Filling missing indices from later caches and storage resolved the workload without changing peer scoring. The two native regressions failed first; all five column-verification tests and the native beacon-chain check passed after the fix.
+
+The expanded native `basic-sim` also completed successfully with two initial nodes, two validator clients and a late third node (`--nodes 2 --proposer-nodes 0 --validators-per-node 32 --speed-up-factor 2 --log-dir /tmp/lighthouse-native-expanded-dst`). Native and simulation `cargo check -p simulator --features spec-minimal --all-targets` passed, as did six storage-model boundary tests, the encrypted discovery/ban-isolation integration test, the guard test's five forbidden-effect subprocess probes, formatting and workspace dependency ordering. Existing dependency/cfg warnings remain visible.
+
+### Earlier qualification
 
 Original PR #28 qualification at commit `227051605d9931152616a154abb83d86273d94f6`:
 
@@ -140,5 +166,7 @@ The existing real-node `basic-sim` workload was also exercised without a determi
 - [PR #25](https://github.com/kevaundray/lighthouse/pull/25): MadSim TCP listener ownership and half-close defects. Reproducer `e93e4ad02`, next-commit fix `7eb87c1a0`; executable listener-drop/rebind and request-half-close cases.
 - [PR #26](https://github.com/kevaundray/lighthouse/pull/26): MadSim overflow on the unbounded sleep used by the real event-source HTTP client. Reproducer `3d0c91682`, next-commit fix `0098d1143`; executable pending/reset and finite-timeout cases. Stacked on #25. These are simulator compatibility defects, not production Lighthouse protocol bugs.
 - [PR #27](https://github.com/kevaundray/lighthouse/pull/27): Lighthouse's execution test model discarded usable ancestry until each parent became canonical. Reproducer `de91c84c6`, next-commit fix `1b3fd21c0`. The regression sends a valid payload chain without intermediate forkchoice updates and requires subsequent payload production; all 42 execution-layer library tests passed after the fix. This is a test-model bug, not a production consensus bug.
+- [PR #28](https://github.com/kevaundray/lighthouse/pull/28): guarded whole-node baseline and partition/execution recovery with production validator clients, canonical checkpoint ancestry, native compatibility and independent-process replay.
+- [PR #29](https://github.com/kevaundray/lighthouse/pull/29): production range-imported custody columns hidden by incomplete caches. Native failing regressions `425528fe6`, immediately followed by fix `e5bcd3f2d`; integrated untrusted discovery recovers without score changes.
 
 The user's fork `unstable` was fast-forwarded to the existing checkout base `03ce8c89c` with explicit approval; no upstream branch was modified.
