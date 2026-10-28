@@ -83,6 +83,16 @@ pub fn process_operations<E: EthSpec, Payload: AbstractExecPayload<E>>(
         )?;
     }
 
+    // [New in EIP-8450]
+    if let Ok(pq_key_registrations) = block_body.pq_key_registrations() {
+        process_pq_key_registrations(
+            state,
+            pq_key_registrations.as_slice(),
+            verify_signatures,
+            spec,
+        )?;
+    }
+
     Ok(())
 }
 
@@ -92,7 +102,7 @@ pub fn process_operations<E: EthSpec, Payload: AbstractExecPayload<E>>(
 pub fn verify_operation_list_lengths<E: EthSpec, Payload: AbstractExecPayload<E>>(
     block_body: BeaconBlockBodyRef<E, Payload>,
 ) -> Result<(), BlockProcessingError> {
-    let checks: [(&str, usize, usize); 6] = [
+    let checks: [(&str, usize, usize); 7] = [
         (
             "proposer_slashings",
             block_body.proposer_slashings().len(),
@@ -128,6 +138,15 @@ pub fn verify_operation_list_lengths<E: EthSpec, Payload: AbstractExecPayload<E>
                 .map(|atts| atts.len())
                 .unwrap_or(0),
             E::MaxPayloadAttestations::to_usize(),
+        ),
+        // [New in EIP-8450]
+        (
+            "pq_key_registrations",
+            block_body
+                .pq_key_registrations()
+                .map(|registrations| registrations.len())
+                .unwrap_or(0),
+            E::MaxPqKeyRegistrations::to_usize(),
         ),
     ];
 
@@ -640,6 +659,48 @@ pub fn process_bls_to_execution_changes<E: EthSpec>(
                 &signed_address_change.message.to_execution_address,
                 spec,
             );
+    }
+
+    Ok(())
+}
+
+/// Validates each `SignedPqKeyRegistration` and writes the registered keys into the state
+/// (`process_pq_key_registration`, EIP-8450).
+///
+/// The registrations are applied in order, so a key registered earlier in `pq_key_registrations`
+/// is in use for the later ones.
+///
+/// Returns `Ok(())` if the validation and state updates completed successfully. Otherwise returns
+/// an `Err` describing the invalid object or cause of failure.
+pub fn process_pq_key_registrations<E: EthSpec>(
+    state: &mut BeaconState<E>,
+    pq_key_registrations: &[SignedPqKeyRegistration],
+    verify_signatures: VerifySignatures,
+    spec: &ChainSpec,
+) -> Result<(), BlockProcessingError> {
+    block_verify!(
+        pq_key_registrations.len() <= E::max_pq_key_registrations(),
+        BlockProcessingError::OperationListTooLong {
+            kind: "pq_key_registrations",
+            length: pq_key_registrations.len(),
+            max: E::max_pq_key_registrations(),
+        }
+    );
+
+    // The uniqueness check of each registration reads the cache, so build it once up front.
+    state.update_pq_pubkey_cache()?;
+
+    let current_epoch = state.current_epoch();
+    for (i, signed_registration) in pq_key_registrations.iter().enumerate() {
+        verify_pq_key_registration(state, signed_registration, verify_signatures, spec)
+            .map_err(|e| e.into_with_index(i))?;
+
+        let registration = &signed_registration.message;
+        state.set_pq_public_keys(
+            registration.validator_index as usize,
+            registration.public_keys.clone(),
+            current_epoch,
+        )?;
     }
 
     Ok(())

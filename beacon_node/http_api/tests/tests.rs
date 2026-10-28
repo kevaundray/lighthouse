@@ -4302,7 +4302,12 @@ impl ApiTester {
     }
 
     pub async fn test_get_config_spec(self) -> Self {
-        let result = if self.chain.spec.is_heze_scheduled() {
+        let result = if self.chain.spec.is_eip8450_scheduled() {
+            self.client
+                .get_config_spec::<ConfigAndPresetEip8450>()
+                .await
+                .map(|res| ConfigAndPreset::Eip8450(res.data))
+        } else if self.chain.spec.is_heze_scheduled() {
             self.client
                 .get_config_spec::<ConfigAndPresetHeze>()
                 .await

@@ -81,6 +81,7 @@ use crate::pending_payload_envelopes::PendingPayloadEnvelopes;
 use crate::persisted_beacon_chain::PersistedBeaconChain;
 use crate::persisted_custody::persist_custody_context;
 use crate::persisted_fork_choice::PersistedForkChoice;
+use crate::pq_key_registration_verification::ObservedPqKeyRegistrations;
 use crate::pre_finalization_cache::PreFinalizationBlockCache;
 use crate::proposer_preferences_verification::proposer_preference_cache::GossipVerifiedProposerPreferenceCache;
 use crate::shuffling_cache::{
@@ -474,6 +475,9 @@ pub struct BeaconChain<T: BeaconChainTypes> {
     /// Maintains a record of which validators we've seen BLS to execution changes for.
     pub observed_bls_to_execution_changes:
         Mutex<ObservedOperations<SignedBlsToExecutionChange, T::EthSpec>>,
+    /// Maintains a record of the `(validator_index, previous_change_epoch)` pairs we've seen
+    /// valid post-quantum key registrations for (EIP-8450).
+    pub observed_pq_key_registrations: Mutex<ObservedPqKeyRegistrations>,
     /// Interfaces with the execution client.
     pub execution_layer: Option<ExecutionLayer<T::EthSpec>>,
     /// Client for the EIP-8025 proof engine, if one is configured.
@@ -6503,7 +6507,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                     "Attempting to produce gloas beacon block via non gloas code path".to_owned(),
                 ));
             }
-            BeaconState::Heze(_) => {
+            BeaconState::Heze(_) | BeaconState::Eip8450(_) => {
                 return Err(BlockProductionError::HezeNotImplemented(
                     "Attempting to produce heze beacon block via non heze code path".to_owned(),
                 ));

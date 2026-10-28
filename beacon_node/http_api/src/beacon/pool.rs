@@ -10,6 +10,9 @@ use crate::version::{
 use crate::{sync_committees, utils};
 use beacon_chain::observed_operations::ObservationOutcome;
 use beacon_chain::payload_attestation_verification::Error as PayloadAttestationError;
+use beacon_chain::pq_key_registration_verification::{
+    Error as PqKeyRegistrationError, PqKeyRegistrationOutcome,
+};
 use beacon_chain::{BeaconChain, BeaconChainTypes};
 use bytes::Bytes;
 use context_deserialize::ContextDeserialize;
@@ -20,7 +23,7 @@ use eth2::types::{
 };
 use lighthouse_network::PubsubMessage;
 use network::NetworkMessage;
-use operation_pool::ReceivedPreCapella;
+use operation_pool::{PqKeyRegistrationInsertOutcome, ReceivedPreCapella};
 use slot_clock::SlotClock;
 use ssz::{Decode, Encode};
 use std::collections::HashSet;
@@ -29,8 +32,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error, info, warn};
 use types::{
     Attestation, AttestationData, AttesterSlashing, ForkName, PayloadAttestationMessage,
-    ProposerSlashing, SignedBlsToExecutionChange, SignedVoluntaryExit, SingleAttestation,
-    SyncCommitteeMessage,
+    ProposerSlashing, SignedBlsToExecutionChange, SignedPqKeyRegistration, SignedVoluntaryExit,
+    SingleAttestation, SyncCommitteeMessage,
 };
 use warp::filters::BoxedFilter;
 use warp::http::response::Builder;
@@ -155,6 +158,126 @@ pub fn get_beacon_pool_bls_to_execution_changes<T: BeaconChainTypes>(
                 task_spawner.blocking_json_task(Priority::P1, move || {
                     let address_changes = chain.op_pool.get_all_bls_to_execution_changes();
                     Ok(GenericResponse::from(address_changes))
+                })
+            },
+        )
+        .boxed()
+}
+
+/// Failure message for a valid registration that the full op pool cannot hold.
+const POOL_FULL_MESSAGE: &str =
+    "pool full: the node holds the maximum number of PQ key registrations, retry later";
+
+/// POST beacon/pool/pq_key_registrations
+///
+/// Verifies each registration against the head state, then imports and publishes the new ones.
+/// Registrations are rejected while the head is prior to the EIP-8450 fork, and when the pool is
+/// full.
+pub fn post_beacon_pool_pq_key_registrations<T: BeaconChainTypes>(
+    network_tx_filter: &NetworkTxFilter<T>,
+    beacon_pool_path: &BeaconPoolPathFilter<T>,
+) -> ResponseFilter {
+    beacon_pool_path
+        .clone()
+        .and(warp::path("pq_key_registrations"))
+        .and(warp::path::end())
+        .and(warp_utils::json::json())
+        .and(network_tx_filter.clone())
+        .then(
+            |task_spawner: TaskSpawner<T::EthSpec>,
+             chain: Arc<BeaconChain<T>>,
+             registrations: Vec<SignedPqKeyRegistration>,
+             network_tx: UnboundedSender<NetworkMessage<T::EthSpec>>| {
+                task_spawner.blocking_json_task(Priority::P0, move || {
+                    let mut failures = vec![];
+
+                    for (index, registration) in registrations.into_iter().enumerate() {
+                        let validator_index = registration.message.validator_index;
+                        let previous_change_epoch = registration.message.previous_change_epoch;
+
+                        match chain.verify_pq_key_registration_for_http_api(registration) {
+                            Ok(PqKeyRegistrationOutcome::New(verified)) => {
+                                let message = verified.as_inner().clone();
+                                // Import to op pool before publishing, so that a registration
+                                // the full pool refused is not announced.
+                                let outcome = chain.import_pq_key_registration(*verified);
+                                if outcome == PqKeyRegistrationInsertOutcome::PoolFull {
+                                    warn!(
+                                        validator_index,
+                                        %previous_change_epoch,
+                                        "PQ key registration pool is full"
+                                    );
+                                    failures.push(Failure::new(index, POOL_FULL_MESSAGE.into()));
+                                    continue;
+                                }
+                                utils::publish_pubsub_message(
+                                    &network_tx,
+                                    PubsubMessage::PqKeyRegistration(Box::new(message)),
+                                )?;
+
+                                info!(
+                                    validator_index,
+                                    %previous_change_epoch,
+                                    ?outcome,
+                                    "Processed PQ key registration"
+                                );
+                            }
+                            Ok(PqKeyRegistrationOutcome::AlreadyKnown) => {
+                                debug!(
+                                    validator_index,
+                                    %previous_change_epoch,
+                                    "PQ key registration already known"
+                                );
+                            }
+                            Err(PqKeyRegistrationError::PoolFull) => {
+                                warn!(
+                                    validator_index,
+                                    %previous_change_epoch,
+                                    "PQ key registration pool is full"
+                                );
+                                failures.push(Failure::new(index, POOL_FULL_MESSAGE.into()));
+                            }
+                            Err(e) => {
+                                warn!(
+                                    validator_index,
+                                    reason = ?e,
+                                    source = "HTTP",
+                                    "Invalid PQ key registration"
+                                );
+                                failures.push(Failure::new(index, format!("invalid: {e:?}")));
+                            }
+                        }
+                    }
+
+                    if failures.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(warp_utils::reject::indexed_bad_request(
+                            "some PQ key registrations failed to verify or did not fit in the \
+                             pool"
+                                .into(),
+                            failures,
+                        ))
+                    }
+                })
+            },
+        )
+        .boxed()
+}
+
+/// GET beacon/pool/pq_key_registrations
+pub fn get_beacon_pool_pq_key_registrations<T: BeaconChainTypes>(
+    beacon_pool_path: &BeaconPoolPathFilter<T>,
+) -> ResponseFilter {
+    beacon_pool_path
+        .clone()
+        .and(warp::path("pq_key_registrations"))
+        .and(warp::path::end())
+        .then(
+            |task_spawner: TaskSpawner<T::EthSpec>, chain: Arc<BeaconChain<T>>| {
+                task_spawner.blocking_json_task(Priority::P1, move || {
+                    let registrations = chain.op_pool.get_all_pq_key_registrations();
+                    Ok(GenericResponse::from(registrations))
                 })
             },
         )

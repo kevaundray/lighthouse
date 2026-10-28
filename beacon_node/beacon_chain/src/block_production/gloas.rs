@@ -28,15 +28,16 @@ use tree_hash::TreeHash;
 use types::consts::gloas::BUILDER_INDEX_SELF_BUILD;
 use types::{
     Address, Attestation, AttestationGloas, AttesterSlashing, AttesterSlashingGloas, BeaconBlock,
-    BeaconBlockBodyGloas, BeaconBlockBodyHeze, BeaconBlockGloas, BeaconBlockHeze, BeaconState,
-    BeaconStateError, BlobsList, BuilderIndex, Deposit, Eth1Data, EthSpec, ExecutionBlockHash,
-    ExecutionPayloadBidGloas, ExecutionPayloadBidHeze, ExecutionPayloadEnvelope,
-    ExecutionRequestsGloas, FullPayload, Graffiti, Hash256, IndexedAttestation, KzgProofs,
-    PayloadAttestation, ProgressiveTransactions, ProposerSlashing, RelativeEpoch,
-    SignedBeaconBlock, SignedBlsToExecutionChange, SignedExecutionPayloadBid,
-    SignedExecutionPayloadBidGloas, SignedExecutionPayloadBidHeze, SignedExecutionPayloadEnvelope,
-    SignedExecutionPayloadEnvelopeSummary, SignedProposerPreferences, SignedVoluntaryExit, Slot,
-    SyncAggregate, Uint256, Withdrawal, Withdrawals,
+    BeaconBlockBodyEip8450, BeaconBlockBodyGloas, BeaconBlockBodyHeze, BeaconBlockEip8450,
+    BeaconBlockGloas, BeaconBlockHeze, BeaconState, BeaconStateError, BlobsList, BuilderIndex,
+    Deposit, Eth1Data, EthSpec, ExecutionBlockHash, ExecutionPayloadBidGloas,
+    ExecutionPayloadBidHeze, ExecutionPayloadEnvelope, ExecutionRequestsGloas, FullPayload,
+    Graffiti, Hash256, IndexedAttestation, KzgProofs, PayloadAttestation, ProgressiveTransactions,
+    ProposerSlashing, RelativeEpoch, SignedBeaconBlock, SignedBlsToExecutionChange,
+    SignedExecutionPayloadBid, SignedExecutionPayloadBidGloas, SignedExecutionPayloadBidHeze,
+    SignedExecutionPayloadEnvelope, SignedExecutionPayloadEnvelopeSummary, SignedPqKeyRegistration,
+    SignedProposerPreferences, SignedVoluntaryExit, Slot, SyncAggregate, Uint256, Withdrawal,
+    Withdrawals,
 };
 
 use builder_client::BidRequestContext;
@@ -101,6 +102,7 @@ pub struct PartialBeaconBlock<E: EthSpec> {
     voluntary_exits: Vec<SignedVoluntaryExit>,
     sync_aggregate: SyncAggregate<E>,
     bls_to_execution_changes: Vec<SignedBlsToExecutionChange>,
+    pq_key_registrations: Vec<SignedPqKeyRegistration>,
 }
 
 /// The result of a local payload build, used to decide whether to include a builder bid
@@ -614,6 +616,33 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             .collect::<Result<Vec<_>, ssz_types::Error>>()
             .map_err(BlockProductionError::SszTypesError)?;
 
+        // [New in EIP-8450] Block processing applies registrations after every other operation,
+        // so skip the validators that this block's earlier operations may exit.
+        let pq_key_registrations = if state.fork_name_unchecked().eip8450_enabled() {
+            let _guard = debug_span!("get_pq_key_registrations").entered();
+            // Key uniqueness checks read the cache.
+            state.update_pq_pubkey_cache()?;
+            let (exiting_indices, exiting_pubkeys) = validators_exiting_before_pq_registrations(
+                &proposer_slashings,
+                &attester_slashings,
+                &voluntary_exits,
+                parent_execution_requests,
+            );
+            self.op_pool.get_pq_key_registrations(
+                &state,
+                |index| {
+                    exiting_indices.contains(&index)
+                        || state
+                            .validators()
+                            .get(index as usize)
+                            .is_none_or(|validator| exiting_pubkeys.contains(&validator.pubkey))
+                },
+                &self.spec,
+            )
+        } else {
+            vec![]
+        };
+
         let attestations = attestations
             .into_iter()
             .filter_map(|a| match a {
@@ -667,6 +696,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 sync_aggregate,
                 payload_attestations,
                 bls_to_execution_changes,
+                pq_key_registrations,
             },
             state,
         ))
@@ -721,6 +751,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             sync_aggregate,
             payload_attestations,
             bls_to_execution_changes,
+            pq_key_registrations,
         } = partial_beacon_block;
 
         let beacon_block = match &state {
@@ -827,6 +858,59 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                         signed_execution_payload_bid,
                         payload_attestations: ProgressiveVariableList::try_from_iter(
                             payload_attestations,
+                        )
+                        .map_err(BlockProductionError::SszTypesError)?,
+                        _phantom: PhantomData::<FullPayload<T::EthSpec>>,
+                    },
+                })
+            }
+            BeaconState::Eip8450(_) => {
+                let SignedExecutionPayloadBid::Heze(signed_execution_payload_bid) =
+                    signed_execution_payload_bid
+                else {
+                    return Err(BlockProductionError::InvalidBlockVariant(
+                        "Cannot construct an Eip8450 block with a non-Heze execution payload bid"
+                            .to_string(),
+                    ));
+                };
+
+                BeaconBlock::Eip8450(BeaconBlockEip8450 {
+                    slot,
+                    proposer_index,
+                    parent_root,
+                    state_root: Hash256::ZERO,
+                    body: BeaconBlockBodyEip8450 {
+                        randao_reveal,
+                        eth1_data,
+                        graffiti,
+                        // The operation list lengths are bounded by the op pool packing limits above.
+                        proposer_slashings: ProgressiveVariableList::try_from_iter(
+                            proposer_slashings,
+                        )
+                        .map_err(BlockProductionError::SszTypesError)?,
+                        attester_slashings: ProgressiveVariableList::try_from_iter(
+                            attester_slashings,
+                        )
+                        .map_err(BlockProductionError::SszTypesError)?,
+                        attestations: ProgressiveVariableList::try_from_iter(attestations)
+                            .map_err(BlockProductionError::SszTypesError)?,
+                        deposits: ProgressiveVariableList::try_from_iter(deposits)
+                            .map_err(BlockProductionError::SszTypesError)?,
+                        voluntary_exits: ProgressiveVariableList::try_from_iter(voluntary_exits)
+                            .map_err(BlockProductionError::SszTypesError)?,
+                        sync_aggregate,
+                        bls_to_execution_changes: ProgressiveVariableList::try_from_iter(
+                            bls_to_execution_changes,
+                        )
+                        .map_err(BlockProductionError::SszTypesError)?,
+                        parent_execution_requests,
+                        signed_execution_payload_bid,
+                        payload_attestations: ProgressiveVariableList::try_from_iter(
+                            payload_attestations,
+                        )
+                        .map_err(BlockProductionError::SszTypesError)?,
+                        pq_key_registrations: ProgressiveVariableList::try_from_iter(
+                            pq_key_registrations,
                         )
                         .map_err(BlockProductionError::SszTypesError)?,
                         _phantom: PhantomData::<FullPayload<T::EthSpec>>,
@@ -1057,7 +1141,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                     signature,
                 })
             }
-            BeaconState::Heze(_) => {
+            BeaconState::Heze(_) | BeaconState::Eip8450(_) => {
                 let bid = ExecutionPayloadBidHeze::<T::EthSpec> {
                     parent_block_hash: executed_ancestor_hash,
                     parent_block_root: parent_root,
@@ -1602,6 +1686,64 @@ fn filter_voluntary_exits_for_parent_execution_requests<E: EthSpec>(
                 .unwrap_or(false)
         });
     }
+}
+
+/// Validators whose exit an operation applied before the block's `pq_key_registrations` may
+/// initiate, as `(indices, pubkeys)`.
+///
+/// Block processing applies the parent's execution requests and then the block's slashings and
+/// voluntary exits before the registrations, and a registration for a validator that initiated an
+/// exit is invalid. Withdrawal and consolidation requests identify validators by pubkey.
+///
+/// Like `filter_voluntary_exits_for_parent_execution_requests` this is conservative: every
+/// withdrawal request and every consolidation source counts, even if processing ignores it.
+fn validators_exiting_before_pq_registrations<E: EthSpec>(
+    proposer_slashings: &[ProposerSlashing],
+    attester_slashings: &[AttesterSlashingGloas<E>],
+    voluntary_exits: &[SignedVoluntaryExit],
+    parent_execution_requests: &ExecutionRequestsGloas<E>,
+) -> (HashSet<u64>, HashSet<PublicKeyBytes>) {
+    let mut indices = HashSet::new();
+    indices.extend(
+        proposer_slashings
+            .iter()
+            .map(|slashing| slashing.signed_header_1.message.proposer_index),
+    );
+    for slashing in attester_slashings {
+        let attesters_2 = slashing
+            .attestation_2
+            .attesting_indices
+            .iter()
+            .collect::<HashSet<_>>();
+        indices.extend(
+            slashing
+                .attestation_1
+                .attesting_indices
+                .iter()
+                .filter(|index| attesters_2.contains(index)),
+        );
+    }
+    indices.extend(
+        voluntary_exits
+            .iter()
+            .map(|exit| exit.message.validator_index),
+    );
+
+    let mut pubkeys = HashSet::new();
+    pubkeys.extend(
+        parent_execution_requests
+            .withdrawals
+            .iter()
+            .map(|request| request.validator_pubkey),
+    );
+    pubkeys.extend(
+        parent_execution_requests
+            .consolidations
+            .iter()
+            .filter(|request| request.source_pubkey != request.target_pubkey)
+            .map(|request| request.source_pubkey),
+    );
+    (indices, pubkeys)
 }
 
 #[cfg(test)]

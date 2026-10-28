@@ -4,12 +4,13 @@ use super::signature_sets::{Error as SignatureSetError, *};
 use crate::per_block_processing::errors::{
     AttestationInvalid, BlockOperationError, PayloadAttestationInvalid,
 };
+use crate::per_block_processing::is_valid_pq_possession_proof;
 use crate::{ConsensusContext, ContextError};
 use bls::{PublicKey, PublicKeyBytes, SignatureSet, verify_signature_sets};
 use std::borrow::Cow;
 use types::{
     AbstractExecPayload, BeaconState, BeaconStateError, ChainSpec, EthSpec, Hash256,
-    SignedBeaconBlock,
+    SignedBeaconBlock, SignedPqKeyRegistration,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -18,6 +19,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     /// All public keys were found but signature verification failed. The block is invalid.
     SignatureInvalid,
+    /// A leanXMSS proof of possession of a post-quantum key registration (EIP-8450) is invalid.
+    /// The block is invalid.
+    PqPossessionProofInvalid,
     /// An attestation in the block was invalid. The block is invalid.
     AttestationValidationError(BlockOperationError<AttestationInvalid>),
     /// A payload attestation in the block was invalid. The block is invalid.
@@ -91,6 +95,9 @@ where
     state: &'a BeaconState<E>,
     spec: &'a ChainSpec,
     sets: ParallelSignatureSets<'a>,
+    /// Post-quantum key registrations whose leanXMSS proofs of possession must be verified
+    /// alongside the BLS signatures (EIP-8450).
+    pq_key_registrations: Vec<&'a SignedPqKeyRegistration>,
 }
 
 #[derive(Default)]
@@ -124,6 +131,7 @@ where
             state,
             spec,
             sets: ParallelSignatureSets::default(),
+            pq_key_registrations: vec![],
         }
     }
 
@@ -182,6 +190,7 @@ where
         self.include_bls_to_execution_changes(block)?;
         self.include_execution_payload_bid(block)?;
         self.include_payload_attestations(block, ctxt)?;
+        self.include_pq_key_registrations(block)?;
 
         Ok(())
     }
@@ -423,11 +432,48 @@ where
         Ok(())
     }
 
+    /// Include the BLS authorizations and the leanXMSS proofs of possession of the block's
+    /// post-quantum key registrations (EIP-8450).
+    pub fn include_pq_key_registrations<Payload: AbstractExecPayload<E>>(
+        &mut self,
+        block: &'a SignedBeaconBlock<E, Payload>,
+    ) -> Result<()> {
+        if let Ok(pq_key_registrations) = block.message().body().pq_key_registrations() {
+            for signed_registration in pq_key_registrations.iter() {
+                self.sets.push(pq_key_registration_signature_set(
+                    self.state,
+                    self.get_pubkey.clone(),
+                    signed_registration,
+                    self.spec,
+                )?);
+                self.pq_key_registrations.push(signed_registration);
+            }
+        }
+        Ok(())
+    }
+
     /// Verify all the signatures that have been included in `self`, returning `true` if and only if
     /// all the signatures are valid.
     ///
+    /// This includes the leanXMSS proofs of possession of post-quantum key registrations, which
+    /// are verified individually.
+    ///
     /// See `ParallelSignatureSets::verify` for more info.
     pub fn verify(self) -> Result<()> {
+        let pq_proofs_valid = self.pq_key_registrations.iter().all(|signed_registration| {
+            let registration = &signed_registration.message;
+            is_valid_pq_possession_proof(
+                self.state,
+                registration.validator_index,
+                &registration.public_keys.xmss_public_key,
+                &signed_registration.possession,
+                self.spec,
+            )
+        });
+        if !pq_proofs_valid {
+            return Err(Error::PqPossessionProofInvalid);
+        }
+
         if self.sets.verify() {
             Ok(())
         } else {

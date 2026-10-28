@@ -5,15 +5,20 @@ mod bls_to_execution_changes;
 mod max_cover;
 mod metrics;
 mod persistence;
+mod pq_key_registrations;
 mod reward_cache;
 mod sync_aggregate_id;
 
 pub use crate::bls_to_execution_changes::ReceivedPreCapella;
+pub use crate::pq_key_registrations::{
+    PqKeyRegistrationInsertOutcome, max_pool_len as max_pq_key_registrations_in_pool,
+};
 pub use attestation::{AttMaxCover, PROPOSER_REWARD_DENOMINATOR, earliest_attestation_validators};
 pub use attestation_storage::{CompactAttestationRef, SplitAttestation};
 pub use max_cover::MaxCover;
 pub use persistence::{
     PersistedOperationPool, PersistedOperationPoolV15, PersistedOperationPoolV20,
+    PersistedOperationPoolV33,
 };
 pub use reward_cache::RewardCache;
 use state_processing::epoch_cache::is_epoch_cache_initialized;
@@ -21,6 +26,7 @@ use types::EpochCacheError;
 
 use crate::attestation_storage::{AttestationMap, CheckpointKey};
 use crate::bls_to_execution_changes::BlsToExecutionChanges;
+use crate::pq_key_registrations::PqKeyRegistrations;
 use crate::sync_aggregate_id::SyncAggregateId;
 use attester_slashing::AttesterSlashingMaxCover;
 use bls::AggregateSignature;
@@ -42,8 +48,8 @@ use types::{
     AbstractExecPayload, Attestation, AttestationData, AttesterSlashing, BeaconState,
     BeaconStateError, ChainSpec, Epoch, EthSpec, Hash256, PTC, PayloadAttestation,
     PayloadAttestationData, PayloadAttestationMessage, ProposerSlashing, SignedBeaconBlock,
-    SignedBlsToExecutionChange, SignedVoluntaryExit, Slot, SyncAggregate, SyncAggregateError,
-    SyncCommitteeContribution, Validator,
+    SignedBlsToExecutionChange, SignedPqKeyRegistration, SignedVoluntaryExit, Slot, SyncAggregate,
+    SyncAggregateError, SyncCommitteeContribution, Validator,
 };
 
 type SyncContributions<E> = RwLock<HashMap<SyncAggregateId, Vec<SyncCommitteeContribution<E>>>>;
@@ -62,6 +68,8 @@ pub struct OperationPool<E: EthSpec + Default> {
     voluntary_exits: RwLock<HashMap<u64, SigVerifiedOp<SignedVoluntaryExit, E>>>,
     /// Map from credential changing validator to their position in the queue.
     bls_to_execution_changes: RwLock<BlsToExecutionChanges<E>>,
+    /// Map from registering validator to their post-quantum key registration (EIP-8450).
+    pq_key_registrations: RwLock<PqKeyRegistrations>,
     /// Map from payload attestation data to the aggregate for that data.
     payload_attestations: RwLock<HashMap<PayloadAttestationData, PayloadAttestation<E>>>,
     /// Reward cache for accelerating attestation packing.
@@ -735,7 +743,82 @@ impl<E: EthSpec> OperationPool<E> {
             .prune(head_block, head_state, spec)
     }
 
+    /// Returns `true` if `registration` fits in the pool: the pool holds fewer than
+    /// `max_pq_key_registrations_in_pool` registrations, or one for the same validator that
+    /// `registration` would replace.
+    pub fn pq_key_registration_has_room(&self, registration: &SignedPqKeyRegistration) -> bool {
+        self.pq_key_registrations
+            .read()
+            .has_room_for(registration, max_pq_key_registrations_in_pool::<E>())
+    }
+
+    /// Insert a post-quantum key registration into the pool.
+    ///
+    /// The registration MUST have been fully verified, including its BLS signature and leanXMSS
+    /// proof of possession. It replaces the validator's existing registration only if it names a
+    /// later `previous_change_epoch`, and is refused if the pool already holds
+    /// `max_pq_key_registrations_in_pool` registrations.
+    pub fn insert_pq_key_registration(
+        &self,
+        registration: SignedPqKeyRegistration,
+    ) -> PqKeyRegistrationInsertOutcome {
+        self.pq_key_registrations
+            .write()
+            .insert(registration, max_pq_key_registrations_in_pool::<E>())
+    }
+
+    /// Get a list of post-quantum key registrations for inclusion in a block built on `state`.
+    ///
+    /// `exits_in_block` must return `true` for every validator whose exit may be initiated by an
+    /// operation that block processing applies before the registrations. The selected list is
+    /// valid when applied in order after those operations. See
+    /// `PqKeyRegistrations::select_for_block`.
+    pub fn get_pq_key_registrations(
+        &self,
+        state: &BeaconState<E>,
+        exits_in_block: impl Fn(u64) -> bool,
+        spec: &ChainSpec,
+    ) -> Vec<SignedPqKeyRegistration> {
+        self.pq_key_registrations.read().select_for_block(
+            state,
+            exits_in_block,
+            E::MaxPqKeyRegistrations::to_usize(),
+            spec,
+        )
+    }
+
+    /// The pooled post-quantum key registration of `validator_index`, if any.
+    pub fn get_pq_key_registration(&self, validator_index: u64) -> Option<SignedPqKeyRegistration> {
+        self.pq_key_registrations
+            .read()
+            .get(validator_index)
+            .cloned()
+    }
+
+    /// Remove `registration` from the pool if the pool holds exactly it. Returns `true` if it was
+    /// removed.
+    pub fn remove_pq_key_registration(&self, registration: &SignedPqKeyRegistration) -> bool {
+        self.pq_key_registrations.write().remove(registration)
+    }
+
+    /// Prune post-quantum key registrations that can no longer be included in a block descending
+    /// from `finalized_state`, returning the `(validator_index, previous_change_epoch)` pairs of
+    /// the pruned registrations. See `PqKeyRegistrations::prune`.
+    pub fn prune_pq_key_registrations(
+        &self,
+        finalized_state: &BeaconState<E>,
+        spec: &ChainSpec,
+    ) -> Vec<(u64, Epoch)> {
+        self.pq_key_registrations
+            .write()
+            .prune(finalized_state, spec)
+    }
+
     /// Prune all types of transactions given the latest head state and head fork.
+    ///
+    /// Returns the `(validator_index, previous_change_epoch)` pairs of the pruned post-quantum key
+    /// registrations, which the caller should forget in its gossip duplicate filter.
+    #[must_use]
     pub fn prune_all<Payload: AbstractExecPayload<E>>(
         &self,
         head_block: &SignedBeaconBlock<E, Payload>,
@@ -743,7 +826,7 @@ impl<E: EthSpec> OperationPool<E> {
         finalized_state: &BeaconState<E>,
         current_epoch: Epoch,
         spec: &ChainSpec,
-    ) {
+    ) -> Vec<(u64, Epoch)> {
         self.prune_attestations(current_epoch);
         self.prune_sync_contributions(head_state.slot());
         self.prune_payload_attestations(head_state.slot());
@@ -751,6 +834,7 @@ impl<E: EthSpec> OperationPool<E> {
         self.prune_attester_slashings(finalized_state);
         self.prune_voluntary_exits(finalized_state, spec);
         self.prune_bls_to_execution_changes(head_block, head_state, spec);
+        self.prune_pq_key_registrations(finalized_state, spec)
     }
 
     /// Total number of voluntary exits in the pool.
@@ -827,6 +911,17 @@ impl<E: EthSpec> OperationPool<E> {
             .map(|address_change| address_change.as_inner().clone())
             .collect()
     }
+
+    /// Returns all known `SignedPqKeyRegistration` objects, oldest first.
+    ///
+    /// This method may return objects that are invalid for block inclusion.
+    pub fn get_all_pq_key_registrations(&self) -> Vec<SignedPqKeyRegistration> {
+        self.pq_key_registrations
+            .read()
+            .iter_fifo()
+            .cloned()
+            .collect()
+    }
 }
 
 /// Filter up to a maximum number of operations out of an iterator.
@@ -884,6 +979,7 @@ impl<E: EthSpec + Default> PartialEq for OperationPool<E> {
             && *self.proposer_slashings.read() == *other.proposer_slashings.read()
             && *self.voluntary_exits.read() == *other.voluntary_exits.read()
             && *self.bls_to_execution_changes.read() == *other.bls_to_execution_changes.read()
+            && *self.pq_key_registrations.read() == *other.pq_key_registrations.read()
     }
 }
 

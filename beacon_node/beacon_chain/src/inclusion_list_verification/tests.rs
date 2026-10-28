@@ -36,6 +36,11 @@ impl TestContext {
     fn new_with_heze_fork_epoch(heze_fork_epoch: Epoch) -> Self {
         let mut spec = test_spec::<E>();
         spec.heze_fork_epoch = Some(heze_fork_epoch);
+        // Eip8450 activates after Heze: two upgrades in one epoch would leave the state's
+        // `previous_version` at Heze's, which the attestations of the epoch before never signed.
+        spec.eip8450_fork_epoch = spec
+            .eip8450_fork_epoch
+            .map(|epoch| epoch.max(heze_fork_epoch + 1));
         let spec = Arc::new(spec);
         let slot_clock = TestingSlotClock::new(
             Slot::new(0),

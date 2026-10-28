@@ -14,6 +14,7 @@ use eth2::types::{
 };
 use ssz::Encode;
 use ssz_types::FixedVector;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use types::{
     AttestationShufflingId, BeaconStateError, CommitteeCache, EthSpec, RelativeEpoch,
@@ -1053,6 +1054,73 @@ pub fn get_beacon_state_validator_balances<T: BeaconChainTypes>(
                             }),
                         _ => Ok(warp::reply::json(&result).into_response()),
                     }
+                })
+            },
+        )
+        .boxed()
+}
+
+// GET beacon/states/{state_id}/pq_public_keys?id
+pub fn get_beacon_state_pq_public_keys<T: BeaconChainTypes>(
+    beacon_states_path: BeaconStatesPath<T>,
+) -> ResponseFilter {
+    beacon_states_path
+        .clone()
+        .and(warp::path("pq_public_keys"))
+        .and(warp::path::end())
+        .and(multi_key_query::<eth2::types::PqPublicKeysQuery>())
+        .then(
+            |state_id: StateId,
+             task_spawner: TaskSpawner<T::EthSpec>,
+             chain: Arc<BeaconChain<T>>,
+             query_res: Result<eth2::types::PqPublicKeysQuery, warp::Rejection>| {
+                task_spawner.blocking_json_task(Priority::P1, move || {
+                    let query = query_res?;
+                    let (data, execution_optimistic, finalized) = state_id
+                        .map_state_and_execution_optimistic_and_finalized(
+                            &chain,
+                            |state, execution_optimistic, finalized| {
+                                let (Ok(public_keys), Ok(change_epochs)) =
+                                    (state.pq_public_keys(), state.pq_key_change_epochs())
+                                else {
+                                    return Err(warp_utils::reject::custom_bad_request(
+                                        "the state is prior to the EIP-8450 fork and has no \
+                                         post-quantum key registry"
+                                            .to_string(),
+                                    ));
+                                };
+                                let entry = |index: u64| {
+                                    let keys = public_keys.get(index as usize)?;
+                                    let change_epoch = change_epochs.get(index as usize)?;
+                                    Some(eth2::types::PqPublicKeysData {
+                                        index,
+                                        version: keys.version,
+                                        xmss_public_key: keys.xmss_public_key.clone(),
+                                        vrf_root: keys.vrf_root.clone(),
+                                        change_epoch: *change_epoch,
+                                    })
+                                };
+                                let data = match &query.id {
+                                    Some(ids) => ids
+                                        .iter()
+                                        .copied()
+                                        .collect::<BTreeSet<_>>()
+                                        .into_iter()
+                                        .filter_map(entry)
+                                        .collect::<Vec<_>>(),
+                                    None => {
+                                        (0..public_keys.len() as u64).filter_map(entry).collect()
+                                    }
+                                };
+                                Ok((data, execution_optimistic, finalized))
+                            },
+                        )?;
+
+                    Ok(eth2::types::ExecutionOptimisticFinalizedResponse {
+                        data,
+                        execution_optimistic: Some(execution_optimistic),
+                        finalized: Some(finalized),
+                    })
                 })
             },
         )

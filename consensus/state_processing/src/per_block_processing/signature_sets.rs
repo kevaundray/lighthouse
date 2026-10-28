@@ -13,8 +13,9 @@ use types::{
     IndexedAttestation, IndexedAttestationRef, IndexedPayloadAttestation, ProposerSlashing,
     SignedAggregateAndProof, SignedBeaconBlock, SignedBeaconBlockHeader,
     SignedBlsToExecutionChange, SignedContributionAndProof, SignedExecutionPayloadBidRef,
-    SignedInclusionList, SignedProposerPreferences, SignedRoot, SignedVoluntaryExit, SigningData,
-    Slot, SyncAggregate, SyncAggregatorSelectionData, consts::gloas::BUILDER_INDEX_SELF_BUILD,
+    SignedInclusionList, SignedPqKeyRegistration, SignedProposerPreferences, SignedRoot,
+    SignedVoluntaryExit, SigningData, Slot, SyncAggregate, SyncAggregatorSelectionData,
+    consts::gloas::BUILDER_INDEX_SELF_BUILD,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -202,6 +203,40 @@ pub fn bls_execution_change_signature_set<'a, E: EthSpec>(
     Ok(SignatureSet::single_pubkey(
         &signed_address_change.signature,
         signing_key,
+        message,
+    ))
+}
+
+/// Returns a signature set that is valid if the `SignedPqKeyRegistration` was authorized by the
+/// BLS signing key of the validator it names (EIP-8450).
+///
+/// The domain uses the genesis fork version, so a registration stays valid across forks.
+pub fn pq_key_registration_signature_set<'a, E, F>(
+    state: &'a BeaconState<E>,
+    get_pubkey: F,
+    signed_registration: &'a SignedPqKeyRegistration,
+    spec: &'a ChainSpec,
+) -> Result<SignatureSet<'a>>
+where
+    E: EthSpec,
+    F: Fn(usize) -> Option<Cow<'a, PublicKey>>,
+{
+    let registration = &signed_registration.message;
+    let validator_index = registration.validator_index;
+
+    let pubkey =
+        get_pubkey(validator_index as usize).ok_or(Error::ValidatorUnknown(validator_index))?;
+
+    let domain = spec.compute_domain(
+        Domain::PqKeyRegistration,
+        spec.genesis_fork_version,
+        state.genesis_validators_root(),
+    );
+    let message = registration.signing_root(domain);
+
+    Ok(SignatureSet::single_pubkey(
+        &signed_registration.signature,
+        pubkey,
         message,
     ))
 }

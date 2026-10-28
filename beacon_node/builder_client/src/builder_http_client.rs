@@ -214,11 +214,9 @@ impl BuilderHttpClient {
                 let versioned: ForkVersionedResponse<SignedExecutionPayloadBid<E>> =
                     serde_json::from_slice(&response_bytes).map_err(Error::InvalidJson)?;
                 let received = versioned.data.message().fork_name_unchecked();
-                if received != fork_name {
-                    return Err(Error::InvalidFork {
-                        expected: fork_name,
-                        received,
-                    });
+                let expected = fork_name.execution_types_fork();
+                if received != expected {
+                    return Err(Error::InvalidFork { expected, received });
                 }
                 Ok(Some(versioned.data))
             }
@@ -342,7 +340,9 @@ mod tests {
     use super::*;
     use arbitrary::Arbitrary;
     use eth2::types::beacon_response::EmptyMetadata;
-    use eth2::types::{ForkName, SignedExecutionPayloadBidGloas, Spec};
+    use eth2::types::{
+        ForkName, SignedExecutionPayloadBidGloas, SignedExecutionPayloadBidHeze, Spec,
+    };
     use mockito::{Matcher, Server, ServerGuard};
     use std::str::FromStr;
 
@@ -365,16 +365,27 @@ mod tests {
         SignedExecutionPayloadBid::Gloas(SignedExecutionPayloadBidGloas::empty())
     }
 
-    fn empty_bid_response() -> ForkVersionedResponse<SignedExecutionPayloadBid<E>> {
+    fn bid_response(
+        bid: SignedExecutionPayloadBid<E>,
+    ) -> ForkVersionedResponse<SignedExecutionPayloadBid<E>> {
         ForkVersionedResponse {
-            version: ForkName::Gloas,
+            version: bid.message().fork_name_unchecked(),
             metadata: EmptyMetadata {},
-            data: empty_bid(),
+            data: bid,
         }
     }
 
     fn mock_bid(server: &mut ServerGuard, content_type: ContentType) {
-        let body = empty_bid_response();
+        mock_bid_with(server, content_type, empty_bid())
+    }
+
+    fn mock_bid_with(
+        server: &mut ServerGuard,
+        content_type: ContentType,
+        bid: SignedExecutionPayloadBid<E>,
+    ) {
+        let body = bid_response(bid);
+        let version = body.version.to_string();
         let mut mock = server.mock(
             "POST",
             Matcher::Regex(r"^/eth/v1/builder/execution_payload_bid/.+$".to_string()),
@@ -382,11 +393,11 @@ mod tests {
         mock = match content_type {
             ContentType::Json => mock
                 .with_header(CONTENT_TYPE_HEADER, JSON_CONTENT_TYPE_HEADER)
-                .with_header(CONSENSUS_VERSION_HEADER, "gloas")
+                .with_header(CONSENSUS_VERSION_HEADER, &version)
                 .with_body(serde_json::to_string(&body).unwrap()),
             ContentType::Ssz => mock
                 .with_header(CONTENT_TYPE_HEADER, SSZ_CONTENT_TYPE_HEADER)
-                .with_header(CONSENSUS_VERSION_HEADER, "gloas")
+                .with_header(CONSENSUS_VERSION_HEADER, &version)
                 .with_body(body.data.as_ssz_bytes()),
         };
         mock.with_status(200).create();
@@ -574,5 +585,27 @@ mod tests {
                 received: ForkName::Gloas,
             })
         ));
+    }
+
+    /// Eip8450 reuses the Heze bid, so a JSON Heze bid answers an Eip8450 bid request.
+    #[tokio::test]
+    async fn get_execution_payload_bid_json_after_eip8450_is_heze_bid() {
+        let heze_bid = SignedExecutionPayloadBid::Heze(SignedExecutionPayloadBidHeze::empty());
+        let mut server = Server::new_async().await;
+        mock_bid_with(&mut server, ContentType::Json, heze_bid.clone());
+        let bid = client_for()
+            .get_execution_payload_bid::<E>(
+                &builder_url(&server),
+                Slot::new(1),
+                ExecutionBlockHash::repeat_byte(1),
+                Hash256::repeat_byte(2),
+                &PublicKeyBytes::empty(),
+                &signed_request_auth(),
+                ForkName::Eip8450,
+            )
+            .await
+            .expect("bid request should succeed")
+            .expect("should have a bid");
+        assert_eq!(bid, heze_bid);
     }
 }

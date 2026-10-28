@@ -38,6 +38,8 @@ pub struct GossipCache {
     sync_committee_message: Option<Duration>,
     /// Timeout for signed BLS to execution changes.
     bls_to_execution_change: Option<Duration>,
+    /// Timeout for post-quantum key registrations.
+    pq_key_registration: Option<Duration>,
     /// Timeout for signed execution payload envelope.
     execution_payload: Option<Duration>,
     /// Timeout for execution payload bid.
@@ -77,6 +79,8 @@ pub struct GossipCacheBuilder {
     sync_committee_message: Option<Duration>,
     /// Timeout for signed BLS to execution changes.
     bls_to_execution_change: Option<Duration>,
+    /// Timeout for post-quantum key registrations.
+    pq_key_registration: Option<Duration>,
     /// Timeout for signed execution payload envelope.
     execution_payload: Option<Duration>,
     /// Timeout for execution payload bid.
@@ -155,6 +159,12 @@ impl GossipCacheBuilder {
         self
     }
 
+    /// Timeout for post-quantum key registrations.
+    pub fn pq_key_registration_timeout(mut self, timeout: Duration) -> Self {
+        self.pq_key_registration = Some(timeout);
+        self
+    }
+
     /// Timeout for signed execution payload envelope.
     pub fn execution_payload_timeout(mut self, timeout: Duration) -> Self {
         self.execution_payload = Some(timeout);
@@ -210,6 +220,7 @@ impl GossipCacheBuilder {
             signed_contribution_and_proof,
             sync_committee_message,
             bls_to_execution_change,
+            pq_key_registration,
             execution_payload,
             execution_payload_bid,
             payload_attestation,
@@ -231,6 +242,7 @@ impl GossipCacheBuilder {
             signed_contribution_and_proof: signed_contribution_and_proof.or(default_timeout),
             sync_committee_message: sync_committee_message.or(default_timeout),
             bls_to_execution_change: bls_to_execution_change.or(default_timeout),
+            pq_key_registration: pq_key_registration.or(default_timeout),
             execution_payload: execution_payload.or(default_timeout),
             execution_payload_bid: execution_payload_bid.or(default_timeout),
             payload_attestation: payload_attestation.or(default_timeout),
@@ -262,6 +274,7 @@ impl GossipCache {
             GossipKind::SignedContributionAndProof => self.signed_contribution_and_proof,
             GossipKind::SyncCommitteeMessage(_) => self.sync_committee_message,
             GossipKind::BlsToExecutionChange => self.bls_to_execution_change,
+            GossipKind::PqKeyRegistration => self.pq_key_registration,
             GossipKind::ExecutionPayload => self.execution_payload,
             GossipKind::ExecutionPayloadBid => self.execution_payload_bid,
             GossipKind::PayloadAttestation => self.payload_attestation,

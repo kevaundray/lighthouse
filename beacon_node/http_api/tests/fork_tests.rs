@@ -2,18 +2,25 @@
 use beacon_chain::custody_context::NodeCustodyType;
 use beacon_chain::{
     StateSkipConfig,
-    test_utils::{DEFAULT_ETH1_BLOCK_HASH, HARNESS_GENESIS_TIME, RelativeSyncCommittee},
+    test_utils::{
+        BeaconChainHarness, DEFAULT_ETH1_BLOCK_HASH, EphemeralHarnessType, HARNESS_GENESIS_TIME,
+        RelativeSyncCommittee,
+    },
 };
 use bls::PublicKey;
-use eth2::types::{IndexedErrorMessage, PtcDuty, StateId, SyncSubcommittee};
+use eth2::types::{IndexedErrorMessage, PqPublicKeysData, PtcDuty, StateId, SyncSubcommittee};
 use execution_layer::test_utils::generate_genesis_header;
 use fixed_bytes::FixedBytesExtended;
 use genesis::{InteropGenesisBuilder, bls_withdrawal_credentials};
 use http_api::test_utils::*;
+use state_processing::per_block_processing::get_pq_possession_signing_root;
 use state_processing::state_advance::complete_state_advance;
 use std::collections::HashSet;
+use std::sync::LazyLock;
 use types::{
-    Address, BeaconState, ChainSpec, Epoch, EthSpec, ForkName, Hash256, Slot, Spec,
+    Address, BeaconState, ChainSpec, Epoch, EthSpec, ForkName, Hash256, PQ_KEYS_VERSION_1,
+    PQ_KEYS_VERSION_UNSET, PQ_POSSESSION_XMSS_INDEX, PqKeyRegistration, PqPublicKeys,
+    SignedPqKeyRegistration, Slot, Spec, VrfRoot, XmssPublicKey, XmssSignature,
     test_utils::{generate_deterministic_keypair, generate_deterministic_keypairs},
 };
 
@@ -797,4 +804,191 @@ async fn bls_to_execution_changes_update_all_around_capella_fork() {
     for validator in head_state.validators() {
         assert!(validator.has_eth1_withdrawal_credential(&spec));
     }
+}
+
+fn eip8450_spec(eip8450_fork_epoch: Epoch) -> ChainSpec {
+    let mut spec = ForkName::Heze.make_genesis_spec(E::default_spec());
+    spec.eip8450_fork_epoch = Some(eip8450_fork_epoch);
+    spec
+}
+
+/// leanXMSS keys from fixed seeds. Key generation and signing are only fast in optimized builds.
+static XMSS_KEYS: LazyLock<Vec<lean_pq::xmss::SecretKey>> = LazyLock::new(|| {
+    (1..=2_u8)
+        .map(|seed| lean_pq::xmss::SecretKey::from_seed([seed; 32]))
+        .collect()
+});
+
+/// A registration of `xmss_key` for `validator_index`, with a valid proof of possession and BLS
+/// authorization.
+fn pq_key_registration(
+    harness: &BeaconChainHarness<EphemeralHarnessType<E>>,
+    validator_index: u64,
+    xmss_key: &lean_pq::xmss::SecretKey,
+    previous_change_epoch: Epoch,
+) -> SignedPqKeyRegistration {
+    let state = harness.get_current_state();
+    let xmss_public_key =
+        XmssPublicKey::try_from(xmss_key.public_key().to_bytes().to_vec()).unwrap();
+    let possession_root =
+        get_pq_possession_signing_root(&state, validator_index, &xmss_public_key, &harness.spec);
+    let possession = xmss_key
+        .sign(&possession_root.0, PQ_POSSESSION_XMSS_INDEX)
+        .unwrap();
+
+    PqKeyRegistration {
+        validator_index,
+        public_keys: PqPublicKeys {
+            version: PQ_KEYS_VERSION_1,
+            xmss_public_key,
+            vrf_root: VrfRoot::try_from(vec![validator_index as u8; 32]).unwrap(),
+        },
+        previous_change_epoch,
+    }
+    .sign(
+        XmssSignature::try_from(possession.to_bytes().to_vec()).unwrap(),
+        &harness.validator_keypairs[validator_index as usize].sk,
+        state.genesis_validators_root(),
+        &harness.spec,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pq_key_registrations_around_eip8450_fork() {
+    let validator_count = E::sync_committee_size();
+    let fork_epoch = Epoch::new(1);
+    let spec = eip8450_spec(fork_epoch);
+    let tester = InteractiveTester::<E>::new(Some(spec.clone()), validator_count).await;
+    let harness = &tester.harness;
+    let client = &tester.client;
+
+    let registration = pq_key_registration(harness, 0, &XMSS_KEYS[0], Epoch::new(0));
+    // A valid BLS authorization, with the proof of possession of another key and validator.
+    let bad_possession = SignedPqKeyRegistration {
+        possession: registration.possession.clone(),
+        ..pq_key_registration(harness, 1, &XMSS_KEYS[1], Epoch::new(0))
+    };
+
+    // Before the fork the head state has no registry: submissions and reads are rejected.
+    let error = client
+        .post_beacon_pool_pq_key_registrations(std::slice::from_ref(&registration))
+        .await
+        .unwrap_err();
+    assert_server_indexed_error(error, 400, vec![0]);
+    assert_eq!(
+        client
+            .get_beacon_states_pq_public_keys(StateId::Head, None)
+            .await
+            .unwrap_err()
+            .status()
+            .unwrap(),
+        400
+    );
+    assert!(
+        client
+            .get_beacon_pool_pq_key_registrations()
+            .await
+            .unwrap()
+            .data
+            .is_empty()
+    );
+
+    // Advance to the first block of the fork.
+    let fork_slot = fork_epoch.start_slot(E::slots_per_epoch());
+    harness.extend_to_slot(fork_slot).await;
+    assert_eq!(harness.head_slot(), fork_slot);
+
+    let error = client
+        .post_beacon_pool_pq_key_registrations(std::slice::from_ref(&bad_possession))
+        .await
+        .unwrap_err();
+    assert_server_indexed_error(error, 400, vec![0]);
+
+    client
+        .post_beacon_pool_pq_key_registrations(std::slice::from_ref(&registration))
+        .await
+        .unwrap();
+    // Submitting it again is accepted as a duplicate.
+    client
+        .post_beacon_pool_pq_key_registrations(std::slice::from_ref(&registration))
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .get_beacon_pool_pq_key_registrations()
+            .await
+            .unwrap()
+            .data,
+        vec![registration.clone()]
+    );
+
+    // The next block includes the registration.
+    let head_block_root = harness.extend_slots(1).await;
+    let head_block = harness
+        .chain
+        .get_block(&head_block_root)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        head_block
+            .message()
+            .body()
+            .pq_key_registrations()
+            .unwrap()
+            .as_slice(),
+        std::slice::from_ref(&registration)
+    );
+
+    // The head state holds the keys, changed at the block's epoch.
+    let change_epoch = head_block.slot().epoch(E::slots_per_epoch());
+    let response = client
+        .get_beacon_states_pq_public_keys(StateId::Head, Some(&[0, 1]))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.finalized, Some(false));
+    assert_eq!(
+        response.data,
+        vec![
+            PqPublicKeysData {
+                index: 0,
+                version: PQ_KEYS_VERSION_1,
+                xmss_public_key: registration.message.public_keys.xmss_public_key.clone(),
+                vrf_root: registration.message.public_keys.vrf_root.clone(),
+                change_epoch,
+            },
+            PqPublicKeysData {
+                index: 1,
+                version: PQ_KEYS_VERSION_UNSET,
+                xmss_public_key: XmssPublicKey::default(),
+                vrf_root: VrfRoot::default(),
+                change_epoch: Epoch::new(0),
+            },
+        ]
+    );
+    let all_keys = client
+        .get_beacon_states_pq_public_keys(StateId::Head, None)
+        .await
+        .unwrap()
+        .unwrap()
+        .data;
+    assert_eq!(all_keys.len(), validator_count);
+
+    // The applied registration is not packed again.
+    let head_block_root = harness.extend_slots(1).await;
+    let head_block = harness
+        .chain
+        .get_block(&head_block_root)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        head_block
+            .message()
+            .body()
+            .pq_key_registrations()
+            .unwrap()
+            .is_empty()
+    );
 }

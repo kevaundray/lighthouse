@@ -46,9 +46,10 @@ use crate::{
         FINALIZED_ROOT_INDEX, FINALIZED_ROOT_INDEX_ELECTRA, NEXT_SYNC_COMMITTEE_FIELD_INDEX,
         NEXT_SYNC_COMMITTEE_INDEX, NEXT_SYNC_COMMITTEE_INDEX_ELECTRA,
     },
+    pq::{PqPublicKeys, XmssPublicKey},
     state::{
         BlockRootsIter, CommitteeCache, EpochCache, EpochCacheError, ExitCache, HistoricalBatch,
-        HistoricalSummary, ProgressiveBalancesCache, PubkeyCache, SlashingsCache,
+        HistoricalSummary, PqPubkeyCache, ProgressiveBalancesCache, PubkeyCache, SlashingsCache,
         get_active_validator_indices,
     },
     sync_committee::{SyncCommittee, SyncDuty},
@@ -137,6 +138,8 @@ pub enum BeaconStateError {
     },
     ZeroSlotsPerEpoch,
     PubkeyCacheInconsistent,
+    /// The `pq_public_keys` list contains the same leanXMSS key for two validators.
+    PqPubkeyCacheInconsistent,
     PubkeyCacheIncomplete {
         cache_len: usize,
         registry_len: usize,
@@ -303,7 +306,9 @@ impl From<BeaconStateHash> for Hash256 {
 ///
 /// https://github.com/sigp/milhouse/issues/43
 #[superstruct(
-    variants(Base, Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze),
+    variants(
+        Base, Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze, Eip8450
+    ),
     variant_attributes(
         derive(
             Educe,
@@ -468,6 +473,33 @@ impl From<BeaconStateHash> for Hash256 {
                     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1
                 )
             )
+        ),
+        Eip8450(
+            metastruct(
+                mappings(
+                    map_beacon_state_eip8450_fields(),
+                    map_beacon_state_eip8450_tree_list_fields(
+                        mutable,
+                        fallible,
+                        groups(tree_lists)
+                    ),
+                    map_beacon_state_eip8450_tree_list_fields_immutable(groups(tree_lists)),
+                ),
+                bimappings(bimap_beacon_state_eip8450_tree_list_fields(
+                    other_type = "BeaconStateEip8450",
+                    self_mutable,
+                    fallible,
+                    groups(tree_lists)
+                )),
+                num_fields(all()),
+            ),
+            tree_hash(
+                struct_behaviour = "progressive_container",
+                active_fields(
+                    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1
+                )
+            )
         )
     ),
     cast_error(
@@ -542,7 +574,10 @@ where
     pub validators: Validators<E>,
     #[compare_fields(as_iter)]
     #[cfg_attr(feature = "arbitrary", arbitrary(default))]
-    #[superstruct(only(Gloas, Heze), partial_getter(rename = "validators_progressive"))]
+    #[superstruct(
+        only(Gloas, Heze, Eip8450),
+        partial_getter(rename = "validators_progressive")
+    )]
     pub validators: ValidatorsGloas,
     #[serde(with = "ssz_types::serde_utils::quoted_u64_var_list")]
     #[compare_fields(as_iter)]
@@ -555,7 +590,10 @@ where
     #[serde(with = "ssz_types::serde_utils::quoted_u64_var_list")]
     #[compare_fields(as_iter)]
     #[cfg_attr(feature = "arbitrary", arbitrary(default))]
-    #[superstruct(only(Gloas, Heze), partial_getter(rename = "balances_progressive"))]
+    #[superstruct(
+        only(Gloas, Heze, Eip8450),
+        partial_getter(rename = "balances_progressive")
+    )]
     pub balances: BalancesGloas,
 
     // Randomness
@@ -585,7 +623,7 @@ where
     pub previous_epoch_participation: List<ParticipationFlags, E::ValidatorRegistryLimit>,
     #[compare_fields(as_iter)]
     #[superstruct(
-        only(Gloas, Heze),
+        only(Gloas, Heze, Eip8450),
         partial_getter(rename = "previous_epoch_participation_progressive")
     )]
     #[cfg_attr(feature = "arbitrary", arbitrary(default))]
@@ -597,7 +635,7 @@ where
     #[cfg_attr(feature = "arbitrary", arbitrary(default))]
     pub current_epoch_participation: List<ParticipationFlags, E::ValidatorRegistryLimit>,
     #[superstruct(
-        only(Gloas, Heze),
+        only(Gloas, Heze, Eip8450),
         partial_getter(rename = "current_epoch_participation_progressive")
     )]
     #[cfg_attr(feature = "arbitrary", arbitrary(default))]
@@ -627,17 +665,17 @@ where
     pub inactivity_scores: List<u64, E::ValidatorRegistryLimit>,
     #[serde(with = "ssz_types::serde_utils::quoted_u64_var_list")]
     #[superstruct(
-        only(Gloas, Heze),
+        only(Gloas, Heze, Eip8450),
         partial_getter(rename = "inactivity_scores_progressive")
     )]
     #[cfg_attr(feature = "arbitrary", arbitrary(default))]
     pub inactivity_scores: ProgressiveList<u64>,
 
     // Light-client sync committees
-    #[superstruct(only(Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze))]
+    #[superstruct(only(Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze, Eip8450))]
     #[metastruct(exclude_from(tree_lists))]
     pub current_sync_committee: Arc<SyncCommittee<E>>,
-    #[superstruct(only(Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze))]
+    #[superstruct(only(Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze, Eip8450))]
     #[metastruct(exclude_from(tree_lists))]
     pub next_sync_committee: Arc<SyncCommittee<E>>,
 
@@ -673,43 +711,49 @@ where
     #[metastruct(exclude_from(tree_lists))]
     pub latest_execution_payload_header: ExecutionPayloadHeaderFulu<E>,
     #[cfg_attr(feature = "arbitrary", arbitrary(default))]
-    #[superstruct(only(Gloas, Heze))]
+    #[superstruct(only(Gloas, Heze, Eip8450))]
     #[metastruct(exclude_from(tree_lists))]
     pub latest_block_hash: ExecutionBlockHash,
-    #[superstruct(only(Capella, Deneb, Electra, Fulu, Gloas, Heze), partial_getter(copy))]
+    #[superstruct(
+        only(Capella, Deneb, Electra, Fulu, Gloas, Heze, Eip8450),
+        partial_getter(copy)
+    )]
     #[serde(with = "serde_utils::quoted_u64")]
     #[metastruct(exclude_from(tree_lists))]
     pub next_withdrawal_index: u64,
-    #[superstruct(only(Capella, Deneb, Electra, Fulu, Gloas, Heze), partial_getter(copy))]
+    #[superstruct(
+        only(Capella, Deneb, Electra, Fulu, Gloas, Heze, Eip8450),
+        partial_getter(copy)
+    )]
     #[serde(with = "serde_utils::quoted_u64")]
     #[metastruct(exclude_from(tree_lists))]
     pub next_withdrawal_validator_index: u64,
     // Deep history valid from Capella onwards.
-    #[superstruct(only(Capella, Deneb, Electra, Fulu, Gloas, Heze))]
+    #[superstruct(only(Capella, Deneb, Electra, Fulu, Gloas, Heze, Eip8450))]
     #[cfg_attr(feature = "arbitrary", arbitrary(default))]
     pub historical_summaries: List<HistoricalSummary, E::HistoricalRootsLimit>,
 
     // Electra
-    #[superstruct(only(Electra, Fulu, Gloas, Heze), partial_getter(copy))]
+    #[superstruct(only(Electra, Fulu, Gloas, Heze, Eip8450), partial_getter(copy))]
     #[metastruct(exclude_from(tree_lists))]
     #[serde(with = "serde_utils::quoted_u64")]
     pub deposit_requests_start_index: u64,
-    #[superstruct(only(Electra, Fulu, Gloas, Heze), partial_getter(copy))]
+    #[superstruct(only(Electra, Fulu, Gloas, Heze, Eip8450), partial_getter(copy))]
     #[metastruct(exclude_from(tree_lists))]
     #[serde(with = "serde_utils::quoted_u64")]
     pub deposit_balance_to_consume: u64,
-    #[superstruct(only(Electra, Fulu, Gloas, Heze), partial_getter(copy))]
+    #[superstruct(only(Electra, Fulu, Gloas, Heze, Eip8450), partial_getter(copy))]
     #[metastruct(exclude_from(tree_lists))]
     #[serde(with = "serde_utils::quoted_u64")]
     pub exit_balance_to_consume: u64,
-    #[superstruct(only(Electra, Fulu, Gloas, Heze), partial_getter(copy))]
+    #[superstruct(only(Electra, Fulu, Gloas, Heze, Eip8450), partial_getter(copy))]
     #[metastruct(exclude_from(tree_lists))]
     pub earliest_exit_epoch: Epoch,
-    #[superstruct(only(Electra, Fulu, Gloas, Heze), partial_getter(copy))]
+    #[superstruct(only(Electra, Fulu, Gloas, Heze, Eip8450), partial_getter(copy))]
     #[metastruct(exclude_from(tree_lists))]
     #[serde(with = "serde_utils::quoted_u64")]
     pub consolidation_balance_to_consume: u64,
-    #[superstruct(only(Electra, Fulu, Gloas, Heze), partial_getter(copy))]
+    #[superstruct(only(Electra, Fulu, Gloas, Heze, Eip8450), partial_getter(copy))]
     #[metastruct(exclude_from(tree_lists))]
     pub earliest_consolidation_epoch: Epoch,
     #[compare_fields(as_iter)]
@@ -719,7 +763,7 @@ where
     #[compare_fields(as_iter)]
     #[cfg_attr(feature = "arbitrary", arbitrary(default))]
     #[superstruct(
-        only(Gloas, Heze),
+        only(Gloas, Heze, Eip8450),
         partial_getter(rename = "pending_deposits_progressive")
     )]
     pub pending_deposits: ProgressiveList<PendingDeposit>,
@@ -734,7 +778,7 @@ where
     #[compare_fields(as_iter)]
     #[cfg_attr(feature = "arbitrary", arbitrary(default))]
     #[superstruct(
-        only(Gloas, Heze),
+        only(Gloas, Heze, Eip8450),
         partial_getter(rename = "pending_partial_withdrawals_progressive")
     )]
     pub pending_partial_withdrawals: ProgressiveList<PendingPartialWithdrawal>,
@@ -748,7 +792,7 @@ where
     #[compare_fields(as_iter)]
     #[cfg_attr(feature = "arbitrary", arbitrary(default))]
     #[superstruct(
-        only(Gloas, Heze),
+        only(Gloas, Heze, Eip8450),
         partial_getter(rename = "pending_consolidations_progressive")
     )]
     pub pending_consolidations: ProgressiveList<PendingConsolidation>,
@@ -756,33 +800,33 @@ where
     // Fulu
     #[compare_fields(as_iter)]
     #[cfg_attr(feature = "arbitrary", arbitrary(default))]
-    #[superstruct(only(Fulu, Gloas, Heze))]
+    #[superstruct(only(Fulu, Gloas, Heze, Eip8450))]
     #[serde(with = "ssz_types::serde_utils::quoted_u64_fixed_vec")]
     pub proposer_lookahead: Vector<u64, E::ProposerLookaheadSlots>,
     // Gloas
     #[compare_fields(as_iter)]
     #[cfg_attr(feature = "arbitrary", arbitrary(default))]
-    #[superstruct(only(Gloas, Heze))]
+    #[superstruct(only(Gloas, Heze, Eip8450))]
     pub builders: ProgressiveList<Builder>,
 
     #[metastruct(exclude_from(tree_lists))]
     #[serde(with = "serde_utils::quoted_u64")]
-    #[superstruct(only(Gloas, Heze), partial_getter(copy))]
+    #[superstruct(only(Gloas, Heze, Eip8450), partial_getter(copy))]
     pub next_withdrawal_builder_index: BuilderIndex,
 
     #[cfg_attr(feature = "arbitrary", arbitrary(default))]
-    #[superstruct(only(Gloas, Heze))]
+    #[superstruct(only(Gloas, Heze, Eip8450))]
     #[metastruct(exclude_from(tree_lists))]
     pub execution_payload_availability: BitVector<E::SlotsPerHistoricalRoot>,
 
     #[compare_fields(as_iter)]
     #[cfg_attr(feature = "arbitrary", arbitrary(default))]
-    #[superstruct(only(Gloas, Heze))]
+    #[superstruct(only(Gloas, Heze, Eip8450))]
     pub builder_pending_payments: Vector<BuilderPendingPayment, E::BuilderPendingPaymentsLimit>,
 
     #[compare_fields(as_iter)]
     #[cfg_attr(feature = "arbitrary", arbitrary(default))]
-    #[superstruct(only(Gloas, Heze))]
+    #[superstruct(only(Gloas, Heze, Eip8450))]
     pub builder_pending_withdrawals: ProgressiveList<BuilderPendingWithdrawal>,
 
     #[cfg_attr(feature = "arbitrary", arbitrary(default))]
@@ -794,7 +838,7 @@ where
     pub latest_execution_payload_bid: ExecutionPayloadBidGloas<E>,
     #[cfg_attr(feature = "arbitrary", arbitrary(default))]
     #[superstruct(
-        only(Heze),
+        only(Heze, Eip8450),
         partial_getter(rename = "latest_execution_payload_bid_heze")
     )]
     #[metastruct(exclude_from(tree_lists))]
@@ -802,13 +846,23 @@ where
 
     #[compare_fields(as_iter)]
     #[cfg_attr(feature = "arbitrary", arbitrary(default))]
-    #[superstruct(only(Gloas, Heze))]
+    #[superstruct(only(Gloas, Heze, Eip8450))]
     pub payload_expected_withdrawals: ProgressiveList<Withdrawal>,
 
     #[compare_fields(as_iter)]
     #[cfg_attr(feature = "arbitrary", arbitrary(default))]
-    #[superstruct(only(Gloas, Heze))]
+    #[superstruct(only(Gloas, Heze, Eip8450))]
     pub ptc_window: Vector<FixedVector<u64, E::PTCSize>, E::PtcWindowLength>,
+
+    // Eip8450
+    #[compare_fields(as_iter)]
+    #[cfg_attr(feature = "arbitrary", arbitrary(default))]
+    #[superstruct(only(Eip8450))]
+    pub pq_public_keys: ProgressiveList<PqPublicKeys>,
+    #[compare_fields(as_iter)]
+    #[cfg_attr(feature = "arbitrary", arbitrary(default))]
+    #[superstruct(only(Eip8450))]
+    pub pq_key_change_epochs: ProgressiveList<Epoch>,
 
     // Caching (not in the spec)
     #[serde(skip_serializing, skip_deserializing)]
@@ -835,6 +889,12 @@ where
     #[cfg_attr(feature = "arbitrary", arbitrary(default))]
     #[metastruct(exclude)]
     pub pubkey_cache: PubkeyCache,
+    #[serde(skip_serializing, skip_deserializing)]
+    #[ssz(skip_serializing, skip_deserializing)]
+    #[tree_hash(skip_hashing)]
+    #[cfg_attr(feature = "arbitrary", arbitrary(default))]
+    #[metastruct(exclude)]
+    pub pq_pubkey_cache: PqPubkeyCache,
     #[serde(skip_serializing, skip_deserializing)]
     #[ssz(skip_serializing, skip_deserializing)]
     #[tree_hash(skip_hashing)]
@@ -914,7 +974,7 @@ impl<E: EthSpec> BeaconState<E> {
         ValidatorsRef<'_, E>,
         ValidatorsMut<'_, E>,
         basic(Base, Altair, Bellatrix, Capella, Deneb, Electra, Fulu),
-        progressive(Gloas, Heze)
+        progressive(Gloas, Heze, Eip8450)
     );
 
     impl_any_list_accessors!(
@@ -923,7 +983,7 @@ impl<E: EthSpec> BeaconState<E> {
         BalancesRef<'_, E>,
         BalancesMut<'_, E>,
         basic(Base, Altair, Bellatrix, Capella, Deneb, Electra, Fulu),
-        progressive(Gloas, Heze)
+        progressive(Gloas, Heze, Eip8450)
     );
 
     impl_any_list_accessors!(
@@ -932,7 +992,7 @@ impl<E: EthSpec> BeaconState<E> {
         AnyListRef<'_, ParticipationFlags, E::ValidatorRegistryLimit>,
         AnyListMut<'_, ParticipationFlags, E::ValidatorRegistryLimit>,
         basic(Altair, Bellatrix, Capella, Deneb, Electra, Fulu),
-        progressive(Gloas, Heze),
+        progressive(Gloas, Heze, Eip8450),
         absent(Base)
     );
 
@@ -942,7 +1002,7 @@ impl<E: EthSpec> BeaconState<E> {
         AnyListRef<'_, ParticipationFlags, E::ValidatorRegistryLimit>,
         AnyListMut<'_, ParticipationFlags, E::ValidatorRegistryLimit>,
         basic(Altair, Bellatrix, Capella, Deneb, Electra, Fulu),
-        progressive(Gloas, Heze),
+        progressive(Gloas, Heze, Eip8450),
         absent(Base)
     );
 
@@ -952,7 +1012,7 @@ impl<E: EthSpec> BeaconState<E> {
         AnyListRef<'_, u64, E::ValidatorRegistryLimit>,
         AnyListMut<'_, u64, E::ValidatorRegistryLimit>,
         basic(Altair, Bellatrix, Capella, Deneb, Electra, Fulu),
-        progressive(Gloas, Heze),
+        progressive(Gloas, Heze, Eip8450),
         absent(Base)
     );
 
@@ -962,7 +1022,7 @@ impl<E: EthSpec> BeaconState<E> {
         AnyListRef<'_, PendingDeposit, E::PendingDepositsLimit>,
         AnyListMut<'_, PendingDeposit, E::PendingDepositsLimit>,
         basic(Electra, Fulu),
-        progressive(Gloas, Heze),
+        progressive(Gloas, Heze, Eip8450),
         absent(Base, Altair, Bellatrix, Capella, Deneb)
     );
 
@@ -972,7 +1032,7 @@ impl<E: EthSpec> BeaconState<E> {
         AnyListRef<'_, PendingPartialWithdrawal, E::PendingPartialWithdrawalsLimit>,
         AnyListMut<'_, PendingPartialWithdrawal, E::PendingPartialWithdrawalsLimit>,
         basic(Electra, Fulu),
-        progressive(Gloas, Heze),
+        progressive(Gloas, Heze, Eip8450),
         absent(Base, Altair, Bellatrix, Capella, Deneb)
     );
 
@@ -982,7 +1042,7 @@ impl<E: EthSpec> BeaconState<E> {
         AnyListRef<'_, PendingConsolidation, E::PendingConsolidationsLimit>,
         AnyListMut<'_, PendingConsolidation, E::PendingConsolidationsLimit>,
         basic(Electra, Fulu),
-        progressive(Gloas, Heze),
+        progressive(Gloas, Heze, Eip8450),
         absent(Base, Altair, Bellatrix, Capella, Deneb)
     );
 
@@ -1042,6 +1102,7 @@ impl<E: EthSpec> BeaconState<E> {
                 default_committee_cache,
             ],
             pubkey_cache: PubkeyCache::default(),
+            pq_pubkey_cache: PqPubkeyCache::default(),
             exit_cache: ExitCache::default(),
             slashings_cache: SlashingsCache::default(),
             epoch_cache: EpochCache::default(),
@@ -1080,6 +1141,7 @@ impl<E: EthSpec> BeaconState<E> {
             BeaconState::Fulu { .. } => ForkName::Fulu,
             BeaconState::Gloas { .. } => ForkName::Gloas,
             BeaconState::Heze { .. } => ForkName::Heze,
+            BeaconState::Eip8450 { .. } => ForkName::Eip8450,
         }
     }
 
@@ -1537,7 +1599,9 @@ impl<E: EthSpec> BeaconState<E> {
             )),
             // TODO(EIP-7732): investigate calling functions
             BeaconState::Gloas(_) => Err(BeaconStateError::IncorrectStateVariant),
-            BeaconState::Heze(_) => Err(BeaconStateError::IncorrectStateVariant),
+            BeaconState::Heze(_) | BeaconState::Eip8450(_) => {
+                Err(BeaconStateError::IncorrectStateVariant)
+            }
         }
     }
 
@@ -1565,7 +1629,9 @@ impl<E: EthSpec> BeaconState<E> {
             )),
             // TODO(EIP-7732): investigate calling functions
             BeaconState::Gloas(_) => Err(BeaconStateError::IncorrectStateVariant),
-            BeaconState::Heze(_) => Err(BeaconStateError::IncorrectStateVariant),
+            BeaconState::Heze(_) | BeaconState::Eip8450(_) => {
+                Err(BeaconStateError::IncorrectStateVariant)
+            }
         }
     }
 
@@ -1587,6 +1653,9 @@ impl<E: EthSpec> BeaconState<E> {
             BeaconState::Heze(state) => Ok(ExecutionPayloadBidRef::Heze(
                 &state.latest_execution_payload_bid,
             )),
+            BeaconState::Eip8450(state) => Ok(ExecutionPayloadBidRef::Heze(
+                &state.latest_execution_payload_bid,
+            )),
         }
     }
 
@@ -1605,6 +1674,9 @@ impl<E: EthSpec> BeaconState<E> {
                 &mut state.latest_execution_payload_bid,
             )),
             BeaconState::Heze(state) => Ok(ExecutionPayloadBidRefMut::Heze(
+                &mut state.latest_execution_payload_bid,
+            )),
+            BeaconState::Eip8450(state) => Ok(ExecutionPayloadBidRefMut::Heze(
                 &mut state.latest_execution_payload_bid,
             )),
         }
@@ -2137,6 +2209,7 @@ impl<E: EthSpec> BeaconState<E> {
             Self::Fulu(state) => validators_and_balances!(state, Basic),
             Self::Gloas(state) => validators_and_balances!(state, Progressive),
             Self::Heze(state) => validators_and_balances!(state, Progressive),
+            Self::Eip8450(state) => validators_and_balances!(state, Progressive),
         }
     }
 
@@ -2181,6 +2254,7 @@ impl<E: EthSpec> BeaconState<E> {
             BeaconState::Fulu(state) => mutable_validator_fields!(state, Basic),
             BeaconState::Gloas(state) => mutable_validator_fields!(state, Progressive),
             BeaconState::Heze(state) => mutable_validator_fields!(state, Progressive),
+            BeaconState::Eip8450(state) => mutable_validator_fields!(state, Progressive),
         }
     }
 
@@ -2209,6 +2283,7 @@ impl<E: EthSpec> BeaconState<E> {
             Self::Fulu(state) => state.validators = List::try_from_iter(iter)?,
             Self::Gloas(state) => state.validators = ProgressiveList::try_from_iter(iter)?,
             Self::Heze(state) => state.validators = ProgressiveList::try_from_iter(iter)?,
+            Self::Eip8450(state) => state.validators = ProgressiveList::try_from_iter(iter)?,
         }
         Ok(())
     }
@@ -2238,6 +2313,7 @@ impl<E: EthSpec> BeaconState<E> {
             Self::Fulu(state) => state.balances = List::try_from_iter(iter)?,
             Self::Gloas(state) => state.balances = ProgressiveList::try_from_iter(iter)?,
             Self::Heze(state) => state.balances = ProgressiveList::try_from_iter(iter)?,
+            Self::Eip8450(state) => state.balances = ProgressiveList::try_from_iter(iter)?,
         }
         Ok(())
     }
@@ -2266,6 +2342,9 @@ impl<E: EthSpec> BeaconState<E> {
                 &mut state.inactivity_scores,
             ))),
             Self::Heze(state) => Ok(AnyList::Progressive(std::mem::take(
+                &mut state.inactivity_scores,
+            ))),
+            Self::Eip8450(state) => Ok(AnyList::Progressive(std::mem::take(
                 &mut state.inactivity_scores,
             ))),
         }
@@ -2309,6 +2388,13 @@ impl<E: EthSpec> BeaconState<E> {
                     std::iter::repeat_n(ParticipationFlags::default(), num_validators),
                 )?;
             }
+            Self::Eip8450(state) => {
+                state.previous_epoch_participation =
+                    std::mem::take(&mut state.current_epoch_participation);
+                state.current_epoch_participation = ProgressiveList::try_from_iter(
+                    std::iter::repeat_n(ParticipationFlags::default(), num_validators),
+                )?;
+            }
         }
         Ok(())
     }
@@ -2328,6 +2414,7 @@ impl<E: EthSpec> BeaconState<E> {
             Self::Fulu(state) => state.pending_deposits = List::try_from_iter(iter)?,
             Self::Gloas(state) => state.pending_deposits = ProgressiveList::try_from_iter(iter)?,
             Self::Heze(state) => state.pending_deposits = ProgressiveList::try_from_iter(iter)?,
+            Self::Eip8450(state) => state.pending_deposits = ProgressiveList::try_from_iter(iter)?,
         }
         Ok(())
     }
@@ -2347,6 +2434,7 @@ impl<E: EthSpec> BeaconState<E> {
             Self::Fulu(state) => state.inactivity_scores = List::try_from_iter(iter)?,
             Self::Gloas(state) => state.inactivity_scores = ProgressiveList::try_from_iter(iter)?,
             Self::Heze(state) => state.inactivity_scores = ProgressiveList::try_from_iter(iter)?,
+            Self::Eip8450(state) => state.inactivity_scores = ProgressiveList::try_from_iter(iter)?,
         }
         Ok(())
     }
@@ -2458,6 +2546,13 @@ impl<E: EthSpec> BeaconState<E> {
         }
         if let Ok(mut inactivity_scores) = self.inactivity_scores_mut() {
             inactivity_scores.push(0)?;
+        }
+        // Eip8450 or later initializations.
+        if let Ok(pq_public_keys) = self.pq_public_keys_mut() {
+            pq_public_keys.push(PqPublicKeys::default())?;
+        }
+        if let Ok(pq_key_change_epochs) = self.pq_key_change_epochs_mut() {
+            pq_key_change_epochs.push(E::genesis_epoch())?;
         }
 
         // Keep the pubkey cache up to date if it was up to date prior to this call.
@@ -2603,7 +2698,8 @@ impl<E: EthSpec> BeaconState<E> {
             | BeaconState::Electra(_)
             | BeaconState::Fulu(_)
             | BeaconState::Gloas(_)
-            | BeaconState::Heze(_) => std::cmp::min(
+            | BeaconState::Heze(_)
+            | BeaconState::Eip8450(_) => std::cmp::min(
                 spec.max_per_epoch_activation_churn_limit,
                 self.get_validator_churn_limit(spec)?,
             ),
@@ -2759,6 +2855,10 @@ impl<E: EthSpec> BeaconState<E> {
         self.update_pubkey_cache()?;
         self.build_exit_cache(spec)?;
         self.build_slashings_cache()?;
+        // [New in EIP-8450] Without the cache, key-uniqueness checks scan the whole registry.
+        if self.fork_name_unchecked().eip8450_enabled() {
+            self.update_pq_pubkey_cache()?;
+        }
 
         Ok(())
     }
@@ -2803,6 +2903,7 @@ impl<E: EthSpec> BeaconState<E> {
         self.drop_committee_cache(RelativeEpoch::Current)?;
         self.drop_committee_cache(RelativeEpoch::Next)?;
         self.drop_pubkey_cache();
+        self.drop_pq_pubkey_cache();
         self.drop_progressive_balances_cache();
         *self.exit_cache_mut() = ExitCache::default();
         *self.slashings_cache_mut() = SlashingsCache::default();
@@ -2997,6 +3098,76 @@ impl<E: EthSpec> BeaconState<E> {
         *self.pubkey_cache_mut() = PubkeyCache::default()
     }
 
+    /// Builds the `pq_pubkey_cache` from `pq_public_keys`, if it is not already built.
+    ///
+    /// States prior to Eip8450 have no registered keys, so their cache is empty.
+    #[instrument(skip_all, level = "debug")]
+    pub fn update_pq_pubkey_cache(&mut self) -> Result<(), BeaconStateError> {
+        if self.pq_pubkey_cache().is_initialized() {
+            return Ok(());
+        }
+        let cache = match self.pq_public_keys() {
+            Ok(pq_public_keys) => PqPubkeyCache::new(pq_public_keys)
+                .ok_or(BeaconStateError::PqPubkeyCacheInconsistent)?,
+            Err(_) => PqPubkeyCache::new_initialized(),
+        };
+        *self.pq_pubkey_cache_mut() = cache;
+        Ok(())
+    }
+
+    /// Completely drops the `pq_pubkey_cache`, replacing it with a new, uninitialized cache.
+    pub fn drop_pq_pubkey_cache(&mut self) {
+        *self.pq_pubkey_cache_mut() = PqPubkeyCache::default()
+    }
+
+    /// Returns the index of the validator that registered the leanXMSS key `xmss_public_key`, if
+    /// any. Builds the `pq_pubkey_cache` if required.
+    pub fn get_pq_public_key_owner(
+        &mut self,
+        xmss_public_key: &XmssPublicKey,
+    ) -> Result<Option<usize>, BeaconStateError> {
+        self.update_pq_pubkey_cache()?;
+        Ok(self.pq_pubkey_cache().get(xmss_public_key))
+    }
+
+    /// Writes the post-quantum keys of the validator at `index` and the epoch of the change,
+    /// keeping the `pq_pubkey_cache` exact.
+    ///
+    /// The key previously registered by the validator, if any, is released.
+    pub fn set_pq_public_keys(
+        &mut self,
+        index: usize,
+        public_keys: PqPublicKeys,
+        change_epoch: Epoch,
+    ) -> Result<(), BeaconStateError> {
+        self.update_pq_pubkey_cache()?;
+
+        let previous = self
+            .pq_public_keys()?
+            .get(index)
+            .cloned()
+            .ok_or(BeaconStateError::UnknownValidator(index))?;
+        let new_keys = public_keys.clone();
+
+        *self
+            .pq_public_keys_mut()?
+            .get_mut(index)
+            .ok_or(BeaconStateError::UnknownValidator(index))? = public_keys;
+        *self
+            .pq_key_change_epochs_mut()?
+            .get_mut(index)
+            .ok_or(BeaconStateError::UnknownValidator(index))? = change_epoch;
+
+        let cache = self.pq_pubkey_cache_mut();
+        if previous.is_registered() {
+            cache.remove(&previous.xmss_public_key, index);
+        }
+        if new_keys.is_registered() && !cache.insert(&new_keys.xmss_public_key, index) {
+            return Err(BeaconStateError::PqPubkeyCacheInconsistent);
+        }
+        Ok(())
+    }
+
     pub fn has_pending_mutations(&self) -> bool {
         let mut any_pending_mutations = false;
         match &self {
@@ -3053,6 +3224,14 @@ impl<E: EthSpec> BeaconState<E> {
                 map_beacon_state_heze_tree_list_fields_immutable!(self_inner, |_, self_field| {
                     any_pending_mutations |= self_field.has_pending_updates();
                 });
+            }
+            Self::Eip8450(self_inner) => {
+                map_beacon_state_eip8450_tree_list_fields_immutable!(
+                    self_inner,
+                    |_, self_field| {
+                        any_pending_mutations |= self_field.has_pending_updates();
+                    }
+                );
             }
         };
         any_pending_mutations
@@ -3353,7 +3532,8 @@ impl<E: EthSpec> BeaconState<E> {
             BeaconState::Electra(_)
             | BeaconState::Fulu(_)
             | BeaconState::Gloas(_)
-            | BeaconState::Heze(_) => {
+            | BeaconState::Heze(_)
+            | BeaconState::Eip8450(_) => {
                 // Consume the balance and update state variables
                 *self.exit_balance_to_consume_mut()? =
                     exit_balance_to_consume.safe_sub(exit_balance)?;
@@ -3403,7 +3583,8 @@ impl<E: EthSpec> BeaconState<E> {
             BeaconState::Electra(_)
             | BeaconState::Fulu(_)
             | BeaconState::Gloas(_)
-            | BeaconState::Heze(_) => {
+            | BeaconState::Heze(_)
+            | BeaconState::Eip8450(_) => {
                 // Consume the balance and update state variables.
                 *self.consolidation_balance_to_consume_mut()? =
                     consolidation_balance_to_consume.safe_sub(consolidation_balance)?;
@@ -3489,6 +3670,14 @@ impl<E: EthSpec> BeaconState<E> {
                 );
             }
             (Self::Heze(_), _) => (),
+            (Self::Eip8450(self_inner), Self::Eip8450(base_inner)) => {
+                bimap_beacon_state_eip8450_tree_list_fields!(
+                    self_inner,
+                    base_inner,
+                    |_, self_field, base_field| { self_field.rebase_on(base_field) }
+                );
+            }
+            (Self::Eip8450(_), _) => (),
         }
 
         // Use sync committees from `base` if they are equal.
@@ -3806,6 +3995,11 @@ impl<E: EthSpec> ForkVersionDecode for BeaconState<E> {
 /// Must match the `active_fields` attribute on the Gloas and Heze variants.
 pub const BEACON_STATE_ACTIVE_FIELDS: [bool; 46] = [true; 46];
 
+/// The `active_fields` of the Eip8450 `BeaconState` progressive container.
+///
+/// Must match the `active_fields` attribute on the Eip8450 variant.
+pub const BEACON_STATE_ACTIVE_FIELDS_EIP8450: [bool; 48] = [true; 48];
+
 impl<E: EthSpec> BeaconState<E> {
     /// The number of fields of the `BeaconState` rounded up to the nearest power of two.
     ///
@@ -3822,6 +4016,7 @@ impl<E: EthSpec> BeaconState<E> {
             ForkName::Fulu => BeaconStateFulu::<E>::NUM_FIELDS.next_power_of_two(),
             ForkName::Gloas => BeaconStateGloas::<E>::NUM_FIELDS.next_power_of_two(),
             ForkName::Heze => BeaconStateHeze::<E>::NUM_FIELDS.next_power_of_two(),
+            ForkName::Eip8450 => BeaconStateEip8450::<E>::NUM_FIELDS.next_power_of_two(),
         }
     }
 
@@ -3877,6 +4072,9 @@ impl<E: EthSpec> BeaconState<E> {
             }
             Self::Heze(inner) => {
                 map_beacon_state_heze_tree_list_fields!(inner, |_, x| { x.apply_updates() })
+            }
+            Self::Eip8450(inner) => {
+                map_beacon_state_eip8450_tree_list_fields!(inner, |_, x| { x.apply_updates() })
             }
         }
         Ok(())
@@ -3948,9 +4146,14 @@ impl<E: EthSpec> BeaconState<E> {
 
         // [Modified in Gloas:EIP7688] the state is a progressive container.
         if self.fork_name_unchecked().gloas_enabled() {
+            let active_fields: &[bool] = if self.fork_name_unchecked().eip8450_enabled() {
+                &BEACON_STATE_ACTIVE_FIELDS_EIP8450
+            } else {
+                &BEACON_STATE_ACTIVE_FIELDS
+            };
             return Ok(merkle_proof::progressive_container_proof(
                 leaves,
-                &BEACON_STATE_ACTIVE_FIELDS,
+                active_fields,
                 field_index,
             )?);
         }
@@ -4006,6 +4209,11 @@ impl<E: EthSpec> BeaconState<E> {
             }
             BeaconState::Heze(state) => {
                 map_beacon_state_heze_fields!(state, |_, field| {
+                    leaves.push(field.tree_hash_root());
+                });
+            }
+            BeaconState::Eip8450(state) => {
+                map_beacon_state_eip8450_fields!(state, |_, field| {
                     leaves.push(field.tree_hash_root());
                 });
             }
@@ -4069,6 +4277,7 @@ impl<E: EthSpec> CompareFields for BeaconState<E> {
             (BeaconState::Fulu(x), BeaconState::Fulu(y)) => x.compare_fields(y),
             (BeaconState::Gloas(x), BeaconState::Gloas(y)) => x.compare_fields(y),
             (BeaconState::Heze(x), BeaconState::Heze(y)) => x.compare_fields(y),
+            (BeaconState::Eip8450(x), BeaconState::Eip8450(y)) => x.compare_fields(y),
             _ => panic!("compare_fields: mismatched state variants",),
         }
     }
@@ -4142,6 +4351,10 @@ mod progressive_container_tests {
         assert_eq!(
             BEACON_STATE_ACTIVE_FIELDS.len(),
             BeaconStateHeze::<MainnetEthSpec>::NUM_FIELDS
+        );
+        assert_eq!(
+            BEACON_STATE_ACTIVE_FIELDS_EIP8450.len(),
+            BeaconStateEip8450::<MainnetEthSpec>::NUM_FIELDS
         );
     }
 }

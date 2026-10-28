@@ -50,6 +50,10 @@ pub trait Handler {
             if fork_name == ForkName::Heze {
                 continue;
             }
+            // EIP-8450 has no consensus-spec-tests vectors.
+            if fork_name == ForkName::Eip8450 {
+                continue;
+            }
             if !self.disabled_forks().contains(&fork_name) && self.is_enabled_for_fork(fork_name) {
                 self.run_for_fork(fork_name);
             }

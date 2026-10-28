@@ -271,6 +271,7 @@ impl<E: EthSpec> Network<E> {
                 // .signed_contribution_and_proof_timeout(timeout) // Do not retry
                 // .sync_committee_message_timeout(timeout) // Do not retry
                 .bls_to_execution_change_timeout(half_epoch * 2)
+                .pq_key_registration_timeout(half_epoch * 2)
                 .build()
         };
 

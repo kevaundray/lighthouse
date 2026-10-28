@@ -34,6 +34,10 @@ pub use verify_deposit::{
     verify_deposit_merkle_proof,
 };
 pub use verify_exit::verify_exit;
+pub use verify_pq_key_registration::{
+    get_pq_possession_signing_root, is_pq_registered, is_valid_pq_possession_proof,
+    pq_public_key_owner, verify_pq_key_registration,
+};
 pub use withdrawals::get_expected_withdrawals;
 
 pub mod altair;
@@ -52,6 +56,7 @@ mod verify_bls_to_execution_change;
 mod verify_deposit;
 mod verify_exit;
 mod verify_payload_attestation;
+mod verify_pq_key_registration;
 mod verify_proposer_slashing;
 pub mod withdrawals;
 

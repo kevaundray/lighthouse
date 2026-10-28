@@ -63,6 +63,11 @@ pub enum BlockProcessingError {
         index: usize,
         reason: BlsExecutionChangeInvalid,
     },
+    /// [New in EIP-8450] A post-quantum key registration is invalid.
+    PqKeyRegistrationInvalid {
+        index: usize,
+        reason: PqKeyRegistrationInvalid,
+    },
     SyncAggregateInvalid {
         reason: SyncAggregateInvalid,
     },
@@ -237,7 +242,8 @@ impl_into_block_processing_error_with_index!(
     PayloadAttestationInvalid,
     DepositInvalid,
     ExitInvalid,
-    BlsExecutionChangeInvalid
+    BlsExecutionChangeInvalid,
+    PqKeyRegistrationInvalid
 );
 
 pub type HeaderValidationError = BlockOperationError<HeaderInvalid>;
@@ -248,6 +254,7 @@ pub type SyncCommitteeMessageValidationError = BlockOperationError<SyncAggregate
 pub type DepositValidationError = BlockOperationError<DepositInvalid>;
 pub type ExitValidationError = BlockOperationError<ExitInvalid>;
 pub type BlsExecutionChangeValidationError = BlockOperationError<BlsExecutionChangeInvalid>;
+pub type PqKeyRegistrationValidationError = BlockOperationError<PqKeyRegistrationInvalid>;
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum BlockOperationError<T> {
@@ -573,6 +580,33 @@ pub enum BlsExecutionChangeInvalid {
     WithdrawalCredentialsMismatch,
     /// The signature is invalid.
     BadSignature,
+}
+
+/// The reasons a `SignedPqKeyRegistration` is invalid, in the order `process_pq_key_registration`
+/// checks them (EIP-8450).
+#[derive(Debug, PartialEq, Clone)]
+pub enum PqKeyRegistrationInvalid {
+    /// The state is prior to EIP-8450 and has no post-quantum key registry.
+    RegistryUnavailable,
+    /// The specified validator is not in the state's validator registry.
+    ValidatorUnknown(u64),
+    /// The validator has initiated an exit.
+    ValidatorExiting { exit_epoch: Epoch },
+    /// The registered keys do not use `PQ_KEYS_VERSION_1`.
+    UnsupportedVersion(u8),
+    /// The registration does not name the epoch of the validator's last change.
+    PreviousChangeEpochMismatch { expected: Epoch, found: Epoch },
+    /// The validator changed its keys less than `MIN_PQ_KEY_CHANGE_DELAY` epochs ago.
+    ChangeTooSoon {
+        current_epoch: Epoch,
+        earliest_epoch: Epoch,
+    },
+    /// The BLS signature of the validator's signing key is invalid.
+    BadSignature,
+    /// Another validator already registered the leanXMSS key.
+    XmssPublicKeyInUse { owner: u64 },
+    /// The proof of possession of the leanXMSS key is invalid.
+    BadPossessionProof,
 }
 
 #[derive(Debug, PartialEq, Clone)]

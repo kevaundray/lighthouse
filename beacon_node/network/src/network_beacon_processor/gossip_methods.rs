@@ -18,6 +18,7 @@ use beacon_chain::payload_bid_verification::PayloadBidError;
 use beacon_chain::payload_envelope_verification::{
     EnvelopeError, EnvelopeSource, gossip_verified_envelope::GossipVerifiedEnvelope,
 };
+use beacon_chain::pq_key_registration_verification::Error as PqKeyRegistrationError;
 use beacon_chain::proposer_preferences_verification::ProposerPreferencesError;
 use beacon_chain::store::Error;
 use beacon_chain::{
@@ -40,7 +41,7 @@ use lighthouse_network::{
     PubsubPartialMessage, ReportSource,
 };
 use logging::crit;
-use operation_pool::ReceivedPreCapella;
+use operation_pool::{PqKeyRegistrationInsertOutcome, ReceivedPreCapella};
 use slot_clock::SlotClock;
 use ssz::Encode;
 use std::fs;
@@ -56,9 +57,9 @@ use types::{
     LightClientOptimisticUpdate, PartialDataColumn, PayloadAttestationMessage, ProposerSlashing,
     SignedAggregateAndProof, SignedBeaconBlock, SignedBlsToExecutionChange,
     SignedContributionAndProof, SignedExecutionPayloadBid, SignedExecutionPayloadEnvelope,
-    SignedInclusionList, SignedProposerPreferences, SignedVoluntaryExit, SingleAttestation, Slot,
-    SubnetId, SyncCommitteeMessage, SyncSubnetId, block::BlockImportSource, data::CellBitmap,
-    execution::SignedExecutionProofEnvelope,
+    SignedInclusionList, SignedPqKeyRegistration, SignedProposerPreferences, SignedVoluntaryExit,
+    SingleAttestation, Slot, SubnetId, SyncCommitteeMessage, SyncSubnetId,
+    block::BlockImportSource, data::CellBitmap, execution::SignedExecutionProofEnvelope,
 };
 
 use beacon_processor::work_reprocessing_queue::QueuedColumnReconstruction;
@@ -2303,6 +2304,93 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
         );
 
         metrics::inc_counter(&metrics::BEACON_PROCESSOR_BLS_TO_EXECUTION_CHANGE_IMPORTED_TOTAL);
+    }
+
+    /// Process a post-quantum key registration (EIP-8450) received from the gossip network.
+    ///
+    /// Verification follows the `pq_key_registration` gossip rules. Rejections that do not depend
+    /// on our view of the chain (version, BLS signature, proof of possession) penalize the peer
+    /// more than those that do, which an honest peer on a different head can trigger.
+    pub fn process_gossip_pq_key_registration(
+        self: &Arc<Self>,
+        message_id: MessageId,
+        peer_id: PeerId,
+        registration: SignedPqKeyRegistration,
+    ) {
+        let validator_index = registration.message.validator_index;
+        let previous_change_epoch = registration.message.previous_change_epoch;
+
+        let verified = match self
+            .chain
+            .verify_pq_key_registration_for_gossip(registration)
+        {
+            Ok(verified) => verified,
+            Err(e) => {
+                debug!(
+                    validator_index,
+                    %previous_change_epoch,
+                    %peer_id,
+                    error = ?e,
+                    "Dropping PQ key registration"
+                );
+                let penalty = match e {
+                    PqKeyRegistrationError::PriorToEip8450 { .. }
+                    | PqKeyRegistrationError::HeadPriorToEip8450
+                    | PqKeyRegistrationError::PriorRegistrationKnown { .. }
+                    | PqKeyRegistrationError::ChangeTooSoon { .. }
+                    | PqKeyRegistrationError::BeaconChainError(_)
+                    | PqKeyRegistrationError::BeaconStateError(_)
+                    | PqKeyRegistrationError::SignatureSetError(_)
+                    | PqKeyRegistrationError::VerificationError(_)
+                    | PqKeyRegistrationError::Invalid(_)
+                    | PqKeyRegistrationError::ConflictsWithPool
+                    | PqKeyRegistrationError::PoolFull => None,
+                    PqKeyRegistrationError::UnknownValidator(_)
+                    | PqKeyRegistrationError::ValidatorExiting { .. }
+                    | PqKeyRegistrationError::PreviousChangeEpochMismatch { .. }
+                    | PqKeyRegistrationError::XmssPublicKeyInUse { .. } => {
+                        Some(PeerAction::HighToleranceError)
+                    }
+                    PqKeyRegistrationError::UnsupportedVersion(_)
+                    | PqKeyRegistrationError::InvalidSignature
+                    | PqKeyRegistrationError::InvalidPossessionProof => {
+                        Some(PeerAction::LowToleranceError)
+                    }
+                };
+                match penalty {
+                    None => self.propagate_validation_result(
+                        message_id,
+                        peer_id,
+                        MessageAcceptance::Ignore,
+                    ),
+                    Some(action) => {
+                        self.propagate_validation_result(
+                            message_id,
+                            peer_id,
+                            MessageAcceptance::Reject,
+                        );
+                        self.gossip_penalize_peer(peer_id, action, "invalid_pq_key_registration");
+                    }
+                }
+                return;
+            }
+        };
+
+        metrics::inc_counter(&metrics::BEACON_PROCESSOR_PQ_KEY_REGISTRATION_VERIFIED_TOTAL);
+
+        self.propagate_validation_result(message_id, peer_id, MessageAcceptance::Accept);
+
+        let outcome = self.chain.import_pq_key_registration(verified);
+        if outcome == PqKeyRegistrationInsertOutcome::Inserted {
+            metrics::inc_counter(&metrics::BEACON_PROCESSOR_PQ_KEY_REGISTRATION_IMPORTED_TOTAL);
+        }
+
+        debug!(
+            validator_index,
+            %previous_change_epoch,
+            ?outcome,
+            "Processed PQ key registration"
+        );
     }
 
     /// Process the sync committee signature received from the gossip network and:

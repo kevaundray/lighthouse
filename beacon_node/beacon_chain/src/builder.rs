@@ -1041,6 +1041,7 @@ where
             observed_proposer_slashings: <_>::default(),
             observed_attester_slashings: <_>::default(),
             observed_bls_to_execution_changes: <_>::default(),
+            observed_pq_key_registrations: <_>::default(),
             execution_layer: self.execution_layer.clone(),
             proof_engine: self.proof_engine,
             builders: self.builders,

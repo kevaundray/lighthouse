@@ -87,6 +87,17 @@ impl<E: EthSpec> LoadCase for TransitionTest<E> {
                 spec.gloas_fork_epoch = Some(Epoch::new(0));
                 spec.heze_fork_epoch = Some(metadata.fork_epoch);
             }
+            ForkName::Eip8450 => {
+                spec.altair_fork_epoch = Some(Epoch::new(0));
+                spec.bellatrix_fork_epoch = Some(Epoch::new(0));
+                spec.capella_fork_epoch = Some(Epoch::new(0));
+                spec.deneb_fork_epoch = Some(Epoch::new(0));
+                spec.electra_fork_epoch = Some(Epoch::new(0));
+                spec.fulu_fork_epoch = Some(Epoch::new(0));
+                spec.gloas_fork_epoch = Some(Epoch::new(0));
+                spec.heze_fork_epoch = Some(Epoch::new(0));
+                spec.eip8450_fork_epoch = Some(metadata.fork_epoch);
+            }
         }
 
         // Load blocks

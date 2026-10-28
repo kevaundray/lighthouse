@@ -376,6 +376,20 @@ pub struct ValidatorIdentityData {
     pub activation_epoch: Epoch,
 }
 
+/// One validator's entry in the post-quantum key registry (EIP-8450).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PqPublicKeysData {
+    #[serde(with = "serde_utils::quoted_u64")]
+    pub index: u64,
+    #[serde(with = "serde_utils::quoted_u8")]
+    pub version: u8,
+    #[serde(with = "ssz_types::serde_utils::hex_fixed_vec")]
+    pub xmss_public_key: XmssPublicKey,
+    #[serde(with = "ssz_types::serde_utils::hex_fixed_vec")]
+    pub vrf_root: VrfRoot,
+    pub change_epoch: Epoch,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BuilderData {
     #[serde(with = "serde_utils::quoted_u64")]
@@ -806,6 +820,13 @@ impl<T: FromStr> From<QueryVec<T>> for Vec<T> {
 pub struct ValidatorBalancesQuery {
     #[serde(default, deserialize_with = "option_query_vec")]
     pub id: Option<Vec<ValidatorId>>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PqPublicKeysQuery {
+    #[serde(default, deserialize_with = "option_query_vec")]
+    pub id: Option<Vec<u64>>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -1352,7 +1373,8 @@ impl<'de> ContextDeserialize<'de, ForkName> for SsePayloadAttributes {
             | ForkName::Electra
             | ForkName::Fulu
             | ForkName::Gloas
-            | ForkName::Heze => {
+            | ForkName::Heze
+            | ForkName::Eip8450 => {
                 Self::V3(Deserialize::deserialize(deserializer).map_err(convert_err)?)
             }
         })
@@ -1404,6 +1426,7 @@ pub enum EventKind<E: EthSpec> {
     ProposerSlashing(Box<ProposerSlashing>),
     AttesterSlashing(Box<AttesterSlashing<E>>),
     BlsToExecutionChange(Box<SignedBlsToExecutionChange>),
+    PqKeyRegistration(Box<SignedPqKeyRegistration>),
     BlockGossip(Box<BlockGossip>),
     ExecutionPayload(SseExecutionPayload),
     ExecutionPayloadGossip(SseExecutionPayloadGossip),
@@ -1435,6 +1458,7 @@ impl<E: EthSpec> EventKind<E> {
             EventKind::ProposerSlashing(_) => "proposer_slashing",
             EventKind::AttesterSlashing(_) => "attester_slashing",
             EventKind::BlsToExecutionChange(_) => "bls_to_execution_change",
+            EventKind::PqKeyRegistration(_) => "pq_key_registration",
             EventKind::BlockGossip(_) => "block_gossip",
             EventKind::ExecutionPayload(_) => "execution_payload",
             EventKind::ExecutionPayloadGossip(_) => "execution_payload_gossip",
@@ -1531,6 +1555,11 @@ impl<E: EthSpec> EventKind<E> {
                     ServerError::InvalidServerSentEvent(format!("Bls To Execution Change: {:?}", e))
                 })?,
             )),
+            "pq_key_registration" => Ok(EventKind::PqKeyRegistration(
+                serde_json::from_str(data).map_err(|e| {
+                    ServerError::InvalidServerSentEvent(format!("PQ Key Registration: {:?}", e))
+                })?,
+            )),
             "block_gossip" => Ok(EventKind::BlockGossip(serde_json::from_str(data).map_err(
                 |e| ServerError::InvalidServerSentEvent(format!("Block Gossip: {:?}", e)),
             )?)),
@@ -1617,6 +1646,7 @@ pub enum EventTopic {
     AttesterSlashing,
     ProposerSlashing,
     BlsToExecutionChange,
+    PqKeyRegistration,
     BlockGossip,
     ExecutionPayload,
     ExecutionPayloadGossip,
@@ -1650,6 +1680,7 @@ impl FromStr for EventTopic {
             "attester_slashing" => Ok(EventTopic::AttesterSlashing),
             "proposer_slashing" => Ok(EventTopic::ProposerSlashing),
             "bls_to_execution_change" => Ok(EventTopic::BlsToExecutionChange),
+            "pq_key_registration" => Ok(EventTopic::PqKeyRegistration),
             "block_gossip" => Ok(EventTopic::BlockGossip),
             "execution_payload" => Ok(EventTopic::ExecutionPayload),
             "execution_payload_gossip" => Ok(EventTopic::ExecutionPayloadGossip),
@@ -1684,6 +1715,7 @@ impl fmt::Display for EventTopic {
             EventTopic::AttesterSlashing => write!(f, "attester_slashing"),
             EventTopic::ProposerSlashing => write!(f, "proposer_slashing"),
             EventTopic::BlsToExecutionChange => write!(f, "bls_to_execution_change"),
+            EventTopic::PqKeyRegistration => write!(f, "pq_key_registration"),
             EventTopic::BlockGossip => write!(f, "block_gossip"),
             EventTopic::ExecutionPayload => write!(f, "execution_payload"),
             EventTopic::ExecutionPayloadGossip => write!(f, "execution_payload_gossip"),
@@ -2935,6 +2967,10 @@ mod test {
             ExecutionPayload::Heze(
                 ExecutionPayloadHeze::<MainnetEthSpec>::arbitrary(&mut u).unwrap(),
             ),
+            // Eip8450 reuses the Heze execution payload.
+            ExecutionPayload::Heze(
+                ExecutionPayloadHeze::<MainnetEthSpec>::arbitrary(&mut u).unwrap(),
+            ),
         ];
         let merged_forks = &ForkName::list_all()[2..];
         assert_eq!(
@@ -2944,7 +2980,7 @@ mod test {
         );
 
         for (payload, &fork_name) in payloads.into_iter().zip(merged_forks) {
-            assert_eq!(payload.fork_name(), fork_name);
+            assert_eq!(payload.fork_name(), fork_name.execution_types_fork());
             let payload_str = serde_json::to_string(&payload).unwrap();
             let mut de = serde_json::Deserializer::from_str(&payload_str);
             generic_deserialize_by_fork(&mut de, payload, fork_name);
@@ -3006,6 +3042,17 @@ mod test {
                     blobs_bundle,
                 }
             },
+            // Eip8450 reuses the Heze execution payload.
+            {
+                let execution_payload = ExecutionPayload::Heze(
+                    ExecutionPayloadHeze::<MainnetEthSpec>::arbitrary(&mut u).unwrap(),
+                );
+                let blobs_bundle = BlobsBundle::<MainnetEthSpec>::arbitrary(&mut u).unwrap();
+                ExecutionPayloadAndBlobs {
+                    execution_payload,
+                    blobs_bundle,
+                }
+            },
         ];
         let blob_forks = &ForkName::list_all()[4..];
 
@@ -3016,7 +3063,10 @@ mod test {
         );
 
         for (payload, &fork_name) in payloads.into_iter().zip(blob_forks) {
-            assert_eq!(payload.execution_payload.fork_name(), fork_name);
+            assert_eq!(
+                payload.execution_payload.fork_name(),
+                fork_name.execution_types_fork()
+            );
             let payload_str = serde_json::to_string(&payload).unwrap();
             let mut de = serde_json::Deserializer::from_str(&payload_str);
             generic_deserialize_by_fork(&mut de, payload, fork_name);

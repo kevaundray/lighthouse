@@ -36,6 +36,7 @@ pub const EXECUTION_PROOF: &str = "execution_proof";
 pub const INCLUSION_LIST: &str = "inclusion_list";
 pub const LIGHT_CLIENT_FINALITY_UPDATE: &str = "light_client_finality_update";
 pub const LIGHT_CLIENT_OPTIMISTIC_UPDATE: &str = "light_client_optimistic_update";
+pub const PQ_KEY_REGISTRATION_TOPIC: &str = "pq_key_registration";
 
 #[derive(Debug)]
 pub struct TopicConfig {
@@ -104,6 +105,10 @@ pub fn core_topics_to_subscribe<E: EthSpec>(
         topics.push(GossipKind::InclusionList);
     }
 
+    if fork_name.eip8450_enabled() {
+        topics.push(GossipKind::PqKeyRegistration);
+    }
+
     topics
 }
 
@@ -132,6 +137,7 @@ pub fn is_fork_non_core_topic(topic: &GossipTopic, _fork_name: ForkName) -> bool
         | GossipKind::ProposerPreferences
         | GossipKind::ExecutionProof
         | GossipKind::InclusionList
+        | GossipKind::PqKeyRegistration
         | GossipKind::LightClientFinalityUpdate
         | GossipKind::LightClientOptimisticUpdate => false,
     }
@@ -204,6 +210,8 @@ pub enum GossipKind {
     LightClientFinalityUpdate,
     /// Topic for publishing optimistic updates for light clients.
     LightClientOptimisticUpdate,
+    /// Topic for EIP-8450 post-quantum key registrations.
+    PqKeyRegistration,
 }
 
 impl GossipKind {
@@ -298,6 +306,7 @@ impl GossipTopic {
                 INCLUSION_LIST => GossipKind::InclusionList,
                 LIGHT_CLIENT_FINALITY_UPDATE => GossipKind::LightClientFinalityUpdate,
                 LIGHT_CLIENT_OPTIMISTIC_UPDATE => GossipKind::LightClientOptimisticUpdate,
+                PQ_KEY_REGISTRATION_TOPIC => GossipKind::PqKeyRegistration,
                 topic => match subnet_topic_index(topic) {
                     Some(kind) => kind,
                     None => return Err(format!("Unknown topic: {}", topic)),
@@ -366,6 +375,7 @@ impl std::fmt::Display for GossipTopic {
             GossipKind::InclusionList => INCLUSION_LIST.into(),
             GossipKind::LightClientFinalityUpdate => LIGHT_CLIENT_FINALITY_UPDATE.into(),
             GossipKind::LightClientOptimisticUpdate => LIGHT_CLIENT_OPTIMISTIC_UPDATE.into(),
+            GossipKind::PqKeyRegistration => PQ_KEY_REGISTRATION_TOPIC.into(),
         };
         write!(
             f,
@@ -610,6 +620,7 @@ mod tests {
             GossipKind::LightClientFinalityUpdate,
             GossipKind::LightClientOptimisticUpdate,
             GossipKind::BlsToExecutionChange,
+            GossipKind::PqKeyRegistration,
         ];
         for subnet in s {
             expected_topics.push(GossipKind::DataColumnSidecar(subnet));

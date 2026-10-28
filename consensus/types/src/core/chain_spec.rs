@@ -41,6 +41,8 @@ pub enum Domain {
     BuilderDeposit,
     InclusionListCommittee,
     ExecutionProof,
+    PqKeyRegistration,
+    PqKeyPossession,
     ApplicationMask(ApplicationDomain),
 }
 
@@ -162,6 +164,8 @@ pub struct ChainSpec {
     pub(crate) domain_builder_deposit: u32,
     pub(crate) domain_inclusion_list_committee: u32,
     pub(crate) domain_execution_proof: u32,
+    pub(crate) domain_pq_key_registration: u32,
+    pub(crate) domain_pq_key_possession: u32,
 
     /*
      * Fork choice
@@ -285,6 +289,14 @@ pub struct ChainSpec {
     pub heze_fork_version: [u8; 4],
     /// The Heze fork epoch is optional, with `None` representing "Heze never happens".
     pub heze_fork_epoch: Option<Epoch>,
+
+    /*
+     * Eip8450 hard fork params
+     */
+    pub eip8450_fork_version: [u8; 4],
+    /// The Eip8450 fork epoch is optional, with `None` representing "Eip8450 never happens".
+    pub eip8450_fork_epoch: Option<Epoch>,
+    pub min_pq_key_change_delay: Epoch,
 
     /*
      * Networking
@@ -419,6 +431,7 @@ impl ChainSpec {
     /// Returns the name of the fork which is active at `epoch`.
     pub fn fork_name_at_epoch(&self, epoch: Epoch) -> ForkName {
         let forks = [
+            (self.eip8450_fork_epoch, ForkName::Eip8450),
             (self.heze_fork_epoch, ForkName::Heze),
             (self.gloas_fork_epoch, ForkName::Gloas),
             (self.fulu_fork_epoch, ForkName::Fulu),
@@ -453,6 +466,7 @@ impl ChainSpec {
             ForkName::Fulu => self.fulu_fork_version,
             ForkName::Gloas => self.gloas_fork_version,
             ForkName::Heze => self.heze_fork_version,
+            ForkName::Eip8450 => self.eip8450_fork_version,
         }
     }
 
@@ -473,6 +487,7 @@ impl ChainSpec {
             ForkName::Fulu => self.fulu_fork_epoch,
             ForkName::Gloas => self.gloas_fork_epoch,
             ForkName::Heze => self.heze_fork_epoch,
+            ForkName::Eip8450 => self.eip8450_fork_epoch,
         }
     }
 
@@ -521,6 +536,12 @@ impl ChainSpec {
     pub fn is_heze_scheduled(&self) -> bool {
         self.heze_fork_epoch
             .is_some_and(|heze_fork_epoch| heze_fork_epoch != self.far_future_epoch)
+    }
+
+    /// Returns true if `EIP8450_FORK_EPOCH` is set and is not set to `FAR_FUTURE_EPOCH`.
+    pub fn is_eip8450_scheduled(&self) -> bool {
+        self.eip8450_fork_epoch
+            .is_some_and(|eip8450_fork_epoch| eip8450_fork_epoch != self.far_future_epoch)
     }
 
     /// Returns a full `Fork` struct for a given epoch.
@@ -577,6 +598,8 @@ impl ChainSpec {
             Domain::BuilderDeposit => self.domain_builder_deposit,
             Domain::InclusionListCommittee => self.domain_inclusion_list_committee,
             Domain::ExecutionProof => self.domain_execution_proof,
+            Domain::PqKeyRegistration => self.domain_pq_key_registration,
+            Domain::PqKeyPossession => self.domain_pq_key_possession,
             Domain::SyncCommittee => self.domain_sync_committee,
             Domain::ContributionAndProof => self.domain_contribution_and_proof,
             Domain::SyncCommitteeSelectionProof => self.domain_sync_committee_selection_proof,
@@ -1323,6 +1346,8 @@ impl ChainSpec {
             domain_builder_deposit: 0x0E,
             domain_inclusion_list_committee: 0x10,
             domain_execution_proof: 0x0F,
+            domain_pq_key_registration: 0x12,
+            domain_pq_key_possession: 0x13,
 
             /*
              * Fork choice
@@ -1472,6 +1497,13 @@ impl ChainSpec {
             max_transactions_bytes_per_inclusion_list: 8192,
             max_request_inclusion_list: 16,
             min_slots_for_inclusion_lists_requests: 1,
+
+            /*
+             * Eip8450 hard fork params
+             */
+            eip8450_fork_version: [0xe8, 0x45, 0x00, 0x00],
+            eip8450_fork_epoch: None,
+            min_pq_key_change_delay: Epoch::new(256),
 
             /*
              * Network specific
@@ -1629,6 +1661,10 @@ impl ChainSpec {
             // Heze
             heze_fork_version: [0x08, 0x00, 0x00, 0x01],
             heze_fork_epoch: None,
+            // Eip8450
+            eip8450_fork_version: [0xe8, 0x45, 0x00, 0x01],
+            eip8450_fork_epoch: None,
+            min_pq_key_change_delay: Epoch::new(8),
 
             /*
              * Derived time values (set by `compute_derived_values()`)
@@ -1779,6 +1815,8 @@ impl ChainSpec {
             domain_builder_deposit: 0x0E,
             domain_inclusion_list_committee: 0x10,
             domain_execution_proof: 0x0F,
+            domain_pq_key_registration: 0x12,
+            domain_pq_key_possession: 0x13,
 
             /*
              * Fork choice
@@ -1932,6 +1970,13 @@ impl ChainSpec {
             max_transactions_bytes_per_inclusion_list: 8192,
             max_request_inclusion_list: 16,
             min_slots_for_inclusion_lists_requests: 1,
+
+            /*
+             * Eip8450 hard fork params
+             */
+            eip8450_fork_version: [0xe8, 0x45, 0x00, 0x64],
+            eip8450_fork_epoch: None,
+            min_pq_key_change_delay: Epoch::new(256),
 
             /*
              * Network specific
@@ -2253,6 +2298,14 @@ pub struct Config {
     #[serde(deserialize_with = "deserialize_fork_epoch")]
     pub heze_fork_epoch: Option<MaybeQuoted<Epoch>>,
 
+    #[serde(default = "default_eip8450_fork_version")]
+    #[serde(with = "serde_utils::bytes_4_hex")]
+    eip8450_fork_version: [u8; 4],
+    #[serde(default)]
+    #[serde(serialize_with = "serialize_fork_epoch")]
+    #[serde(deserialize_with = "deserialize_fork_epoch")]
+    pub eip8450_fork_epoch: Option<MaybeQuoted<Epoch>>,
+
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     seconds_per_slot: Option<MaybeQuoted<u64>>,
@@ -2506,6 +2559,11 @@ fn default_gloas_fork_version() -> [u8; 4] {
 }
 
 fn default_heze_fork_version() -> [u8; 4] {
+    // This value shouldn't be used.
+    [0xff, 0xff, 0xff, 0xff]
+}
+
+fn default_eip8450_fork_version() -> [u8; 4] {
     // This value shouldn't be used.
     [0xff, 0xff, 0xff, 0xff]
 }
@@ -2951,6 +3009,11 @@ impl Config {
                 .heze_fork_epoch
                 .map(|epoch| MaybeQuoted { value: epoch }),
 
+            eip8450_fork_version: spec.eip8450_fork_version,
+            eip8450_fork_epoch: spec
+                .eip8450_fork_epoch
+                .map(|epoch| MaybeQuoted { value: epoch }),
+
             seconds_per_slot: Some(MaybeQuoted {
                 value: spec.seconds_per_slot,
             }),
@@ -3084,6 +3147,8 @@ impl Config {
             gloas_fork_epoch,
             heze_fork_version,
             heze_fork_epoch,
+            eip8450_fork_version,
+            eip8450_fork_epoch,
             seconds_per_slot,
             slot_duration_ms,
             seconds_per_eth1_block,
@@ -3223,6 +3288,8 @@ impl Config {
             gloas_fork_epoch: gloas_fork_epoch.map(|q| q.value),
             heze_fork_version,
             heze_fork_epoch: heze_fork_epoch.map(|q| q.value),
+            eip8450_fork_version,
+            eip8450_fork_epoch: eip8450_fork_epoch.map(|q| q.value),
             seconds_per_slot: seconds_per_slot
                 .map(|q| q.value)
                 .or_else(|| slot_duration_ms.and_then(|q| q.value.checked_div(1000)))?,
@@ -3381,6 +3448,16 @@ mod tests {
         test_domain(Domain::BeaconBuilder, spec.domain_beacon_builder, &spec);
         test_domain(Domain::PTCAttester, spec.domain_ptc_attester, &spec);
         test_domain(Domain::ExecutionProof, spec.domain_execution_proof, &spec);
+        test_domain(
+            Domain::PqKeyRegistration,
+            spec.domain_pq_key_registration,
+            &spec,
+        );
+        test_domain(
+            Domain::PqKeyPossession,
+            spec.domain_pq_key_possession,
+            &spec,
+        );
         test_domain(
             Domain::InclusionListCommittee,
             spec.domain_inclusion_list_committee,

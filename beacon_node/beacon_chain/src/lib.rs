@@ -59,6 +59,7 @@ pub mod persisted_beacon_chain;
 pub mod persisted_custody;
 mod persisted_fast_confirmation;
 mod persisted_fork_choice;
+pub mod pq_key_registration_verification;
 mod pre_finalization_cache;
 pub mod proposer_preferences_verification;
 pub mod proposer_prep_service;

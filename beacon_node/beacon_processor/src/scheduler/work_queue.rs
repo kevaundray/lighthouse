@@ -315,6 +315,7 @@ pub struct BeaconProcessorQueueLengths {
     payload_envelopes_brange_queue: usize,
     payload_envelopes_broots_queue: usize,
     gossip_bls_to_execution_change_queue: usize,
+    gossip_pq_key_registration_queue: usize,
     gossip_execution_payload_queue: usize,
     gossip_execution_proof_queue: usize,
     gossip_execution_payload_bid_queue: usize,
@@ -397,6 +398,7 @@ impl BeaconProcessorQueueLengths {
             payload_envelopes_brange_queue: 1024,
             payload_envelopes_broots_queue: 1024,
             gossip_bls_to_execution_change_queue: 16384,
+            gossip_pq_key_registration_queue: 4096,
             // TODO(EIP-7732): verify 1024 is preferable.
             gossip_execution_payload_queue: 1024,
             gossip_execution_proof_queue: 1024,
@@ -459,6 +461,7 @@ pub struct WorkQueues<E: EthSpec> {
     pub dcbroots_queue: FifoQueue<Work<E>>,
     pub dcbrange_queue: FifoQueue<Work<E>>,
     pub gossip_bls_to_execution_change_queue: FifoQueue<Work<E>>,
+    pub gossip_pq_key_registration_queue: FifoQueue<Work<E>>,
     pub gossip_execution_payload_queue: FifoQueue<Work<E>>,
     pub gossip_execution_proof_queue: FifoQueue<Work<E>>,
     pub gossip_execution_payload_bid_queue: FifoQueue<Work<E>>,
@@ -548,6 +551,8 @@ impl<E: EthSpec> WorkQueues<E> {
 
         let gossip_bls_to_execution_change_queue =
             FifoQueue::new(queue_lengths.gossip_bls_to_execution_change_queue);
+        let gossip_pq_key_registration_queue =
+            FifoQueue::new(queue_lengths.gossip_pq_key_registration_queue);
 
         let gossip_execution_payload_queue =
             FifoQueue::new(queue_lengths.gossip_execution_payload_queue);
@@ -614,6 +619,7 @@ impl<E: EthSpec> WorkQueues<E> {
             payload_envelopes_brange_queue,
             payload_envelopes_broots_queue,
             gossip_bls_to_execution_change_queue,
+            gossip_pq_key_registration_queue,
             gossip_execution_payload_queue,
             gossip_execution_proof_queue,
             gossip_execution_payload_bid_queue,

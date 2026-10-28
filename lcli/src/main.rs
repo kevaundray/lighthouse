@@ -6,11 +6,12 @@ mod indexed_attestations;
 mod mnemonic_validators;
 mod mock_el;
 mod parse_ssz;
+mod pq_key_registration;
 mod skip_slots;
 mod state_root;
 mod transition_blocks;
 
-use clap::{Arg, ArgAction, ArgMatches, Command};
+use clap::{Arg, ArgAction, ArgGroup, ArgMatches, Command};
 use clap_utils::{FLAG_HEADER, parse_optional};
 use environment::{EnvironmentBuilder, LoggerConfig};
 use eth2_network_config::Eth2NetworkConfig;
@@ -588,6 +589,15 @@ fn main() {
                                 until Heze is triggered on mainnet.")
                         .display_order(0)
                 )
+                .arg(
+                    Arg::new("eip8450-time")
+                        .long("eip8450-time")
+                        .value_name("UNIX_TIMESTAMP")
+                        .action(ArgAction::Set)
+                        .help("The payload timestamp at which the EIP-8450 fork activates. It uses \
+                                the same engine API as Heze. No default is provided.")
+                        .display_order(0)
+                )
         )
         .subcommand(
             Command::new("http-sync")
@@ -655,6 +665,175 @@ fn main() {
                         .action(ArgAction::Set)
                         .help("Directory to keep a cache of the downloaded SSZ blocks.")
                         .display_order(0)
+                )
+        )
+        .subcommand(
+            Command::new("pq-key-registration")
+                .about("Creates an EIP-8450 post-quantum key registration for a validator and \
+                        optionally submits it to a beacon node. Signs a proof of possession of \
+                        the leanXMSS key at leaf index 0 and authorizes the registration with \
+                        the validator's BLS signing key.")
+                .arg(
+                    Arg::new("beacon-node")
+                        .long("beacon-node")
+                        .value_name("URL")
+                        .action(ArgAction::Set)
+                        .default_value("http://localhost:5052")
+                        .help("Beacon node to fetch the genesis, spec, validator and current \
+                                post-quantum keys from, and to submit to.")
+                        .display_order(0)
+                )
+                .arg(
+                    Arg::new("validator-index")
+                        .long("validator-index")
+                        .value_name("INDEX")
+                        .action(ArgAction::Set)
+                        .required(true)
+                        .help("Index of the validator registering keys.")
+                        .display_order(0)
+                )
+                .arg(
+                    Arg::new("mnemonic")
+                        .long("mnemonic")
+                        .value_name("PHRASE")
+                        .action(ArgAction::Set)
+                        .help("Mnemonic from which to derive the validator's BLS signing key \
+                                (EIP-2334 path m/12381/3600/i/0/0).")
+                        .display_order(0)
+                )
+                .arg(
+                    Arg::new("mnemonic-file")
+                        .long("mnemonic-file")
+                        .value_name("PATH")
+                        .action(ArgAction::Set)
+                        .help("File containing the mnemonic, as an alternative to --mnemonic \
+                                that keeps it off the command line.")
+                        .display_order(0)
+                )
+                .group(
+                    ArgGroup::new("mnemonic-source")
+                        .args(["mnemonic", "mnemonic-file"])
+                )
+                .arg(
+                    Arg::new("derivation-index")
+                        .long("derivation-index")
+                        .value_name("INDEX")
+                        .action(ArgAction::Set)
+                        .requires("mnemonic-source")
+                        .help("Index i of the EIP-2334 signing key path. Defaults to the \
+                                validator index.")
+                        .display_order(0)
+                )
+                .arg(
+                    Arg::new("keystore")
+                        .long("keystore")
+                        .value_name("PATH")
+                        .action(ArgAction::Set)
+                        .requires("password-file")
+                        .help("EIP-2335 keystore holding the validator's BLS signing key.")
+                        .display_order(0)
+                )
+                .arg(
+                    Arg::new("password-file")
+                        .long("password-file")
+                        .value_name("PATH")
+                        .action(ArgAction::Set)
+                        .requires("keystore")
+                        .help("File containing the password of --keystore.")
+                        .display_order(0)
+                )
+                .arg(
+                    Arg::new("bls-secret-key")
+                        .long("bls-secret-key")
+                        .value_name("HEX")
+                        .action(ArgAction::Set)
+                        .help("The validator's BLS signing key as 0x-prefixed hex.")
+                        .display_order(0)
+                )
+                .arg(
+                    Arg::new("bls-secret-key-file")
+                        .long("bls-secret-key-file")
+                        .value_name("PATH")
+                        .action(ArgAction::Set)
+                        .help("File containing the validator's BLS signing key as 0x-prefixed \
+                                hex, as an alternative to --bls-secret-key.")
+                        .display_order(0)
+                )
+                .group(
+                    ArgGroup::new("bls-key-source")
+                        .args([
+                            "mnemonic",
+                            "mnemonic-file",
+                            "keystore",
+                            "bls-secret-key",
+                            "bls-secret-key-file",
+                        ])
+                        .required(true)
+                )
+                .arg(
+                    Arg::new("xmss-seed-file")
+                        .long("xmss-seed-file")
+                        .value_name("PATH")
+                        .action(ArgAction::Set)
+                        .help("XMSS seed file written by an earlier --xmss-seed-out run, holding \
+                                {\"seed\": \"0x..\", \"validator_index\": \"N\"}. Signing is refused \
+                                unless its validator_index equals --validator-index, so the \
+                                key's leaf 0 only ever proves possession for one validator.")
+                        .display_order(0)
+                )
+                .arg(
+                    Arg::new("xmss-seed-out")
+                        .long("xmss-seed-out")
+                        .value_name("PATH")
+                        .action(ArgAction::Set)
+                        .required_unless_present("xmss-seed-file")
+                        .conflicts_with("xmss-seed-file")
+                        .help("New file (mode 0600, never overwritten) to write a leanXMSS seed \
+                                generated from OS randomness to, bound to --validator-index. \
+                                Reuse it with --xmss-seed-file.")
+                        .display_order(0)
+                )
+                .arg(
+                    Arg::new("vrf-root")
+                        .long("vrf-root")
+                        .value_name("HEX32")
+                        .action(ArgAction::Set)
+                        .required(true)
+                        .help("32-byte root of the validator's VRF tree, as 0x-prefixed hex.")
+                        .display_order(0)
+                )
+                .arg(
+                    Arg::new("previous-change-epoch")
+                        .long("previous-change-epoch")
+                        .value_name("EPOCH")
+                        .action(ArgAction::Set)
+                        .help("Epoch of the validator's last key change. Defaults to the \
+                                change_epoch fetched from the beacon node's head state.")
+                        .display_order(0)
+                )
+                .arg(
+                    Arg::new("output")
+                        .long("output")
+                        .value_name("PATH")
+                        .action(ArgAction::Set)
+                        .help("Path to write the registration to, as a JSON array suitable for \
+                                POST /eth/v1/beacon/pool/pq_key_registrations. At least one of \
+                                --output and --submit is required.")
+                        .display_order(0)
+                )
+                .arg(
+                    Arg::new("submit")
+                        .long("submit")
+                        .action(ArgAction::SetTrue)
+                        .help_heading(FLAG_HEADER)
+                        .help("Submit the registration to the beacon node's pool.")
+                        .display_order(0)
+                )
+                .group(
+                    ArgGroup::new("destination")
+                        .args(["output", "submit"])
+                        .multiple(true)
+                        .required(true)
                 )
         )
         .get_matches();
@@ -788,6 +967,8 @@ fn run<E: EthSpec>(env_builder: EnvironmentBuilder<E>, matches: &ArgMatches) -> 
             http_sync::run::<E>(env, network_config, matches)
                 .map_err(|e| format!("Failed to run http-sync command: {}", e))
         }
+        Some(("pq-key-registration", matches)) => pq_key_registration::run::<E>(env, matches)
+            .map_err(|e| format!("Failed to run pq-key-registration command: {}", e)),
         Some((other, _)) => Err(format!("Unknown subcommand {}. See --help.", other)),
         _ => Err("No subcommand provided. See --help.".to_string()),
     }

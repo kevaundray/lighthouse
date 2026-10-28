@@ -390,6 +390,23 @@ impl HezePreset {
     }
 }
 
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub struct Eip8450Preset {
+    #[serde(with = "serde_utils::quoted_u64")]
+    pub max_pq_key_registrations: u64,
+    pub min_pq_key_change_delay: Epoch,
+}
+
+impl Eip8450Preset {
+    pub fn from_chain_spec<E: EthSpec>(spec: &ChainSpec) -> Self {
+        Self {
+            max_pq_key_registrations: E::max_pq_key_registrations() as u64,
+            min_pq_key_change_delay: spec.min_pq_key_change_delay,
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -443,6 +460,9 @@ mod test {
 
         let heze: HezePreset = preset_from_file(&preset_name, "heze.yaml");
         assert_eq!(heze, HezePreset::from_chain_spec::<E>(&spec));
+
+        let eip8450: Eip8450Preset = preset_from_file(&preset_name, "eip8450.yaml");
+        assert_eq!(eip8450, Eip8450Preset::from_chain_spec::<E>(&spec));
     }
 
     #[test]

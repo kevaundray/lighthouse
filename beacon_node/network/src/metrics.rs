@@ -227,6 +227,21 @@ pub static BEACON_PROCESSOR_BLS_TO_EXECUTION_CHANGE_IMPORTED_TOTAL: LazyLock<Res
             "Total number of address changes imported to the op pool.",
         )
     });
+// Gossip post-quantum key registrations (EIP-8450).
+pub static BEACON_PROCESSOR_PQ_KEY_REGISTRATION_VERIFIED_TOTAL: LazyLock<Result<IntCounter>> =
+    LazyLock::new(|| {
+        try_create_int_counter(
+            "beacon_processor_pq_key_registration_verified_total",
+            "Total number of post-quantum key registrations verified for propagation.",
+        )
+    });
+pub static BEACON_PROCESSOR_PQ_KEY_REGISTRATION_IMPORTED_TOTAL: LazyLock<Result<IntCounter>> =
+    LazyLock::new(|| {
+        try_create_int_counter(
+            "beacon_processor_pq_key_registration_imported_total",
+            "Total number of post-quantum key registrations imported to the op pool.",
+        )
+    });
 
 // Rpc blocks.
 pub static BEACON_PROCESSOR_RPC_BLOCK_IMPORTED_TOTAL: LazyLock<Result<IntCounter>> =

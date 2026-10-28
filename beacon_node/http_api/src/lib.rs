@@ -227,6 +227,7 @@ pub fn prometheus_metrics() -> warp::filters::log::Log<impl Fn(warp::filters::lo
                 .or_else(|| starts_with("v2/beacon/pool/attestations"))
                 .or_else(|| starts_with("v1/beacon/pool/attester_slashings"))
                 .or_else(|| starts_with("v1/beacon/pool/bls_to_execution_changes"))
+                .or_else(|| starts_with("v1/beacon/pool/pq_key_registrations"))
                 .or_else(|| starts_with("v1/beacon/pool/proposer_slashings"))
                 .or_else(|| starts_with("v1/beacon/pool/sync_committees"))
                 .or_else(|| starts_with("v1/beacon/pool/voluntary_exits"))
@@ -626,6 +627,10 @@ pub async fn serve<T: BeaconChainTypes>(
     // GET beacon/states/{state_id}/validator_balances?id
     let get_beacon_state_validator_balances =
         states::get_beacon_state_validator_balances(beacon_states_path.clone());
+
+    // GET beacon/states/{state_id}/pq_public_keys?id
+    let get_beacon_state_pq_public_keys =
+        states::get_beacon_state_pq_public_keys(beacon_states_path.clone());
 
     // POST beacon/states/{state_id}/validator_balances
     let post_beacon_state_validator_balances =
@@ -1610,6 +1615,14 @@ pub async fn serve<T: BeaconChainTypes>(
     // POST beacon/pool/bls_to_execution_changes
     let post_beacon_pool_bls_to_execution_changes =
         post_beacon_pool_bls_to_execution_changes(&network_tx_filter, &beacon_pool_path);
+
+    // GET beacon/pool/pq_key_registrations
+    let get_beacon_pool_pq_key_registrations =
+        get_beacon_pool_pq_key_registrations(&beacon_pool_path);
+
+    // POST beacon/pool/pq_key_registrations
+    let post_beacon_pool_pq_key_registrations =
+        post_beacon_pool_pq_key_registrations(&network_tx_filter, &beacon_pool_path);
 
     // POST validator/proposer_preferences (JSON)
     let post_validator_proposer_preferences = post_validator_proposer_preferences(
@@ -3397,6 +3410,9 @@ pub async fn serve<T: BeaconChainTypes>(
                                 api_types::EventTopic::BlsToExecutionChange => {
                                     event_handler.subscribe_bls_to_execution_change()
                                 }
+                                api_types::EventTopic::PqKeyRegistration => {
+                                    event_handler.subscribe_pq_key_registration()
+                                }
                                 api_types::EventTopic::BlockGossip => {
                                     event_handler.subscribe_block_gossip()
                                 }
@@ -3532,6 +3548,7 @@ pub async fn serve<T: BeaconChainTypes>(
                 .uor(get_beacon_state_fork)
                 .uor(get_beacon_state_finality_checkpoints)
                 .uor(get_beacon_state_validator_balances)
+                .uor(get_beacon_state_pq_public_keys)
                 .uor(get_beacon_state_validators_id)
                 .uor(get_beacon_state_validators)
                 .uor(get_beacon_state_committees)
@@ -3559,6 +3576,7 @@ pub async fn serve<T: BeaconChainTypes>(
                 .uor(get_beacon_pool_proposer_slashings)
                 .uor(get_beacon_pool_voluntary_exits)
                 .uor(get_beacon_pool_bls_to_execution_changes)
+                .uor(get_beacon_pool_pq_key_registrations)
                 .uor(get_beacon_pool_payload_attestations)
                 .uor(get_beacon_rewards_blocks)
                 .uor(get_config_fork_schedule)
@@ -3634,6 +3652,7 @@ pub async fn serve<T: BeaconChainTypes>(
                     .uor(post_beacon_pool_sync_committees)
                     .uor(post_beacon_pool_payload_attestations)
                     .uor(post_beacon_pool_bls_to_execution_changes)
+                    .uor(post_beacon_pool_pq_key_registrations)
                     .uor(post_validator_proposer_preferences)
                     .uor(post_beacon_execution_payload_envelopes)
                     .uor(post_beacon_execution_payload_bids)

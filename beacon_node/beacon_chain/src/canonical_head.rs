@@ -1707,13 +1707,22 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             .get_hot_state(&new_finalized_state_root, update_cache)?
             .ok_or(Error::MissingBeaconState(new_finalized_state_root))?;
 
-        self.op_pool.prune_all(
+        let pruned_pq_key_registrations = self.op_pool.prune_all(
             &new_snapshot.beacon_block,
             &new_snapshot.beacon_state,
             &new_finalized_state,
             self.epoch()?,
             &self.spec,
         );
+        {
+            // Forget the pairs of pruned registrations, e.g. one that lost a race for its key, so
+            // that a new registration for the pair is accepted again.
+            let mut observed = self.observed_pq_key_registrations.lock();
+            observed.prune(&new_finalized_state);
+            for (validator_index, previous_change_epoch) in pruned_pq_key_registrations {
+                observed.forget(validator_index, previous_change_epoch);
+            }
+        }
 
         // Persist before migration can advance the split and prune the checkpoint state needed
         // to initialize FCR on restart. Finality can advance without a head change.
