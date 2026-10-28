@@ -6,9 +6,9 @@ use crate::per_block_processing::signature_sets::{
     get_pubkey_from_state, pq_key_registration_signature_set,
 };
 use lean_pq::xmss;
-use safe_arith::SafeArith;
+use std::cmp::Ordering;
 use types::{
-    BeaconState, BeaconStateError, ChainSpec, Domain, EthSpec, Hash256, PQ_KEYS_VERSION_1,
+    BeaconState, BeaconStateError, ChainSpec, Domain, Epoch, EthSpec, Hash256, PQ_KEYS_VERSION_1,
     PQ_POSSESSION_XMSS_INDEX, PqKeyPossession, PqPublicKeys, SignedPqKeyRegistration, SignedRoot,
     XmssPublicKey, XmssSignature,
 };
@@ -50,6 +50,38 @@ pub fn pq_public_key_owner<E: EthSpec>(
     Ok(owner
         .map(|owner| owner as u64)
         .filter(|owner| *owner != excluded_index))
+}
+
+/// `FAR_FUTURE_EPOCH`, the `pq_key_change_epochs` entry of a validator that has never registered.
+///
+/// It is `ChainSpec::far_future_epoch` on every network, which is not configurable.
+const PQ_UNREGISTERED_CHANGE_EPOCH: Epoch = Epoch::new(u64::MAX);
+
+/// Compares two values of a validator's `pq_key_change_epochs` entry by the order in which a chain
+/// takes them.
+///
+/// The entry starts at `FAR_FUTURE_EPOCH` (never registered), and every change stores the current
+/// epoch, which is later than the previous change. So `FAR_FUTURE_EPOCH` comes before every epoch,
+/// and epochs compare numerically.
+pub fn cmp_pq_change_epochs(a: Epoch, b: Epoch) -> Ordering {
+    match (
+        a == PQ_UNREGISTERED_CHANGE_EPOCH,
+        b == PQ_UNREGISTERED_CHANGE_EPOCH,
+    ) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => a.cmp(&b),
+    }
+}
+
+/// Returns whether no state descending from one whose `pq_key_change_epochs` entry for a validator
+/// is `stored` can apply a registration of that validator naming `previous_change_epoch`.
+///
+/// Along a chain the entry only moves forward in the order of [`cmp_pq_change_epochs`], so a
+/// registration naming an entry behind `stored` can never match again.
+pub fn is_pq_registration_superseded(stored: Epoch, previous_change_epoch: Epoch) -> bool {
+    cmp_pq_change_epochs(stored, previous_change_epoch) == Ordering::Greater
 }
 
 /// Returns the message that the proof of possession of `xmss_public_key` for `index` signs.
@@ -146,10 +178,11 @@ pub fn verify_pq_key_registration<E: EthSpec>(
         }
     );
 
-    // Changes of registered keys are rate-limited.
+    // Changes of registered keys are rate-limited. Only a registered validator's entry is a change
+    // epoch: an unregistered one holds `FAR_FUTURE_EPOCH`, which must not be added to.
     if is_pq_registered(state, index)? {
         let current_epoch = state.current_epoch();
-        let earliest_epoch = last_change_epoch.safe_add(spec.min_pq_key_change_delay)?;
+        let earliest_epoch = last_change_epoch.saturating_add(spec.min_pq_key_change_delay);
         verify!(
             current_epoch >= earliest_epoch,
             Invalid::ChangeTooSoon {

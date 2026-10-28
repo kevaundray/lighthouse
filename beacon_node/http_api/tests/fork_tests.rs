@@ -862,11 +862,12 @@ async fn pq_key_registrations_around_eip8450_fork() {
     let harness = &tester.harness;
     let client = &tester.client;
 
-    let registration = pq_key_registration(harness, 0, &XMSS_KEYS[0], Epoch::new(0));
+    let never_registered = harness.spec.far_future_epoch;
+    let registration = pq_key_registration(harness, 0, &XMSS_KEYS[0], never_registered);
     // A valid BLS authorization, with the proof of possession of another key and validator.
     let bad_possession = SignedPqKeyRegistration {
         possession: registration.possession.clone(),
-        ..pq_key_registration(harness, 1, &XMSS_KEYS[1], Epoch::new(0))
+        ..pq_key_registration(harness, 1, &XMSS_KEYS[1], never_registered)
     };
 
     // Before the fork the head state has no registry: submissions and reads are rejected.
@@ -963,7 +964,7 @@ async fn pq_key_registrations_around_eip8450_fork() {
                 version: PQ_KEYS_VERSION_UNSET,
                 xmss_public_key: XmssPublicKey::default(),
                 vrf_root: VrfRoot::default(),
-                change_epoch: Epoch::new(0),
+                change_epoch: never_registered,
             },
         ]
     );

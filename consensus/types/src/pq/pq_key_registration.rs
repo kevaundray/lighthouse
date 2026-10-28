@@ -18,7 +18,7 @@ pub struct PqKeyRegistration {
     #[serde(with = "serde_utils::quoted_u64")]
     pub validator_index: u64,
     pub public_keys: PqPublicKeys,
-    /// Epoch of the validator's last change, or `GENESIS_EPOCH` if it has never registered.
+    /// Epoch of the validator's last change, or `FAR_FUTURE_EPOCH` if it has never registered.
     pub previous_change_epoch: Epoch,
 }
 

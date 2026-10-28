@@ -45,6 +45,8 @@ type E = MinimalEthSpec;
 type Harness = BeaconChainHarness<EphemeralHarnessType<E>>;
 
 const VALIDATOR_COUNT: usize = 32;
+/// The `pq_key_change_epochs` entry of a validator that has never registered: `FAR_FUTURE_EPOCH`.
+const NEVER_REGISTERED: Epoch = Epoch::new(u64::MAX);
 /// `MAX_PQ_KEY_REGISTRATIONS + 1` leanXMSS keys, so a block can carry one registration too many.
 static XMSS_KEYS: [LazyLock<xmss::SecretKey>; 9] = [
     LazyLock::new(|| generate_xmss_key(0)),
@@ -305,9 +307,12 @@ async fn first_registration_writes_keys_and_change_epoch() {
     let mut state = state_at_epoch(&harness, 3);
 
     assert!(!is_pq_registered(&state, 1).unwrap());
-    assert_eq!(entry(&state, 1), (PqPublicKeys::default(), Epoch::new(0)));
+    assert_eq!(
+        entry(&state, 1),
+        (PqPublicKeys::default(), NEVER_REGISTERED)
+    );
 
-    let signed = registration(&state, 1, 0, 0xaa, Epoch::new(0), spec);
+    let signed = registration(&state, 1, 0, 0xaa, NEVER_REGISTERED, spec);
     assert_eq!(
         verify_pq_key_registration(&state, &signed, VerifySignatures::True, spec),
         Ok(())
@@ -327,7 +332,7 @@ async fn first_registration_writes_keys_and_change_epoch() {
             assert_eq!(*keys, PqPublicKeys::default());
             assert_eq!(
                 state.pq_key_change_epochs().unwrap().get(index),
-                Some(&Epoch::new(0))
+                Some(&NEVER_REGISTERED)
             );
         }
     }
@@ -342,7 +347,7 @@ async fn key_change_respects_min_delay_and_replays_are_rejected() {
     let first_epoch = 3;
     let mut state = state_at_epoch(&harness, first_epoch);
 
-    let first = registration(&state, 1, 0, 0xaa, Epoch::new(0), spec);
+    let first = registration(&state, 1, 0, 0xaa, NEVER_REGISTERED, spec);
     process(&mut state, &first, spec);
 
     // One epoch before the delay has passed, the change is rejected.
@@ -373,13 +378,16 @@ async fn key_change_respects_min_delay_and_replays_are_rejected() {
     // Replaying either registration fails: the change epoch they name is stale, even once the
     // delay has passed again.
     *state.slot_mut() = Epoch::new(change_epoch + delay).start_slot(E::slots_per_epoch());
-    for (stale, previous_change_epoch) in [(&first, 0), (&change, first_epoch)] {
+    for (stale, previous_change_epoch) in [
+        (&first, NEVER_REGISTERED),
+        (&change, Epoch::new(first_epoch)),
+    ] {
         assert_rejected(
             &state,
             stale,
             PqKeyRegistrationInvalid::PreviousChangeEpochMismatch {
                 expected: Epoch::new(change_epoch),
-                found: Epoch::new(previous_change_epoch),
+                found: previous_change_epoch,
             },
             spec,
         );
@@ -393,7 +401,7 @@ async fn vrf_root_only_change_keeps_the_key() {
     let delay = spec.min_pq_key_change_delay.as_u64();
     let mut state = state_at_epoch(&harness, 2);
 
-    register(&mut state, 4, 0, 0xaa, Epoch::new(0), spec);
+    register(&mut state, 4, 0, 0xaa, NEVER_REGISTERED, spec);
 
     // Same leanXMSS key (and therefore the same proof of possession), new VRF root.
     *state.slot_mut() = Epoch::new(2 + delay).start_slot(E::slots_per_epoch());
@@ -426,7 +434,7 @@ async fn exiting_validator_is_rejected() {
     let exit_epoch = state.validators().get(5).unwrap().exit_epoch;
     assert_ne!(exit_epoch, spec.far_future_epoch);
 
-    let signed = registration(&state, 5, 0, 0xaa, Epoch::new(0), spec);
+    let signed = registration(&state, 5, 0, 0xaa, NEVER_REGISTERED, spec);
     assert_rejected(
         &state,
         &signed,
@@ -442,7 +450,7 @@ async fn unknown_validator_is_rejected() {
     let state = harness.get_current_state();
     let index = state.validators().len() as u64;
 
-    let mut signed = registration(&state, 0, 0, 0xaa, Epoch::new(0), spec);
+    let mut signed = registration(&state, 0, 0, 0xaa, NEVER_REGISTERED, spec);
     signed.message.validator_index = index;
     let signed = resign(signed, &state, spec);
     assert_rejected(
@@ -462,7 +470,7 @@ async fn unsupported_versions_are_rejected() {
     for version in [PQ_KEYS_VERSION_UNSET, PQ_KEYS_VERSION_1 + 1] {
         let mut keys = public_keys(0, 0xaa);
         keys.version = version;
-        let signed = registration_with_keys(&state, 1, 0, keys, Epoch::new(0), spec);
+        let signed = registration_with_keys(&state, 1, 0, keys, NEVER_REGISTERED, spec);
         assert_rejected(
             &state,
             &signed,
@@ -478,10 +486,10 @@ async fn key_registered_by_another_validator_is_rejected() {
     let spec = &harness.spec;
     let mut state = harness.get_current_state();
 
-    register(&mut state, 1, 0, 0xaa, Epoch::new(0), spec);
+    register(&mut state, 1, 0, 0xaa, NEVER_REGISTERED, spec);
 
     // Validator 2 holds a valid proof of possession of the same key for its own index.
-    let copy = registration(&state, 2, 0, 0xbb, Epoch::new(0), spec);
+    let copy = registration(&state, 2, 0, 0xbb, NEVER_REGISTERED, spec);
     assert!(is_valid_pq_possession_proof(
         &state,
         2,
@@ -509,8 +517,8 @@ async fn key_freed_by_a_change_is_registerable_by_another_validator() {
     let delay = spec.min_pq_key_change_delay.as_u64();
     let mut state = state_at_epoch(&harness, 1);
 
-    register(&mut state, 1, 0, 0xaa, Epoch::new(0), spec);
-    let takeover = registration(&state, 2, 0, 0xbb, Epoch::new(0), spec);
+    register(&mut state, 1, 0, 0xaa, NEVER_REGISTERED, spec);
+    let takeover = registration(&state, 2, 0, 0xbb, NEVER_REGISTERED, spec);
     assert_rejected(
         &state,
         &takeover,
@@ -540,7 +548,7 @@ async fn invalid_possession_proofs_are_rejected() {
     let harness = eip8450_harness();
     let spec = &harness.spec;
     let state = harness.get_current_state();
-    let valid = registration(&state, 1, 0, 0xaa, Epoch::new(0), spec);
+    let valid = registration(&state, 1, 0, 0xaa, NEVER_REGISTERED, spec);
 
     // One corrupted byte (past the leaf index).
     let mut corrupted = valid.clone();
@@ -585,7 +593,7 @@ async fn possession_proof_at_leaf_index_one_is_rejected() {
     let spec = &harness.spec;
     let state = harness.get_current_state();
 
-    let mut signed = registration(&state, 1, 0, 0xaa, Epoch::new(0), spec);
+    let mut signed = registration(&state, 1, 0, 0xaa, NEVER_REGISTERED, spec);
     signed.possession = possession_proof(&state, 1, 0, 1, spec);
 
     // The real key signed the right message, at the wrong leaf index.
@@ -619,7 +627,7 @@ async fn bls_signature_under_current_fork_version_is_rejected() {
     let state = harness.get_current_state();
     assert_ne!(state.fork().current_version, spec.genesis_fork_version);
 
-    let mut signed = registration(&state, 1, 0, 0xaa, Epoch::new(0), spec);
+    let mut signed = registration(&state, 1, 0, 0xaa, NEVER_REGISTERED, spec);
     let domain = spec.get_domain(
         state.current_epoch(),
         Domain::PqKeyRegistration,
@@ -686,7 +694,7 @@ fn distinct_registrations(
     spec: &ChainSpec,
 ) -> Vec<SignedPqKeyRegistration> {
     (0..count)
-        .map(|i| registration(state, i as u64, i, i as u8, Epoch::new(0), spec))
+        .map(|i| registration(state, i as u64, i, i as u8, NEVER_REGISTERED, spec))
         .collect()
 }
 
@@ -781,8 +789,8 @@ async fn block_registering_one_key_for_two_validators_is_invalid() {
     let spec = &harness.spec;
     let state = harness.get_current_state();
     // Each registration alone is valid.
-    let first = registration(&state, 1, 0, 0xaa, Epoch::new(0), spec);
-    let second = registration(&state, 2, 0, 0xbb, Epoch::new(0), spec);
+    let first = registration(&state, 1, 0, 0xaa, NEVER_REGISTERED, spec);
+    let second = registration(&state, 2, 0, 0xbb, NEVER_REGISTERED, spec);
     for signed in [&first, &second] {
         assert_eq!(
             verify_pq_key_registration(&state, signed, VerifySignatures::True, spec),
@@ -831,7 +839,7 @@ async fn block_exiting_a_validator_before_its_registration_is_invalid() {
     ] {
         // The registration alone is valid.
         let state = harness.get_current_state();
-        let signed = registration(&state, index, 0, 0xaa, Epoch::new(0), spec);
+        let signed = registration(&state, index, 0, 0xaa, NEVER_REGISTERED, spec);
         assert_eq!(
             verify_pq_key_registration(&state, &signed, VerifySignatures::True, spec),
             Ok(())
@@ -881,7 +889,7 @@ async fn block_with_invalid_possession_proof_is_invalid() {
     let harness = eip8450_harness();
     let spec = &harness.spec;
     let state = harness.get_current_state();
-    let mut corrupted = registration(&state, 1, 0, 0xaa, Epoch::new(0), spec);
+    let mut corrupted = registration(&state, 1, 0, 0xaa, NEVER_REGISTERED, spec);
     corrupted.possession[100] ^= 0x80;
 
     let (block, pre_state) = block_with_registrations(&harness, vec![corrupted]).await;
@@ -947,12 +955,12 @@ async fn fork_upgrade_initializes_unset_entries() {
             .pq_key_change_epochs()
             .unwrap()
             .iter()
-            .all(|epoch| *epoch == E::genesis_epoch())
+            .all(|epoch| *epoch == NEVER_REGISTERED)
     );
     assert!(state.pq_pubkey_cache().is_initialized());
 
     // Keys can be registered right after the upgrade.
-    let signed = registration(&state, 3, 0, 0xaa, Epoch::new(0), spec);
+    let signed = registration(&state, 3, 0, 0xaa, NEVER_REGISTERED, spec);
     process(&mut state, &signed, spec);
     assert_eq!(entry(&state, 3), (public_keys(0, 0xaa), Epoch::new(1)));
 }
@@ -962,7 +970,7 @@ async fn deposit_after_fork_keeps_registry_lengths() {
     let harness = eip8450_harness();
     let spec = &harness.spec;
     let mut state = harness.get_current_state();
-    register(&mut state, 1, 0, 0xaa, Epoch::new(0), spec);
+    register(&mut state, 1, 0, 0xaa, NEVER_REGISTERED, spec);
     let cache_before = state.pq_pubkey_cache().clone();
 
     let new_keypair = generate_deterministic_keypair(VALIDATOR_COUNT);
@@ -979,7 +987,7 @@ async fn deposit_after_fork_keeps_registry_lengths() {
     assert_registry_invariant(&state);
     assert_eq!(
         entry(&state, VALIDATOR_COUNT as u64),
-        (PqPublicKeys::default(), E::genesis_epoch())
+        (PqPublicKeys::default(), NEVER_REGISTERED)
     );
     assert_eq!(*state.pq_pubkey_cache(), cache_before);
     assert_eq!(entry(&state, 1), (public_keys(0, 0xaa), Epoch::new(0)));
@@ -993,8 +1001,8 @@ async fn pq_pubkey_cache_rebuilt_from_uncached_state_matches() {
     let mut state = state_at_epoch(&harness, 1);
 
     // Registrations, a key change (freeing key 0) and a VRF-only change.
-    register(&mut state, 1, 0, 0xaa, Epoch::new(0), spec);
-    register(&mut state, 2, 1, 0xbb, Epoch::new(0), spec);
+    register(&mut state, 1, 0, 0xaa, NEVER_REGISTERED, spec);
+    register(&mut state, 2, 1, 0xbb, NEVER_REGISTERED, spec);
     *state.slot_mut() = Epoch::new(1 + delay).start_slot(E::slots_per_epoch());
     register(&mut state, 1, 2, 0xaa, Epoch::new(1), spec);
     register(&mut state, 2, 1, 0xcc, Epoch::new(1), spec);
@@ -1034,8 +1042,8 @@ async fn pq_pubkey_cache_rebuilt_from_uncached_state_matches() {
     assert_eq!(cloned.pq_pubkey_cache(), state.pq_pubkey_cache());
 
     // Further processing gives identical results on the original and the rebuilt state.
-    let copy = registration(&state, 3, 1, 0xdd, Epoch::new(0), spec);
-    let freed = registration(&state, 3, 0, 0xdd, Epoch::new(0), spec);
+    let copy = registration(&state, 3, 1, 0xdd, NEVER_REGISTERED, spec);
+    let freed = registration(&state, 3, 0, 0xdd, NEVER_REGISTERED, spec);
     for state in [&mut state, &mut decoded] {
         assert_eq!(
             verify_pq_key_registration(state, &copy, VerifySignatures::True, spec),
@@ -1047,4 +1055,56 @@ async fn pq_pubkey_cache_rebuilt_from_uncached_state_matches() {
     }
     assert_eq!(decoded.as_ssz_bytes(), state.as_ssz_bytes());
     assert_eq!(decoded.pq_pubkey_cache(), state.pq_pubkey_cache());
+}
+
+/// A registration applied in the genesis epoch moves the validator's entry from
+/// `FAR_FUTURE_EPOCH` to `GENESIS_EPOCH`, so it cannot be included again once the change delay has
+/// passed. (With `GENESIS_EPOCH` as the marker, it stored the value it named and could be.)
+#[tokio::test]
+async fn registration_applied_in_genesis_epoch_cannot_be_replayed() {
+    let harness = eip8450_harness();
+    let spec = &harness.spec;
+    let delay = spec.min_pq_key_change_delay.as_u64();
+    let mut state = harness.get_current_state();
+    assert_eq!(state.current_epoch(), E::genesis_epoch());
+
+    let first = registration(&state, 1, 0, 0xaa, NEVER_REGISTERED, spec);
+    process(&mut state, &first, spec);
+    assert_eq!(entry(&state, 1), (public_keys(0, 0xaa), E::genesis_epoch()));
+
+    *state.slot_mut() = Epoch::new(delay).start_slot(E::slots_per_epoch());
+    assert_rejected(
+        &state,
+        &first,
+        PqKeyRegistrationInvalid::PreviousChangeEpochMismatch {
+            expected: E::genesis_epoch(),
+            found: NEVER_REGISTERED,
+        },
+        spec,
+    );
+
+    // A change naming the genesis epoch, the stored change epoch, is the one that applies.
+    let change = registration(&state, 1, 1, 0xbb, E::genesis_epoch(), spec);
+    process(&mut state, &change, spec);
+    assert_eq!(entry(&state, 1), (public_keys(1, 0xbb), Epoch::new(delay)));
+}
+
+/// An unregistered validator's entry is `FAR_FUTURE_EPOCH`, so a first registration naming
+/// `GENESIS_EPOCH` names the wrong entry.
+#[tokio::test]
+async fn first_registration_naming_genesis_epoch_is_rejected() {
+    let harness = eip8450_harness();
+    let spec = &harness.spec;
+    let state = harness.get_current_state();
+
+    let signed = registration(&state, 1, 0, 0xaa, E::genesis_epoch(), spec);
+    assert_rejected(
+        &state,
+        &signed,
+        PqKeyRegistrationInvalid::PreviousChangeEpochMismatch {
+            expected: NEVER_REGISTERED,
+            found: E::genesis_epoch(),
+        },
+        spec,
+    );
 }

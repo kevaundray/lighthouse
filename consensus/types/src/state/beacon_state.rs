@@ -2552,7 +2552,7 @@ impl<E: EthSpec> BeaconState<E> {
             pq_public_keys.push(PqPublicKeys::default())?;
         }
         if let Ok(pq_key_change_epochs) = self.pq_key_change_epochs_mut() {
-            pq_key_change_epochs.push(E::genesis_epoch())?;
+            pq_key_change_epochs.push(spec.far_future_epoch)?;
         }
 
         // Keep the pubkey cache up to date if it was up to date prior to this call.

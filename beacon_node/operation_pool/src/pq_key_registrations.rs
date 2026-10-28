@@ -1,4 +1,8 @@
-use state_processing::per_block_processing::{VerifySignatures, verify_pq_key_registration};
+use state_processing::per_block_processing::{
+    VerifySignatures, cmp_pq_change_epochs, is_pq_registration_superseded,
+    verify_pq_key_registration,
+};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
 use types::{BeaconState, ChainSpec, Epoch, EthSpec, SignedPqKeyRegistration, XmssPublicKey};
 
@@ -70,7 +74,8 @@ impl PqKeyRegistrations {
     /// Insert a verified registration, keeping at most `max_len` registrations.
     ///
     /// A registration replaces the validator's existing one only if it names a later
-    /// `previous_change_epoch`, i.e. it applies to a later change of the validator's keys.
+    /// `previous_change_epoch` in chain order (see `cmp_pq_change_epochs`), i.e. it applies to a
+    /// later change of the validator's keys.
     pub fn insert(
         &mut self,
         registration: SignedPqKeyRegistration,
@@ -91,8 +96,10 @@ impl PqKeyRegistrations {
                 entry.insert(pooled);
             }
             Entry::Occupied(mut entry) => {
-                if entry.get().registration.message.previous_change_epoch
-                    >= pooled.registration.message.previous_change_epoch
+                if cmp_pq_change_epochs(
+                    pooled.registration.message.previous_change_epoch,
+                    entry.get().registration.message.previous_change_epoch,
+                ) != Ordering::Greater
                 {
                     return PqKeyRegistrationInsertOutcome::NotNewer;
                 }
@@ -197,8 +204,9 @@ impl PqKeyRegistrations {
     ///
     /// A registration is pruned if, in `finalized_state`:
     ///
-    /// - its validator's `pq_key_change_epochs` entry is past its `previous_change_epoch`: change
-    ///   epochs only increase along a chain, so it was applied or a later change superseded it;
+    /// - its validator's `pq_key_change_epochs` entry is past its `previous_change_epoch`: the
+    ///   entry only moves forward along a chain, from `FAR_FUTURE_EPOCH` (never registered) to
+    ///   increasing change epochs, so it was applied or a later change superseded it;
     /// - its validator already holds exactly its keys: it was applied, and applying it again
     ///   would change nothing;
     /// - another validator owns its leanXMSS key: it lost a race for the key (a validator only
@@ -238,9 +246,9 @@ impl PqKeyRegistrations {
                 let exited = validators
                     .get(index)
                     .is_some_and(|validator| validator.exit_epoch != spec.far_future_epoch);
-                let superseded = change_epochs
-                    .get(index)
-                    .is_some_and(|epoch| *epoch > message.previous_change_epoch);
+                let superseded = change_epochs.get(index).is_some_and(|epoch| {
+                    is_pq_registration_superseded(*epoch, message.previous_change_epoch)
+                });
                 let applied = public_keys
                     .get(index)
                     .is_some_and(|keys| *keys == message.public_keys);
@@ -322,6 +330,8 @@ mod tests {
     type E = MinimalEthSpec;
 
     const VALIDATOR_COUNT: usize = 16;
+    /// The `previous_change_epoch` of a first registration: `FAR_FUTURE_EPOCH`.
+    const NEVER: u64 = u64::MAX;
 
     fn spec() -> ChainSpec {
         ForkName::Eip8450.make_genesis_spec(E::default_spec())
@@ -383,9 +393,9 @@ mod tests {
         let spec = spec();
         let state = genesis_state(&spec);
         let pool = pool_with(&[
-            registration(0, 1, 0),
-            registration(1, 1, 0),
-            registration(2, 2, 0),
+            registration(0, 1, NEVER),
+            registration(1, 1, NEVER),
+            registration(2, 2, NEVER),
         ]);
 
         let selected = pool.select_for_block(&state, |_| false, 8, &spec);
@@ -404,16 +414,16 @@ mod tests {
         state.set_pq_public_keys(6, keys(6), Epoch::new(0)).unwrap();
 
         let pool = pool_with(&[
-            // Stale: the state's change epoch of validator 0 is 0.
+            // Stale: validator 0 never registered, so its change epoch is `FAR_FUTURE_EPOCH`.
             registration(0, 10, 3),
             // Exited validator.
-            registration(1, 11, 0),
+            registration(1, 11, NEVER),
             // Exited by an operation of the same block.
-            registration(2, 12, 0),
+            registration(2, 12, NEVER),
             // Valid.
-            registration(3, 13, 0),
+            registration(3, 13, NEVER),
             // Key owned by validator 5.
-            registration(4, 5, 0),
+            registration(4, 5, NEVER),
             // Change of validator 6 before `MIN_PQ_KEY_CHANGE_DELAY` epochs.
             registration(6, 16, 0),
         ]);
@@ -436,7 +446,7 @@ mod tests {
         let op_pool = OperationPool::<E>::new();
         for index in 0..10 {
             assert_eq!(
-                op_pool.insert_pq_key_registration(registration(index, index as u8 + 1, 0)),
+                op_pool.insert_pq_key_registration(registration(index, index as u8 + 1, NEVER)),
                 PqKeyRegistrationInsertOutcome::Inserted
             );
         }
@@ -450,7 +460,7 @@ mod tests {
     fn nothing_selected_before_eip8450() {
         let spec = ForkName::Heze.make_genesis_spec(E::default_spec());
         let state = genesis_state(&spec);
-        let pool = pool_with(&[registration(0, 1, 0)]);
+        let pool = pool_with(&[registration(0, 1, NEVER)]);
 
         assert!(
             pool.select_for_block(&state, |_| false, 8, &spec)
@@ -460,36 +470,39 @@ mod tests {
 
     #[test]
     fn insert_replaces_only_later_previous_change_epoch() {
-        let mut pool = pool_with(&[registration(0, 1, 4), registration(1, 1, 0)]);
+        let mut pool = pool_with(&[registration(0, 1, 4), registration(1, 1, NEVER)]);
 
-        assert_eq!(
-            pool.insert(registration(0, 2, 4), usize::MAX),
-            PqKeyRegistrationInsertOutcome::NotNewer
-        );
-        assert_eq!(
-            pool.insert(registration(0, 2, 3), usize::MAX),
-            PqKeyRegistrationInsertOutcome::NotNewer
-        );
+        // Not later in chain order: the same change epoch, an earlier one, or a first
+        // registration, which comes before every change.
+        for previous_change_epoch in [4, 3, NEVER] {
+            assert_eq!(
+                pool.insert(registration(0, 2, previous_change_epoch), usize::MAX),
+                PqKeyRegistrationInsertOutcome::NotNewer
+            );
+        }
         assert_eq!(pool.get(0), Some(&registration(0, 1, 4)));
         assert_eq!(pool.get(2), None);
 
         // Only the exact pooled registration is removed.
-        assert!(!pool.remove(&registration(1, 2, 0)));
-        assert!(pool.remove(&registration(1, 1, 0)));
+        assert!(!pool.remove(&registration(1, 2, NEVER)));
+        assert!(pool.remove(&registration(1, 1, NEVER)));
         assert_eq!(pool.get(1), None);
         assert_eq!(
-            pool.insert(registration(1, 1, 0), usize::MAX),
+            pool.insert(registration(1, 1, NEVER), usize::MAX),
             PqKeyRegistrationInsertOutcome::Inserted
         );
 
-        // The replacement moves to the back of the FIFO order.
-        assert_eq!(
-            pool.insert(registration(0, 2, 5), usize::MAX),
-            PqKeyRegistrationInsertOutcome::Inserted
-        );
+        // A change replaces a pooled first registration, and a replacement moves to the back of
+        // the FIFO order.
+        for replacement in [registration(1, 2, 0), registration(0, 2, 5)] {
+            assert_eq!(
+                pool.insert(replacement, usize::MAX),
+                PqKeyRegistrationInsertOutcome::Inserted
+            );
+        }
         assert_eq!(
             pool.iter_fifo().cloned().collect::<Vec<_>>(),
-            vec![registration(1, 1, 0), registration(0, 2, 5)]
+            vec![registration(1, 2, 0), registration(0, 2, 5)]
         );
     }
 
@@ -501,17 +514,17 @@ mod tests {
         let max_len = 3;
         let mut pool = PqKeyRegistrations::default();
         for index in 0..3 {
-            assert!(pool.has_room_for(&registration(index, 1, 0), max_len));
+            assert!(pool.has_room_for(&registration(index, 1, NEVER), max_len));
             assert_eq!(
-                pool.insert(registration(index, 1, 0), max_len),
+                pool.insert(registration(index, 1, NEVER), max_len),
                 PqKeyRegistrationInsertOutcome::Inserted
             );
         }
 
         // A new validator does not fit.
-        assert!(!pool.has_room_for(&registration(3, 1, 0), max_len));
+        assert!(!pool.has_room_for(&registration(3, 1, NEVER), max_len));
         assert_eq!(
-            pool.insert(registration(3, 1, 0), max_len),
+            pool.insert(registration(3, 1, NEVER), max_len),
             PqKeyRegistrationInsertOutcome::PoolFull
         );
         // A later registration of a pooled validator replaces its entry.
@@ -534,7 +547,7 @@ mod tests {
             .unwrap();
         pool.prune(&finalized_state, &spec);
         assert_eq!(
-            pool.insert(registration(3, 1, 0), max_len),
+            pool.insert(registration(3, 1, NEVER), max_len),
             PqKeyRegistrationInsertOutcome::Inserted
         );
         assert_eq!(
@@ -547,13 +560,17 @@ mod tests {
     fn prune_removes_only_registrations_dead_in_finalized_state() {
         let spec = spec();
         let mut finalized_state = genesis_state(&spec);
-        // Validator 0 changed its keys at epoch 3 in the finalized chain.
+        // Validator 0 registered keys 1 at epoch 3 in the finalized chain.
         finalized_state
             .set_pq_public_keys(0, keys(1), Epoch::new(3))
             .unwrap();
         // Validator 5 registered keys 6 at epoch 0.
         finalized_state
             .set_pq_public_keys(5, keys(6), Epoch::new(0))
+            .unwrap();
+        // Validator 7 last changed its keys at epoch 4.
+        finalized_state
+            .set_pq_public_keys(7, keys(8), Epoch::new(4))
             .unwrap();
         // Validator 3 exited in the finalized state.
         finalized_state
@@ -563,21 +580,23 @@ mod tests {
             .exit_epoch = Epoch::new(1);
 
         let registrations = [
-            // Superseded by the finalized change at epoch 3.
-            registration(0, 1, 0),
+            // A first registration of other keys, superseded by validator 0's registration.
+            registration(0, 7, NEVER),
             // Applicable to the finalized state, or applied in a block that is not finalized:
             // kept, so a re-org can include it again.
-            registration(1, 2, 0),
-            // Names a change after the finalized state's (made in a non-finalized block).
+            registration(1, 2, NEVER),
+            // Names a change made in a non-finalized block, while the finalized state has none.
             registration(2, 3, 5),
             // Exited.
-            registration(3, 4, 0),
+            registration(3, 4, NEVER),
             // Lost the race for key 1 to validator 0.
-            registration(4, 1, 0),
+            registration(4, 1, NEVER),
             // Applied: validator 5 holds exactly these keys.
-            registration(5, 6, 0),
+            registration(5, 6, NEVER),
             // Validator 5's keys, for validator 6: lost the race too.
-            registration(6, 6, 0),
+            registration(6, 6, NEVER),
+            // Names a change before validator 7's finalized change at epoch 4.
+            registration(7, 9, 2),
         ];
 
         // With the finalized state's PQ pubkey cache built, and without it.
@@ -590,12 +609,13 @@ mod tests {
 
             assert_eq!(
                 pool.iter_fifo().cloned().collect::<Vec<_>>(),
-                vec![registration(1, 2, 0), registration(2, 3, 5)]
+                vec![registration(1, 2, NEVER), registration(2, 3, 5)]
             );
-            assert_eq!(
-                pruned,
-                [0, 3, 4, 5, 6].map(|index| (index, Epoch::new(0))).to_vec()
-            );
+            let mut expected = [0, 3, 4, 5, 6]
+                .map(|index| (index, Epoch::new(NEVER)))
+                .to_vec();
+            expected.push((7, Epoch::new(2)));
+            assert_eq!(pruned, expected);
         }
     }
 
@@ -604,7 +624,7 @@ mod tests {
         let op_pool = OperationPool::<E>::new();
         for index in [3, 1, 2] {
             assert_eq!(
-                op_pool.insert_pq_key_registration(registration(index, index as u8, 0)),
+                op_pool.insert_pq_key_registration(registration(index, index as u8, NEVER)),
                 PqKeyRegistrationInsertOutcome::Inserted
             );
         }

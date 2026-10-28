@@ -547,6 +547,13 @@ mod tests {
     fn registration_passes_state_verification() {
         let spec = ForkName::Eip8450.make_genesis_spec(E::default_spec());
         let (mut state, keypair) = genesis_state(&spec);
+        // A first registration names the validator's stored entry, `FAR_FUTURE_EPOCH`.
+        let previous_change_epoch = *state
+            .pq_key_change_epochs()
+            .unwrap()
+            .get(VALIDATOR_INDEX as usize)
+            .unwrap();
+        assert_eq!(previous_change_epoch, spec.far_future_epoch);
         let xmss_secret_key = xmss::SecretKey::from_seed(XMSS_SEED);
 
         let signed = build_signed_registration(
@@ -554,7 +561,7 @@ mod tests {
             &keypair,
             &xmss_secret_key,
             [9; 32],
-            Epoch::new(0),
+            previous_change_epoch,
             state.genesis_validators_root(),
             &spec,
         )
@@ -610,7 +617,7 @@ mod tests {
             &keypair,
             &reused_key,
             [10; 32],
-            Epoch::new(0),
+            previous_change_epoch,
             state.genesis_validators_root(),
             &spec,
         )

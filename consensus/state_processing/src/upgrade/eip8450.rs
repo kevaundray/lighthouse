@@ -25,13 +25,14 @@ pub fn upgrade_state_to_eip8450<E: EthSpec>(
     let pre = pre_state.as_heze_mut()?;
     let num_validators = pre.validators.len();
 
-    // [New in EIP-8450] one unset registry entry per validator.
+    // [New in EIP-8450] one unset registry entry per validator. `FAR_FUTURE_EPOCH` marks a
+    // validator that has never registered.
     let pq_public_keys = ProgressiveList::try_from_iter(std::iter::repeat_n(
         PqPublicKeys::default(),
         num_validators,
     ))?;
     let pq_key_change_epochs =
-        ProgressiveList::try_from_iter(std::iter::repeat_n(E::genesis_epoch(), num_validators))?;
+        ProgressiveList::try_from_iter(std::iter::repeat_n(spec.far_future_epoch, num_validators))?;
 
     // Where possible, use something like `mem::take` to move fields from behind the &mut
     // reference. For other fields that don't have a good default value, use `clone`.

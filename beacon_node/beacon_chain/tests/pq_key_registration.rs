@@ -67,7 +67,12 @@ fn registration(state: &BeaconState<E>, spec: &ChainSpec) -> SignedPqKeyRegistra
     PqKeyRegistration {
         validator_index: REGISTRANT,
         public_keys: public_keys(),
-        previous_change_epoch: Epoch::new(0),
+        // A first registration names the stored entry, `FAR_FUTURE_EPOCH` until it registers.
+        previous_change_epoch: *state
+            .pq_key_change_epochs()
+            .unwrap()
+            .get(REGISTRANT as usize)
+            .unwrap(),
     }
     .sign(
         XmssSignature::new(possession.to_bytes().to_vec()).unwrap(),
@@ -116,6 +121,13 @@ async fn harness_past_eip8450_fork() -> Harness {
     assert_eq!(
         head_state.pq_key_change_epochs().unwrap().len(),
         VALIDATOR_COUNT
+    );
+    assert!(
+        head_state
+            .pq_key_change_epochs()
+            .unwrap()
+            .iter()
+            .all(|epoch| *epoch == harness.spec.far_future_epoch)
     );
     harness
 }

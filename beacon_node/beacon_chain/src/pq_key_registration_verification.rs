@@ -7,7 +7,6 @@
 use crate::{BeaconChain, BeaconChainError, BeaconChainTypes};
 use eth2::types::EventKind;
 use operation_pool::PqKeyRegistrationInsertOutcome;
-use safe_arith::SafeArith;
 use state_processing::per_block_processing::errors::{
     BlockOperationError, PqKeyRegistrationInvalid,
 };
@@ -15,8 +14,8 @@ use state_processing::per_block_processing::signature_sets::{
     Error as SignatureSetError, get_pubkey_from_state, pq_key_registration_signature_set,
 };
 use state_processing::per_block_processing::{
-    VerifySignatures, is_pq_registered, is_valid_pq_possession_proof, pq_public_key_owner,
-    verify_pq_key_registration,
+    VerifySignatures, is_pq_registered, is_pq_registration_superseded,
+    is_valid_pq_possession_proof, pq_public_key_owner, verify_pq_key_registration,
 };
 use std::collections::HashSet;
 use types::{
@@ -221,7 +220,9 @@ impl ObservedPqKeyRegistrations {
             .retain(|(validator_index, previous_change_epoch)| {
                 change_epochs
                     .get(*validator_index as usize)
-                    .is_none_or(|finalized_epoch| *finalized_epoch <= *previous_change_epoch)
+                    .is_none_or(|finalized_epoch| {
+                        !is_pq_registration_superseded(*finalized_epoch, *previous_change_epoch)
+                    })
             });
     }
 
@@ -307,12 +308,13 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             });
         }
 
-        // [IGNORE] A registered validator's change delay has passed at the current epoch.
+        // [IGNORE] A registered validator's change delay has passed at the current epoch. An
+        // unregistered validator's entry is `FAR_FUTURE_EPOCH`, not a change epoch, and is never
+        // added to.
         if is_pq_registered(state, validator_index)? {
             let earliest_epoch = registration
                 .previous_change_epoch
-                .safe_add(self.spec.min_pq_key_change_delay)
-                .map_err(BeaconStateError::from)?;
+                .saturating_add(self.spec.min_pq_key_change_delay);
             if current_epoch < earliest_epoch {
                 return Err(Error::ChangeTooSoon {
                     current_epoch,
@@ -475,6 +477,8 @@ mod tests {
     };
 
     type E = MinimalEthSpec;
+    /// The `previous_change_epoch` of a first registration: `FAR_FUTURE_EPOCH`.
+    const NEVER: u64 = u64::MAX;
 
     const VALIDATOR_COUNT: usize = 8;
 
@@ -539,7 +543,7 @@ mod tests {
         let chain = &harness.chain;
         let [key_a, key_b] = [&XMSS_KEYS[0], &XMSS_KEYS[1]];
 
-        let valid = registration(&harness, 0, key_a, 0);
+        let valid = registration(&harness, 0, key_a, NEVER);
         assert_eq!(
             chain
                 .verify_pq_key_registration_for_gossip(valid.clone())
@@ -553,7 +557,7 @@ mod tests {
             chain.verify_pq_key_registration_for_gossip(valid.clone()),
             Err(Error::PriorRegistrationKnown { .. })
         ));
-        let other_key = registration(&harness, 0, key_b, 0);
+        let other_key = registration(&harness, 0, key_b, NEVER);
         assert!(matches!(
             chain.verify_pq_key_registration_for_gossip(other_key.clone()),
             Err(Error::PriorRegistrationKnown { .. })
@@ -568,29 +572,30 @@ mod tests {
         ));
 
         // [REJECT] Unknown validator.
-        let mut unknown_validator = registration(&harness, 1, key_b, 0);
+        let mut unknown_validator = registration(&harness, 1, key_b, NEVER);
         unknown_validator.message.validator_index = VALIDATOR_COUNT as u64;
         assert!(matches!(
             chain.verify_pq_key_registration_for_gossip(unknown_validator),
             Err(Error::UnknownValidator(_))
         ));
 
-        // [REJECT] Stale previous change epoch.
+        // [REJECT] Stale previous change epoch: a first registration naming `GENESIS_EPOCH`.
         assert!(matches!(
-            chain.verify_pq_key_registration_for_gossip(registration(&harness, 1, key_b, 5)),
-            Err(Error::PreviousChangeEpochMismatch { .. })
+            chain.verify_pq_key_registration_for_gossip(registration(&harness, 1, key_b, 0)),
+            Err(Error::PreviousChangeEpochMismatch { expected, found })
+                if expected == Epoch::new(NEVER) && found == Epoch::new(0)
         ));
 
         // [REJECT] BLS signature of another validator.
-        let mut bad_signature = registration(&harness, 1, key_b, 0);
-        bad_signature.signature = registration(&harness, 2, key_b, 0).signature;
+        let mut bad_signature = registration(&harness, 1, key_b, NEVER);
+        bad_signature.signature = registration(&harness, 2, key_b, NEVER).signature;
         assert!(matches!(
             chain.verify_pq_key_registration_for_gossip(bad_signature),
             Err(Error::InvalidSignature)
         ));
 
         // [REJECT] Proof of possession of another key and validator.
-        let mut bad_possession = registration(&harness, 1, key_b, 0);
+        let mut bad_possession = registration(&harness, 1, key_b, NEVER);
         bad_possession.possession = valid.possession.clone();
         assert!(matches!(
             chain.verify_pq_key_registration_for_gossip(bad_possession),
@@ -600,7 +605,7 @@ mod tests {
         // Rejected registrations do not mark their pair as observed.
         assert!(
             chain
-                .verify_pq_key_registration_for_gossip(registration(&harness, 1, key_b, 0))
+                .verify_pq_key_registration_for_gossip(registration(&harness, 1, key_b, NEVER))
                 .is_ok()
         );
     }
@@ -611,7 +616,7 @@ mod tests {
         let chain = &harness.chain;
         let [key_a, key_b] = [&XMSS_KEYS[0], &XMSS_KEYS[1]];
 
-        let valid = registration(&harness, 2, key_a, 0);
+        let valid = registration(&harness, 2, key_a, NEVER);
         let PqKeyRegistrationOutcome::New(verified) = chain
             .verify_pq_key_registration_for_http_api(valid.clone())
             .unwrap()
@@ -634,12 +639,12 @@ mod tests {
             PqKeyRegistrationOutcome::AlreadyKnown
         );
         assert!(matches!(
-            chain.verify_pq_key_registration_for_http_api(registration(&harness, 2, key_b, 0)),
+            chain.verify_pq_key_registration_for_http_api(registration(&harness, 2, key_b, NEVER)),
             Err(Error::ConflictsWithPool)
         ));
 
-        let mut bad_possession = registration(&harness, 3, key_b, 0);
-        bad_possession.possession = registration(&harness, 4, key_b, 0).possession;
+        let mut bad_possession = registration(&harness, 3, key_b, NEVER);
+        bad_possession.possession = registration(&harness, 4, key_b, NEVER).possession;
         assert!(matches!(
             chain.verify_pq_key_registration_for_http_api(bad_possession),
             Err(Error::Invalid(PqKeyRegistrationInvalid::BadPossessionProof))
@@ -652,7 +657,7 @@ mod tests {
         let chain = &harness.chain;
 
         // Observed on gossip, but never stored (e.g. dropped by a re-org or a full pool).
-        let valid = registration(&harness, 0, &XMSS_KEYS[0], 0);
+        let valid = registration(&harness, 0, &XMSS_KEYS[0], NEVER);
         chain
             .verify_pq_key_registration_for_gossip(valid.clone())
             .unwrap();
@@ -675,8 +680,8 @@ mod tests {
     async fn full_pool_ignores_without_observing() {
         let harness = get_harness();
         let chain = &harness.chain;
-        let first = registration(&harness, 0, &XMSS_KEYS[0], 0);
-        let second = registration(&harness, 1, &XMSS_KEYS[1], 0);
+        let first = registration(&harness, 0, &XMSS_KEYS[0], NEVER);
+        let second = registration(&harness, 1, &XMSS_KEYS[1], NEVER);
 
         // Verified while the pool has room.
         let verified = chain
@@ -703,7 +708,7 @@ mod tests {
             !chain
                 .observed_pq_key_registrations
                 .lock()
-                .is_known(0, Epoch::new(0))
+                .is_known(0, Epoch::new(NEVER))
         );
 
         // Gossip ignores a valid registration without observing its pair, and HTTP refuses it.
@@ -716,8 +721,8 @@ mod tests {
             Err(Error::PoolFull)
         ));
         let observed = chain.observed_pq_key_registrations.lock();
-        assert!(!observed.is_known(0, Epoch::new(0)));
-        assert!(!observed.is_known(1, Epoch::new(0)));
+        assert!(!observed.is_known(0, Epoch::new(NEVER)));
+        assert!(!observed.is_known(1, Epoch::new(NEVER)));
     }
 
     /// A head state loaded from disk (e.g. after a restart) gets its PQ pubkey cache built with
@@ -781,8 +786,8 @@ mod tests {
         let [key_a, key_b] = [&XMSS_KEYS[0], &XMSS_KEYS[1]];
 
         // Validators 1 and 0 race for key A; validator 1 is first in the pool and wins.
-        let winner = registration(&harness, 1, key_a, 0);
-        let loser = registration(&harness, 0, key_a, 0);
+        let winner = registration(&harness, 1, key_a, NEVER);
+        let loser = registration(&harness, 0, key_a, NEVER);
         let included = import_and_pack(&harness, &[winner.clone(), loser.clone()]).await;
         assert_eq!(included, vec![winner.clone()]);
 
@@ -793,7 +798,7 @@ mod tests {
         ));
 
         // The loser's pair is observed, so a registration of another key is ignored on gossip.
-        let retry = registration(&harness, 0, key_b, 0);
+        let retry = registration(&harness, 0, key_b, NEVER);
         assert!(matches!(
             chain.verify_pq_key_registration_for_gossip(retry.clone()),
             Err(Error::PriorRegistrationKnown { .. })
@@ -809,7 +814,7 @@ mod tests {
             !chain
                 .observed_pq_key_registrations
                 .lock()
-                .is_known(0, Epoch::new(0))
+                .is_known(0, Epoch::new(NEVER))
         );
 
         // The validator registers another key.
@@ -830,12 +835,12 @@ mod tests {
         let chain = &harness.chain;
         let [key_a, key_b] = [&XMSS_KEYS[0], &XMSS_KEYS[1]];
 
-        let winner = registration(&harness, 1, key_a, 0);
-        let loser = registration(&harness, 0, key_a, 0);
+        let winner = registration(&harness, 1, key_a, NEVER);
+        let loser = registration(&harness, 0, key_a, NEVER);
         let included = import_and_pack(&harness, &[winner.clone(), loser.clone()]).await;
         assert_eq!(included, vec![winner.clone()]);
 
-        let retry = registration(&harness, 0, key_b, 0);
+        let retry = registration(&harness, 0, key_b, NEVER);
         let PqKeyRegistrationOutcome::New(verified) = chain
             .verify_pq_key_registration_for_http_api(retry.clone())
             .unwrap()
@@ -867,24 +872,31 @@ mod tests {
     async fn observed_pairs_are_pruned_by_finalized_state() {
         let harness = get_harness();
         let mut finalized_state = harness.get_current_state();
-        let keys = registration(&harness, 0, &XMSS_KEYS[0], 0)
+        let keys = registration(&harness, 0, &XMSS_KEYS[0], NEVER)
             .message
             .public_keys;
+        // Validator 0 last changed its keys at epoch 5; validator 1 never registered.
         finalized_state
             .set_pq_public_keys(0, keys, Epoch::new(5))
             .unwrap();
 
         let mut observed = ObservedPqKeyRegistrations::default();
-        for (validator_index, previous_change_epoch) in [(0, 0), (0, 5), (0, 6), (1, 0)] {
+        let pairs = [(0, NEVER), (0, 4), (0, 5), (0, 6), (1, NEVER), (1, 3)];
+        for (validator_index, previous_change_epoch) in pairs {
             assert!(observed.observe(validator_index, Epoch::new(previous_change_epoch)));
         }
-        assert!(!observed.observe(1, Epoch::new(0)));
+        assert!(!observed.observe(1, Epoch::new(NEVER)));
 
         observed.prune(&finalized_state);
-        assert_eq!(observed.len(), 3);
-        assert!(!observed.is_known(0, Epoch::new(0)));
+        // Behind validator 0's finalized change: its first registration and a change naming
+        // epoch 4. Validator 1's change naming epoch 3 was made in a block that is not
+        // finalized, so it is kept.
+        assert_eq!(observed.len(), 4);
+        assert!(!observed.is_known(0, Epoch::new(NEVER)));
+        assert!(!observed.is_known(0, Epoch::new(4)));
         assert!(observed.is_known(0, Epoch::new(5)));
         assert!(observed.is_known(0, Epoch::new(6)));
-        assert!(observed.is_known(1, Epoch::new(0)));
+        assert!(observed.is_known(1, Epoch::new(NEVER)));
+        assert!(observed.is_known(1, Epoch::new(3)));
     }
 }
