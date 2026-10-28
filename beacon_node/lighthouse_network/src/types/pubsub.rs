@@ -764,9 +764,8 @@ mod tests {
             message: types::PqKeyRegistration {
                 validator_index: 7,
                 public_keys: types::PqPublicKeys {
-                    version: types::PQ_KEYS_VERSION_1,
                     xmss_public_key: vec![1; 32].try_into().unwrap(),
-                    vrf_root: vec![2; 32].try_into().unwrap(),
+                    vrf_root: Hash256::repeat_byte(2),
                 },
                 previous_change_epoch: Epoch::new(3),
             },

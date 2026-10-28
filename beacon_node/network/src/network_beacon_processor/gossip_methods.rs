@@ -2351,8 +2351,7 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
                     | PqKeyRegistrationError::XmssPublicKeyInUse { .. } => {
                         Some(PeerAction::HighToleranceError)
                     }
-                    PqKeyRegistrationError::UnsupportedVersion(_)
-                    | PqKeyRegistrationError::InvalidSignature
+                    PqKeyRegistrationError::InvalidSignature
                     | PqKeyRegistrationError::InvalidPossessionProof => {
                         Some(PeerAction::LowToleranceError)
                     }

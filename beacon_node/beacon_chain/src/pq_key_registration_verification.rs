@@ -19,9 +19,7 @@ use state_processing::per_block_processing::{
     pq_public_key_owner, verify_pq_key_registration,
 };
 use std::collections::HashSet;
-use types::{
-    BeaconState, BeaconStateError, Epoch, EthSpec, PQ_KEYS_VERSION_1, SignedPqKeyRegistration, Slot,
-};
+use types::{BeaconState, BeaconStateError, Epoch, EthSpec, SignedPqKeyRegistration, Slot};
 
 /// Reasons a `SignedPqKeyRegistration` failed verification.
 ///
@@ -41,12 +39,6 @@ pub enum Error {
     ///
     /// IGNORE: our head lags the fork boundary.
     HeadPriorToEip8450,
-    /// The registered keys do not use `PQ_KEYS_VERSION_1`.
-    ///
-    /// ## Peer scoring
-    ///
-    /// REJECT.
-    UnsupportedVersion(u8),
     /// The validator is not in the head state.
     ///
     /// ## Peer scoring
@@ -272,10 +264,12 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         let validator_index = registration.validator_index;
         let public_keys = &registration.public_keys;
 
-        // [REJECT] The keys use `PQ_KEYS_VERSION_1`.
-        if public_keys.version != PQ_KEYS_VERSION_1 {
-            return Err(Error::UnsupportedVersion(public_keys.version));
-        }
+        // [IGNORE] The head state is at or after the fork, so that it has the registry. A head
+        // state prior to the fork (e.g. right after the fork boundary) has nothing to check
+        // against.
+        let change_epochs = state
+            .pq_key_change_epochs()
+            .map_err(|_| Error::HeadPriorToEip8450)?;
 
         // [REJECT] The validator is in the head state and has not initiated an exit.
         let validator = state
@@ -302,12 +296,6 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         }
 
         // [REJECT] The registration names the validator's last change in the head state.
-        //
-        // A head state prior to the fork (e.g. right after the fork boundary) has no registry to
-        // check against: ignore the registration.
-        let change_epochs = state
-            .pq_key_change_epochs()
-            .map_err(|_| Error::HeadPriorToEip8450)?;
         let last_change_epoch = *change_epochs
             .get(validator_index as usize)
             .ok_or(BeaconStateError::UnknownValidator(validator_index as usize))?;
@@ -484,8 +472,8 @@ mod tests {
     use std::sync::{Arc, LazyLock};
     use std::time::Duration;
     use types::{
-        ForkName, MinimalEthSpec, PQ_POSSESSION_XMSS_INDEX, PqKeyRegistration, PqPublicKeys,
-        XmssPublicKey,
+        ForkName, Hash256, MinimalEthSpec, PQ_POSSESSION_XMSS_INDEX, PqKeyRegistration,
+        PqPublicKeys, XmssPublicKey,
     };
 
     type E = MinimalEthSpec;
@@ -539,9 +527,8 @@ mod tests {
         PqKeyRegistration {
             validator_index,
             public_keys: PqPublicKeys {
-                version: PQ_KEYS_VERSION_1,
                 xmss_public_key,
-                vrf_root: vec![validator_index as u8; 32].try_into().unwrap(),
+                vrf_root: Hash256::repeat_byte(validator_index as u8),
             },
             previous_change_epoch: Epoch::new(previous_change_epoch),
         }
@@ -575,16 +562,8 @@ mod tests {
         ));
         let other_key = registration(&harness, 0, key_b, NEVER);
         assert!(matches!(
-            chain.verify_pq_key_registration_for_gossip(other_key.clone()),
+            chain.verify_pq_key_registration_for_gossip(other_key),
             Err(Error::PriorRegistrationKnown { .. })
-        ));
-
-        // [REJECT] The version is checked before the pair.
-        let mut bad_version = other_key;
-        bad_version.message.public_keys.version = 2;
-        assert!(matches!(
-            chain.verify_pq_key_registration_for_gossip(bad_version),
-            Err(Error::UnsupportedVersion(2))
         ));
 
         // [REJECT] Unknown validator.
@@ -656,7 +635,15 @@ mod tests {
         // Within the disparity: the fork gate passes, and the pre-fork head is what ignores it.
         chain.slot_clock.set_current_time(fork_start - disparity);
         assert!(matches!(
-            chain.verify_pq_key_registration_for_gossip(valid),
+            chain.verify_pq_key_registration_for_gossip(valid.clone()),
+            Err(Error::HeadPriorToEip8450)
+        ));
+
+        // The head state is checked before the validator.
+        let mut unknown_validator = valid;
+        unknown_validator.message.validator_index = VALIDATOR_COUNT as u64;
+        assert!(matches!(
+            chain.verify_pq_key_registration_for_gossip(unknown_validator),
             Err(Error::HeadPriorToEip8450)
         ));
     }

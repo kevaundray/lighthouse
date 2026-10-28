@@ -17,9 +17,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use types::{
-    ChainSpec, Config, Domain, Epoch, EthSpec, Hash256, PQ_KEYS_VERSION_1,
-    PQ_POSSESSION_XMSS_INDEX, PqKeyPossession, PqKeyRegistration, PqPublicKeys,
-    SignedPqKeyRegistration, SignedRoot, VrfRoot, XmssPublicKey, XmssSignature,
+    ChainSpec, Config, Domain, Epoch, EthSpec, Hash256, PQ_POSSESSION_XMSS_INDEX, PqKeyPossession,
+    PqKeyRegistration, PqPublicKeys, SignedPqKeyRegistration, SignedRoot, VrfRoot, XmssPublicKey,
+    XmssSignature,
 };
 use zeroize::Zeroizing;
 
@@ -229,12 +229,17 @@ async fn fetch_chain_context<E: EthSpec>(
                         validator_index
                     )
                 })?;
-            eprintln!(
-                "Current post-quantum keys: version {}, xmss_public_key 0x{}, change_epoch {}",
-                entry.version,
-                hex::encode(&entry.xmss_public_key[..]),
-                entry.change_epoch
-            );
+            if entry.change_epoch == spec.far_future_epoch {
+                eprintln!("Validator {validator_index} has no registered post-quantum keys");
+            } else {
+                eprintln!(
+                    "Current post-quantum keys: xmss_public_key 0x{}, vrf_root {:?}, \
+                     change_epoch {}",
+                    hex::encode(&entry.xmss_public_key[..]),
+                    entry.vrf_root,
+                    entry.change_epoch
+                );
+            }
             entry.change_epoch
         }
     };
@@ -267,8 +272,7 @@ pub fn build_signed_registration(
     let xmss_public_key = xmss_secret_key.public_key();
     let xmss_public_key_bytes = XmssPublicKey::new(xmss_public_key.to_bytes().to_vec())
         .map_err(|e| format!("Invalid XMSS public key length: {:?}", e))?;
-    let vrf_root =
-        VrfRoot::new(vrf_root.to_vec()).map_err(|e| format!("Invalid VRF root length: {:?}", e))?;
+    let vrf_root = VrfRoot::from(vrf_root);
 
     let possession_domain = spec.compute_domain(
         Domain::PqKeyPossession,
@@ -297,7 +301,6 @@ pub fn build_signed_registration(
     let signed_registration = PqKeyRegistration {
         validator_index,
         public_keys: PqPublicKeys {
-            version: PQ_KEYS_VERSION_1,
             xmss_public_key: xmss_public_key_bytes,
             vrf_root,
         },
@@ -570,7 +573,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(signed.message.public_keys.version, PQ_KEYS_VERSION_1);
+        assert_eq!(signed.message.public_keys.vrf_root, Hash256::repeat_byte(9));
+        assert_eq!(signed.message.previous_change_epoch, spec.far_future_epoch);
         assert_eq!(
             xmss::Signature::from_bytes(&signed.possession)
                 .unwrap()

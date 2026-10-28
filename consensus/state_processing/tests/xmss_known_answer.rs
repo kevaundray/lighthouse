@@ -1,8 +1,9 @@
-//! Known-answer tests pinning leanXMSS verification (`lean_pq::xmss`) and the EIP-8450 proof of
-//! possession to EIP-CRYPTO v1.
+//! Known-answer tests pinning leanXMSS verification (`lean_pq::xmss`, which implements EIP-8450's
+//! `xmss.Verify` and `xmss_signature_index`) and the EIP-8450 proof of possession.
 //!
-//! The vectors in `xmss_known_answer.txt` come from an independent Python signer over the
-//! EIP-CRYPTO pseudocode, which also decided every expected outcome; see the header of that file.
+//! The vectors in `xmss_known_answer.txt` come from an independent Python signer over a reference
+//! leanXMSS construction (Keccak-256), which also decided every expected outcome; see the header
+//! of that file.
 
 use bls::PublicKeyBytes;
 use lean_pq::{Error, xmss};
@@ -133,7 +134,7 @@ fn signatures_and_keys_decode_to_their_bytes_and_leaf_index() {
 }
 
 #[test]
-fn lean_pq_matches_every_eip_crypto_outcome() {
+fn lean_pq_matches_every_reference_outcome() {
     let vectors = vectors();
     let mut counts: HashMap<&str, usize> = HashMap::new();
     let mut mismatches = vec![];
@@ -157,7 +158,7 @@ fn lean_pq_matches_every_eip_crypto_outcome() {
             other => other,
         };
         if outcome != expected_outcome {
-            mismatches.push(format!("{name}: EIP-CRYPTO {expected}, lean-pq {outcome}"));
+            mismatches.push(format!("{name}: reference {expected}, lean-pq {outcome}"));
         }
         *counts.entry(*expected).or_default() += 1;
     }

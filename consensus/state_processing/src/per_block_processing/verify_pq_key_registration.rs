@@ -9,9 +9,9 @@ use bls::PublicKeyBytes;
 use lean_pq::xmss;
 use std::cmp::Ordering;
 use types::{
-    BeaconState, BeaconStateError, ChainSpec, Domain, Epoch, EthSpec, Hash256, PQ_KEYS_VERSION_1,
-    PQ_POSSESSION_XMSS_INDEX, PqKeyPossession, PqPublicKeys, SignedPqKeyRegistration, SignedRoot,
-    XmssPublicKey, XmssSignature,
+    BeaconState, BeaconStateError, ChainSpec, Domain, Epoch, EthSpec, Hash256,
+    PQ_POSSESSION_XMSS_INDEX, PQ_UNREGISTERED_CHANGE_EPOCH, PqKeyPossession, PqPublicKeys,
+    SignedPqKeyRegistration, SignedRoot, XmssPublicKey, XmssSignature,
 };
 
 type Result<T, E = BlockOperationError<Invalid>> = std::result::Result<T, E>;
@@ -20,21 +20,23 @@ fn error(reason: Invalid) -> BlockOperationError<Invalid> {
     BlockOperationError::invalid(reason)
 }
 
-/// Returns whether the validator at `index` has registered post-quantum keys (`is_pq_registered`).
+/// Returns whether the validator at `index` has registered post-quantum keys (`is_pq_registered`):
+/// whether its `pq_key_change_epochs` entry is not `FAR_FUTURE_EPOCH`.
 pub fn is_pq_registered<E: EthSpec>(
     state: &BeaconState<E>,
     index: u64,
 ) -> Result<bool, BeaconStateError> {
     state
-        .pq_public_keys()?
+        .pq_key_change_epochs()?
         .get(index as usize)
-        .map(PqPublicKeys::is_registered)
+        .map(|change_epoch| *change_epoch != PQ_UNREGISTERED_CHANGE_EPOCH)
         .ok_or(BeaconStateError::UnknownValidator(index as usize))
 }
 
-/// Returns whether a validator other than `excluded_index` registered the leanXMSS key of
+/// Returns whether a registered validator other than `excluded_index` holds the leanXMSS key of
 /// `public_keys` (`is_pq_public_key_in_use`), returning that validator's index.
 ///
+/// Unregistered validators are skipped, so their all-zero entries never own the all-zero key.
 /// Uses the state's `PqPubkeyCache` when it is built, and scans the registry otherwise.
 pub fn pq_public_key_owner<E: EthSpec>(
     state: &BeaconState<E>,
@@ -44,19 +46,15 @@ pub fn pq_public_key_owner<E: EthSpec>(
     let owner = if state.pq_pubkey_cache().is_initialized() {
         state.pq_pubkey_cache().get(&public_keys.xmss_public_key)
     } else {
-        state.pq_public_keys()?.iter().position(|entry| {
-            entry.is_registered() && entry.xmss_public_key == public_keys.xmss_public_key
-        })
+        state
+            .registered_pq_public_keys()?
+            .find(|(_, entry)| entry.xmss_public_key == public_keys.xmss_public_key)
+            .map(|(index, _)| index)
     };
     Ok(owner
         .map(|owner| owner as u64)
         .filter(|owner| *owner != excluded_index))
 }
-
-/// `FAR_FUTURE_EPOCH`, the `pq_key_change_epochs` entry of a validator that has never registered.
-///
-/// It is `ChainSpec::far_future_epoch` on every network, which is not configurable.
-const PQ_UNREGISTERED_CHANGE_EPOCH: Epoch = Epoch::new(u64::MAX);
 
 /// Compares two values of a validator's `pq_key_change_epochs` entry by the order in which a chain
 /// takes them.
@@ -183,10 +181,6 @@ pub fn verify_pq_key_registration<E: EthSpec>(
         Invalid::ValidatorExiting {
             exit_epoch: validator.exit_epoch
         }
-    );
-    verify!(
-        public_keys.version == PQ_KEYS_VERSION_1,
-        Invalid::UnsupportedVersion(public_keys.version)
     );
 
     // The registration applies to the validator's current entry only.

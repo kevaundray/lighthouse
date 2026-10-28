@@ -19,9 +19,9 @@ use std::time::Instant;
 use types::test_utils::generate_deterministic_keypairs;
 use types::{
     BeaconState, BlockImportSource, ChainSpec, Domain, Epoch, EthSpec, ForkName, Hash256,
-    MinimalEthSpec, PQ_KEYS_VERSION_1, PQ_POSSESSION_XMSS_INDEX, PqKeyRegistration, PqPublicKeys,
-    SignedBeaconBlock, SignedExecutionPayloadEnvelope, SignedPqKeyRegistration, SignedRoot,
-    VrfRoot, XmssPublicKey, XmssSignature,
+    MinimalEthSpec, PQ_POSSESSION_XMSS_INDEX, PqKeyRegistration, PqPublicKeys, SignedBeaconBlock,
+    SignedExecutionPayloadEnvelope, SignedPqKeyRegistration, SignedRoot, XmssPublicKey,
+    XmssSignature,
 };
 
 type E = MinimalEthSpec;
@@ -49,9 +49,8 @@ fn xmss_public_key() -> XmssPublicKey {
 
 fn public_keys() -> PqPublicKeys {
     PqPublicKeys {
-        version: PQ_KEYS_VERSION_1,
         xmss_public_key: xmss_public_key(),
-        vrf_root: VrfRoot::new(vec![0xaa; 32]).unwrap(),
+        vrf_root: Hash256::repeat_byte(0xaa),
     }
 }
 

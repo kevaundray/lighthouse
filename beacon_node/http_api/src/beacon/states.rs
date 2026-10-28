@@ -1094,9 +1094,8 @@ pub fn get_beacon_state_pq_public_keys<T: BeaconChainTypes>(
                                     let change_epoch = change_epochs.get(index as usize)?;
                                     Some(eth2::types::PqPublicKeysData {
                                         index,
-                                        version: keys.version,
                                         xmss_public_key: keys.xmss_public_key.clone(),
-                                        vrf_root: keys.vrf_root.clone(),
+                                        vrf_root: keys.vrf_root,
                                         change_epoch: *change_epoch,
                                     })
                                 };

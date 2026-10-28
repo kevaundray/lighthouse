@@ -1,7 +1,6 @@
-use milhouse::ProgressiveList;
 use rpds::HashTrieMapSync as HashTrieMap;
 
-use crate::pq::{PqPublicKeys, XmssPublicKey};
+use crate::pq::XmssPublicKey;
 
 type ValidatorIndex = usize;
 
@@ -17,13 +16,18 @@ fn key_bytes(xmss_public_key: &XmssPublicKey) -> [u8; 32] {
 /// Map from registered leanXMSS public keys to the index of the validator that registered them
 /// (EIP-8450).
 ///
-/// The cache is not part of consensus. It is built lazily from `pq_public_keys` and then kept
-/// exact by `BeaconState::set_pq_public_keys`, the only writer of registered keys. Appending
-/// validators adds unset entries only, so it never invalidates the cache. The map is persistent,
-/// so cloning a state shares it cheaply.
+/// It indexes exactly the validators that are registered (`is_pq_registered`): those whose
+/// `pq_key_change_epochs` entry is not `FAR_FUTURE_EPOCH`. The all-zero `pq_public_keys` entry of
+/// an unregistered validator is never indexed.
+///
+/// The cache is not part of consensus. It is built lazily from
+/// `BeaconState::registered_pq_public_keys` and then kept exact by
+/// `BeaconState::set_pq_public_keys`, the only writer of the registry. Appending validators adds
+/// unregistered entries only, so it never invalidates the cache. The map is persistent, so cloning
+/// a state shares it cheaply.
 #[derive(Debug, PartialEq, Clone, Default)]
 pub struct PqPubkeyCache {
-    /// `false` until the map reflects the state's `pq_public_keys`.
+    /// `false` until the map reflects the state's registry.
     initialized: bool,
     map: HashTrieMap<[u8; 32], ValidatorIndex>,
 }
@@ -37,12 +41,15 @@ impl PqPubkeyCache {
         }
     }
 
-    /// Builds the cache from the registry, or returns `None` if two validators registered the
-    /// same leanXMSS key (which a valid state never contains).
-    pub fn new(pq_public_keys: &ProgressiveList<PqPublicKeys>) -> Option<Self> {
+    /// Builds the cache from the keys of the registered validators, by validator index, or returns
+    /// `None` if two validators registered the same leanXMSS key (which a valid state never
+    /// contains).
+    pub fn new<'a>(
+        registered_keys: impl IntoIterator<Item = (ValidatorIndex, &'a XmssPublicKey)>,
+    ) -> Option<Self> {
         let mut cache = Self::new_initialized();
-        for (index, entry) in pq_public_keys.iter().enumerate() {
-            if entry.is_registered() && !cache.insert(&entry.xmss_public_key, index) {
+        for (index, xmss_public_key) in registered_keys {
+            if !cache.insert(xmss_public_key, index) {
                 return None;
             }
         }
@@ -90,31 +97,20 @@ impl arbitrary::Arbitrary<'_> for PqPubkeyCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pq::PQ_KEYS_VERSION_1;
 
     fn key(byte: u8) -> XmssPublicKey {
         XmssPublicKey::new(vec![byte; 32]).unwrap()
     }
 
-    fn entry(byte: u8) -> PqPublicKeys {
-        PqPublicKeys {
-            version: PQ_KEYS_VERSION_1,
-            xmss_public_key: key(byte),
-            vrf_root: <_>::default(),
-        }
-    }
-
     #[test]
-    fn build_skips_unset_and_rejects_duplicates() {
-        let list =
-            ProgressiveList::try_from_iter([entry(1), PqPublicKeys::default(), entry(2)]).unwrap();
-        let cache = PqPubkeyCache::new(&list).unwrap();
+    fn build_indexes_given_keys_and_rejects_duplicates() {
+        let (one, two) = (key(1), key(2));
+        let cache = PqPubkeyCache::new([(0, &one), (2, &two)]).unwrap();
         assert_eq!(cache.get(&key(1)), Some(0));
         assert_eq!(cache.get(&key(2)), Some(2));
         assert_eq!(cache.get(&key(0)), None);
 
-        let duplicates = ProgressiveList::try_from_iter([entry(1), entry(1)]).unwrap();
-        assert!(PqPubkeyCache::new(&duplicates).is_none());
+        assert!(PqPubkeyCache::new([(0, &one), (1, &one)]).is_none());
     }
 
     #[test]

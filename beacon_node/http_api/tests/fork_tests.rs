@@ -18,9 +18,9 @@ use state_processing::state_advance::complete_state_advance;
 use std::collections::HashSet;
 use std::sync::LazyLock;
 use types::{
-    Address, BeaconState, ChainSpec, Epoch, EthSpec, ForkName, Hash256, PQ_KEYS_VERSION_1,
-    PQ_KEYS_VERSION_UNSET, PQ_POSSESSION_XMSS_INDEX, PqKeyRegistration, PqPublicKeys,
-    SignedPqKeyRegistration, Slot, Spec, VrfRoot, XmssPublicKey, XmssSignature,
+    Address, BeaconState, ChainSpec, Epoch, EthSpec, ForkName, Hash256, PQ_POSSESSION_XMSS_INDEX,
+    PqKeyRegistration, PqPublicKeys, SignedPqKeyRegistration, Slot, Spec, VrfRoot, XmssPublicKey,
+    XmssSignature,
     test_utils::{generate_deterministic_keypair, generate_deterministic_keypairs},
 };
 
@@ -843,9 +843,8 @@ fn pq_key_registration(
     PqKeyRegistration {
         validator_index,
         public_keys: PqPublicKeys {
-            version: PQ_KEYS_VERSION_1,
             xmss_public_key,
-            vrf_root: VrfRoot::try_from(vec![validator_index as u8; 32]).unwrap(),
+            vrf_root: Hash256::repeat_byte(validator_index as u8),
         },
         previous_change_epoch,
     }
@@ -958,14 +957,12 @@ async fn pq_key_registrations_around_eip8450_fork() {
         vec![
             PqPublicKeysData {
                 index: 0,
-                version: PQ_KEYS_VERSION_1,
                 xmss_public_key: registration.message.public_keys.xmss_public_key.clone(),
-                vrf_root: registration.message.public_keys.vrf_root.clone(),
+                vrf_root: registration.message.public_keys.vrf_root,
                 change_epoch,
             },
             PqPublicKeysData {
                 index: 1,
-                version: PQ_KEYS_VERSION_UNSET,
                 xmss_public_key: XmssPublicKey::default(),
                 vrf_root: VrfRoot::default(),
                 change_epoch: never_registered,

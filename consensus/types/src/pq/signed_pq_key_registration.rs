@@ -16,7 +16,8 @@ use crate::{
 pub struct SignedPqKeyRegistration {
     /// Validator, keys, and last change being registered. The BLS signature signs it.
     pub message: PqKeyRegistration,
-    /// Signature of the validator index and leanXMSS key by that key, at leaf index 0.
+    /// Signature of the validator's BLS public key and the leanXMSS key by that key, at leaf index
+    /// 0. It proves that the registrant holds the secret key.
     #[serde(with = "ssz_types::serde_utils::hex_fixed_vec")]
     pub possession: XmssSignature,
     /// Signature of the registration by the validator's BLS signing key.
@@ -32,7 +33,8 @@ mod tests {
     #[test]
     fn serialized_size() {
         use ssz::Encode;
-        // 8 + 65 + 8 + 2404 + 96 bytes, as stated by EIP-8450.
-        assert_eq!(<SignedPqKeyRegistration as Encode>::ssz_fixed_len(), 2581);
+        // 8 + 64 + 8 + 2404 + 96 bytes, as stated by EIP-8450.
+        assert!(<SignedPqKeyRegistration as Encode>::is_ssz_fixed_len());
+        assert_eq!(<SignedPqKeyRegistration as Encode>::ssz_fixed_len(), 2580);
     }
 }

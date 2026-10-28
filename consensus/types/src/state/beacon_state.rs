@@ -46,7 +46,7 @@ use crate::{
         FINALIZED_ROOT_INDEX, FINALIZED_ROOT_INDEX_ELECTRA, NEXT_SYNC_COMMITTEE_FIELD_INDEX,
         NEXT_SYNC_COMMITTEE_INDEX, NEXT_SYNC_COMMITTEE_INDEX_ELECTRA,
     },
-    pq::{PqPublicKeys, XmssPublicKey},
+    pq::{PQ_UNREGISTERED_CHANGE_EPOCH, PqPublicKeys, XmssPublicKey},
     state::{
         BlockRootsIter, CommitteeCache, EpochCache, EpochCacheError, ExitCache, HistoricalBatch,
         HistoricalSummary, PqPubkeyCache, ProgressiveBalancesCache, PubkeyCache, SlashingsCache,
@@ -138,8 +138,13 @@ pub enum BeaconStateError {
     },
     ZeroSlotsPerEpoch,
     PubkeyCacheInconsistent,
-    /// The `pq_public_keys` list contains the same leanXMSS key for two validators.
+    /// Two registered validators hold the same leanXMSS key in `pq_public_keys`.
     PqPubkeyCacheInconsistent,
+    /// `pq_public_keys` and `pq_key_change_epochs` have different lengths.
+    PqRegistryLengthMismatch {
+        pq_public_keys: usize,
+        pq_key_change_epochs: usize,
+    },
     PubkeyCacheIncomplete {
         cache_len: usize,
         registry_len: usize,
@@ -3098,7 +3103,32 @@ impl<E: EthSpec> BeaconState<E> {
         *self.pubkey_cache_mut() = PubkeyCache::default()
     }
 
-    /// Builds the `pq_pubkey_cache` from `pq_public_keys`, if it is not already built.
+    /// Returns the index and keys of every validator that has registered post-quantum keys, i.e.
+    /// whose `pq_key_change_epochs` entry is not `FAR_FUTURE_EPOCH` (`is_pq_registered`).
+    ///
+    /// The all-zero `pq_public_keys` entry of an unregistered validator is skipped, so it never
+    /// counts as a registration of the all-zero key.
+    pub fn registered_pq_public_keys(
+        &self,
+    ) -> Result<impl Iterator<Item = (usize, &PqPublicKeys)>, BeaconStateError> {
+        let pq_public_keys = self.pq_public_keys()?;
+        let pq_key_change_epochs = self.pq_key_change_epochs()?;
+        if pq_public_keys.len() != pq_key_change_epochs.len() {
+            return Err(BeaconStateError::PqRegistryLengthMismatch {
+                pq_public_keys: pq_public_keys.len(),
+                pq_key_change_epochs: pq_key_change_epochs.len(),
+            });
+        }
+        Ok(pq_public_keys
+            .iter()
+            .zip(pq_key_change_epochs.iter())
+            .enumerate()
+            .filter(|(_, (_, change_epoch))| **change_epoch != PQ_UNREGISTERED_CHANGE_EPOCH)
+            .map(|(index, (public_keys, _))| (index, public_keys)))
+    }
+
+    /// Builds the `pq_pubkey_cache` from the registered validators' keys, if it is not already
+    /// built.
     ///
     /// States prior to Eip8450 have no registered keys, so their cache is empty.
     #[instrument(skip_all, level = "debug")]
@@ -3106,10 +3136,14 @@ impl<E: EthSpec> BeaconState<E> {
         if self.pq_pubkey_cache().is_initialized() {
             return Ok(());
         }
-        let cache = match self.pq_public_keys() {
-            Ok(pq_public_keys) => PqPubkeyCache::new(pq_public_keys)
-                .ok_or(BeaconStateError::PqPubkeyCacheInconsistent)?,
-            Err(_) => PqPubkeyCache::new_initialized(),
+        let cache = if self.fork_name_unchecked().eip8450_enabled() {
+            PqPubkeyCache::new(
+                self.registered_pq_public_keys()?
+                    .map(|(index, public_keys)| (index, &public_keys.xmss_public_key)),
+            )
+            .ok_or(BeaconStateError::PqPubkeyCacheInconsistent)?
+        } else {
+            PqPubkeyCache::new_initialized()
         };
         *self.pq_pubkey_cache_mut() = cache;
         Ok(())
@@ -3133,7 +3167,9 @@ impl<E: EthSpec> BeaconState<E> {
     /// Writes the post-quantum keys of the validator at `index` and the epoch of the change,
     /// keeping the `pq_pubkey_cache` exact.
     ///
-    /// The key previously registered by the validator, if any, is released.
+    /// The key previously registered by the validator, if any, is released. A validator is
+    /// registered before (after) the write if its previous (new) change epoch is not
+    /// `FAR_FUTURE_EPOCH`.
     pub fn set_pq_public_keys(
         &mut self,
         index: usize,
@@ -3142,27 +3178,25 @@ impl<E: EthSpec> BeaconState<E> {
     ) -> Result<(), BeaconStateError> {
         self.update_pq_pubkey_cache()?;
 
-        let previous = self
-            .pq_public_keys()?
-            .get(index)
-            .cloned()
-            .ok_or(BeaconStateError::UnknownValidator(index))?;
-        let new_keys = public_keys.clone();
-
-        *self
-            .pq_public_keys_mut()?
-            .get_mut(index)
-            .ok_or(BeaconStateError::UnknownValidator(index))? = public_keys;
-        *self
-            .pq_key_change_epochs_mut()?
-            .get_mut(index)
-            .ok_or(BeaconStateError::UnknownValidator(index))? = change_epoch;
+        let new_key = public_keys.xmss_public_key.clone();
+        let previous_change_epoch = std::mem::replace(
+            self.pq_key_change_epochs_mut()?
+                .get_mut(index)
+                .ok_or(BeaconStateError::UnknownValidator(index))?,
+            change_epoch,
+        );
+        let previous = std::mem::replace(
+            self.pq_public_keys_mut()?
+                .get_mut(index)
+                .ok_or(BeaconStateError::UnknownValidator(index))?,
+            public_keys,
+        );
 
         let cache = self.pq_pubkey_cache_mut();
-        if previous.is_registered() {
+        if previous_change_epoch != PQ_UNREGISTERED_CHANGE_EPOCH {
             cache.remove(&previous.xmss_public_key, index);
         }
-        if new_keys.is_registered() && !cache.insert(&new_keys.xmss_public_key, index) {
+        if change_epoch != PQ_UNREGISTERED_CHANGE_EPOCH && !cache.insert(&new_key, index) {
             return Err(BeaconStateError::PqPubkeyCacheInconsistent);
         }
         Ok(())

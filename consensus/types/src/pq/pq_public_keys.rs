@@ -5,34 +5,25 @@ use tree_hash_derive::TreeHash;
 
 use crate::{
     fork::ForkName,
-    pq::{PQ_KEYS_VERSION_UNSET, VrfRoot, XmssPublicKey},
+    pq::{VrfRoot, XmssPublicKey},
 };
 
 /// The post-quantum keys of one validator, as stored in the registry.
 ///
-/// The default value is the all-zero entry, of version `PQ_KEYS_VERSION_UNSET`.
+/// The default value is the all-zero entry, held by every validator that has never registered
+/// keys. Whether a validator is registered is decided by its `pq_key_change_epochs` entry
+/// (`is_pq_registered`), never by this value.
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(
     Debug, PartialEq, Eq, Hash, Clone, Default, Serialize, Deserialize, Encode, Decode, TreeHash,
 )]
 #[context_deserialize(ForkName)]
 pub struct PqPublicKeys {
-    /// Version of EIP-CRYPTO that the keys use, or 0 when no keys are registered.
-    #[serde(with = "serde_utils::quoted_u8")]
-    pub version: u8,
     /// leanXMSS public key.
     #[serde(with = "ssz_types::serde_utils::hex_fixed_vec")]
     pub xmss_public_key: XmssPublicKey,
     /// Root of the VRF tree.
-    #[serde(with = "ssz_types::serde_utils::hex_fixed_vec")]
     pub vrf_root: VrfRoot,
-}
-
-impl PqPublicKeys {
-    /// Returns `true` if this entry holds registered keys (`is_pq_registered`).
-    pub fn is_registered(&self) -> bool {
-        self.version != PQ_KEYS_VERSION_UNSET
-    }
 }
 
 #[cfg(test)]
@@ -44,7 +35,8 @@ mod tests {
     #[test]
     fn serialized_size() {
         use ssz::Encode;
-        assert_eq!(PqPublicKeys::default().as_ssz_bytes().len(), 65);
-        assert!(!PqPublicKeys::default().is_registered());
+        // 32 + 32 bytes, as stated by EIP-8450.
+        assert_eq!(<PqPublicKeys as Encode>::ssz_fixed_len(), 64);
+        assert_eq!(PqPublicKeys::default().as_ssz_bytes(), vec![0; 64]);
     }
 }

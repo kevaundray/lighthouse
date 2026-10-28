@@ -36,9 +36,8 @@ use std::time::Instant;
 use types::test_utils::{generate_deterministic_keypair, generate_deterministic_keypairs};
 use types::{
     BeaconBlock, BeaconState, ChainSpec, DepositData, Domain, Epoch, EthSpec, ForkName, Hash256,
-    MinimalEthSpec, PQ_KEYS_VERSION_1, PQ_KEYS_VERSION_UNSET, PQ_POSSESSION_XMSS_INDEX,
-    PqKeyRegistration, PqPublicKeys, SignedBeaconBlock, SignedPqKeyRegistration, SignedRoot, Slot,
-    VrfRoot, XmssPublicKey, XmssSignature,
+    MinimalEthSpec, PQ_POSSESSION_XMSS_INDEX, PqKeyRegistration, PqPublicKeys, SignedBeaconBlock,
+    SignedPqKeyRegistration, SignedRoot, Slot, VrfRoot, XmssPublicKey, XmssSignature,
 };
 
 type E = MinimalEthSpec;
@@ -128,12 +127,11 @@ fn possession_proof(
 }
 
 fn vrf_root(byte: u8) -> VrfRoot {
-    VrfRoot::new(vec![byte; 32]).unwrap()
+    VrfRoot::repeat_byte(byte)
 }
 
 fn public_keys(key: usize, vrf_byte: u8) -> PqPublicKeys {
     PqPublicKeys {
-        version: PQ_KEYS_VERSION_1,
         xmss_public_key: xmss_public_key(key),
         vrf_root: vrf_root(vrf_byte),
     }
@@ -476,21 +474,75 @@ async fn unknown_validator_is_rejected() {
     );
 }
 
+/// Registration is decided by `pq_key_change_epochs` alone: the all-zero `pq_public_keys` entry of
+/// an unregistered validator never owns the all-zero key, whether the `PqPubkeyCache` is built or
+/// not, while a registered validator holding that key does.
 #[tokio::test]
-async fn unsupported_versions_are_rejected() {
+async fn unregistered_entries_never_own_the_all_zero_key() {
     let harness = eip8450_harness();
     let spec = &harness.spec;
-    let state = harness.get_current_state();
+    let mut state = harness.get_current_state();
+    let zero_keys = PqPublicKeys::default();
+    let zero_key = XmssPublicKey::default();
 
-    for version in [PQ_KEYS_VERSION_UNSET, PQ_KEYS_VERSION_1 + 1] {
-        let mut keys = public_keys(0, 0xaa);
-        keys.version = version;
-        let signed = registration_with_keys(&state, 1, 0, keys, NEVER_REGISTERED, spec);
+    let mut uncached = state.clone();
+    uncached.drop_pq_pubkey_cache();
+    let mut rebuilt = uncached.clone();
+    rebuilt.update_pq_pubkey_cache().unwrap();
+    for state in [&state, &uncached, &rebuilt] {
+        assert!(
+            state
+                .pq_public_keys()
+                .unwrap()
+                .iter()
+                .all(|keys| *keys == zero_keys)
+        );
+        assert_eq!(state.registered_pq_public_keys().unwrap().count(), 0);
+        for excluded_index in [0, 1, u64::MAX] {
+            assert_eq!(
+                pq_public_key_owner(state, &zero_keys, excluded_index),
+                Ok(None)
+            );
+        }
+        // A registration of the all-zero key passes the uniqueness check and fails only on its
+        // proof of possession.
+        let signed = registration_with_keys(state, 1, 0, zero_keys.clone(), NEVER_REGISTERED, spec);
+        assert_eq!(
+            verify_pq_key_registration(state, &signed, VerifySignatures::False, spec),
+            Ok(())
+        );
         assert_rejected(
-            &state,
+            state,
             &signed,
-            PqKeyRegistrationInvalid::UnsupportedVersion(version),
+            PqKeyRegistrationInvalid::BadPossessionProof,
             spec,
+        );
+    }
+    assert!(!uncached.pq_pubkey_cache().is_initialized());
+    assert_eq!(rebuilt.pq_pubkey_cache().get(&zero_key), None);
+
+    // A registered validator holding the all-zero key (written directly: no proof of possession
+    // of it exists) owns it, and the unregistered all-zero entries still do not.
+    state
+        .set_pq_public_keys(5, zero_keys.clone(), Epoch::new(0))
+        .unwrap();
+    assert!(is_pq_registered(&state, 5).unwrap());
+    assert!(!is_pq_registered(&state, 4).unwrap());
+    let mut uncached = state.clone();
+    uncached.drop_pq_pubkey_cache();
+    let mut rebuilt = uncached.clone();
+    rebuilt.update_pq_pubkey_cache().unwrap();
+    assert_eq!(rebuilt.pq_pubkey_cache(), state.pq_pubkey_cache());
+    assert_eq!(state.pq_pubkey_cache().get(&zero_key), Some(5));
+    for state in [&state, &uncached, &rebuilt] {
+        assert_eq!(pq_public_key_owner(state, &zero_keys, 1), Ok(Some(5)));
+        assert_eq!(pq_public_key_owner(state, &zero_keys, 5), Ok(None));
+        assert_eq!(
+            state
+                .registered_pq_public_keys()
+                .unwrap()
+                .collect::<Vec<_>>(),
+            vec![(5, &zero_keys)]
         );
     }
 }
@@ -980,7 +1032,7 @@ async fn fork_upgrade_initializes_unset_entries() {
             .pq_public_keys()
             .unwrap()
             .iter()
-            .all(|keys| *keys == PqPublicKeys::default() && !keys.is_registered())
+            .all(|keys| *keys == PqPublicKeys::default())
     );
     assert!(
         state

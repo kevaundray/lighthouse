@@ -15,7 +15,7 @@ pub const PQ_KEY_REGISTRATION_POOL_EPOCHS: usize = 64;
 ///
 /// Blocks include at most `MAX_PQ_KEY_REGISTRATIONS` registrations, so this is 64 epochs (about 7
 /// hours on mainnet) of full blocks: more than the network can include before entries are pruned
-/// at the next finalization, while bounding the pool at about 45 MB (registrations are 2581 bytes
+/// at the next finalization, while bounding the pool at about 45 MB (registrations are 2580 bytes
 /// of SSZ). Registrations that do not fit are ignored and can be submitted again once the pool
 /// drains.
 pub fn max_pool_len<E: EthSpec>() -> usize {
@@ -294,13 +294,11 @@ impl PqKeyRegistrations {
                 .filter_map(|key| cache.get(key).map(|owner| (key.clone(), owner as u64)))
                 .collect();
         }
-        let Ok(public_keys) = state.pq_public_keys() else {
+        let Ok(registered) = state.registered_pq_public_keys() else {
             return HashMap::new();
         };
-        public_keys
-            .iter()
-            .enumerate()
-            .filter(|(_, keys)| keys.is_registered() && pooled_keys.contains(&keys.xmss_public_key))
+        registered
+            .filter(|(_, keys)| pooled_keys.contains(&keys.xmss_public_key))
             .map(|(owner, keys)| (keys.xmss_public_key.clone(), owner as u64))
             .collect()
     }
@@ -324,8 +322,7 @@ mod tests {
     use store::StoreItem;
     use types::test_utils::generate_deterministic_keypairs;
     use types::{
-        Epoch, ForkName, Hash256, MainnetEthSpec, MinimalEthSpec, PQ_KEYS_VERSION_1,
-        PqKeyRegistration, PqPublicKeys,
+        Epoch, ForkName, Hash256, MainnetEthSpec, MinimalEthSpec, PqKeyRegistration, PqPublicKeys,
     };
 
     type E = MinimalEthSpec;
@@ -347,9 +344,8 @@ mod tests {
 
     fn keys(key_byte: u8) -> PqPublicKeys {
         PqPublicKeys {
-            version: PQ_KEYS_VERSION_1,
             xmss_public_key: vec![key_byte; 32].try_into().unwrap(),
-            vrf_root: vec![key_byte; 32].try_into().unwrap(),
+            vrf_root: Hash256::repeat_byte(key_byte),
         }
     }
 

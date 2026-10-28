@@ -592,8 +592,6 @@ pub enum PqKeyRegistrationInvalid {
     ValidatorUnknown(u64),
     /// The validator has initiated an exit.
     ValidatorExiting { exit_epoch: Epoch },
-    /// The registered keys do not use `PQ_KEYS_VERSION_1`.
-    UnsupportedVersion(u8),
     /// The registration does not name the epoch of the validator's last change.
     PreviousChangeEpochMismatch { expected: Epoch, found: Epoch },
     /// The validator changed its keys less than `MIN_PQ_KEY_CHANGE_DELAY` epochs ago.

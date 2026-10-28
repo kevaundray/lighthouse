@@ -377,15 +377,16 @@ pub struct ValidatorIdentityData {
 }
 
 /// One validator's entry in the post-quantum key registry (EIP-8450).
+///
+/// `change_epoch` is the validator's `pq_key_change_epochs` entry. It is `FAR_FUTURE_EPOCH` exactly
+/// when the validator has never registered keys, in which case `xmss_public_key` and `vrf_root`
+/// are all zero.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PqPublicKeysData {
     #[serde(with = "serde_utils::quoted_u64")]
     pub index: u64,
-    #[serde(with = "serde_utils::quoted_u8")]
-    pub version: u8,
     #[serde(with = "ssz_types::serde_utils::hex_fixed_vec")]
     pub xmss_public_key: XmssPublicKey,
-    #[serde(with = "ssz_types::serde_utils::hex_fixed_vec")]
     pub vrf_root: VrfRoot,
     pub change_epoch: Epoch,
 }
@@ -2854,6 +2855,39 @@ mod test {
         assert!(pre_gloas_json.get("builder_index").is_none());
         assert!(pre_gloas_json.get("block_hash").is_none());
         assert_eq!(pre_gloas_json.as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn pq_public_keys_data_json() {
+        let unregistered = PqPublicKeysData {
+            index: 3,
+            xmss_public_key: XmssPublicKey::default(),
+            vrf_root: VrfRoot::ZERO,
+            change_epoch: Epoch::new(u64::MAX),
+        };
+        let zero = format!("0x{}", "00".repeat(32));
+        let json = serde_json::json!({
+            "index": "3",
+            "xmss_public_key": zero,
+            "vrf_root": zero,
+            "change_epoch": "18446744073709551615",
+        });
+        assert_eq!(serde_json::to_value(&unregistered).unwrap(), json);
+        assert_eq!(
+            serde_json::from_value::<PqPublicKeysData>(json).unwrap(),
+            unregistered
+        );
+
+        let registered = PqPublicKeysData {
+            index: 4,
+            xmss_public_key: XmssPublicKey::new(vec![0xab; 32]).unwrap(),
+            vrf_root: VrfRoot::repeat_byte(0xcd),
+            change_epoch: Epoch::new(7),
+        };
+        let json = serde_json::to_value(&registered).unwrap();
+        assert_eq!(json["vrf_root"], format!("0x{}", "cd".repeat(32)));
+        assert_eq!(json["xmss_public_key"], format!("0x{}", "ab".repeat(32)));
+        assert_eq!(json.as_object().unwrap().len(), 4);
     }
 
     #[test]
