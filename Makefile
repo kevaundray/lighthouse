@@ -114,8 +114,8 @@ JEMALLOC_OVERRIDE = /usr/lib/$(JEMALLOC_LIB_ARCH)-linux-gnu/libjemalloc.a
 RUST_TARGET ?= x86_64-unknown-linux-gnu
 
 # Default images for different architectures
-RUST_IMAGE_AMD64 ?= rust:1.91-bookworm@sha256:8322627e69ba7780b54f39e9f4d3758c006a3ae0123ea01d63b91f0626169891
-RUST_IMAGE_ARM64 ?= rust:1.91-bookworm@sha256:20262682d0201e219012287e8c1e6a7a14b6ebd46bb2b280714f23c06678c285
+RUST_IMAGE_AMD64 ?= rust:1.95-bookworm@sha256:4c2fd73ef19c5ef9d54bee03b06b2839a392604fbfcd578ed948b71b37c1d7fb
+RUST_IMAGE_ARM64 ?= rust:1.95-bookworm@sha256:8e45ae5b178fa788bbbd818b42a1f93a6e2c03e7144badd5e0a37087537177e1
 
 .PHONY: build-reproducible
 build-reproducible: ## Build the lighthouse binary into `target` directory with reproducible builds
