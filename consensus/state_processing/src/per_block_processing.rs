@@ -36,7 +36,7 @@ pub use verify_deposit::{
 pub use verify_exit::verify_exit;
 pub use verify_pq_key_registration::{
     cmp_pq_change_epochs, get_pq_possession_signing_root, is_pq_registered,
-    is_pq_registration_superseded, is_valid_pq_possession_proof, pq_public_key_owner,
+    is_pq_registration_dead, is_valid_pq_possession_proof, pq_public_key_owner,
     verify_pq_key_registration,
 };
 pub use withdrawals::get_expected_withdrawals;

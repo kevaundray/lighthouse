@@ -1,6 +1,5 @@
 use state_processing::per_block_processing::{
-    VerifySignatures, cmp_pq_change_epochs, is_pq_registration_superseded,
-    verify_pq_key_registration,
+    VerifySignatures, cmp_pq_change_epochs, is_pq_registration_dead, verify_pq_key_registration,
 };
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
@@ -204,9 +203,10 @@ impl PqKeyRegistrations {
     ///
     /// A registration is pruned if, in `finalized_state`:
     ///
-    /// - its validator's `pq_key_change_epochs` entry is past its `previous_change_epoch`: the
-    ///   entry only moves forward along a chain, from `FAR_FUTURE_EPOCH` (never registered) to
-    ///   increasing change epochs, so it was applied or a later change superseded it;
+    /// - its `previous_change_epoch` is dead (`is_pq_registration_dead`): its validator's
+    ///   `pq_key_change_epochs` entry is past it, so it was applied or a later change superseded
+    ///   it, or it names a change before the finalized epoch that the finalized chain does not
+    ///   hold, made on a fork that is not canonical;
     /// - its validator already holds exactly its keys: it was applied, and applying it again
     ///   would change nothing;
     /// - another validator owns its leanXMSS key: it lost a race for the key (a validator only
@@ -232,6 +232,7 @@ impl PqKeyRegistrations {
             return vec![];
         };
         let validators = finalized_state.validators();
+        let finalized_epoch = finalized_state.current_epoch();
         let key_owners = self.finalized_key_owners(finalized_state);
 
         let mut pruned = vec![];
@@ -246,8 +247,8 @@ impl PqKeyRegistrations {
                 let exited = validators
                     .get(index)
                     .is_some_and(|validator| validator.exit_epoch != spec.far_future_epoch);
-                let superseded = change_epochs.get(index).is_some_and(|epoch| {
-                    is_pq_registration_superseded(*epoch, message.previous_change_epoch)
+                let dead = change_epochs.get(index).is_some_and(|epoch| {
+                    is_pq_registration_dead(*epoch, message.previous_change_epoch, finalized_epoch)
                 });
                 let applied = public_keys
                     .get(index)
@@ -255,7 +256,7 @@ impl PqKeyRegistrations {
                 let key_taken = key_owners
                     .get(&message.public_keys.xmss_public_key)
                     .is_some_and(|owner| *owner != validator_index);
-                let keep = !exited && !superseded && !applied && !key_taken;
+                let keep = !exited && !dead && !applied && !key_taken;
                 if !keep {
                     pruned.push((*sequence, validator_index, message.previous_change_epoch));
                 }
@@ -617,6 +618,57 @@ mod tests {
             expected.push((7, Epoch::new(2)));
             assert_eq!(pruned, expected);
         }
+    }
+
+    /// A registration naming a change before the finalized epoch that the finalized state does
+    /// not hold was made on an orphaned fork, and is pruned. One naming the finalized epoch or a
+    /// later one may still be made by a canonical block, and is kept.
+    #[test]
+    fn prune_removes_registrations_naming_orphaned_changes() {
+        let spec = spec();
+        let mut finalized_state = genesis_state(&spec);
+        let finalized_epoch = Epoch::new(5);
+        *finalized_state.slot_mut() = finalized_epoch.start_slot(E::slots_per_epoch());
+        // Validators 4 and 5 last changed their keys at epoch 2 in the finalized chain.
+        for index in [4, 5] {
+            finalized_state
+                .set_pq_public_keys(index, keys(40 + index as u8), Epoch::new(2))
+                .unwrap();
+        }
+
+        let registrations = [
+            // Validators 0, 1 and 2 never registered in the finalized chain: changes at epochs 4,
+            // 5 and 6 on other forks.
+            registration(0, 1, 4),
+            registration(1, 2, 5),
+            registration(2, 3, 6),
+            // A first registration.
+            registration(3, 4, NEVER),
+            // A change after validator 4's finalized change, but before the finalized epoch.
+            registration(4, 5, 3),
+            // The finalized change of validator 5.
+            registration(5, 6, 2),
+        ];
+        let mut pool = pool_with(&registrations);
+        let mut pruned = pool.prune(&finalized_state, &spec);
+        pruned.sort();
+
+        assert_eq!(pruned, vec![(0, Epoch::new(4)), (4, Epoch::new(3))]);
+        assert_eq!(
+            pool.iter_fifo().cloned().collect::<Vec<_>>(),
+            vec![
+                registration(1, 2, 5),
+                registration(2, 3, 6),
+                registration(3, 4, NEVER),
+                registration(5, 6, 2),
+            ]
+        );
+
+        // The first registration of validator 0 is accepted once the orphaned one is pruned.
+        assert_eq!(
+            pool.insert(registration(0, 1, NEVER), usize::MAX),
+            PqKeyRegistrationInsertOutcome::Inserted
+        );
     }
 
     #[test]

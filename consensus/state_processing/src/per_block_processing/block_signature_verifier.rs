@@ -456,19 +456,25 @@ where
     /// all the signatures are valid.
     ///
     /// This includes the leanXMSS proofs of possession of post-quantum key registrations, which
-    /// are verified individually.
+    /// are verified individually against the BLS public key of each registered validator. A
+    /// registration for an unknown validator makes its proof invalid.
     ///
     /// See `ParallelSignatureSets::verify` for more info.
     pub fn verify(self) -> Result<()> {
+        let validators = self.state.validators();
         let pq_proofs_valid = self.pq_key_registrations.iter().all(|signed_registration| {
             let registration = &signed_registration.message;
-            is_valid_pq_possession_proof(
-                self.state,
-                registration.validator_index,
-                &registration.public_keys.xmss_public_key,
-                &signed_registration.possession,
-                self.spec,
-            )
+            validators
+                .get(registration.validator_index as usize)
+                .is_some_and(|validator| {
+                    is_valid_pq_possession_proof(
+                        self.state,
+                        &validator.pubkey,
+                        &registration.public_keys.xmss_public_key,
+                        &signed_registration.possession,
+                        self.spec,
+                    )
+                })
         });
         if !pq_proofs_valid {
             return Err(Error::PqPossessionProofInvalid);

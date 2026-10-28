@@ -4,11 +4,13 @@
 //! The vectors in `xmss_known_answer.txt` come from an independent Python signer over the
 //! EIP-CRYPTO pseudocode, which also decided every expected outcome; see the header of that file.
 
+use bls::PublicKeyBytes;
 use lean_pq::{Error, xmss};
 use state_processing::per_block_processing::{
     get_pq_possession_signing_root, is_valid_pq_possession_proof,
 };
 use std::collections::HashMap;
+use types::test_utils::generate_deterministic_keypair;
 use types::{
     BeaconState, ChainSpec, Eth1Data, Hash256, MinimalEthSpec, XmssPublicKey, XmssSignature,
 };
@@ -185,6 +187,7 @@ fn possession_proofs_match_eip_8450() {
             fork_version,
             gvr,
             validator_index,
+            validator_pubkey,
             signing_root,
         ] = fields.as_slice()
         else {
@@ -193,17 +196,25 @@ fn possession_proofs_match_eip_8450() {
         assert_eq!(hex(fork_version), spec.genesis_fork_version, "{name}");
         let mut state = BeaconState::<MinimalEthSpec>::new(0, Eth1Data::default(), &spec);
         *state.genesis_validators_root_mut() = Hash256::from_slice(&hex(gvr));
-        let validator_index: u64 = validator_index.parse().unwrap();
+        // The proof binds the key to the BLS public key of interop validator `validator_index`.
+        let validator_pubkey = PublicKeyBytes::deserialize(&hex(validator_pubkey)).unwrap();
+        assert_eq!(
+            validator_pubkey,
+            generate_deterministic_keypair(validator_index.parse().unwrap())
+                .pk
+                .compress(),
+            "{name}"
+        );
         let public_key = XmssPublicKey::new(vectors.keys[key].clone()).unwrap();
         let proof = XmssSignature::new(vectors.sigs[sig].1.clone()).unwrap();
 
         assert_eq!(
-            get_pq_possession_signing_root(&state, validator_index, &public_key, &spec),
+            get_pq_possession_signing_root(&state, &validator_pubkey, &public_key, &spec),
             Hash256::from_slice(&hex(signing_root)),
             "{name}"
         );
         let valid =
-            is_valid_pq_possession_proof(&state, validator_index, &public_key, &proof, &spec);
+            is_valid_pq_possession_proof(&state, &validator_pubkey, &public_key, &proof, &spec);
         assert_eq!(valid, *expected == "accept", "{name}");
     }
 }

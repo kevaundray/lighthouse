@@ -830,8 +830,12 @@ fn pq_key_registration(
     let state = harness.get_current_state();
     let xmss_public_key =
         XmssPublicKey::try_from(xmss_key.public_key().to_bytes().to_vec()).unwrap();
+    let validator_pubkey = state
+        .get_validator(validator_index as usize)
+        .unwrap()
+        .pubkey;
     let possession_root =
-        get_pq_possession_signing_root(&state, validator_index, &xmss_public_key, &harness.spec);
+        get_pq_possession_signing_root(&state, &validator_pubkey, &xmss_public_key, &harness.spec);
     let possession = xmss_key
         .sign(&possession_root.0, PQ_POSSESSION_XMSS_INDEX)
         .unwrap();

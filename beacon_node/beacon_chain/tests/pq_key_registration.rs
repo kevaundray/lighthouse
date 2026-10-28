@@ -58,7 +58,9 @@ fn public_keys() -> PqPublicKeys {
 /// A first registration of `XMSS_KEY` for `REGISTRANT`, with a valid proof of possession and a
 /// valid BLS authorization.
 fn registration(state: &BeaconState<E>, spec: &ChainSpec) -> SignedPqKeyRegistration {
-    let signing_root = get_pq_possession_signing_root(state, REGISTRANT, &xmss_public_key(), spec);
+    let validator_pubkey = state.get_validator(REGISTRANT as usize).unwrap().pubkey;
+    let signing_root =
+        get_pq_possession_signing_root(state, &validator_pubkey, &xmss_public_key(), spec);
     let start = Instant::now();
     let possession = XMSS_KEY
         .sign(&signing_root.0, PQ_POSSESSION_XMSS_INDEX)

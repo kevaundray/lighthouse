@@ -5,6 +5,7 @@ use crate::VerifySignatures;
 use crate::per_block_processing::signature_sets::{
     get_pubkey_from_state, pq_key_registration_signature_set,
 };
+use bls::PublicKeyBytes;
 use lean_pq::xmss;
 use std::cmp::Ordering;
 use types::{
@@ -75,21 +76,41 @@ pub fn cmp_pq_change_epochs(a: Epoch, b: Epoch) -> Ordering {
     }
 }
 
-/// Returns whether no state descending from one whose `pq_key_change_epochs` entry for a validator
-/// is `stored` can apply a registration of that validator naming `previous_change_epoch`.
+/// Returns whether no state descending from a finalized state can apply a registration of a
+/// validator naming `previous_change_epoch`, where `stored` is the validator's
+/// `pq_key_change_epochs` entry in the finalized state and `finalized_epoch` its current epoch.
 ///
-/// Along a chain the entry only moves forward in the order of [`cmp_pq_change_epochs`], so a
-/// registration naming an entry behind `stored` can never match again.
-pub fn is_pq_registration_superseded(stored: Epoch, previous_change_epoch: Epoch) -> bool {
-    cmp_pq_change_epochs(stored, previous_change_epoch) == Ordering::Greater
+/// A descendant's entry is either `stored`, or the epoch of a block applied on top of the
+/// finalized state, which is at least `finalized_epoch`. So the registration is dead if it names
+/// another value that is:
+///
+/// - behind `stored` in the order of [`cmp_pq_change_epochs`]: the entry only moves forward along
+///   a chain;
+/// - or a change epoch before `finalized_epoch`: a change at such an epoch on the finalized chain
+///   would be in the finalized state, so it was made on a fork that is not canonical.
+///
+/// A registration naming `finalized_epoch` itself is not dead: a block of that epoch after the
+/// finalized checkpoint can still make a change at it.
+pub fn is_pq_registration_dead(
+    stored: Epoch,
+    previous_change_epoch: Epoch,
+    finalized_epoch: Epoch,
+) -> bool {
+    previous_change_epoch != stored
+        && (cmp_pq_change_epochs(stored, previous_change_epoch) == Ordering::Greater
+            || (previous_change_epoch != PQ_UNREGISTERED_CHANGE_EPOCH
+                && previous_change_epoch < finalized_epoch))
 }
 
-/// Returns the message that the proof of possession of `xmss_public_key` for `index` signs.
+/// Returns the signing root of the `PqKeyPossession` of `xmss_public_key` for the validator
+/// holding `validator_pubkey` (`get_pq_possession_signing_root`).
 ///
-/// The domain uses the genesis fork version, so a proof stays valid across forks.
+/// The proof binds the leanXMSS key to the validator's BLS public key, which never changes and is
+/// known before the validator has an index. The domain uses the genesis fork version, so a proof
+/// stays valid across forks.
 pub fn get_pq_possession_signing_root<E: EthSpec>(
     state: &BeaconState<E>,
-    index: u64,
+    validator_pubkey: &PublicKeyBytes,
     xmss_public_key: &XmssPublicKey,
     spec: &ChainSpec,
 ) -> Hash256 {
@@ -99,17 +120,19 @@ pub fn get_pq_possession_signing_root<E: EthSpec>(
         state.genesis_validators_root(),
     );
     PqKeyPossession {
-        validator_index: index,
+        validator_pubkey: *validator_pubkey,
         xmss_public_key: xmss_public_key.clone(),
     }
     .signing_root(domain)
 }
 
-/// Checks that the holder of `xmss_public_key` signed it for the validator at `index`, at leaf
-/// index `PQ_POSSESSION_XMSS_INDEX`.
+/// Checks if `proof` is a signature, by `xmss_public_key`, of the key itself for the validator
+/// holding `validator_pubkey` (`is_valid_pq_possession_proof`).
+///
+/// The proof must be at leaf index `PQ_POSSESSION_XMSS_INDEX`, which is reserved for it.
 pub fn is_valid_pq_possession_proof<E: EthSpec>(
     state: &BeaconState<E>,
-    index: u64,
+    validator_pubkey: &PublicKeyBytes,
     xmss_public_key: &XmssPublicKey,
     proof: &XmssSignature,
     spec: &ChainSpec,
@@ -117,14 +140,14 @@ pub fn is_valid_pq_possession_proof<E: EthSpec>(
     let Ok(signature) = xmss::Signature::from_bytes(proof) else {
         return false;
     };
-    // Leaf index 0 is reserved for the proof of possession.
     if signature.leaf_index() != PQ_POSSESSION_XMSS_INDEX {
         return false;
     }
     let Ok(public_key) = xmss::PublicKey::from_bytes(xmss_public_key) else {
         return false;
     };
-    let signing_root = get_pq_possession_signing_root(state, index, xmss_public_key, spec);
+    let signing_root =
+        get_pq_possession_signing_root(state, validator_pubkey, xmss_public_key, spec);
     public_key.verify(&signing_root.0, &signature).is_ok()
 }
 
@@ -206,7 +229,8 @@ pub fn verify_pq_key_registration<E: EthSpec>(
         );
     }
 
-    // The key must be unique, and the registrant must prove possession of it.
+    // The key must be unique, and the registrant must prove possession of it for the validator's
+    // BLS public key.
     if let Some(owner) = pq_public_key_owner(state, public_keys, index)? {
         return Err(error(Invalid::XmssPublicKeyInUse { owner }));
     }
@@ -214,7 +238,7 @@ pub fn verify_pq_key_registration<E: EthSpec>(
         verify!(
             is_valid_pq_possession_proof(
                 state,
-                index,
+                &validator.pubkey,
                 &public_keys.xmss_public_key,
                 &signed_registration.possession,
                 spec

@@ -7,6 +7,7 @@
 use crate::{BeaconChain, BeaconChainError, BeaconChainTypes};
 use eth2::types::EventKind;
 use operation_pool::PqKeyRegistrationInsertOutcome;
+use slot_clock::SlotClock;
 use state_processing::per_block_processing::errors::{
     BlockOperationError, PqKeyRegistrationInvalid,
 };
@@ -14,8 +15,8 @@ use state_processing::per_block_processing::signature_sets::{
     Error as SignatureSetError, get_pubkey_from_state, pq_key_registration_signature_set,
 };
 use state_processing::per_block_processing::{
-    VerifySignatures, is_pq_registered, is_pq_registration_superseded,
-    is_valid_pq_possession_proof, pq_public_key_owner, verify_pq_key_registration,
+    VerifySignatures, is_pq_registered, is_pq_registration_dead, is_valid_pq_possession_proof,
+    pq_public_key_owner, verify_pq_key_registration,
 };
 use std::collections::HashSet;
 use types::{
@@ -27,7 +28,8 @@ use types::{
 /// The doc comment of each gossip variant states the action the gossip rules prescribe.
 #[derive(Debug)]
 pub enum Error {
-    /// The current slot is prior to the EIP-8450 fork.
+    /// The current slot, allowing for `MAXIMUM_GOSSIP_CLOCK_DISPARITY`, is prior to the EIP-8450
+    /// fork.
     ///
     /// ## Peer scoring
     ///
@@ -76,7 +78,8 @@ pub enum Error {
     /// REJECT.
     PreviousChangeEpochMismatch { expected: Epoch, found: Epoch },
     /// The validator has registered keys, and `MIN_PQ_KEY_CHANGE_DELAY` epochs have not passed
-    /// since its last change at the current (wall-clock) epoch.
+    /// since its last change at the current (wall-clock) epoch, allowing for
+    /// `MAXIMUM_GOSSIP_CLOCK_DISPARITY`.
     ///
     /// ## Peer scoring
     ///
@@ -185,8 +188,8 @@ pub enum PqKeyRegistrationOutcome {
 /// implementing the gossip rule that only the first valid registration for a pair is forwarded.
 ///
 /// Registrations are signed with the genesis fork version, so the set is not reset at fork
-/// boundaries. A pair is pruned once the finalized state moved the validator's change epoch past
-/// it, since no registration for that pair can become valid again.
+/// boundaries. A pair is pruned once it is dead in the finalized state (see
+/// `is_pq_registration_dead`), since no registration for that pair can become valid again.
 #[derive(Debug, Default)]
 pub struct ObservedPqKeyRegistrations {
     observed: HashSet<(u64, Epoch)>,
@@ -216,12 +219,13 @@ impl ObservedPqKeyRegistrations {
         let Ok(change_epochs) = finalized_state.pq_key_change_epochs() else {
             return;
         };
+        let finalized_epoch = finalized_state.current_epoch();
         self.observed
             .retain(|(validator_index, previous_change_epoch)| {
                 change_epochs
                     .get(*validator_index as usize)
-                    .is_none_or(|finalized_epoch| {
-                        !is_pq_registration_superseded(*finalized_epoch, *previous_change_epoch)
+                    .is_none_or(|stored| {
+                        !is_pq_registration_dead(*stored, *previous_change_epoch, finalized_epoch)
                     })
             });
     }
@@ -241,11 +245,17 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
     /// Verify a post-quantum key registration received on gossip, following the
     /// `pq_key_registration` gossip rules of EIP-8450 in their stated order. On success the
     /// registration's pair is recorded as observed.
+    ///
+    /// The current epoch of the fork gate and the change delay allows for
+    /// `MAXIMUM_GOSSIP_CLOCK_DISPARITY`, as the spec's `is_future_epoch` does.
     pub fn verify_pq_key_registration_for_gossip(
         &self,
         signed_registration: SignedPqKeyRegistration,
     ) -> Result<VerifiedPqKeyRegistration, Error> {
-        let current_slot = self.slot()?;
+        let current_slot = self
+            .slot_clock
+            .now_with_future_tolerance(self.spec.maximum_gossip_clock_disparity())
+            .ok_or(BeaconChainError::UnableToReadSlot)?;
         if !self
             .spec
             .fork_name_at_slot::<T::EthSpec>(current_slot)
@@ -308,9 +318,9 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             });
         }
 
-        // [IGNORE] A registered validator's change delay has passed at the current epoch. An
-        // unregistered validator's entry is `FAR_FUTURE_EPOCH`, not a change epoch, and is never
-        // added to.
+        // [IGNORE] A registered validator's change delay has passed at the current epoch, allowing
+        // for clock disparity. An unregistered validator's entry is `FAR_FUTURE_EPOCH`, not a
+        // change epoch, and is never added to.
         if is_pq_registered(state, validator_index)? {
             let earliest_epoch = registration
                 .previous_change_epoch
@@ -339,10 +349,11 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             return Err(Error::XmssPublicKeyInUse { owner });
         }
 
-        // [REJECT] The proof of possession of the leanXMSS key is valid.
+        // [REJECT] The proof of possession of the leanXMSS key for the validator's BLS public key
+        // is valid.
         if !is_valid_pq_possession_proof(
             state,
-            validator_index,
+            &validator.pubkey,
             &public_keys.xmss_public_key,
             &signed_registration.possession,
             &self.spec,
@@ -471,6 +482,7 @@ mod tests {
     use crate::test_utils::{BeaconChainHarness, EphemeralHarnessType};
     use state_processing::per_block_processing::get_pq_possession_signing_root;
     use std::sync::{Arc, LazyLock};
+    use std::time::Duration;
     use types::{
         ForkName, MinimalEthSpec, PQ_POSSESSION_XMSS_INDEX, PqKeyRegistration, PqPublicKeys,
         XmssPublicKey,
@@ -510,9 +522,13 @@ mod tests {
         let state = harness.get_current_state();
         let xmss_public_key =
             XmssPublicKey::try_from(xmss_key.public_key().to_bytes().to_vec()).unwrap();
+        let validator_pubkey = state
+            .get_validator(validator_index as usize)
+            .unwrap()
+            .pubkey;
         let possession_root = get_pq_possession_signing_root(
             &state,
-            validator_index,
+            &validator_pubkey,
             &xmss_public_key,
             &harness.spec,
         );
@@ -608,6 +624,41 @@ mod tests {
                 .verify_pq_key_registration_for_gossip(registration(&harness, 1, key_b, NEVER))
                 .is_ok()
         );
+    }
+
+    /// The fork gate uses the current slot allowing for `MAXIMUM_GOSSIP_CLOCK_DISPARITY`: a
+    /// registration received within the disparity before the fork boundary passes it.
+    #[tokio::test]
+    async fn fork_gate_allows_gossip_clock_disparity() {
+        let mut spec = ForkName::Heze.make_genesis_spec(E::default_spec());
+        spec.eip8450_fork_epoch = Some(Epoch::new(1));
+        let harness = BeaconChainHarness::builder(E::default())
+            .spec(Arc::new(spec))
+            .deterministic_keypairs(VALIDATOR_COUNT)
+            .fresh_ephemeral_store()
+            .mock_execution_layer()
+            .build();
+        let chain = &harness.chain;
+        let fork_slot = Epoch::new(1).start_slot(E::slots_per_epoch());
+        let fork_start = chain.slot_clock.start_of(fork_slot).unwrap();
+        let disparity = chain.spec.maximum_gossip_clock_disparity();
+        let valid = registration(&harness, 0, &XMSS_KEYS[0], NEVER);
+
+        // Just outside the disparity: still before the fork.
+        chain
+            .slot_clock
+            .set_current_time(fork_start - disparity - Duration::from_millis(1));
+        assert!(matches!(
+            chain.verify_pq_key_registration_for_gossip(valid.clone()),
+            Err(Error::PriorToEip8450 { current_slot }) if current_slot == fork_slot - 1
+        ));
+
+        // Within the disparity: the fork gate passes, and the pre-fork head is what ignores it.
+        chain.slot_clock.set_current_time(fork_start - disparity);
+        assert!(matches!(
+            chain.verify_pq_key_registration_for_gossip(valid),
+            Err(Error::HeadPriorToEip8450)
+        ));
     }
 
     #[tokio::test]
@@ -872,16 +923,28 @@ mod tests {
     async fn observed_pairs_are_pruned_by_finalized_state() {
         let harness = get_harness();
         let mut finalized_state = harness.get_current_state();
+        *finalized_state.slot_mut() = Epoch::new(5).start_slot(E::slots_per_epoch());
         let keys = registration(&harness, 0, &XMSS_KEYS[0], NEVER)
             .message
             .public_keys;
-        // Validator 0 last changed its keys at epoch 5; validator 1 never registered.
+        // Validator 0 last changed its keys at epoch 3; validator 1 never registered.
         finalized_state
-            .set_pq_public_keys(0, keys, Epoch::new(5))
+            .set_pq_public_keys(0, keys, Epoch::new(3))
             .unwrap();
 
         let mut observed = ObservedPqKeyRegistrations::default();
-        let pairs = [(0, NEVER), (0, 4), (0, 5), (0, 6), (1, NEVER), (1, 3)];
+        let pairs = [
+            (0, NEVER),
+            (0, 2),
+            (0, 3),
+            (0, 4),
+            (0, 5),
+            (0, 6),
+            (1, NEVER),
+            (1, 4),
+            (1, 5),
+            (1, 6),
+        ];
         for (validator_index, previous_change_epoch) in pairs {
             assert!(observed.observe(validator_index, Epoch::new(previous_change_epoch)));
         }
@@ -889,14 +952,13 @@ mod tests {
 
         observed.prune(&finalized_state);
         // Behind validator 0's finalized change: its first registration and a change naming
-        // epoch 4. Validator 1's change naming epoch 3 was made in a block that is not
-        // finalized, so it is kept.
-        assert_eq!(observed.len(), 4);
-        assert!(!observed.is_known(0, Epoch::new(NEVER)));
-        assert!(!observed.is_known(0, Epoch::new(4)));
-        assert!(observed.is_known(0, Epoch::new(5)));
-        assert!(observed.is_known(0, Epoch::new(6)));
-        assert!(observed.is_known(1, Epoch::new(NEVER)));
-        assert!(observed.is_known(1, Epoch::new(3)));
+        // epoch 2. Changes at epoch 4, before the finalized epoch 5, that the finalized state
+        // does not hold were made on orphaned forks. Changes at the finalized epoch or later may
+        // still be made by canonical blocks, so they are kept.
+        let kept = [(0, 3), (0, 5), (0, 6), (1, NEVER), (1, 5), (1, 6)];
+        assert_eq!(observed.len(), kept.len());
+        for (validator_index, previous_change_epoch) in kept {
+            assert!(observed.is_known(validator_index, Epoch::new(previous_change_epoch)));
+        }
     }
 }

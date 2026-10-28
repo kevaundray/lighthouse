@@ -250,6 +250,9 @@ async fn fetch_chain_context<E: EthSpec>(
 /// Builds a registration of `xmss_secret_key`'s public key and `vrf_root` for `validator_index`,
 /// signed by `bls_keypair` and carrying a proof of possession, then verifies both signatures.
 ///
+/// The proof of possession binds the leanXMSS key to the validator's BLS public key, the public
+/// key of `bls_keypair`, which the caller checks against the validator's on-chain public key.
+///
 /// Signing roots match `get_pq_possession_signing_root` and `pq_key_registration_signature_set`
 /// in `state_processing`: both domains use the genesis fork version.
 pub fn build_signed_registration(
@@ -273,7 +276,7 @@ pub fn build_signed_registration(
         genesis_validators_root,
     );
     let possession_root = PqKeyPossession {
-        validator_index,
+        validator_pubkey: bls_keypair.pk.compress(),
         xmss_public_key: xmss_public_key_bytes.clone(),
     }
     .signing_root(possession_domain);
@@ -574,9 +577,22 @@ mod tests {
                 .leaf_index(),
             PQ_POSSESSION_XMSS_INDEX
         );
+        // The proof of possession is for the validator's BLS public key in the state.
+        let validator_pubkey = state
+            .get_validator(VALIDATOR_INDEX as usize)
+            .unwrap()
+            .pubkey;
+        assert_eq!(validator_pubkey, keypair.pk.compress());
         assert!(is_valid_pq_possession_proof(
             &state,
-            VALIDATOR_INDEX,
+            &validator_pubkey,
+            &signed.message.public_keys.xmss_public_key,
+            &signed.possession,
+            &spec
+        ));
+        assert!(!is_valid_pq_possession_proof(
+            &state,
+            &state.get_validator(0).unwrap().pubkey,
             &signed.message.public_keys.xmss_public_key,
             &signed.possession,
             &spec

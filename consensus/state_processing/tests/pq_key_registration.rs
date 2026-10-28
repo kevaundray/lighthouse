@@ -105,16 +105,25 @@ fn xmss_sign(key: usize, message: Hash256, leaf_index: u32) -> XmssSignature {
         .clone()
 }
 
-/// The proof of possession of leanXMSS key `key` for `validator_index`, at `leaf_index`.
+/// The BLS public key of the validator at `validator_index` in `state`.
+fn validator_pubkey(state: &BeaconState<E>, validator_index: u64) -> PublicKeyBytes {
+    state
+        .get_validator(validator_index as usize)
+        .unwrap()
+        .pubkey
+}
+
+/// The proof of possession of leanXMSS key `key` for the validator holding `validator_pubkey`,
+/// at `leaf_index`.
 fn possession_proof(
     state: &BeaconState<E>,
-    validator_index: u64,
+    validator_pubkey: &PublicKeyBytes,
     key: usize,
     leaf_index: u32,
     spec: &ChainSpec,
 ) -> XmssSignature {
     let signing_root =
-        get_pq_possession_signing_root(state, validator_index, &xmss_public_key(key), spec);
+        get_pq_possession_signing_root(state, validator_pubkey, &xmss_public_key(key), spec);
     xmss_sign(key, signing_root, leaf_index)
 }
 
@@ -140,7 +149,13 @@ fn registration_with_keys(
     previous_change_epoch: Epoch,
     spec: &ChainSpec,
 ) -> SignedPqKeyRegistration {
-    let possession = possession_proof(state, validator_index, key, PQ_POSSESSION_XMSS_INDEX, spec);
+    let possession = possession_proof(
+        state,
+        &validator_pubkey(state, validator_index),
+        key,
+        PQ_POSSESSION_XMSS_INDEX,
+        spec,
+    );
     PqKeyRegistration {
         validator_index,
         public_keys,
@@ -488,11 +503,11 @@ async fn key_registered_by_another_validator_is_rejected() {
 
     register(&mut state, 1, 0, 0xaa, NEVER_REGISTERED, spec);
 
-    // Validator 2 holds a valid proof of possession of the same key for its own index.
+    // Validator 2 holds a valid proof of possession of the same key for its own BLS public key.
     let copy = registration(&state, 2, 0, 0xbb, NEVER_REGISTERED, spec);
     assert!(is_valid_pq_possession_proof(
         &state,
-        2,
+        &validator_pubkey(&state, 2),
         &xmss_public_key(0),
         &copy.possession,
         spec
@@ -554,21 +569,23 @@ async fn invalid_possession_proofs_are_rejected() {
     let mut corrupted = valid.clone();
     let last = corrupted.possession.len() - 1;
     corrupted.possession[last] ^= 0x01;
-    // A valid proof of the same key for a different validator index.
-    let mut other_index = valid.clone();
-    other_index.possession = possession_proof(&state, 7, 0, PQ_POSSESSION_XMSS_INDEX, spec);
+    // A valid proof of the same key for another validator's BLS public key.
+    let other_pubkey = validator_pubkey(&state, 7);
+    let mut other_validator = valid.clone();
+    other_validator.possession =
+        possession_proof(&state, &other_pubkey, 0, PQ_POSSESSION_XMSS_INDEX, spec);
     assert!(is_valid_pq_possession_proof(
         &state,
-        7,
+        &other_pubkey,
         &xmss_public_key(0),
-        &other_index.possession,
+        &other_validator.possession,
         spec
     ));
 
-    for signed in [&corrupted, &other_index] {
+    for signed in [&corrupted, &other_validator] {
         assert!(!is_valid_pq_possession_proof(
             &state,
-            1,
+            &validator_pubkey(&state, 1),
             &xmss_public_key(0),
             &signed.possession,
             spec
@@ -594,12 +611,13 @@ async fn possession_proof_at_leaf_index_one_is_rejected() {
     let state = harness.get_current_state();
 
     let mut signed = registration(&state, 1, 0, 0xaa, NEVER_REGISTERED, spec);
-    signed.possession = possession_proof(&state, 1, 0, 1, spec);
+    let pubkey = validator_pubkey(&state, 1);
+    signed.possession = possession_proof(&state, &pubkey, 0, 1, spec);
 
     // The real key signed the right message, at the wrong leaf index.
     let signature = xmss::Signature::from_bytes(&signed.possession).unwrap();
     assert_eq!(signature.leaf_index(), 1);
-    let signing_root = get_pq_possession_signing_root(&state, 1, &xmss_public_key(0), spec);
+    let signing_root = get_pq_possession_signing_root(&state, &pubkey, &xmss_public_key(0), spec);
     assert_eq!(
         xmss_key(0).public_key().verify(&signing_root.0, &signature),
         Ok(())
@@ -607,7 +625,7 @@ async fn possession_proof_at_leaf_index_one_is_rejected() {
 
     assert!(!is_valid_pq_possession_proof(
         &state,
-        1,
+        &pubkey,
         &xmss_public_key(0),
         &signed.possession,
         spec
@@ -889,40 +907,54 @@ async fn block_with_invalid_possession_proof_is_invalid() {
     let harness = eip8450_harness();
     let spec = &harness.spec;
     let state = harness.get_current_state();
-    let mut corrupted = registration(&state, 1, 0, 0xaa, NEVER_REGISTERED, spec);
+    let valid = registration(&state, 1, 0, 0xaa, NEVER_REGISTERED, spec);
+    let mut corrupted = valid.clone();
     corrupted.possession[100] ^= 0x80;
-
-    let (block, pre_state) = block_with_registrations(&harness, vec![corrupted]).await;
-
-    // Individual verification attributes the failure to the registration.
-    let mut state = pre_state.clone();
-    assert_eq!(
-        process_block(
-            &mut state,
-            &block,
-            BlockSignatureStrategy::VerifyIndividual,
-            spec
-        ),
-        Err(invalid(PqKeyRegistrationInvalid::BadPossessionProof))
+    // A valid proof of the key for another validator's BLS public key.
+    let mut other_validator = valid;
+    other_validator.possession = possession_proof(
+        &state,
+        &validator_pubkey(&state, 7),
+        0,
+        PQ_POSSESSION_XMSS_INDEX,
+        spec,
     );
 
-    // Bulk verification checks the proof alongside the (valid) BLS signatures.
-    let mut state = pre_state.clone();
-    assert_eq!(
-        process_block(&mut state, &block, BlockSignatureStrategy::VerifyBulk, spec),
-        Err(BlockProcessingError::BulkSignatureVerificationFailed)
-    );
-    assert_eq!(
-        BlockSignatureVerifier::verify_entire_block(
-            &pre_state,
-            |i| get_pubkey_from_state(&pre_state, i),
-            |pk_bytes: &PublicKeyBytes| pk_bytes.decompress().ok().map(Cow::Owned),
-            &block,
-            &mut ConsensusContext::new(block.slot()),
-            spec,
-        ),
-        Err(BlockSignatureVerifierError::PqPossessionProofInvalid)
-    );
+    for invalid_registration in [corrupted, other_validator] {
+        let (block, pre_state) =
+            block_with_registrations(&harness, vec![invalid_registration]).await;
+
+        // Individual verification attributes the failure to the registration.
+        let mut state = pre_state.clone();
+        assert_eq!(
+            process_block(
+                &mut state,
+                &block,
+                BlockSignatureStrategy::VerifyIndividual,
+                spec
+            ),
+            Err(invalid(PqKeyRegistrationInvalid::BadPossessionProof))
+        );
+
+        // Bulk verification checks the proof, against the validator's BLS public key in the
+        // state, alongside the (valid) BLS signatures.
+        let mut state = pre_state.clone();
+        assert_eq!(
+            process_block(&mut state, &block, BlockSignatureStrategy::VerifyBulk, spec),
+            Err(BlockProcessingError::BulkSignatureVerificationFailed)
+        );
+        assert_eq!(
+            BlockSignatureVerifier::verify_entire_block(
+                &pre_state,
+                |i| get_pubkey_from_state(&pre_state, i),
+                |pk_bytes: &PublicKeyBytes| pk_bytes.decompress().ok().map(Cow::Owned),
+                &block,
+                &mut ConsensusContext::new(block.slot()),
+                spec,
+            ),
+            Err(BlockSignatureVerifierError::PqPossessionProofInvalid)
+        );
+    }
 }
 
 #[tokio::test]
