@@ -7,7 +7,7 @@ use beacon_chain::test_utils::{
 };
 use beacon_chain::{
     AvailabilityProcessingStatus, BlockError, ChainConfig, InvalidSignature, NotifyExecutionLayer,
-    block_verification_types::{AsBlock, LookupBlock},
+    block_verification_types::{AsBlock, AvailableBlockData, LookupBlock, RangeSyncBlock},
 };
 use bls::{Keypair, Signature};
 use logging::create_test_tracing_subscriber;
@@ -44,6 +44,101 @@ fn get_harness(
     harness.advance_slot();
 
     harness
+}
+
+async fn assert_range_import_columns_servable(prefetch_column: bool) {
+    let mut spec = test_spec::<E>();
+    spec.altair_fork_epoch = Some(Epoch::new(0));
+    spec.bellatrix_fork_epoch = Some(Epoch::new(0));
+    spec.capella_fork_epoch = Some(Epoch::new(0));
+    spec.deneb_fork_epoch = Some(Epoch::new(0));
+    spec.electra_fork_epoch = Some(Epoch::new(0));
+    spec.fulu_fork_epoch = Some(Epoch::new(0));
+    spec.gloas_fork_epoch = None;
+    spec.heze_fork_epoch = None;
+    let spec = Arc::new(spec);
+    let producer = get_harness(VALIDATOR_COUNT, spec.clone(), NodeCustodyType::Supernode);
+    let receiver = get_harness(VALIDATOR_COUNT, spec.clone(), NodeCustodyType::Supernode);
+    producer.execution_block_generator().set_min_blob_count(1);
+    let ((block, _), _) = producer
+        .make_block(producer.get_current_state(), producer.get_current_slot())
+        .await;
+    assert!(block.num_expected_blobs() > 0);
+    let root = block.canonical_root();
+    let columns = generate_data_column_sidecars_from_block(&block, &spec);
+
+    if prefetch_column {
+        receiver
+            .chain
+            .process_rpc_custody_columns(vec![columns[0].clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            receiver
+                .chain
+                .get_data_columns_checking_all_caches(root, &[0])
+                .unwrap(),
+            vec![columns[0].clone()],
+            "an unimported cached column must remain servable",
+        );
+    }
+
+    let range_block = RangeSyncBlock::new(
+        block,
+        AvailableBlockData::DataColumns(columns.clone()),
+        &receiver.chain.custody_context,
+    )
+    .unwrap();
+    receiver
+        .chain
+        .process_chain_segment(vec![range_block], NotifyExecutionLayer::Yes)
+        .await
+        .into_block_error()
+        .unwrap();
+    receiver.chain.recompute_head_at_current_slot().await;
+    assert_eq!(receiver.chain.head().head_block_root(), root);
+
+    // Establish that real import persisted every column before checking the RPC path.
+    for column in &columns {
+        assert_eq!(
+            receiver
+                .chain
+                .store
+                .get_data_column(&root, column.index(), ForkName::Fulu)
+                .unwrap(),
+            Some(column.clone()),
+        );
+    }
+    let indices = columns
+        .iter()
+        .map(|column| *column.index())
+        .collect::<Vec<_>>();
+    let mut served = receiver
+        .chain
+        .get_data_columns_checking_all_caches(root, &indices)
+        .unwrap();
+    served.sort_by_key(|column| *column.index());
+    assert_eq!(
+        served
+            .iter()
+            .map(|column| *column.index())
+            .collect::<Vec<_>>(),
+        indices,
+        "an incomplete DA cache must not hide imported custody columns"
+    );
+    for (actual, expected) in served.iter().zip(&columns) {
+        assert_eq!(actual, expected);
+    }
+}
+
+#[tokio::test]
+async fn range_import_columns_are_servable_with_empty_da_cache() {
+    assert_range_import_columns_servable(false).await;
+}
+
+#[tokio::test]
+async fn range_import_columns_are_servable_with_partial_da_cache() {
+    assert_range_import_columns_servable(true).await;
 }
 
 // Regression test for https://github.com/sigp/lighthouse/issues/7650
