@@ -4,8 +4,9 @@
 //! `process_pq_key_registration`, block-level limits, the fork upgrade, the registry length
 //! invariant and the `PqPubkeyCache`.
 //!
-//! leanXMSS keys come from fixed seeds and possession proofs are deterministic, so every test is
-//! deterministic. Keys and proofs are cached per process.
+//! leanXMSS keys come from fixed seeds. Each `(key, message, leaf index)` is signed once per process
+//! and the signature is reused, as a signer reuses its stored proof of possession: signing is not
+//! assumed to be deterministic.
 #![cfg(not(feature = "fake_crypto"))]
 
 use beacon_chain::test_utils::{BeaconChainHarness, EphemeralHarnessType};

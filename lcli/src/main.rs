@@ -670,9 +670,10 @@ fn main() {
         .subcommand(
             Command::new("pq-key-registration")
                 .about("Creates an EIP-8450 post-quantum key registration for a validator and \
-                        optionally submits it to a beacon node. Signs a proof of possession of \
-                        the leanXMSS key at leaf index 0 and authorizes the registration with \
-                        the validator's BLS signing key.")
+                        optionally submits it to a beacon node. A new leanXMSS key signs its \
+                        proof of possession at leaf index 0 once, when it is created, and the \
+                        proof is stored with its seed; a reused key carries the stored proof. \
+                        The validator's BLS signing key authorizes the registration.")
                 .arg(
                     Arg::new("beacon-node")
                         .long("beacon-node")
@@ -775,10 +776,12 @@ fn main() {
                         .long("xmss-seed-file")
                         .value_name("PATH")
                         .action(ArgAction::Set)
-                        .help("XMSS seed file written by an earlier --xmss-seed-out run, holding \
-                                {\"seed\": \"0x..\", \"validator_index\": \"N\"}. Signing is refused \
-                                unless its validator_index equals --validator-index, so the \
-                                key's leaf 0 only ever proves possession for one validator.")
+                        .help("Reuse a key created by an earlier --xmss-seed-out run. The file \
+                                holds {\"seed\", \"validator_index\", \"validator_pubkey\", \
+                                \"possession\"}; the registration carries the stored proof of \
+                                possession and leaf 0 is never signed again. Refused unless \
+                                validator_index and validator_pubkey match the validator and \
+                                the stored proof verifies for the seed's key.")
                         .display_order(0)
                 )
                 .arg(
@@ -788,9 +791,11 @@ fn main() {
                         .action(ArgAction::Set)
                         .required_unless_present("xmss-seed-file")
                         .conflicts_with("xmss-seed-file")
-                        .help("New file (mode 0600, never overwritten) to write a leanXMSS seed \
-                                generated from OS randomness to, bound to --validator-index. \
-                                Reuse it with --xmss-seed-file.")
+                        .help("New file (mode 0600, never overwritten) for a leanXMSS key \
+                                generated from OS randomness. Its proof of possession is signed \
+                                at leaf 0, once, for the validator's on-chain BLS public key, \
+                                and stored in the file with the seed before the registration \
+                                is output or submitted. Reuse the key with --xmss-seed-file.")
                         .display_order(0)
                 )
                 .arg(

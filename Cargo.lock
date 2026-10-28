@@ -5733,6 +5733,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snap",
+ "ssz_types",
  "state_processing",
  "store",
  "tempfile",
