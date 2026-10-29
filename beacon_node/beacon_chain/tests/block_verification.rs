@@ -1153,6 +1153,13 @@ async fn invalid_signature_attestation() {
 
 #[tokio::test]
 async fn invalid_signature_deposit() {
+    // EIP-8015 removes `deposits` from Heze block bodies.
+    if test_spec::<E>()
+        .fork_name_at_epoch(Epoch::new(0))
+        .heze_enabled()
+    {
+        return;
+    }
     let (chain_segment, ref_blobs) = get_chain_segment().await;
     let mut chain_segment_blobs = ref_blobs.clone();
     for &block_index in BLOCK_INDICES {
