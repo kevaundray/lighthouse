@@ -10,7 +10,7 @@ use lean_pq::xmss;
 use std::cmp::Ordering;
 use types::{
     BeaconState, BeaconStateError, ChainSpec, Domain, Epoch, EthSpec, Hash256,
-    PQ_POSSESSION_XMSS_INDEX, PQ_UNREGISTERED_CHANGE_EPOCH, PqKeyPossession, PqPublicKeys,
+    PQ_POSSESSION_XMSS_INDEX, PQ_UNREGISTERED_CHANGE_EPOCH, PqKeyPossession,
     SignedPqKeyRegistration, SignedRoot, XmssPublicKey, XmssSignature,
 };
 
@@ -33,27 +33,27 @@ pub fn is_pq_registered<E: EthSpec>(
         .ok_or(BeaconStateError::UnknownValidator(index as usize))
 }
 
-/// Returns whether a registered validator other than `excluded_index` holds the leanXMSS key of
-/// `public_keys` (`is_pq_public_key_in_use`), returning that validator's index.
+/// Returns whether any registered validator, including the one registering, holds
+/// `xmss_public_key` (`is_pq_public_key_in_use`), returning that validator's index.
+///
+/// Every registration therefore carries a new leanXMSS key: a validator cannot re-register its own
+/// current key, even to change only its VRF root.
 ///
 /// Unregistered validators are skipped, so their all-zero entries never own the all-zero key.
 /// Uses the state's `PqPubkeyCache` when it is built, and scans the registry otherwise.
 pub fn pq_public_key_owner<E: EthSpec>(
     state: &BeaconState<E>,
-    public_keys: &PqPublicKeys,
-    excluded_index: u64,
+    xmss_public_key: &XmssPublicKey,
 ) -> Result<Option<u64>, BeaconStateError> {
     let owner = if state.pq_pubkey_cache().is_initialized() {
-        state.pq_pubkey_cache().get(&public_keys.xmss_public_key)
+        state.pq_pubkey_cache().get(xmss_public_key)
     } else {
         state
             .registered_pq_public_keys()?
-            .find(|(_, entry)| entry.xmss_public_key == public_keys.xmss_public_key)
+            .find(|(_, entry)| entry.xmss_public_key == *xmss_public_key)
             .map(|(index, _)| index)
     };
-    Ok(owner
-        .map(|owner| owner as u64)
-        .filter(|owner| *owner != excluded_index))
+    Ok(owner.map(|owner| owner as u64))
 }
 
 /// Compares two values of a validator's `pq_key_change_epochs` entry by the order in which a chain
@@ -223,9 +223,9 @@ pub fn verify_pq_key_registration<E: EthSpec>(
         );
     }
 
-    // The key must be unique, and the registrant must prove possession of it for the validator's
-    // BLS public key.
-    if let Some(owner) = pq_public_key_owner(state, public_keys, index)? {
+    // The key must be new: no validator, including this one, may hold it. The registrant must also
+    // prove possession of it for the validator's BLS public key.
+    if let Some(owner) = pq_public_key_owner(state, &public_keys.xmss_public_key)? {
         return Err(error(Invalid::XmssPublicKeyInUse { owner }));
     }
     if verify_signatures.is_true() {

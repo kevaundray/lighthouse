@@ -11,7 +11,6 @@ use eth2::{BeaconNodeHttpClient, SensitiveUrl, Timeouts};
 use eth2_wallet::bip39::{Language, Mnemonic, Seed};
 use eth2_wallet::{KeyType, recover_validator_secret_from_mnemonic};
 use lean_pq::xmss;
-use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -43,34 +42,20 @@ pub fn run<E: EthSpec>(env: Environment<E>, matches: &ArgMatches) -> Result<(), 
     )?;
     let previous_change_epoch_override: Option<Epoch> =
         parse_optional::<u64>(matches, "previous-change-epoch")?.map(Epoch::new);
-    let xmss_seed_file: Option<PathBuf> = parse_optional(matches, "xmss-seed-file")?;
-    let xmss_seed_out: Option<PathBuf> = parse_optional(matches, "xmss-seed-out")?;
+    let xmss_seed_out: PathBuf = parse_required(matches, "xmss-seed-out")?;
     let output_path: Option<PathBuf> = parse_optional(matches, "output")?;
     let submit = matches.get_flag("submit");
 
-    // Read an existing key, or fail early if a new one has nowhere to go. The seed file is only
-    // created at write time, with `create_new`, so this check cannot cause an overwrite.
-    let key_source = match (xmss_seed_file, xmss_seed_out) {
-        (Some(path), _) => {
-            let seed_file = read_xmss_seed_file(&path, validator_index)?;
-            XmssKeySource::Reuse { path, seed_file }
-        }
-        (None, Some(path)) if path.exists() => {
-            return Err(format!(
-                "Refusing to overwrite existing XMSS seed file {}; use --xmss-seed-file to \
-                 reuse it",
-                path.display()
-            ));
-        }
-        (None, Some(path)) => XmssKeySource::Create { path },
-        (None, None) => {
-            return Err(
-                "One of --xmss-seed-file or --xmss-seed-out is required, otherwise a generated \
-                 leanXMSS key and its proof of possession would be lost"
-                    .to_string(),
-            );
-        }
-    };
+    // Fail early if the new key has nowhere to go. The seed file is only created at write time,
+    // with `create_new`, so this check cannot cause an overwrite.
+    if xmss_seed_out.exists() {
+        return Err(format!(
+            "Refusing to overwrite existing XMSS seed file {}. Every registration needs a new \
+             key, so give a new path; a registration that was not included is resubmitted by \
+             POSTing its --output file unchanged",
+            xmss_seed_out.display()
+        ));
+    }
 
     let bls_keypair = load_bls_keypair(matches, validator_index)?;
 
@@ -96,41 +81,22 @@ pub fn run<E: EthSpec>(env: Environment<E>, matches: &ArgMatches) -> Result<(), 
         ));
     }
 
-    // Leaf `PQ_POSSESSION_XMSS_INDEX` of a key signs once, when the key is created. Reusing a key
-    // reuses the proof stored with it and never reaches a signing call.
+    // Every registration carries a new key: leaf `PQ_POSSESSION_XMSS_INDEX` of the key created
+    // here signs its proof of possession once, and no other run ever signs with this key.
     let key_start = Instant::now();
-    let xmss_key = match &key_source {
-        XmssKeySource::Reuse { path, seed_file } => {
-            let key = possessed_key_from_seed_file(
-                seed_file,
-                path,
-                &context.on_chain_pubkey,
-                context.genesis_validators_root,
-                &context.spec,
-            )?;
-            eprintln!(
-                "Reusing the proof of possession stored in {}",
-                path.display()
-            );
-            key
-        }
-        XmssKeySource::Create { path } => {
-            let key = create_xmss_key(
-                path,
-                validator_index,
-                &context.on_chain_pubkey,
-                context.genesis_validators_root,
-                &context.spec,
-            )?;
-            eprintln!(
-                "Wrote the new XMSS seed and its proof of possession for validator {} to {}",
-                validator_index,
-                path.display()
-            );
-            key
-        }
-    };
+    let xmss_key = create_xmss_key(
+        &xmss_seed_out,
+        validator_index,
+        &context.on_chain_pubkey,
+        context.genesis_validators_root,
+        &context.spec,
+    )?;
     let key_time = key_start.elapsed();
+    eprintln!(
+        "Wrote the new XMSS seed for validator {} to {}",
+        validator_index,
+        xmss_seed_out.display()
+    );
 
     let sign_start = Instant::now();
     let signed_registration = build_signed_registration(
@@ -153,28 +119,21 @@ pub fn run<E: EthSpec>(env: Environment<E>, matches: &ArgMatches) -> Result<(), 
         "previous_change_epoch: {}",
         signed_registration.message.previous_change_epoch
     );
-    if matches!(key_source, XmssKeySource::Reuse { .. }) {
-        eprintln!(
-            "Deriving the XMSS public key and verifying the stored proof took {:?}, \
-             signing the registration took {:?}",
-            key_time, sign_time
-        );
-    } else {
-        eprintln!(
-            "XMSS key generation and proof of possession took {:?}, signing the registration \
-             took {:?}",
-            key_time, sign_time
-        );
-    }
+    eprintln!(
+        "XMSS key generation and proof of possession took {:?}, signing the registration took \
+         {:?}",
+        key_time, sign_time
+    );
 
     let registrations = vec![signed_registration];
-    let json = serde_json::to_string_pretty(&registrations)
-        .map_err(|e| format!("Unable to serialize registration: {:?}", e))?;
 
     if let Some(path) = &output_path {
-        fs::write(path, &json)
-            .map_err(|e| format!("Unable to write {}: {:?}", path.display(), e))?;
-        eprintln!("Wrote registration to {}", path.display());
+        write_registration_output(path, &registrations)?;
+        eprintln!(
+            "Wrote registration to {}. If it is not included, resubmit this file unchanged to \
+             POST /eth/v1/beacon/pool/pq_key_registrations",
+            path.display()
+        );
     }
 
     if submit {
@@ -280,20 +239,9 @@ async fn fetch_chain_context<E: EthSpec>(
     })
 }
 
-/// Where the leanXMSS key of the registration comes from.
-enum XmssKeySource {
-    /// A key created by an earlier run, with the proof of possession it signed then.
-    Reuse {
-        path: PathBuf,
-        seed_file: XmssSeedFile,
-    },
-    /// A new key, saved with its proof of possession to a new file at `path`.
-    Create { path: PathBuf },
-}
-
 /// A leanXMSS public key and the proof of possession its key signed at leaf index
-/// `PQ_POSSESSION_XMSS_INDEX` when it was created: the only proof that key ever signs, which
-/// every registration of the key carries.
+/// `PQ_POSSESSION_XMSS_INDEX` when it was created: the only proof that key ever signs, carried by
+/// its one registration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PossessedXmssKey {
     pub xmss_public_key: XmssPublicKey,
@@ -368,8 +316,8 @@ fn encode_xmss_public_key(public_key: &xmss::PublicKey) -> Result<XmssPublicKey,
 /// Signs, at leaf index `PQ_POSSESSION_XMSS_INDEX`, the proof of possession of
 /// `xmss_secret_key`'s public key for the validator holding `validator_pubkey`.
 ///
-/// A key signs at a leaf index at most once. Call this only for a key that was just created, and
-/// store the result with the key: it is the only proof the key may ever sign.
+/// A key signs at a leaf index at most once. Call this only for a key that was just created: every
+/// registration carries a new key, so this is the only proof the key ever signs.
 fn sign_possession(
     xmss_secret_key: &xmss::SecretKey,
     validator_pubkey: &PublicKeyBytes,
@@ -401,8 +349,12 @@ fn sign_possession(
     })
 }
 
-/// Creates a leanXMSS key from OS randomness for the validator holding `validator_pubkey`, and
-/// saves it with its proof of possession (see `save_new_xmss_key`).
+/// Creates a leanXMSS key from OS randomness for the validator `validator_index` holding
+/// `validator_pubkey`, saves its seed to a new seed file at `path`, then signs its proof of
+/// possession.
+///
+/// The seed is saved before the key signs anything, so the signer of the key's later duties has
+/// it. If the file cannot be created, the key is discarded without having signed.
 fn create_xmss_key(
     path: &Path,
     validator_index: u64,
@@ -410,35 +362,7 @@ fn create_xmss_key(
     genesis_validators_root: Hash256,
     spec: &ChainSpec,
 ) -> Result<PossessedXmssKey, String> {
-    save_new_xmss_key(
-        path,
-        xmss::SecretKey::generate(),
-        validator_index,
-        validator_pubkey,
-        genesis_validators_root,
-        spec,
-    )
-}
-
-/// Signs the proof of possession of a just-created `xmss_secret_key` for the validator holding
-/// `validator_pubkey`, and saves both, with `validator_index`, to a new seed file at `path`.
-///
-/// Takes the secret key by value, so it does not outlive this function. If the file cannot be
-/// created, the key and its proof are discarded unused.
-fn save_new_xmss_key(
-    path: &Path,
-    xmss_secret_key: xmss::SecretKey,
-    validator_index: u64,
-    validator_pubkey: &PublicKeyBytes,
-    genesis_validators_root: Hash256,
-    spec: &ChainSpec,
-) -> Result<PossessedXmssKey, String> {
-    let key = sign_possession(
-        &xmss_secret_key,
-        validator_pubkey,
-        genesis_validators_root,
-        spec,
-    )?;
+    let xmss_secret_key = xmss::SecretKey::generate();
     write_xmss_seed_file(
         path,
         &XmssSeedFile {
@@ -448,56 +372,18 @@ fn save_new_xmss_key(
             )),
             validator_index,
             validator_pubkey: *validator_pubkey,
-            possession: key.possession.clone(),
         },
     )?;
-    Ok(key)
-}
-
-/// Returns the key of `seed_file`, read from `path`, with the proof of possession stored in it,
-/// after checking that the proof is a valid proof of the seed's key for `validator_pubkey`, the
-/// validator's on-chain public key. Never signs.
-fn possessed_key_from_seed_file(
-    seed_file: &XmssSeedFile,
-    path: &Path,
-    validator_pubkey: &PublicKeyBytes,
-    genesis_validators_root: Hash256,
-    spec: &ChainSpec,
-) -> Result<PossessedXmssKey, String> {
-    if seed_file.validator_pubkey != *validator_pubkey {
-        return Err(format!(
-            "XMSS seed file {} holds a proof of possession for BLS public key {}, but the \
-             validator's public key is {}",
-            path.display(),
-            seed_file.validator_pubkey.as_hex_string(),
-            validator_pubkey.as_hex_string()
-        ));
-    }
-    let seed = Zeroizing::new(parse_hex32(&seed_file.seed, "XMSS seed")?);
-    // Only the public key is needed: the secret key is dropped here, unused.
-    let xmss_public_key = encode_xmss_public_key(&xmss::SecretKey::from_seed(*seed).public_key())?;
-    verify_possession(
+    sign_possession(
+        &xmss_secret_key,
         validator_pubkey,
-        &xmss_public_key,
-        &seed_file.possession,
         genesis_validators_root,
         spec,
     )
-    .map_err(|e| {
-        format!(
-            "Refusing the proof of possession stored in XMSS seed file {}: {}",
-            path.display(),
-            e
-        )
-    })?;
-    Ok(PossessedXmssKey {
-        xmss_public_key,
-        possession: seed_file.possession.clone(),
-    })
 }
 
 /// Builds a registration of `xmss_key` and `vrf_root` for `validator_index`, carrying the key's
-/// stored proof of possession and signed by `bls_keypair`, then verifies both signatures.
+/// proof of possession and signed by `bls_keypair`, then verifies both signatures.
 ///
 /// The proof must be for the public key of `bls_keypair`, which the caller checks against the
 /// validator's on-chain public key. The signing root matches `pq_key_registration_signature_set`
@@ -661,11 +547,8 @@ fn parse_hex32(value: &str, name: &str) -> Result<[u8; 32], String> {
         .map_err(|_| format!("{} must be 32 bytes, got {}", name, bytes.len()))
 }
 
-/// The contents of an XMSS seed file: a leanXMSS seed, the validator it was created for, and the
-/// proof of possession the key signed then at leaf index `PQ_POSSESSION_XMSS_INDEX`.
-///
-/// That proof is the only one the key ever signs: every registration of the key, including a
-/// resubmission or a VRF-root-only change, carries these bytes.
+/// The contents of an XMSS seed file: what the validator's signer needs for the key's later
+/// duties, namely the leanXMSS seed and the validator it was created for.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct XmssSeedFile {
@@ -673,51 +556,20 @@ struct XmssSeedFile {
     seed: Zeroizing<String>,
     #[serde(with = "serde_utils::quoted_u64")]
     validator_index: u64,
-    /// BLS public key of the validator, which the proof of possession names.
+    /// BLS public key of the validator, which the key's proof of possession names.
     validator_pubkey: PublicKeyBytes,
-    #[serde(with = "ssz_types::serde_utils::hex_fixed_vec")]
-    possession: XmssSignature,
 }
 
-/// A seed file written before seed files stored the proof of possession.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyXmssSeedFile {
-    #[serde(rename = "seed")]
-    _seed: IgnoredAny,
-    #[serde(rename = "validator_index")]
-    _validator_index: IgnoredAny,
-}
-
-/// Reads an XMSS seed file, refusing a file of another validator, and a file in the earlier
-/// format, which has no stored proof of possession.
-fn read_xmss_seed_file(path: &Path, validator_index: u64) -> Result<XmssSeedFile, String> {
-    let contents = read_secret_file(path)?;
-    let seed_file: XmssSeedFile = serde_json::from_str(&contents).map_err(|e| {
-        if serde_json::from_str::<LegacyXmssSeedFile>(&contents).is_ok() {
-            format!(
-                "XMSS seed file {} predates stored proofs of possession. Its key already signed \
-                 its proof of possession at leaf index {}, and signing there again would be a \
-                 second signature at that leaf, so this tool will not re-sign it. The original \
-                 proof is in the registration output of the run that created the key. Create a \
-                 new key with --xmss-seed-out",
-                path.display(),
-                PQ_POSSESSION_XMSS_INDEX
-            )
-        } else {
-            format!("Invalid XMSS seed file {}: {}", path.display(), e)
-        }
-    })?;
-    if seed_file.validator_index != validator_index {
-        return Err(format!(
-            "XMSS seed file {} belongs to validator {}, refusing to register its key for \
-             validator {}",
-            path.display(),
-            seed_file.validator_index,
-            validator_index
-        ));
-    }
-    Ok(seed_file)
+/// Writes `registrations` to `path` as the JSON body of
+/// `POST /eth/v1/beacon/pool/pq_key_registrations`. A registration that is not included is
+/// resubmitted by POSTing this file unchanged.
+fn write_registration_output(
+    path: &Path,
+    registrations: &[SignedPqKeyRegistration],
+) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(registrations)
+        .map_err(|e| format!("Unable to serialize registration: {:?}", e))?;
+    fs::write(path, json).map_err(|e| format!("Unable to write {}: {:?}", path.display(), e))
 }
 
 /// Writes `seed_file` to a new file at `path` that only the owner can read. Fails if `path`
@@ -806,56 +658,82 @@ mod tests {
         serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
     }
 
-    /// Reads the seed file at `path` and returns its key, as the reuse path of `run` does.
-    fn reuse(
-        path: &Path,
-        validator_pubkey: &PublicKeyBytes,
-        state: &BeaconState<E>,
-        spec: &ChainSpec,
-    ) -> Result<PossessedXmssKey, String> {
-        let seed_file = read_xmss_seed_file(path, VALIDATOR_INDEX)?;
-        possessed_key_from_seed_file(
-            &seed_file,
-            path,
-            validator_pubkey,
-            state.genesis_validators_root(),
-            spec,
-        )
+    /// Reads a seed file as the validator's signer would.
+    fn read_seed_file(path: &Path) -> Result<XmssSeedFile, serde_json::Error> {
+        serde_json::from_str(&fs::read_to_string(path).unwrap())
     }
 
-    #[test]
-    fn stored_proof_is_the_proof_of_every_registration() {
-        let spec = ForkName::Eip8450.make_genesis_spec(E::default_spec());
-        let (mut state, keypair) = genesis_state(&spec);
-        let validator_pubkey = pubkey_of(&state, VALIDATOR_INDEX);
-        assert_eq!(validator_pubkey, keypair.pk.compress());
-        // A first registration names the validator's stored entry, `FAR_FUTURE_EPOCH`.
-        let previous_change_epoch = *state
+    /// The stored change epoch of validator `VALIDATOR_INDEX`, which its registration names.
+    fn previous_change_epoch(state: &BeaconState<E>) -> Epoch {
+        *state
             .pq_key_change_epochs()
             .unwrap()
             .get(VALIDATOR_INDEX as usize)
-            .unwrap();
-        assert_eq!(previous_change_epoch, spec.far_future_epoch);
+            .unwrap()
+    }
 
-        // Creating the key signs its proof of possession and stores it with the seed.
+    /// Creates a key for validator `VALIDATOR_INDEX` in a new seed file at `path`, as a run does.
+    fn new_key(path: &Path, state: &BeaconState<E>, spec: &ChainSpec) -> PossessedXmssKey {
+        create_xmss_key(
+            path,
+            VALIDATOR_INDEX,
+            &pubkey_of(state, VALIDATOR_INDEX),
+            state.genesis_validators_root(),
+            spec,
+        )
+        .unwrap()
+    }
+
+    /// Builds the registration of `key` with a VRF root of `vrf_byte`s, as a run does.
+    fn register(
+        key: &PossessedXmssKey,
+        keypair: &Keypair,
+        vrf_byte: u8,
+        state: &BeaconState<E>,
+        spec: &ChainSpec,
+    ) -> SignedPqKeyRegistration {
+        build_signed_registration(
+            VALIDATOR_INDEX,
+            keypair,
+            key,
+            [vrf_byte; 32],
+            previous_change_epoch(state),
+            state.genesis_validators_root(),
+            spec,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn run_creates_a_key_and_saves_only_its_seed() {
+        let spec = ForkName::Eip8450.make_genesis_spec(E::default_spec());
+        let (state, _) = genesis_state(&spec);
+        let validator_pubkey = pubkey_of(&state, VALIDATOR_INDEX);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("xmss_seed.json");
-        let created = save_new_xmss_key(
-            &path,
-            xmss::SecretKey::from_seed(XMSS_SEED),
-            VALIDATOR_INDEX,
-            &validator_pubkey,
-            state.genesis_validators_root(),
-            &spec,
-        )
-        .unwrap();
+        let created = new_key(&path, &state, &spec);
+
         let stored = read_json(&path);
-        assert_eq!(
-            stored["possession"],
-            format!("0x{}", hex::encode(&created.possession[..]))
-        );
-        assert_eq!(stored["validator_pubkey"], validator_pubkey.as_hex_string());
+        let mut fields = stored
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        fields.sort_unstable();
+        assert_eq!(fields, ["seed", "validator_index", "validator_pubkey"]);
         assert_eq!(stored["validator_index"], VALIDATOR_INDEX.to_string());
+        assert_eq!(stored["validator_pubkey"], validator_pubkey.as_hex_string());
+
+        // The stored seed is the seed of the created key.
+        let seed_file = read_seed_file(&path).unwrap();
+        let seed = Zeroizing::new(parse_hex32(&seed_file.seed, "XMSS seed").unwrap());
+        assert_eq!(
+            encode_xmss_public_key(&xmss::SecretKey::from_seed(*seed).public_key()).unwrap(),
+            created.xmss_public_key
+        );
+
+        // The key signed its proof of possession at the reserved leaf, for this validator only.
         assert_eq!(
             xmss::Signature::from_bytes(&created.possession)
                 .unwrap()
@@ -876,32 +754,39 @@ mod tests {
             &created.possession,
             &spec
         ));
+    }
 
-        let first = build_signed_registration(
-            VALIDATOR_INDEX,
-            &keypair,
-            &created,
-            [9; 32],
-            previous_change_epoch,
-            state.genesis_validators_root(),
-            &spec,
-        )
-        .unwrap();
-        assert_eq!(first.possession, created.possession);
-        assert_eq!(first.message.public_keys.vrf_root, Hash256::repeat_byte(9));
-        assert_eq!(first.message.previous_change_epoch, spec.far_future_epoch);
-        verify_pq_key_registration(&state, &first, VerifySignatures::True, &spec).unwrap();
+    #[test]
+    fn registration_verifies_against_an_eip8450_state() {
+        let spec = ForkName::Eip8450.make_genesis_spec(E::default_spec());
+        let (mut state, keypair) = genesis_state(&spec);
+        assert_eq!(pubkey_of(&state, VALIDATOR_INDEX), keypair.pk.compress());
+        // A first registration names the validator's stored entry, `FAR_FUTURE_EPOCH`.
+        assert_eq!(previous_change_epoch(&state), spec.far_future_epoch);
+        let dir = tempfile::tempdir().unwrap();
+        let key = new_key(&dir.path().join("xmss_seed.json"), &state, &spec);
 
-        // The JSON written by the command round-trips.
-        let json = serde_json::to_string(&vec![first.clone()]).unwrap();
-        let decoded: Vec<SignedPqKeyRegistration> = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded, vec![first.clone()]);
+        let registration = register(&key, &keypair, 9, &state, &spec);
+        assert_eq!(registration.possession, key.possession);
+        assert_eq!(
+            registration.message.public_keys.xmss_public_key,
+            key.xmss_public_key
+        );
+        assert_eq!(
+            registration.message.public_keys.vrf_root,
+            Hash256::repeat_byte(9)
+        );
+        assert_eq!(
+            registration.message.previous_change_epoch,
+            spec.far_future_epoch
+        );
+        verify_pq_key_registration(&state, &registration, VerifySignatures::True, &spec).unwrap();
 
         // The registration applies to the state.
         let mut applied = state.clone();
         process_pq_key_registrations(
             &mut applied,
-            std::slice::from_ref(&first),
+            std::slice::from_ref(&registration),
             VerifySignatures::True,
             &spec,
         )
@@ -912,186 +797,75 @@ mod tests {
                 .unwrap()
                 .get(VALIDATOR_INDEX as usize)
                 .unwrap(),
-            &first.message.public_keys
+            &registration.message.public_keys
         );
-
-        // Reusing the file yields the stored proof, byte for byte, without signing.
-        let reused = reuse(&path, &validator_pubkey, &state, &spec).unwrap();
-        assert_eq!(reused, created);
-
-        // A resubmission, e.g. after an orphaned block, is the same registration.
-        let resubmission = build_signed_registration(
-            VALIDATOR_INDEX,
-            &keypair,
-            &reused,
-            [9; 32],
-            previous_change_epoch,
-            state.genesis_validators_root(),
-            &spec,
-        )
-        .unwrap();
-        assert_eq!(resubmission, first);
-
-        // A VRF-root-only change carries the same proof.
-        let vrf_change = build_signed_registration(
-            VALIDATOR_INDEX,
-            &keypair,
-            &reuse(&path, &validator_pubkey, &state, &spec).unwrap(),
-            [10; 32],
-            previous_change_epoch,
-            state.genesis_validators_root(),
-            &spec,
-        )
-        .unwrap();
-        assert_eq!(vrf_change.possession, created.possession);
-        assert_eq!(
-            vrf_change.message.public_keys.xmss_public_key,
-            created.xmss_public_key
-        );
-        assert_eq!(
-            vrf_change.message.public_keys.vrf_root,
-            Hash256::repeat_byte(10)
-        );
-        verify_pq_key_registration(&state, &vrf_change, VerifySignatures::True, &spec).unwrap();
-
-        // The file was only read.
-        assert_eq!(read_json(&path), stored);
 
         // Signatures are bound to the network via the genesis validators root.
         *state.genesis_validators_root_mut() = Hash256::repeat_byte(0x01);
         assert!(matches!(
-            verify_pq_key_registration(&state, &first, VerifySignatures::True, &spec),
+            verify_pq_key_registration(&state, &registration, VerifySignatures::True, &spec),
             Err(BlockOperationError::Invalid(
                 PqKeyRegistrationInvalid::BadSignature
             ))
         ));
-        let err = reuse(&path, &validator_pubkey, &state, &spec).unwrap_err();
-        assert!(err.contains("does not verify"), "{err}");
     }
 
     #[test]
-    fn seed_file_with_a_foreign_or_corrupted_proof_is_refused() {
+    fn each_run_creates_a_different_key() {
         let spec = ForkName::Eip8450.make_genesis_spec(E::default_spec());
-        let (state, _) = genesis_state(&spec);
-        let gvr = state.genesis_validators_root();
-        let validator_pubkey = pubkey_of(&state, VALIDATOR_INDEX);
-        let other_pubkey = pubkey_of(&state, 0);
+        let (state, keypair) = genesis_state(&spec);
         let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("first.json");
+        let second_path = dir.path().join("second.json");
+        let first = new_key(&first_path, &state, &spec);
+        let second = new_key(&second_path, &state, &spec);
 
-        let path = dir.path().join("good.json");
-        let created = save_new_xmss_key(
-            &path,
-            xmss::SecretKey::from_seed(XMSS_SEED),
-            VALIDATOR_INDEX,
-            &validator_pubkey,
-            gvr,
-            &spec,
-        )
-        .unwrap();
-        assert_eq!(
-            reuse(&path, &validator_pubkey, &state, &spec).unwrap(),
-            created
-        );
-        let good = read_xmss_seed_file(&path, VALIDATOR_INDEX).unwrap();
-        let other_key = sign_possession(
-            &xmss::SecretKey::from_seed(OTHER_XMSS_SEED),
-            &other_pubkey,
-            gvr,
-            &spec,
-        )
-        .unwrap();
-
-        let variant = |name: &str, edit: &dyn Fn(&mut XmssSeedFile)| -> String {
-            let mut seed_file = XmssSeedFile {
-                seed: good.seed.clone(),
-                validator_index: good.validator_index,
-                validator_pubkey: good.validator_pubkey,
-                possession: good.possession.clone(),
-            };
-            edit(&mut seed_file);
-            let path = dir.path().join(name);
-            write_xmss_seed_file(&path, &seed_file).unwrap();
-            reuse(&path, &validator_pubkey, &state, &spec).unwrap_err()
-        };
-
-        // The file names another validator's public key.
-        let err = variant("other_pubkey.json", &|f| f.validator_pubkey = other_pubkey);
-        assert!(
-            err.contains("holds a proof of possession for BLS public key"),
-            "{err}"
+        assert_ne!(first.xmss_public_key, second.xmss_public_key);
+        assert_ne!(first.possession, second.possession);
+        assert_ne!(
+            read_json(&first_path)["seed"],
+            read_json(&second_path)["seed"]
         );
 
-        // The stored proof is for another validator's public key.
-        let err = variant("foreign_proof.json", &|f| {
-            f.seed = Zeroizing::new(format!("0x{}", hex::encode(OTHER_XMSS_SEED)));
-            f.possession = other_key.possession.clone();
-        });
-        assert!(err.contains("does not verify"), "{err}");
-
-        // The stored proof is for another key.
-        let err = variant("other_seed.json", &|f| {
-            f.seed = Zeroizing::new(format!("0x{}", hex::encode(OTHER_XMSS_SEED)));
-        });
-        assert!(err.contains("does not verify"), "{err}");
-
-        // The stored proof is corrupted.
-        let err = variant("corrupted.json", &|f| f.possession[1000] ^= 1);
-        assert!(err.contains("does not verify"), "{err}");
-
-        // The stored proof is not at the leaf index reserved for it.
-        let err = variant("leaf_index.json", &|f| f.possession[0] = 1);
-        assert!(err.contains("at leaf index 1, expected 0"), "{err}");
+        // Each run's registration carries its own key and the proof that key signed.
+        for key in [&first, &second] {
+            let registration = register(key, &keypair, 9, &state, &spec);
+            assert_eq!(
+                registration.message.public_keys.xmss_public_key,
+                key.xmss_public_key
+            );
+            assert_eq!(registration.possession, key.possession);
+            verify_pq_key_registration(&state, &registration, VerifySignatures::True, &spec)
+                .unwrap();
+        }
     }
 
     #[test]
-    fn legacy_seed_file_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("legacy.json");
-        fs::write(
-            &path,
-            format!(
-                r#"{{"seed":"0x{}","validator_index":"{}"}}"#,
-                "07".repeat(32),
-                VALIDATOR_INDEX
-            ),
-        )
-        .unwrap();
-        let err = read_xmss_seed_file(&path, VALIDATOR_INDEX).err().unwrap();
-        assert!(
-            err.contains("predates stored proofs of possession"),
-            "{err}"
-        );
-        assert!(err.contains("will not re-sign"), "{err}");
-    }
-
-    #[test]
-    fn created_key_is_saved_with_its_proof() {
+    fn output_file_round_trips_unchanged() {
         let spec = ForkName::Eip8450.make_genesis_spec(E::default_spec());
-        let (state, _) = genesis_state(&spec);
-        let validator_pubkey = pubkey_of(&state, VALIDATOR_INDEX);
+        let (state, keypair) = genesis_state(&spec);
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("xmss_seed.json");
-        let created = create_xmss_key(
-            &path,
-            VALIDATOR_INDEX,
-            &validator_pubkey,
-            state.genesis_validators_root(),
-            &spec,
-        )
-        .unwrap();
-        assert_eq!(
-            reuse(&path, &validator_pubkey, &state, &spec).unwrap(),
-            created
-        );
+        let key = new_key(&dir.path().join("xmss_seed.json"), &state, &spec);
+        let registrations = vec![register(&key, &keypair, 9, &state, &spec)];
+
+        let path = dir.path().join("registration.json");
+        write_registration_output(&path, &registrations).unwrap();
+        let contents = fs::read_to_string(&path).unwrap();
+
+        // The file decodes to the signed registration, which re-encodes to the same bytes: a
+        // resubmission POSTs exactly what was signed.
+        let decoded: Vec<SignedPqKeyRegistration> = serde_json::from_str(&contents).unwrap();
+        assert_eq!(decoded, registrations);
+        assert_eq!(serde_json::to_string_pretty(&decoded).unwrap(), contents);
+        verify_pq_key_registration(&state, &decoded[0], VerifySignatures::True, &spec).unwrap();
     }
 
     #[test]
-    fn xmss_seed_file_is_private_never_overwritten_and_bound_to_its_validator() {
+    fn xmss_seed_file_is_private_and_never_overwritten() {
         let seed_file = |seed: [u8; 32]| XmssSeedFile {
             seed: Zeroizing::new(format!("0x{}", hex::encode(seed))),
             validator_index: VALIDATOR_INDEX,
             validator_pubkey: generate_deterministic_keypair(1).pk.compress(),
-            possession: XmssSignature::new(vec![0; 2404]).unwrap(),
         };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("xmss_seed.json");
@@ -1112,12 +886,9 @@ mod tests {
         assert!(write_xmss_seed_file(&path, &seed_file(OTHER_XMSS_SEED)).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), contents);
 
-        let read = read_xmss_seed_file(&path, VALIDATOR_INDEX).unwrap();
+        let read = read_seed_file(&path).unwrap();
         assert_eq!(*read.seed, format!("0x{}", "07".repeat(32)));
-        let err = read_xmss_seed_file(&path, VALIDATOR_INDEX + 1)
-            .err()
-            .unwrap();
-        assert!(err.contains("belongs to validator 1"), "{err}");
+        assert_eq!(read.validator_index, VALIDATOR_INDEX);
 
         // A planted symlink, even a dangling one, is not followed.
         #[cfg(unix)]
@@ -1129,17 +900,13 @@ mod tests {
             assert!(!target.exists());
         }
 
-        // Unknown fields and malformed files are rejected.
+        // Unknown fields are rejected.
         let mut extra = json.clone();
         extra["extra"] = 1.into();
         let bad = dir.path().join("bad.json");
         fs::write(&bad, extra.to_string()).unwrap();
-        let err = read_xmss_seed_file(&bad, VALIDATOR_INDEX).err().unwrap();
+        let err = read_seed_file(&bad).err().unwrap().to_string();
         assert!(err.contains("unknown field"), "{err}");
-        let mut short = json.clone();
-        short["possession"] = "0x0000".into();
-        fs::write(&bad, short.to_string()).unwrap();
-        assert!(read_xmss_seed_file(&bad, VALIDATOR_INDEX).is_err());
     }
 
     #[test]

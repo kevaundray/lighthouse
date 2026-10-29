@@ -131,7 +131,8 @@ impl PqKeyRegistrations {
     /// Registrations are taken oldest first. A registration is skipped if:
     ///
     /// - it is invalid against `state` (unknown or exiting validator, stale
-    ///   `previous_change_epoch`, change delay not elapsed, key owned by another validator), or
+    ///   `previous_change_epoch`, change delay not elapsed, key held by any validator, including
+    ///   its own), or
     /// - `exits_in_block` returns `true` for its validator, because an operation processed before
     ///   registrations in the same block (slashing, voluntary exit, parent execution request) may
     ///   initiate its exit, or
@@ -207,10 +208,11 @@ impl PqKeyRegistrations {
     ///   `pq_key_change_epochs` entry is past it, so it was applied or a later change superseded
     ///   it, or it names a change before the finalized epoch that the finalized chain does not
     ///   hold, made on a fork that is not canonical;
-    /// - its validator already holds exactly its keys: it was applied, and applying it again
-    ///   would change nothing;
-    /// - another validator owns its leanXMSS key: it lost a race for the key (a validator only
-    ///   releases a key by changing its own keys, which is not expected for a key it just won);
+    /// - any validator holds its leanXMSS key: another validator won a race for the key, or its
+    ///   own validator holds it, because it was applied or because it re-registers the key its
+    ///   validator already holds. Either way it is invalid: every registration needs a key no
+    ///   validator holds, and a holder only releases a key by changing its own keys, which is not
+    ///   expected for a key it just won;
     /// - its validator initiated an exit.
     ///
     /// The caller should forget the returned pairs in its gossip duplicate filter: a pair whose
@@ -225,15 +227,12 @@ impl PqKeyRegistrations {
         finalized_state: &BeaconState<E>,
         spec: &ChainSpec,
     ) -> Vec<(u64, Epoch)> {
-        let (Ok(change_epochs), Ok(public_keys)) = (
-            finalized_state.pq_key_change_epochs(),
-            finalized_state.pq_public_keys(),
-        ) else {
+        let Ok(change_epochs) = finalized_state.pq_key_change_epochs() else {
             return vec![];
         };
         let validators = finalized_state.validators();
         let finalized_epoch = finalized_state.current_epoch();
-        let key_owners = self.finalized_key_owners(finalized_state);
+        let held_keys = self.finalized_held_keys(finalized_state);
 
         let mut pruned = vec![];
         self.by_validator_index.retain(
@@ -250,13 +249,8 @@ impl PqKeyRegistrations {
                 let dead = change_epochs.get(index).is_some_and(|epoch| {
                     is_pq_registration_dead(*epoch, message.previous_change_epoch, finalized_epoch)
                 });
-                let applied = public_keys
-                    .get(index)
-                    .is_some_and(|keys| *keys == message.public_keys);
-                let key_taken = key_owners
-                    .get(&message.public_keys.xmss_public_key)
-                    .is_some_and(|owner| *owner != validator_index);
-                let keep = !exited && !dead && !applied && !key_taken;
+                let key_taken = held_keys.contains(&message.public_keys.xmss_public_key);
+                let keep = !exited && !dead && !key_taken;
                 if !keep {
                     pruned.push((*sequence, validator_index, message.previous_change_epoch));
                 }
@@ -272,34 +266,33 @@ impl PqKeyRegistrations {
             .collect()
     }
 
-    /// The owners in `state` of the leanXMSS keys of the pooled registrations.
+    /// The leanXMSS keys of the pooled registrations that a validator holds in `state`.
     ///
     /// Uses the state's `PqPubkeyCache` when it is built, and otherwise scans the registry once.
-    fn finalized_key_owners<E: EthSpec>(
-        &self,
-        state: &BeaconState<E>,
-    ) -> HashMap<XmssPublicKey, u64> {
+    fn finalized_held_keys<E: EthSpec>(&self, state: &BeaconState<E>) -> HashSet<XmssPublicKey> {
         let pooled_keys = self
             .by_validator_index
             .values()
             .map(|pooled| &pooled.registration.message.public_keys.xmss_public_key)
             .collect::<HashSet<_>>();
         if pooled_keys.is_empty() {
-            return HashMap::new();
+            return HashSet::new();
         }
         let cache = state.pq_pubkey_cache();
         if cache.is_initialized() {
             return pooled_keys
                 .into_iter()
-                .filter_map(|key| cache.get(key).map(|owner| (key.clone(), owner as u64)))
+                .filter(|key| cache.get(key).is_some())
+                .cloned()
                 .collect();
         }
         let Ok(registered) = state.registered_pq_public_keys() else {
-            return HashMap::new();
+            return HashSet::new();
         };
         registered
-            .filter(|(_, keys)| pooled_keys.contains(&keys.xmss_public_key))
-            .map(|(owner, keys)| (keys.xmss_public_key.clone(), owner as u64))
+            .map(|(_, keys)| &keys.xmss_public_key)
+            .filter(|key| pooled_keys.contains(key))
+            .cloned()
             .collect()
     }
 }
@@ -406,9 +399,14 @@ mod tests {
 
         // Validator 1 initiated an exit.
         state.validators_mut().get_mut(1).unwrap().exit_epoch = Epoch::new(10);
-        // Validator 5 holds key 5, validator 6 registered at epoch 0.
+        // Validator 5 holds key 5, validators 6 and 7 registered at epoch 0.
         state.set_pq_public_keys(5, keys(5), Epoch::new(0)).unwrap();
         state.set_pq_public_keys(6, keys(6), Epoch::new(0)).unwrap();
+        state.set_pq_public_keys(7, keys(7), Epoch::new(0)).unwrap();
+
+        // Validator 7 re-registers the leanXMSS key it holds, with a new VRF root.
+        let mut own_key = registration(7, 7, 0);
+        own_key.message.public_keys.vrf_root = Hash256::repeat_byte(0xee);
 
         let pool = pool_with(&[
             // Stale: validator 0 never registered, so its change epoch is `FAR_FUTURE_EPOCH`.
@@ -423,12 +421,16 @@ mod tests {
             registration(4, 5, NEVER),
             // Change of validator 6 before `MIN_PQ_KEY_CHANGE_DELAY` epochs.
             registration(6, 16, 0),
+            // Validator 7's own current key: no validator may hold a registered key, including
+            // the registering one, even once the delay has passed.
+            own_key,
         ]);
 
         let selected = pool.select_for_block(&state, |index| index == 2, 8, &spec);
         assert_eq!(validator_indices(&selected), vec![3]);
 
-        // Once the delay has passed, validator 6 can change its keys.
+        // Once the delay has passed, validator 6 can change its keys, but validator 7 cannot keep
+        // its key.
         *state.slot_mut() = spec
             .min_pq_key_change_delay
             .start_slot(E::slots_per_epoch());
@@ -565,9 +567,12 @@ mod tests {
         finalized_state
             .set_pq_public_keys(5, keys(6), Epoch::new(0))
             .unwrap();
-        // Validator 7 last changed its keys at epoch 4.
+        // Validator 7 last changed its keys at epoch 4, and validator 8 at epoch 1.
         finalized_state
             .set_pq_public_keys(7, keys(8), Epoch::new(4))
+            .unwrap();
+        finalized_state
+            .set_pq_public_keys(8, keys(10), Epoch::new(1))
             .unwrap();
         // Validator 3 exited in the finalized state.
         finalized_state
@@ -575,6 +580,10 @@ mod tests {
             .get_mut(3)
             .unwrap()
             .exit_epoch = Epoch::new(1);
+
+        // Validator 8 re-registers the leanXMSS key it holds, with a new VRF root.
+        let mut own_key = registration(8, 10, 1);
+        own_key.message.public_keys.vrf_root = Hash256::repeat_byte(0xee);
 
         let registrations = [
             // A first registration of other keys, superseded by validator 0's registration.
@@ -594,6 +603,8 @@ mod tests {
             registration(6, 6, NEVER),
             // Names a change before validator 7's finalized change at epoch 4.
             registration(7, 9, 2),
+            // Names validator 8's finalized change, but re-registers the key it holds.
+            own_key,
         ];
 
         // With the finalized state's PQ pubkey cache built, and without it.
@@ -612,6 +623,7 @@ mod tests {
                 .map(|index| (index, Epoch::new(NEVER)))
                 .to_vec();
             expected.push((7, Epoch::new(2)));
+            expected.push((8, Epoch::new(1)));
             assert_eq!(pruned, expected);
         }
     }

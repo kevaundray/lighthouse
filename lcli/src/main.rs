@@ -670,10 +670,13 @@ fn main() {
         .subcommand(
             Command::new("pq-key-registration")
                 .about("Creates an EIP-8450 post-quantum key registration for a validator and \
-                        optionally submits it to a beacon node. A new leanXMSS key signs its \
-                        proof of possession at leaf index 0 once, when it is created, and the \
-                        proof is stored with its seed; a reused key carries the stored proof. \
-                        The validator's BLS signing key authorizes the registration.")
+                        optionally submits it to a beacon node. Every registration carries a new \
+                        leanXMSS key: each run creates one, saves its seed to --xmss-seed-out, \
+                        and signs its proof of possession at leaf index 0 once. The validator's \
+                        BLS signing key authorizes the registration. A registration that was not \
+                        included is resubmitted, never re-signed, by POSTing the --output file \
+                        unchanged to /eth/v1/beacon/pool/pq_key_registrations. A new \
+                        registration always needs a new key, from a new run.")
                 .arg(
                     Arg::new("beacon-node")
                         .long("beacon-node")
@@ -772,30 +775,17 @@ fn main() {
                         .required(true)
                 )
                 .arg(
-                    Arg::new("xmss-seed-file")
-                        .long("xmss-seed-file")
-                        .value_name("PATH")
-                        .action(ArgAction::Set)
-                        .help("Reuse a key created by an earlier --xmss-seed-out run. The file \
-                                holds {\"seed\", \"validator_index\", \"validator_pubkey\", \
-                                \"possession\"}; the registration carries the stored proof of \
-                                possession and leaf 0 is never signed again. Refused unless \
-                                validator_index and validator_pubkey match the validator and \
-                                the stored proof verifies for the seed's key.")
-                        .display_order(0)
-                )
-                .arg(
                     Arg::new("xmss-seed-out")
                         .long("xmss-seed-out")
                         .value_name("PATH")
                         .action(ArgAction::Set)
-                        .required_unless_present("xmss-seed-file")
-                        .conflicts_with("xmss-seed-file")
-                        .help("New file (mode 0600, never overwritten) for a leanXMSS key \
-                                generated from OS randomness. Its proof of possession is signed \
-                                at leaf 0, once, for the validator's on-chain BLS public key, \
-                                and stored in the file with the seed before the registration \
-                                is output or submitted. Reuse the key with --xmss-seed-file.")
+                        .required(true)
+                        .help("New file (mode 0600, never overwritten) for the leanXMSS key this \
+                                run generates from OS randomness. It holds {\"seed\", \
+                                \"validator_index\", \"validator_pubkey\"}, what the validator's \
+                                signer needs for the key's later duties, and is written before \
+                                the key signs its proof of possession. Each run needs a new path: \
+                                a new registration always needs a new key.")
                         .display_order(0)
                 )
                 .arg(
@@ -822,8 +812,10 @@ fn main() {
                         .value_name("PATH")
                         .action(ArgAction::Set)
                         .help("Path to write the registration to, as a JSON array suitable for \
-                                POST /eth/v1/beacon/pool/pq_key_registrations. At least one of \
-                                --output and --submit is required.")
+                                POST /eth/v1/beacon/pool/pq_key_registrations. A registration \
+                                that was not included is resubmitted by POSTing this file \
+                                unchanged to that endpoint. At least one of --output and \
+                                --submit is required.")
                         .display_order(0)
                 )
                 .arg(
@@ -831,7 +823,9 @@ fn main() {
                         .long("submit")
                         .action(ArgAction::SetTrue)
                         .help_heading(FLAG_HEADER)
-                        .help("Submit the registration to the beacon node's pool.")
+                        .help("Submit the registration to the beacon node's pool. Without \
+                                --output, a registration that was not included cannot be \
+                                resubmitted, and a new run with a new key replaces it.")
                         .display_order(0)
                 )
                 .group(

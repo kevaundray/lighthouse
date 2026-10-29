@@ -336,7 +336,7 @@ async fn first_registration_writes_keys_and_change_epoch() {
     assert!(is_pq_registered(&state, 1).unwrap());
     assert_eq!(entry(&state, 1), (public_keys(0, 0xaa), Epoch::new(3)));
     assert_eq!(
-        pq_public_key_owner(&state, &public_keys(0, 0xaa), u64::MAX),
+        pq_public_key_owner(&state, &xmss_public_key(0)),
         Ok(Some(1))
     );
     assert_eq!(state.pq_pubkey_cache().get(&xmss_public_key(0)), Some(1));
@@ -408,8 +408,11 @@ async fn key_change_respects_min_delay_and_replays_are_rejected() {
     }
 }
 
+/// Every registration carries a leanXMSS key that no validator holds, including the registering
+/// validator: a change that keeps the current key is rejected, whether it changes only the VRF root
+/// or nothing at all.
 #[tokio::test]
-async fn vrf_root_only_change_keeps_the_key() {
+async fn change_keeping_the_key_is_rejected() {
     let harness = eip8450_harness();
     let spec = &harness.spec;
     let delay = spec.min_pq_key_change_delay.as_u64();
@@ -417,24 +420,88 @@ async fn vrf_root_only_change_keeps_the_key() {
 
     register(&mut state, 4, 0, 0xaa, NEVER_REGISTERED, spec);
 
-    // Same leanXMSS key (and therefore the same proof of possession), new VRF root.
+    // Same leanXMSS key (and therefore the same proof of possession), once the delay has passed:
+    // with a new VRF root, and with the current keys unchanged.
     *state.slot_mut() = Epoch::new(2 + delay).start_slot(E::slots_per_epoch());
     let vrf_change = registration(&state, 4, 0, 0xcc, Epoch::new(2), spec);
+    let same_keys = registration(&state, 4, 0, 0xaa, Epoch::new(2), spec);
+    assert_eq!(same_keys.message.public_keys, entry(&state, 4).0);
+    let expected = PqKeyRegistrationInvalid::XmssPublicKeyInUse { owner: 4 };
+    for keeps_key in [&vrf_change, &same_keys] {
+        assert_eq!(
+            keeps_key.message.public_keys.xmss_public_key,
+            xmss_public_key(0)
+        );
+        assert_rejected(&state, keeps_key, expected.clone(), spec);
+    }
+
+    // The registry scan finds the validator itself too.
+    let mut uncached = state.clone();
+    uncached.drop_pq_pubkey_cache();
     assert_eq!(
-        vrf_change.message.public_keys.xmss_public_key,
-        xmss_public_key(0)
+        verify_pq_key_registration(&uncached, &vrf_change, VerifySignatures::True, spec),
+        Err(BlockOperationError::Invalid(expected))
     );
-    process(&mut state, &vrf_change, spec);
+    assert_eq!(
+        pq_public_key_owner(&uncached, &xmss_public_key(0)),
+        Ok(Some(4))
+    );
+    assert_eq!(entry(&state, 4), (public_keys(0, 0xaa), Epoch::new(2)));
+}
+
+#[tokio::test]
+async fn key_change_keeping_the_vrf_root_is_accepted() {
+    let harness = eip8450_harness();
+    let spec = &harness.spec;
+    let delay = spec.min_pq_key_change_delay.as_u64();
+    let mut state = state_at_epoch(&harness, 2);
+
+    register(&mut state, 4, 0, 0xaa, NEVER_REGISTERED, spec);
+
+    // New leanXMSS key, same VRF root.
+    *state.slot_mut() = Epoch::new(2 + delay).start_slot(E::slots_per_epoch());
+    let key_change = registration(&state, 4, 1, 0xaa, Epoch::new(2), spec);
+    assert_eq!(
+        key_change.message.public_keys.vrf_root,
+        entry(&state, 4).0.vrf_root
+    );
+    process(&mut state, &key_change, spec);
 
     assert_eq!(
         entry(&state, 4),
-        (public_keys(0, 0xcc), Epoch::new(2 + delay))
+        (public_keys(1, 0xaa), Epoch::new(2 + delay))
     );
-    assert_eq!(state.pq_pubkey_cache().get(&xmss_public_key(0)), Some(4));
+    assert_eq!(state.pq_pubkey_cache().get(&xmss_public_key(0)), None);
+    assert_eq!(state.pq_pubkey_cache().get(&xmss_public_key(1)), Some(4));
     assert_eq!(
-        pq_public_key_owner(&state, &public_keys(0, 0xcc), u64::MAX),
+        pq_public_key_owner(&state, &xmss_public_key(1)),
         Ok(Some(4))
     );
+}
+
+/// A key is held only by the validator whose current entry holds it, so once a validator changes
+/// away from a key, no one holds it and the validator itself may register it again.
+#[tokio::test]
+async fn own_key_freed_by_a_change_is_registerable_again() {
+    let harness = eip8450_harness();
+    let spec = &harness.spec;
+    let delay = spec.min_pq_key_change_delay.as_u64();
+    let mut state = state_at_epoch(&harness, 2);
+
+    register(&mut state, 4, 0, 0xaa, NEVER_REGISTERED, spec);
+    *state.slot_mut() = Epoch::new(2 + delay).start_slot(E::slots_per_epoch());
+    register(&mut state, 4, 1, 0xbb, Epoch::new(2), spec);
+    assert_eq!(pq_public_key_owner(&state, &xmss_public_key(0)), Ok(None));
+
+    // Key 0 again, with the stored proof of possession.
+    *state.slot_mut() = Epoch::new(2 + 2 * delay).start_slot(E::slots_per_epoch());
+    register(&mut state, 4, 0, 0xcc, Epoch::new(2 + delay), spec);
+    assert_eq!(
+        entry(&state, 4),
+        (public_keys(0, 0xcc), Epoch::new(2 + 2 * delay))
+    );
+    assert_eq!(state.pq_pubkey_cache().get(&xmss_public_key(0)), Some(4));
+    assert_eq!(state.pq_pubkey_cache().get(&xmss_public_key(1)), None);
 }
 
 #[tokio::test]
@@ -499,12 +566,7 @@ async fn unregistered_entries_never_own_the_all_zero_key() {
                 .all(|keys| *keys == zero_keys)
         );
         assert_eq!(state.registered_pq_public_keys().unwrap().count(), 0);
-        for excluded_index in [0, 1, u64::MAX] {
-            assert_eq!(
-                pq_public_key_owner(state, &zero_keys, excluded_index),
-                Ok(None)
-            );
-        }
+        assert_eq!(pq_public_key_owner(state, &zero_key), Ok(None));
         // A registration of the all-zero key passes the uniqueness check and fails only on its
         // proof of possession.
         let signed = registration_with_keys(state, 1, 0, zero_keys.clone(), NEVER_REGISTERED, spec);
@@ -536,8 +598,7 @@ async fn unregistered_entries_never_own_the_all_zero_key() {
     assert_eq!(rebuilt.pq_pubkey_cache(), state.pq_pubkey_cache());
     assert_eq!(state.pq_pubkey_cache().get(&zero_key), Some(5));
     for state in [&state, &uncached, &rebuilt] {
-        assert_eq!(pq_public_key_owner(state, &zero_keys, 1), Ok(Some(5)));
-        assert_eq!(pq_public_key_owner(state, &zero_keys, 5), Ok(None));
+        assert_eq!(pq_public_key_owner(state, &zero_key), Ok(Some(5)));
         assert_eq!(
             state
                 .registered_pq_public_keys()
@@ -597,10 +658,7 @@ async fn key_freed_by_a_change_is_registerable_by_another_validator() {
     // Validator 1 changes away from key 0, which frees it.
     *state.slot_mut() = Epoch::new(1 + delay).start_slot(E::slots_per_epoch());
     register(&mut state, 1, 1, 0xaa, Epoch::new(1), spec);
-    assert_eq!(
-        pq_public_key_owner(&state, &public_keys(0, 0xbb), 2),
-        Ok(None)
-    );
+    assert_eq!(pq_public_key_owner(&state, &xmss_public_key(0)), Ok(None));
 
     process(&mut state, &takeover, spec);
     assert_eq!(
@@ -1085,12 +1143,13 @@ async fn pq_pubkey_cache_rebuilt_from_uncached_state_matches() {
     let delay = spec.min_pq_key_change_delay.as_u64();
     let mut state = state_at_epoch(&harness, 1);
 
-    // Registrations, a key change (freeing key 0) and a VRF-only change.
+    // Registrations, a key change (freeing key 0) and a key change keeping the VRF root (freeing
+    // key 1).
     register(&mut state, 1, 0, 0xaa, NEVER_REGISTERED, spec);
     register(&mut state, 2, 1, 0xbb, NEVER_REGISTERED, spec);
     *state.slot_mut() = Epoch::new(1 + delay).start_slot(E::slots_per_epoch());
     register(&mut state, 1, 2, 0xaa, Epoch::new(1), spec);
-    register(&mut state, 2, 1, 0xcc, Epoch::new(1), spec);
+    register(&mut state, 2, 3, 0xbb, Epoch::new(1), spec);
     assert!(state.pq_pubkey_cache().is_initialized());
 
     // A state decoded from SSZ (as when loaded from disk) carries no cache.
@@ -1098,25 +1157,18 @@ async fn pq_pubkey_cache_rebuilt_from_uncached_state_matches() {
     assert!(!decoded.pq_pubkey_cache().is_initialized());
 
     // The registry scan agrees with the cache before the rebuild...
-    for key in 0..3 {
-        let keys = public_keys(key, 0);
+    for key in 0..4 {
         assert_eq!(
-            pq_public_key_owner(&decoded, &keys, u64::MAX),
-            pq_public_key_owner(&state, &keys, u64::MAX)
+            pq_public_key_owner(&decoded, &xmss_public_key(key)),
+            pq_public_key_owner(&state, &xmss_public_key(key))
         );
     }
-    assert_eq!(
-        pq_public_key_owner(&state, &public_keys(0, 0), u64::MAX),
-        Ok(None)
-    );
-    assert_eq!(
-        pq_public_key_owner(&state, &public_keys(1, 0), u64::MAX),
-        Ok(Some(2))
-    );
-    assert_eq!(
-        pq_public_key_owner(&state, &public_keys(2, 0), u64::MAX),
-        Ok(Some(1))
-    );
+    for (key, owner) in [(0, None), (1, None), (2, Some(1)), (3, Some(2))] {
+        assert_eq!(
+            pq_public_key_owner(&state, &xmss_public_key(key)),
+            Ok(owner)
+        );
+    }
 
     // ...and the rebuilt cache is identical.
     decoded.update_pq_pubkey_cache().unwrap();
@@ -1127,7 +1179,7 @@ async fn pq_pubkey_cache_rebuilt_from_uncached_state_matches() {
     assert_eq!(cloned.pq_pubkey_cache(), state.pq_pubkey_cache());
 
     // Further processing gives identical results on the original and the rebuilt state.
-    let copy = registration(&state, 3, 1, 0xdd, NEVER_REGISTERED, spec);
+    let copy = registration(&state, 3, 3, 0xdd, NEVER_REGISTERED, spec);
     let freed = registration(&state, 3, 0, 0xdd, NEVER_REGISTERED, spec);
     for state in [&mut state, &mut decoded] {
         assert_eq!(

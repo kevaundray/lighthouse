@@ -86,7 +86,7 @@ pub enum Error {
     ///
     /// REJECT.
     InvalidSignature,
-    /// Another validator registered the leanXMSS key in the head state.
+    /// A validator, possibly the one registering, registered the leanXMSS key in the head state.
     ///
     /// ## Peer scoring
     ///
@@ -332,8 +332,9 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             return Err(Error::InvalidSignature);
         }
 
-        // [REJECT] No other validator registered the leanXMSS key in the head state.
-        if let Some(owner) = pq_public_key_owner(state, public_keys, validator_index)? {
+        // [REJECT] No validator, including this one, registered the leanXMSS key in the head
+        // state.
+        if let Some(owner) = pq_public_key_owner(state, &public_keys.xmss_public_key)? {
             return Err(Error::XmssPublicKeyInUse { owner });
         }
 
@@ -864,6 +865,60 @@ mod tests {
             PqKeyRegistrationInsertOutcome::Inserted
         );
         assert_eq!(chain.op_pool.get_all_pq_key_registrations(), vec![retry]);
+    }
+
+    /// Gossip and HTTP reject a change that re-registers the key its own validator holds: every
+    /// registration carries a key that no validator holds, including the registering one.
+    #[tokio::test]
+    async fn own_current_key_is_rejected() {
+        let mut spec = ForkName::Eip8450.make_genesis_spec(E::default_spec());
+        // Changes are allowed at once, so the key check is reached.
+        spec.min_pq_key_change_delay = Epoch::new(0);
+        let harness = BeaconChainHarness::builder(E::default())
+            .spec(Arc::new(spec))
+            .deterministic_keypairs(VALIDATOR_COUNT)
+            .fresh_ephemeral_store()
+            .mock_execution_layer()
+            .build();
+        harness.advance_slot();
+        let chain = &harness.chain;
+        let [key_a, key_b] = [&XMSS_KEYS[0], &XMSS_KEYS[1]];
+
+        let first = registration(&harness, 0, key_a, NEVER);
+        assert_eq!(
+            import_and_pack(&harness, std::slice::from_ref(&first)).await,
+            vec![first]
+        );
+        let change_epoch = *harness
+            .get_current_state()
+            .pq_key_change_epochs()
+            .unwrap()
+            .get(0)
+            .unwrap();
+
+        let same_key = registration(&harness, 0, key_a, change_epoch.as_u64());
+        assert!(matches!(
+            chain.verify_pq_key_registration_for_gossip(same_key.clone()),
+            Err(Error::XmssPublicKeyInUse { owner: 0 })
+        ));
+        assert!(matches!(
+            chain.verify_pq_key_registration_for_http_api(same_key),
+            Err(Error::Invalid(
+                PqKeyRegistrationInvalid::XmssPublicKeyInUse { owner: 0 }
+            ))
+        ));
+
+        // A change to a new key is accepted: the rejection did not observe the pair.
+        assert!(
+            chain
+                .verify_pq_key_registration_for_gossip(registration(
+                    &harness,
+                    0,
+                    key_b,
+                    change_epoch.as_u64()
+                ))
+                .is_ok()
+        );
     }
 
     /// Over HTTP, a pooled registration that lost its key is replaced right away.

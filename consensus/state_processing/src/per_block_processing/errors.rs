@@ -601,7 +601,7 @@ pub enum PqKeyRegistrationInvalid {
     },
     /// The BLS signature of the validator's signing key is invalid.
     BadSignature,
-    /// Another validator already registered the leanXMSS key.
+    /// A validator, possibly the one registering, already registered the leanXMSS key.
     XmssPublicKeyInUse { owner: u64 },
     /// The proof of possession of the leanXMSS key is invalid.
     BadPossessionProof,
