@@ -777,7 +777,11 @@ pub fn apply_deposit<E: EthSpec>(
     increment_eth1_deposit_index: bool,
     spec: &ChainSpec,
 ) -> Result<(), BlockProcessingError> {
-    let deposit_index = state.eth1_deposit_index()? as usize;
+    // Only labels errors: EIP-8015 removes `eth1_deposit_index` from Heze states, where deposits
+    // are applied without a proof and without incrementing it.
+    let deposit_index = state
+        .eth1_deposit_index()
+        .map_or(0, |deposit_index| deposit_index as usize);
     if let Some(proof) = proof {
         let deposit = Deposit {
             proof,
