@@ -62,11 +62,17 @@ pub const BLOB_KZG_COMMITMENTS_INDEX: usize = 11;
 ///
 /// Must match the `active_fields` attribute on the Gloas and Heze variants.
 pub const BEACON_BLOCK_BODY_ACTIVE_FIELDS: [bool; 13] = [true; 13];
+pub const BEACON_BLOCK_BODY_ACTIVE_FIELDS_HEZE: [bool; 13] = [
+    true, false, true, true, true, true, false, true, true, true, true, true, true,
+];
 
-/// The `active_fields` of the Eip8450 `BeaconBlockBody` progressive container.
+/// The `active_fields` of the Eip8450 `BeaconBlockBody` progressive container: Heze's
+/// (EIP-8015 gaps at 1 and 6) with `pq_key_registrations` appended at 13.
 ///
 /// Must match the `active_fields` attribute on the Eip8450 variant.
-pub const BEACON_BLOCK_BODY_ACTIVE_FIELDS_EIP8450: [bool; 14] = [true; 14];
+pub const BEACON_BLOCK_BODY_ACTIVE_FIELDS_EIP8450: [bool; 14] = [
+    true, false, true, true, true, true, false, true, true, true, true, true, true, true,
+];
 
 /// The body of a `BeaconChain` block, containing operations.
 ///
@@ -115,14 +121,14 @@ pub const BEACON_BLOCK_BODY_ACTIVE_FIELDS_EIP8450: [bool; 14] = [true; 14];
             metastruct(mappings(beacon_block_body_heze_fields(groups(fields)))),
             tree_hash(
                 struct_behaviour = "progressive_container",
-                active_fields(1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1)
+                active_fields(1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1)
             )
         ),
         Eip8450(
             metastruct(mappings(beacon_block_body_eip8450_fields(groups(fields)))),
             tree_hash(
                 struct_behaviour = "progressive_container",
-                active_fields(1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1)
+                active_fields(1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1)
             )
         ),
     ),
@@ -147,6 +153,10 @@ pub const BEACON_BLOCK_BODY_ACTIVE_FIELDS_EIP8450: [bool; 14] = [true; 14];
 #[tree_hash(enum_behaviour = "transparent")]
 pub struct BeaconBlockBody<E: EthSpec, Payload: AbstractExecPayload<E> = FullPayload<E>> {
     pub randao_reveal: Signature,
+    #[superstruct(
+        only(Base, Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas),
+        partial_getter()
+    )]
     pub eth1_data: Eth1Data,
     pub graffiti: Graffiti,
     #[superstruct(
@@ -193,10 +203,7 @@ pub struct BeaconBlockBody<E: EthSpec, Payload: AbstractExecPayload<E> = FullPay
         partial_getter(rename = "deposits_basic")
     )]
     pub deposits: VariableList<Deposit, E::MaxDeposits>,
-    #[superstruct(
-        only(Gloas, Heze, Eip8450),
-        partial_getter(rename = "deposits_progressive")
-    )]
+    #[superstruct(only(Gloas), partial_getter(rename = "deposits_progressive"))]
     pub deposits: ProgressiveVariableList<Deposit, E::MaxDeposits>,
     #[superstruct(
         only(Base, Altair, Bellatrix, Capella, Deneb, Electra, Fulu),
@@ -283,7 +290,7 @@ impl<E: EthSpec, Payload: AbstractExecPayload<E>> BeaconBlockBody<E, Payload> {
         self.to_ref().proposer_slashings()
     }
 
-    pub fn deposits(&self) -> ListRef<'_, Deposit, E::MaxDeposits> {
+    pub fn deposits(&self) -> Result<ListRef<'_, Deposit, E::MaxDeposits>, BeaconStateError> {
         self.to_ref().deposits()
     }
 
@@ -480,10 +487,10 @@ impl<'a, E: EthSpec, Payload: AbstractExecPayload<E>> BeaconBlockBodyRef<'a, E, 
 
         proof.push(signature.tree_hash_root());
 
-        let body_active_fields: &[bool] = if self.fork_name().eip8450_enabled() {
-            &BEACON_BLOCK_BODY_ACTIVE_FIELDS_EIP8450
-        } else {
-            &BEACON_BLOCK_BODY_ACTIVE_FIELDS
+        let body_active_fields: &[bool] = match self {
+            Self::Eip8450(_) => &BEACON_BLOCK_BODY_ACTIVE_FIELDS_EIP8450,
+            Self::Heze(_) => &BEACON_BLOCK_BODY_ACTIVE_FIELDS_HEZE,
+            _ => &BEACON_BLOCK_BODY_ACTIVE_FIELDS,
         };
         proof.extend(merkle_proof::progressive_container_proof(
             &self.body_merkle_leaves(),
@@ -562,11 +569,18 @@ impl<'a, E: EthSpec, Payload: AbstractExecPayload<E>> BeaconBlockBodyRef<'a, E, 
         })
     }
 
-    pub fn deposits(&self) -> ListRef<'a, Deposit, E::MaxDeposits> {
-        map_beacon_block_body_ref!(&'a _, self, |inner, cons| {
-            cons(inner);
-            ListRef::from(&inner.deposits)
-        })
+    pub fn deposits(&self) -> Result<ListRef<'a, Deposit, E::MaxDeposits>, BeaconStateError> {
+        match self {
+            Self::Base(body) => Ok(ListRef::from(&body.deposits)),
+            Self::Altair(body) => Ok(ListRef::from(&body.deposits)),
+            Self::Bellatrix(body) => Ok(ListRef::from(&body.deposits)),
+            Self::Capella(body) => Ok(ListRef::from(&body.deposits)),
+            Self::Deneb(body) => Ok(ListRef::from(&body.deposits)),
+            Self::Electra(body) => Ok(ListRef::from(&body.deposits)),
+            Self::Fulu(body) => Ok(ListRef::from(&body.deposits)),
+            Self::Gloas(body) => Ok(ListRef::from(&body.deposits)),
+            Self::Heze(_) | Self::Eip8450(_) => Err(BeaconStateError::IncorrectStateVariant),
+        }
     }
 
     pub fn voluntary_exits(&self) -> ListRef<'a, SignedVoluntaryExit, E::MaxVoluntaryExits> {
@@ -780,14 +794,7 @@ impl<'a, E: EthSpec, Payload: AbstractExecPayload<E>> BeaconBlockBodyRefMut<'a, 
                 .deposits
                 .push(deposit)
                 .map_err(BeaconStateError::SszTypesError),
-            Self::Heze(body) => body
-                .deposits
-                .push(deposit)
-                .map_err(BeaconStateError::SszTypesError),
-            Self::Eip8450(body) => body
-                .deposits
-                .push(deposit)
-                .map_err(BeaconStateError::SszTypesError),
+            Self::Heze(_) | Self::Eip8450(_) => Err(BeaconStateError::IncorrectStateVariant),
         }
     }
 
@@ -829,13 +836,8 @@ impl<'a, E: EthSpec, Payload: AbstractExecPayload<E>> BeaconBlockBodyRefMut<'a, 
                 body.deposits = ssz::TryFromIter::try_from_iter(deposits)
                     .map_err(BeaconStateError::SszTypesError)?;
             }
-            Self::Heze(body) => {
-                body.deposits = ssz::TryFromIter::try_from_iter(deposits)
-                    .map_err(BeaconStateError::SszTypesError)?;
-            }
-            Self::Eip8450(body) => {
-                body.deposits = ssz::TryFromIter::try_from_iter(deposits)
-                    .map_err(BeaconStateError::SszTypesError)?;
+            Self::Heze(_) | Self::Eip8450(_) => {
+                return Err(BeaconStateError::IncorrectStateVariant);
             }
         }
         Ok(())
@@ -981,12 +983,10 @@ impl<E: EthSpec> From<BeaconBlockBodyHeze<E, BlindedPayload<E>>>
     fn from(body: BeaconBlockBodyHeze<E, BlindedPayload<E>>) -> Self {
         let BeaconBlockBodyHeze {
             randao_reveal,
-            eth1_data,
             graffiti,
             proposer_slashings,
             attester_slashings,
             attestations,
-            deposits,
             voluntary_exits,
             sync_aggregate,
             bls_to_execution_changes,
@@ -998,12 +998,10 @@ impl<E: EthSpec> From<BeaconBlockBodyHeze<E, BlindedPayload<E>>>
 
         BeaconBlockBodyHeze {
             randao_reveal,
-            eth1_data,
             graffiti,
             proposer_slashings,
             attester_slashings,
             attestations,
-            deposits,
             voluntary_exits,
             sync_aggregate,
             bls_to_execution_changes,
@@ -1021,12 +1019,10 @@ impl<E: EthSpec> From<BeaconBlockBodyEip8450<E, BlindedPayload<E>>>
     fn from(body: BeaconBlockBodyEip8450<E, BlindedPayload<E>>) -> Self {
         let BeaconBlockBodyEip8450 {
             randao_reveal,
-            eth1_data,
             graffiti,
             proposer_slashings,
             attester_slashings,
             attestations,
-            deposits,
             voluntary_exits,
             sync_aggregate,
             bls_to_execution_changes,
@@ -1039,12 +1035,10 @@ impl<E: EthSpec> From<BeaconBlockBodyEip8450<E, BlindedPayload<E>>>
 
         BeaconBlockBodyEip8450 {
             randao_reveal,
-            eth1_data,
             graffiti,
             proposer_slashings,
             attester_slashings,
             attestations,
-            deposits,
             voluntary_exits,
             sync_aggregate,
             bls_to_execution_changes,
@@ -1405,12 +1399,10 @@ impl<E: EthSpec> From<BeaconBlockBodyHeze<E, FullPayload<E>>>
     fn from(body: BeaconBlockBodyHeze<E, FullPayload<E>>) -> Self {
         let BeaconBlockBodyHeze {
             randao_reveal,
-            eth1_data,
             graffiti,
             proposer_slashings,
             attester_slashings,
             attestations,
-            deposits,
             voluntary_exits,
             sync_aggregate,
             bls_to_execution_changes,
@@ -1423,12 +1415,10 @@ impl<E: EthSpec> From<BeaconBlockBodyHeze<E, FullPayload<E>>>
         (
             BeaconBlockBodyHeze {
                 randao_reveal,
-                eth1_data,
                 graffiti,
                 proposer_slashings,
                 attester_slashings,
                 attestations,
-                deposits,
                 voluntary_exits,
                 sync_aggregate,
                 bls_to_execution_changes,
@@ -1451,12 +1441,10 @@ impl<E: EthSpec> From<BeaconBlockBodyEip8450<E, FullPayload<E>>>
     fn from(body: BeaconBlockBodyEip8450<E, FullPayload<E>>) -> Self {
         let BeaconBlockBodyEip8450 {
             randao_reveal,
-            eth1_data,
             graffiti,
             proposer_slashings,
             attester_slashings,
             attestations,
-            deposits,
             voluntary_exits,
             sync_aggregate,
             bls_to_execution_changes,
@@ -1470,12 +1458,10 @@ impl<E: EthSpec> From<BeaconBlockBodyEip8450<E, FullPayload<E>>>
         (
             BeaconBlockBodyEip8450 {
                 randao_reveal,
-                eth1_data,
                 graffiti,
                 proposer_slashings,
                 attester_slashings,
                 attestations,
-                deposits,
                 voluntary_exits,
                 sync_aggregate,
                 bls_to_execution_changes,
@@ -1801,6 +1787,64 @@ mod tests {
             );
         }
     }
+
+    mod heze {
+        use super::super::*;
+        use crate::block::BeaconBlock;
+        use crate::core::{ChainSpec, Spec};
+
+        ssz_and_tree_hash_tests!(BeaconBlockBodyHeze<Spec>);
+
+        #[test]
+        fn heze_body_omits_legacy_deposit_fields() {
+            type E = Spec;
+            let spec: ChainSpec = ForkName::Heze.make_genesis_spec(E::default_spec());
+            let block: BeaconBlock<E> = BeaconBlock::empty(&spec);
+            let BeaconBlock::Heze(block) = block else {
+                panic!("expected a Heze block");
+            };
+            let body = &block.body;
+
+            let field_roots = [
+                body.randao_reveal.tree_hash_root(),
+                body.graffiti.tree_hash_root(),
+                body.proposer_slashings.tree_hash_root(),
+                body.attester_slashings.tree_hash_root(),
+                body.attestations.tree_hash_root(),
+                body.voluntary_exits.tree_hash_root(),
+                body.sync_aggregate.tree_hash_root(),
+                body.bls_to_execution_changes.tree_hash_root(),
+                body.signed_execution_payload_bid.tree_hash_root(),
+                body.payload_attestations.tree_hash_root(),
+                body.parent_execution_requests.tree_hash_root(),
+            ];
+            let mut active_fields = [0u8; 32];
+            active_fields[0] = 0xbd;
+            active_fields[1] = 0x1f;
+            let expected = merkle_proof::progressive_container_root(
+                &field_roots,
+                &BEACON_BLOCK_BODY_ACTIVE_FIELDS_HEZE,
+            )
+            .unwrap();
+            assert_eq!(body.tree_hash_root(), expected);
+            assert_eq!(
+                field_roots.len(),
+                BEACON_BLOCK_BODY_ACTIVE_FIELDS_HEZE
+                    .iter()
+                    .filter(|&&active| active)
+                    .count()
+            );
+            assert_eq!(
+                merkle_proof::pack_active_fields(&BEACON_BLOCK_BODY_ACTIVE_FIELDS_HEZE).unwrap(),
+                Hash256::from(active_fields)
+            );
+
+            let json = serde_json::to_value(body).unwrap();
+            assert!(json.get("eth1_data").is_none());
+            assert!(json.get("deposits").is_none());
+        }
+    }
+
     mod eip8450 {
         use super::super::*;
         use crate::block::BeaconBlock;
@@ -1809,7 +1853,7 @@ mod tests {
         ssz_and_tree_hash_tests!(BeaconBlockBodyEip8450<Spec>);
 
         /// The Eip8450 body is the Heze body with `pq_key_registrations` appended, so its root
-        /// is the progressive container root of 14 fields.
+        /// is the progressive container root of 14 fields with the EIP-8015 gaps at 1 and 6.
         #[test]
         fn eip8450_body_progressive_container_root() {
             type E = Spec;
@@ -1822,12 +1866,10 @@ mod tests {
 
             let field_roots = [
                 body.randao_reveal.tree_hash_root(),
-                body.eth1_data.tree_hash_root(),
                 body.graffiti.tree_hash_root(),
                 body.proposer_slashings.tree_hash_root(),
                 body.attester_slashings.tree_hash_root(),
                 body.attestations.tree_hash_root(),
-                body.deposits.tree_hash_root(),
                 body.voluntary_exits.tree_hash_root(),
                 body.sync_aggregate.tree_hash_root(),
                 body.bls_to_execution_changes.tree_hash_root(),
@@ -1837,23 +1879,32 @@ mod tests {
                 body.pq_key_registrations.tree_hash_root(),
             ];
 
-            let mut hasher = tree_hash::ProgressiveMerkleHasher::new();
-            for root in &field_roots {
-                hasher.write(root.as_slice()).unwrap();
-            }
-            let container_root = hasher.finish().unwrap();
-
-            // `active_fields = [1] * 14`.
+            // `active_fields(width=14, gaps=(1, 6))`.
             let mut active_fields = [0u8; 32];
-            active_fields[0] = 0xff;
+            active_fields[0] = 0xbd;
             active_fields[1] = 0x3f;
-            let expected = tree_hash::mix_in_active_fields(&container_root, active_fields);
+            let expected = merkle_proof::progressive_container_root(
+                &field_roots,
+                &BEACON_BLOCK_BODY_ACTIVE_FIELDS_EIP8450,
+            )
+            .unwrap();
 
             assert_eq!(body.tree_hash_root(), expected);
             assert_eq!(
                 field_roots.len(),
-                BEACON_BLOCK_BODY_ACTIVE_FIELDS_EIP8450.len()
+                BEACON_BLOCK_BODY_ACTIVE_FIELDS_EIP8450
+                    .iter()
+                    .filter(|&&active| active)
+                    .count()
             );
+            assert_eq!(
+                merkle_proof::pack_active_fields(&BEACON_BLOCK_BODY_ACTIVE_FIELDS_EIP8450).unwrap(),
+                Hash256::from(active_fields)
+            );
+
+            let json = serde_json::to_value(body).unwrap();
+            assert!(json.get("eth1_data").is_none());
+            assert!(json.get("deposits").is_none());
         }
     }
 }

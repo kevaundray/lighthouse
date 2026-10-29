@@ -62,10 +62,6 @@ pub fn upgrade_state_to_eip8450<E: EthSpec>(
         block_roots: pre.block_roots.clone(),
         state_roots: pre.state_roots.clone(),
         historical_roots: mem::take(&mut pre.historical_roots),
-        // Eth1
-        eth1_data: pre.eth1_data.clone(),
-        eth1_data_votes: mem::take(&mut pre.eth1_data_votes),
-        eth1_deposit_index: pre.eth1_deposit_index,
         // Registry
         validators: mem::take(&mut pre.validators),
         balances: mem::take(&mut pre.balances),
@@ -93,7 +89,6 @@ pub fn upgrade_state_to_eip8450<E: EthSpec>(
         next_withdrawal_validator_index: pre.next_withdrawal_validator_index,
         historical_summaries: pre.historical_summaries.clone(),
         // Electra
-        deposit_requests_start_index: pre.deposit_requests_start_index,
         deposit_balance_to_consume: pre.deposit_balance_to_consume,
         exit_balance_to_consume: pre.exit_balance_to_consume,
         earliest_exit_epoch: pre.earliest_exit_epoch,

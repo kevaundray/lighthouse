@@ -1712,18 +1712,20 @@ async fn fork_upgrade_initializes_builder_entries_with_their_deposit_epoch() {
         (PqPublicKeys::default(), Epoch::new(2))
     );
 
-    // The state is a 50-field progressive container: proofs of the first and the last field
-    // verify against its root.
+    // The state is a 50-field progressive container with the EIP-8015 gaps at 8, 9, 10 and 28:
+    // proofs of a field between the gaps and of the last field verify against its root.
     let root = state.update_tree_hash_cache().unwrap();
     let leaves = state.get_beacon_state_leaves();
-    assert_eq!(leaves.len(), 50);
+    let gaps = [8, 9, 10, 28];
+    assert_eq!(leaves.len(), 50 - gaps.len());
     for field_index in [FINALIZED_CHECKPOINT_FIELD_INDEX, 49] {
+        let leaf = leaves[field_index - gaps.iter().filter(|&&gap| gap < field_index).count()];
         let proof = state.generate_proof(field_index, &leaves).unwrap();
         let gindex = merkle_proof::progressive_container_gindex(field_index).unwrap();
         let depth = gindex.ilog2() as usize;
         assert_eq!(proof.len(), depth);
         assert!(merkle_proof::verify_merkle_proof(
-            leaves[field_index],
+            leaf,
             &proof,
             depth,
             gindex - (1 << depth),

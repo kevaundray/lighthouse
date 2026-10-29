@@ -216,7 +216,9 @@ pub fn per_block_processing<E: EthSpec, Payload: AbstractExecPayload<E>>(
     }
 
     process_randao(state, block, verify_randao, ctxt, spec)?;
-    process_eth1_data(state, block.body().eth1_data())?;
+    if !state.fork_name_unchecked().heze_enabled() {
+        process_eth1_data(state, block.body().eth1_data()?)?;
+    }
     process_operations(
         state,
         block.body(),
@@ -366,10 +368,10 @@ pub fn process_eth1_data<E: EthSpec>(
     eth1_data: &Eth1Data,
 ) -> Result<(), BeaconStateError> {
     if let Some(new_eth1_data) = get_new_eth1_data(state, eth1_data)? {
-        *state.eth1_data_mut() = new_eth1_data;
+        *state.eth1_data_mut()? = new_eth1_data;
     }
 
-    state.eth1_data_votes_mut().push(eth1_data.clone())?;
+    state.eth1_data_votes_mut()?.push(eth1_data.clone())?;
 
     Ok(())
 }
@@ -379,9 +381,9 @@ pub fn process_eth1_data<E: EthSpec>(
 pub fn get_new_eth1_data<E: EthSpec>(
     state: &BeaconState<E>,
     eth1_data: &Eth1Data,
-) -> Result<Option<Eth1Data>, ArithError> {
+) -> Result<Option<Eth1Data>, BeaconStateError> {
     let num_votes = state
-        .eth1_data_votes()
+        .eth1_data_votes()?
         .iter()
         .filter(|vote| *vote == eth1_data)
         .count();
