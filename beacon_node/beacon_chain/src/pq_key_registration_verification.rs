@@ -12,14 +12,18 @@ use state_processing::per_block_processing::errors::{
     BlockOperationError, PqKeyRegistrationInvalid,
 };
 use state_processing::per_block_processing::signature_sets::{
-    Error as SignatureSetError, get_pubkey_from_state, pq_key_registration_signature_set,
+    Error as SignatureSetError, get_builder_pubkey_from_state, get_pubkey_from_state,
+    pq_key_registration_signature_set,
 };
 use state_processing::per_block_processing::{
-    VerifySignatures, is_pq_registered, is_pq_registration_dead, is_valid_pq_possession_proof,
-    pq_public_key_owner, verify_pq_key_registration,
+    VerifySignatures, is_pq_registration_dead, is_valid_pq_possession_proof, pq_public_key_owner,
+    verify_pq_key_registration,
 };
 use std::collections::HashSet;
-use types::{BeaconState, BeaconStateError, Epoch, EthSpec, SignedPqKeyRegistration, Slot};
+use types::{
+    BeaconState, BeaconStateError, BuilderIndex, Epoch, EthSpec, PqRegistryIndex,
+    SignedPqKeyRegistration, Slot, VrfRoot, XmssPublicKey,
+};
 
 /// Reasons a `SignedPqKeyRegistration` failed verification.
 ///
@@ -54,22 +58,42 @@ pub enum Error {
         validator_index: u64,
         exit_epoch: Epoch,
     },
-    /// A valid registration for the same validator and previous change epoch was already seen.
+    /// The builder (index without `BUILDER_INDEX_FLAG`) is not in the head state.
+    ///
+    /// ## Peer scoring
+    ///
+    /// REJECT.
+    UnknownBuilder(BuilderIndex),
+    /// The builder is not active in the head state: its deposit epoch is not finalized, or it has
+    /// initiated an exit.
+    ///
+    /// ## Peer scoring
+    ///
+    /// REJECT. Activity depends on the finalized checkpoint of the head state, so a peer with a
+    /// different view of finality can trigger it.
+    BuilderNotActive(BuilderIndex),
+    /// The builder registers a non-zero VRF root.
+    ///
+    /// ## Peer scoring
+    ///
+    /// REJECT.
+    BuilderNonZeroVrfRoot(BuilderIndex),
+    /// A valid registration for the same index and previous change epoch was already seen.
     ///
     /// ## Peer scoring
     ///
     /// IGNORE.
     PriorRegistrationKnown {
-        validator_index: u64,
+        index: u64,
         previous_change_epoch: Epoch,
     },
-    /// The registration does not name the validator's last change in the head state.
+    /// The registration does not name the stored change epoch of its index in the head state.
     ///
     /// ## Peer scoring
     ///
     /// REJECT.
     PreviousChangeEpochMismatch { expected: Epoch, found: Epoch },
-    /// The validator has registered keys, and `MIN_PQ_KEY_CHANGE_DELAY` epochs have not passed
+    /// The index has registered keys, and `MIN_PQ_KEY_CHANGE_DELAY` epochs have not passed
     /// since its last change at the current (wall-clock) epoch, allowing for
     /// `MAXIMUM_GOSSIP_CLOCK_DISPARITY`.
     ///
@@ -80,13 +104,20 @@ pub enum Error {
         current_epoch: Epoch,
         earliest_epoch: Epoch,
     },
-    /// The BLS signature of the validator's signing key is invalid.
+    /// The BLS signature of the registrant's signing key is invalid.
     ///
     /// ## Peer scoring
     ///
     /// REJECT.
     InvalidSignature,
-    /// A validator, possibly the one registering, registered the leanXMSS key in the head state.
+    /// The registration carries the all-zero leanXMSS key.
+    ///
+    /// ## Peer scoring
+    ///
+    /// REJECT.
+    ZeroXmssPublicKey,
+    /// A validator or builder, possibly the one registering, registered the leanXMSS key in the
+    /// head state. `owner` is flagged for a builder.
     ///
     /// ## Peer scoring
     ///
@@ -100,8 +131,8 @@ pub enum Error {
     InvalidPossessionProof,
     /// HTTP API only: the registration fails a check of block processing against the head state.
     Invalid(PqKeyRegistrationInvalid),
-    /// HTTP API only: the pool holds a different registration for the same validator and
-    /// previous change epoch.
+    /// HTTP API only: the pool holds a different registration for the same index and previous
+    /// change epoch.
     ConflictsWithPool,
     /// The registration is valid but the op pool is full (see
     /// `operation_pool::max_pq_key_registrations_in_pool`). Its pair is not marked as observed,
@@ -176,8 +207,9 @@ pub enum PqKeyRegistrationOutcome {
     AlreadyKnown,
 }
 
-/// Tracks the `(validator_index, previous_change_epoch)` pairs of the valid registrations seen,
-/// implementing the gossip rule that only the first valid registration for a pair is forwarded.
+/// Tracks the `(index, previous_change_epoch)` pairs of the valid registrations seen, implementing
+/// the gossip rule that only the first valid registration for a pair is forwarded. Builder indices
+/// are flagged.
 ///
 /// Registrations are signed with the genesis fork version, so the set is not reset at fork
 /// boundaries. A pair is pruned once it is dead in the finalized state (see
@@ -189,37 +221,35 @@ pub struct ObservedPqKeyRegistrations {
 
 impl ObservedPqKeyRegistrations {
     /// Returns `true` if a valid registration for the pair was observed.
-    pub fn is_known(&self, validator_index: u64, previous_change_epoch: Epoch) -> bool {
-        self.observed
-            .contains(&(validator_index, previous_change_epoch))
+    pub fn is_known(&self, index: u64, previous_change_epoch: Epoch) -> bool {
+        self.observed.contains(&(index, previous_change_epoch))
     }
 
     /// Record a valid registration for the pair. Returns `true` if the pair was not known.
-    pub fn observe(&mut self, validator_index: u64, previous_change_epoch: Epoch) -> bool {
-        self.observed
-            .insert((validator_index, previous_change_epoch))
+    pub fn observe(&mut self, index: u64, previous_change_epoch: Epoch) -> bool {
+        self.observed.insert((index, previous_change_epoch))
     }
 
     /// Forget the pair, e.g. because its registration could not be stored after all.
-    pub fn forget(&mut self, validator_index: u64, previous_change_epoch: Epoch) {
-        self.observed
-            .remove(&(validator_index, previous_change_epoch));
+    pub fn forget(&mut self, index: u64, previous_change_epoch: Epoch) {
+        self.observed.remove(&(index, previous_change_epoch));
     }
 
-    /// Drop the pairs that no registration can match on top of `finalized_state`.
+    /// Drop the pairs that no registration can match on top of `finalized_state`. The stored
+    /// change epoch of a builder index is read from the builder registry lists.
     pub fn prune<E: EthSpec>(&mut self, finalized_state: &BeaconState<E>) {
-        let Ok(change_epochs) = finalized_state.pq_key_change_epochs() else {
+        if finalized_state.pq_key_change_epochs().is_err() {
             return;
-        };
+        }
         let finalized_epoch = finalized_state.current_epoch();
-        self.observed
-            .retain(|(validator_index, previous_change_epoch)| {
-                change_epochs
-                    .get(*validator_index as usize)
-                    .is_none_or(|stored| {
-                        !is_pq_registration_dead(*stored, *previous_change_epoch, finalized_epoch)
-                    })
-            });
+        self.observed.retain(|(index, previous_change_epoch)| {
+            finalized_state
+                .get_pq_key_change_epoch(*index)
+                .ok()
+                .is_none_or(|stored| {
+                    !is_pq_registration_dead(stored, *previous_change_epoch, finalized_epoch)
+                })
+        });
     }
 
     /// Number of observed pairs.
@@ -261,44 +291,62 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         let state = &head.beacon_state;
 
         let registration = &signed_registration.message;
-        let validator_index = registration.validator_index;
+        let index = registration.index;
         let public_keys = &registration.public_keys;
 
         // [IGNORE] The head state is at or after the fork, so that it has the registry. A head
         // state prior to the fork (e.g. right after the fork boundary) has nothing to check
         // against.
-        let change_epochs = state
-            .pq_key_change_epochs()
-            .map_err(|_| Error::HeadPriorToEip8450)?;
-
-        // [REJECT] The validator is in the head state and has not initiated an exit.
-        let validator = state
-            .validators()
-            .get(validator_index as usize)
-            .ok_or(Error::UnknownValidator(validator_index))?;
-        if validator.exit_epoch != self.spec.far_future_epoch {
-            return Err(Error::ValidatorExiting {
-                validator_index,
-                exit_epoch: validator.exit_epoch,
-            });
+        if state.pq_key_change_epochs().is_err() {
+            return Err(Error::HeadPriorToEip8450);
         }
+
+        // [REJECT] The index is a validator in the head state that has not initiated an exit, or
+        // a flagged builder index of an active builder.
+        // [REJECT] A builder registers a zero VRF root.
+        let pubkey = match PqRegistryIndex::new(index) {
+            PqRegistryIndex::Validator(validator_index) => {
+                let validator = state
+                    .validators()
+                    .get(validator_index as usize)
+                    .ok_or(Error::UnknownValidator(validator_index))?;
+                if validator.exit_epoch != self.spec.far_future_epoch {
+                    return Err(Error::ValidatorExiting {
+                        validator_index,
+                        exit_epoch: validator.exit_epoch,
+                    });
+                }
+                validator.pubkey
+            }
+            PqRegistryIndex::Builder(builder_index) => {
+                let builder = state
+                    .builders()?
+                    .get(builder_index as usize)
+                    .ok_or(Error::UnknownBuilder(builder_index))?;
+                if !state.is_active_builder(builder_index, &self.spec)? {
+                    return Err(Error::BuilderNotActive(builder_index));
+                }
+                if public_keys.vrf_root != VrfRoot::ZERO {
+                    return Err(Error::BuilderNonZeroVrfRoot(builder_index));
+                }
+                builder.pubkey
+            }
+        };
 
         // Hold the lock until the registration is observed, so that only the first valid
         // registration for a pair passes.
         let mut observed = self.observed_pq_key_registrations.lock();
 
         // [IGNORE] The registration is the first valid one for its pair.
-        if observed.is_known(validator_index, registration.previous_change_epoch) {
+        if observed.is_known(index, registration.previous_change_epoch) {
             return Err(Error::PriorRegistrationKnown {
-                validator_index,
+                index,
                 previous_change_epoch: registration.previous_change_epoch,
             });
         }
 
-        // [REJECT] The registration names the validator's last change in the head state.
-        let last_change_epoch = *change_epochs
-            .get(validator_index as usize)
-            .ok_or(BeaconStateError::UnknownValidator(validator_index as usize))?;
+        // [REJECT] The registration names the stored change epoch of the index in the head state.
+        let last_change_epoch = state.get_pq_key_change_epoch(index)?;
         if registration.previous_change_epoch != last_change_epoch {
             return Err(Error::PreviousChangeEpochMismatch {
                 expected: last_change_epoch,
@@ -306,10 +354,10 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             });
         }
 
-        // [IGNORE] A registered validator's change delay has passed at the current epoch, allowing
-        // for clock disparity. An unregistered validator's entry is `FAR_FUTURE_EPOCH`, not a
-        // change epoch, and is never added to.
-        if is_pq_registered(state, validator_index)? {
+        // [IGNORE] If the index's stored leanXMSS key is not all-zero, its change delay has passed
+        // at the current epoch, allowing for clock disparity. An entry holding the all-zero key
+        // stores its never-registered marker, not a change epoch, which is never added to.
+        if state.is_pq_registered(index)? {
             let earliest_epoch = registration
                 .previous_change_epoch
                 .saturating_add(self.spec.min_pq_key_change_delay);
@@ -321,10 +369,20 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             }
         }
 
-        // [REJECT] The validator's signing key signed the registration.
+        // [REJECT] The leanXMSS key is not all-zero and is not registered for any index in the head
+        // state, including this one. Checked before the signature, as it is cheaper.
+        if public_keys.xmss_public_key == XmssPublicKey::default() {
+            return Err(Error::ZeroXmssPublicKey);
+        }
+        if let Some(owner) = pq_public_key_owner(state, &public_keys.xmss_public_key)? {
+            return Err(Error::XmssPublicKeyInUse { owner });
+        }
+
+        // [REJECT] The signing key of the validator or builder signed the registration.
         let signature_set = pq_key_registration_signature_set(
             state,
             |i| get_pubkey_from_state(state, i),
+            |i| get_builder_pubkey_from_state(state, i),
             &signed_registration,
             &self.spec,
         )?;
@@ -332,17 +390,11 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             return Err(Error::InvalidSignature);
         }
 
-        // [REJECT] No validator, including this one, registered the leanXMSS key in the head
-        // state.
-        if let Some(owner) = pq_public_key_owner(state, &public_keys.xmss_public_key)? {
-            return Err(Error::XmssPublicKeyInUse { owner });
-        }
-
-        // [REJECT] The proof of possession of the leanXMSS key for the validator's BLS public key
-        // is valid.
+        // [REJECT] The proof of possession of the leanXMSS key for the BLS public key of the
+        // validator or builder is valid.
         if !is_valid_pq_possession_proof(
             state,
-            &validator.pubkey,
+            &pubkey,
             &public_keys.xmss_public_key,
             &signed_registration.possession,
             &self.spec,
@@ -359,7 +411,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             return Err(Error::PoolFull);
         }
 
-        observed.observe(validator_index, registration.previous_change_epoch);
+        observed.observe(index, registration.previous_change_epoch);
         drop(observed);
 
         Ok(VerifiedPqKeyRegistration(signed_registration))
@@ -372,7 +424,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
     /// holds it (until finalization prunes it). A valid registration already in the pool is then
     /// `AlreadyKnown`.
     ///
-    /// If the pool holds a different registration for the validator, it is replaced when it no
+    /// If the pool holds a different registration for the index, it is replaced when it no
     /// longer verifies against the head (e.g. another validator took its key), and conflicts
     /// otherwise.
     ///
@@ -384,7 +436,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         signed_registration: SignedPqKeyRegistration,
     ) -> Result<PqKeyRegistrationOutcome, Error> {
         let registration = &signed_registration.message;
-        let validator_index = registration.validator_index;
+        let index = registration.index;
         let previous_change_epoch = registration.previous_change_epoch;
 
         let head = self.head_snapshot();
@@ -396,7 +448,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             &self.spec,
         )?;
 
-        if let Some(pooled) = self.op_pool.get_pq_key_registration(validator_index) {
+        if let Some(pooled) = self.op_pool.get_pq_key_registration(index) {
             if pooled == signed_registration {
                 return Ok(PqKeyRegistrationOutcome::AlreadyKnown);
             }
@@ -418,7 +470,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
 
         self.observed_pq_key_registrations
             .lock()
-            .observe(validator_index, previous_change_epoch);
+            .observe(index, previous_change_epoch);
 
         Ok(PqKeyRegistrationOutcome::New(Box::new(
             VerifiedPqKeyRegistration(signed_registration),
@@ -434,7 +486,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         &self,
         registration: VerifiedPqKeyRegistration,
     ) -> PqKeyRegistrationInsertOutcome {
-        let validator_index = registration.as_inner().message.validator_index;
+        let index = registration.as_inner().message.index;
         let previous_change_epoch = registration.as_inner().message.previous_change_epoch;
         let event = self
             .event_handler
@@ -457,7 +509,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             PqKeyRegistrationInsertOutcome::PoolFull => {
                 self.observed_pq_key_registrations
                     .lock()
-                    .forget(validator_index, previous_change_epoch);
+                    .forget(index, previous_change_epoch);
             }
             PqKeyRegistrationInsertOutcome::NotNewer => {}
         }
@@ -474,7 +526,7 @@ mod tests {
     use std::time::Duration;
     use types::{
         ForkName, Hash256, MinimalEthSpec, PQ_POSSESSION_XMSS_INDEX, PqKeyRegistration,
-        PqPublicKeys, XmssPublicKey,
+        PqPublicKeys, PqRegistryIndex, XmssPublicKey,
     };
 
     type E = MinimalEthSpec;
@@ -526,7 +578,7 @@ mod tests {
             .unwrap();
 
         PqKeyRegistration {
-            validator_index,
+            index: validator_index,
             public_keys: PqPublicKeys {
                 xmss_public_key,
                 vrf_root: Hash256::repeat_byte(validator_index as u8),
@@ -569,7 +621,7 @@ mod tests {
 
         // [REJECT] Unknown validator.
         let mut unknown_validator = registration(&harness, 1, key_b, NEVER);
-        unknown_validator.message.validator_index = VALIDATOR_COUNT as u64;
+        unknown_validator.message.index = VALIDATOR_COUNT as u64;
         assert!(matches!(
             chain.verify_pq_key_registration_for_gossip(unknown_validator),
             Err(Error::UnknownValidator(_))
@@ -580,6 +632,14 @@ mod tests {
             chain.verify_pq_key_registration_for_gossip(registration(&harness, 1, key_b, 0)),
             Err(Error::PreviousChangeEpochMismatch { expected, found })
                 if expected == Epoch::new(NEVER) && found == Epoch::new(0)
+        ));
+
+        // [REJECT] The all-zero key, checked before the signature.
+        let mut zero_key = registration(&harness, 1, key_b, NEVER);
+        zero_key.message.public_keys.xmss_public_key = XmssPublicKey::default();
+        assert!(matches!(
+            chain.verify_pq_key_registration_for_gossip(zero_key),
+            Err(Error::ZeroXmssPublicKey)
         ));
 
         // [REJECT] BLS signature of another validator.
@@ -642,7 +702,7 @@ mod tests {
 
         // The head state is checked before the validator.
         let mut unknown_validator = valid;
-        unknown_validator.message.validator_index = VALIDATOR_COUNT as u64;
+        unknown_validator.message.index = VALIDATOR_COUNT as u64;
         assert!(matches!(
             chain.verify_pq_key_registration_for_gossip(unknown_validator),
             Err(Error::HeadPriorToEip8450)
@@ -731,7 +791,7 @@ mod tests {
         let max_len = operation_pool::max_pq_key_registrations_in_pool::<E>();
         for validator_index in 0..max_len as u64 {
             let mut filler = second.clone();
-            filler.message.validator_index = validator_index + VALIDATOR_COUNT as u64;
+            filler.message.index = validator_index + VALIDATOR_COUNT as u64;
             assert_eq!(
                 chain.op_pool.insert_pq_key_registration(filler),
                 PqKeyRegistrationInsertOutcome::Inserted
@@ -901,6 +961,19 @@ mod tests {
             chain.verify_pq_key_registration_for_gossip(same_key.clone()),
             Err(Error::XmssPublicKeyInUse { owner: 0 })
         ));
+        // On gossip the key rule comes before the signature: a key in use with a signature of
+        // another validator is rejected for its key.
+        let mut bad_signature = same_key.clone();
+        bad_signature.signature = registration(&harness, 1, key_b, NEVER).signature;
+        assert!(matches!(
+            chain.verify_pq_key_registration_for_gossip(bad_signature.clone()),
+            Err(Error::XmssPublicKeyInUse { owner: 0 })
+        ));
+        // Block processing checks the signature first.
+        assert!(matches!(
+            chain.verify_pq_key_registration_for_http_api(bad_signature),
+            Err(Error::Invalid(PqKeyRegistrationInvalid::BadSignature))
+        ));
         assert!(matches!(
             chain.verify_pq_key_registration_for_http_api(same_key),
             Err(Error::Invalid(
@@ -1001,6 +1074,213 @@ mod tests {
         assert_eq!(observed.len(), kept.len());
         for (validator_index, previous_change_epoch) in kept {
             assert!(observed.is_known(validator_index, Epoch::new(previous_change_epoch)));
+        }
+    }
+
+    /// Validators whose keys the genesis builders of `builder_harness` use, by builder index.
+    const BUILDER_VALIDATORS: [usize; 2] = [6, 7];
+
+    /// The registry index of the builder at `builder_index`, with `BUILDER_INDEX_FLAG` set.
+    fn builder(builder_index: u64) -> u64 {
+        PqRegistryIndex::Builder(builder_index).as_u64()
+    }
+
+    /// An Eip8450-genesis harness with the builders of `BUILDER_VALIDATORS`, deposited at genesis
+    /// and so not active until epoch 0 is finalized.
+    fn builder_harness() -> BeaconChainHarness<EphemeralHarnessType<E>> {
+        let spec = ForkName::Eip8450.make_genesis_spec(E::default_spec());
+        let harness = BeaconChainHarness::builder(E::default())
+            .spec(Arc::new(spec))
+            .deterministic_keypairs(VALIDATOR_COUNT)
+            .genesis_builders(BUILDER_VALIDATORS.to_vec(), 32_000_000_000)
+            .fresh_ephemeral_store()
+            .mock_execution_layer()
+            .build();
+        harness.advance_slot();
+        harness
+    }
+
+    /// A registration of `xmss_key`, with the zero VRF root, for the builder at `builder_index`,
+    /// with a valid proof of possession and BLS authorization.
+    fn builder_registration(
+        harness: &BeaconChainHarness<EphemeralHarnessType<E>>,
+        builder_index: u64,
+        xmss_key: &lean_pq::xmss::SecretKey,
+        previous_change_epoch: u64,
+    ) -> SignedPqKeyRegistration {
+        let state = harness.get_current_state();
+        let xmss_public_key =
+            XmssPublicKey::try_from(xmss_key.public_key().to_bytes().to_vec()).unwrap();
+        let pubkey = state.get_builder(builder_index).unwrap().pubkey;
+        let possession_root =
+            get_pq_possession_signing_root(&state, &pubkey, &xmss_public_key, &harness.spec);
+        let possession = xmss_key
+            .sign(&possession_root.0, PQ_POSSESSION_XMSS_INDEX)
+            .unwrap();
+
+        PqKeyRegistration {
+            index: builder(builder_index),
+            public_keys: PqPublicKeys {
+                xmss_public_key,
+                vrf_root: Hash256::ZERO,
+            },
+            previous_change_epoch: Epoch::new(previous_change_epoch),
+        }
+        .sign(
+            possession.to_bytes().to_vec().try_into().unwrap(),
+            &harness.validator_keypairs[BUILDER_VALIDATORS[builder_index as usize]].sk,
+            state.genesis_validators_root(),
+            &harness.spec,
+        )
+    }
+
+    #[tokio::test]
+    async fn gossip_builder_rules_apply_in_order() {
+        let harness = builder_harness();
+        let chain = &harness.chain;
+        let [key_a, key_b] = [&XMSS_KEYS[0], &XMSS_KEYS[1]];
+        let deposit_epoch = 0;
+        let with_vrf_root = |mut registration: SignedPqKeyRegistration| {
+            registration.message.public_keys.vrf_root = Hash256::repeat_byte(1);
+            registration
+        };
+
+        // [REJECT] Not active: the deposit epoch is not finalized. The index rule comes before
+        // the VRF root rule.
+        assert!(matches!(
+            chain.verify_pq_key_registration_for_gossip(with_vrf_root(builder_registration(
+                &harness,
+                0,
+                key_a,
+                deposit_epoch
+            ))),
+            Err(Error::BuilderNotActive(0))
+        ));
+        // [REJECT] Outside the builder registry.
+        let mut unknown = builder_registration(&harness, 0, key_a, deposit_epoch);
+        unknown.message.index = builder(BUILDER_VALIDATORS.len() as u64);
+        assert!(matches!(
+            chain.verify_pq_key_registration_for_gossip(unknown),
+            Err(Error::UnknownBuilder(2))
+        ));
+
+        // Finalize the deposit epoch.
+        harness
+            .extend_slots(5 * E::slots_per_epoch() as usize)
+            .await;
+        assert!(harness.finalized_checkpoint().epoch > deposit_epoch);
+
+        // [REJECT] A non-zero VRF root, checked before the stored change epoch.
+        assert!(matches!(
+            chain.verify_pq_key_registration_for_gossip(with_vrf_root(builder_registration(
+                &harness, 0, key_a, NEVER
+            ))),
+            Err(Error::BuilderNonZeroVrfRoot(0))
+        ));
+        // [REJECT] A builder's never-registered marker is its deposit epoch, not
+        // `FAR_FUTURE_EPOCH`.
+        assert!(matches!(
+            chain.verify_pq_key_registration_for_gossip(builder_registration(
+                &harness, 0, key_a, NEVER
+            )),
+            Err(Error::PreviousChangeEpochMismatch { expected, found })
+                if expected == Epoch::new(deposit_epoch) && found == Epoch::new(NEVER)
+        ));
+        // [REJECT] The all-zero key, checked before the signature.
+        let mut zero_key = builder_registration(&harness, 0, key_a, deposit_epoch);
+        zero_key.message.public_keys.xmss_public_key = XmssPublicKey::default();
+        zero_key.signature = registration(&harness, 0, key_a, NEVER).signature;
+        assert!(matches!(
+            chain.verify_pq_key_registration_for_gossip(zero_key),
+            Err(Error::ZeroXmssPublicKey)
+        ));
+        // [REJECT] Signed by a validator's key rather than the builder's.
+        let mut validator_signed = builder_registration(&harness, 0, key_a, deposit_epoch);
+        validator_signed.signature = validator_signed
+            .message
+            .clone()
+            .sign(
+                validator_signed.possession.clone(),
+                &harness.validator_keypairs[0].sk,
+                harness.get_current_state().genesis_validators_root(),
+                &harness.spec,
+            )
+            .signature;
+        assert!(matches!(
+            chain.verify_pq_key_registration_for_gossip(validator_signed),
+            Err(Error::InvalidSignature)
+        ));
+        // [REJECT] A proof of possession for a validator's BLS public key.
+        let mut other_pubkey = builder_registration(&harness, 0, key_a, deposit_epoch);
+        other_pubkey.possession = registration(&harness, 0, key_a, NEVER).possession;
+        assert!(matches!(
+            chain.verify_pq_key_registration_for_gossip(other_pubkey),
+            Err(Error::InvalidPossessionProof)
+        ));
+
+        let valid = builder_registration(&harness, 0, key_a, deposit_epoch);
+        assert!(chain.verify_pq_key_registration_for_gossip(valid).is_ok());
+        assert!(
+            chain
+                .observed_pq_key_registrations
+                .lock()
+                .is_known(builder(0), Epoch::new(deposit_epoch))
+        );
+        // [IGNORE] Only the first valid registration for the pair passes, but the VRF root rule
+        // comes first.
+        assert!(matches!(
+            chain.verify_pq_key_registration_for_gossip(builder_registration(
+                &harness,
+                0,
+                key_b,
+                deposit_epoch
+            )),
+            Err(Error::PriorRegistrationKnown { index, .. }) if index == builder(0)
+        ));
+        assert!(matches!(
+            chain.verify_pq_key_registration_for_gossip(with_vrf_root(builder_registration(
+                &harness,
+                0,
+                key_b,
+                deposit_epoch
+            ))),
+            Err(Error::BuilderNonZeroVrfRoot(0))
+        ));
+    }
+
+    /// Builder pairs are pruned against the builder lists, whose never-registered marker is the
+    /// deposit epoch.
+    #[tokio::test]
+    async fn observed_builder_pairs_are_pruned_by_builder_lists() {
+        let harness = builder_harness();
+        let mut finalized_state = harness.get_current_state();
+        *finalized_state.slot_mut() = Epoch::new(5).start_slot(E::slots_per_epoch());
+        let keys = builder_registration(&harness, 0, &XMSS_KEYS[0], 0)
+            .message
+            .public_keys;
+        // Builder 0 last changed its keys at epoch 3; builder 1 never registered (deposit
+        // epoch 0).
+        finalized_state
+            .set_pq_public_keys(builder(0), keys, Epoch::new(3))
+            .unwrap();
+
+        let mut observed = ObservedPqKeyRegistrations::default();
+        let pairs = [
+            (builder(0), 0),
+            (builder(0), 3),
+            (builder(1), 0),
+            (builder(1), 2),
+            (builder(1), 6),
+            (builder(1), NEVER),
+        ];
+        for (index, previous_change_epoch) in pairs {
+            assert!(observed.observe(index, Epoch::new(previous_change_epoch)));
+        }
+        observed.prune(&finalized_state);
+        let kept = [(builder(0), 3), (builder(1), 0), (builder(1), 6)];
+        assert_eq!(observed.len(), kept.len());
+        for (index, previous_change_epoch) in kept {
+            assert!(observed.is_known(index, Epoch::new(previous_change_epoch)));
         }
     }
 }

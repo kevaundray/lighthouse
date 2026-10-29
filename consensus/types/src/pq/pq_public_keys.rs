@@ -8,11 +8,11 @@ use crate::{
     pq::{VrfRoot, XmssPublicKey},
 };
 
-/// The post-quantum keys of one validator, as stored in the registry.
+/// The post-quantum keys of one validator or builder, as stored in the registry.
 ///
-/// The default value is the all-zero entry, held by every validator that has never registered
-/// keys. Whether a validator is registered is decided by its `pq_key_change_epochs` entry
-/// (`is_pq_registered`), never by this value.
+/// The default value is the all-zero entry, held by every validator and builder that has never
+/// registered keys. An entry is registered (`is_pq_registered`) exactly when its leanXMSS key is
+/// not all-zero: a registration never carries the all-zero key.
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(
     Debug, PartialEq, Eq, Hash, Clone, Default, Serialize, Deserialize, Encode, Decode, TreeHash,
@@ -22,7 +22,7 @@ pub struct PqPublicKeys {
     /// leanXMSS public key.
     #[serde(with = "ssz_types::serde_utils::hex_fixed_vec")]
     pub xmss_public_key: XmssPublicKey,
-    /// Root of the VRF tree.
+    /// Root of the VRF tree, or zero for a builder.
     pub vrf_root: VrfRoot,
 }
 

@@ -744,7 +744,7 @@ impl<E: EthSpec> OperationPool<E> {
     }
 
     /// Returns `true` if `registration` fits in the pool: the pool holds fewer than
-    /// `max_pq_key_registrations_in_pool` registrations, or one for the same validator that
+    /// `max_pq_key_registrations_in_pool` registrations, or one for the same index that
     /// `registration` would replace.
     pub fn pq_key_registration_has_room(&self, registration: &SignedPqKeyRegistration) -> bool {
         self.pq_key_registrations
@@ -755,7 +755,7 @@ impl<E: EthSpec> OperationPool<E> {
     /// Insert a post-quantum key registration into the pool.
     ///
     /// The registration MUST have been fully verified, including its BLS signature and leanXMSS
-    /// proof of possession. It replaces the validator's existing registration only if it names a
+    /// proof of possession. It replaces the existing registration of its index only if it names a
     /// later `previous_change_epoch`, and is refused if the pool already holds
     /// `max_pq_key_registrations_in_pool` registrations.
     pub fn insert_pq_key_registration(
@@ -769,8 +769,10 @@ impl<E: EthSpec> OperationPool<E> {
 
     /// Get a list of post-quantum key registrations for inclusion in a block built on `state`.
     ///
-    /// `exits_in_block` must return `true` for every validator whose exit may be initiated by an
-    /// operation that block processing applies before the registrations. The selected list is
+    /// `exits_in_block` must return `true` for every validator or flagged builder index whose exit
+    /// may be initiated by an operation that block processing applies before the registrations,
+    /// and for every index whose registration the block's earlier operations may otherwise
+    /// invalidate. The selected list is
     /// valid when applied in order after those operations. See
     /// `PqKeyRegistrations::select_for_block`.
     pub fn get_pq_key_registrations(
@@ -787,12 +789,9 @@ impl<E: EthSpec> OperationPool<E> {
         )
     }
 
-    /// The pooled post-quantum key registration of `validator_index`, if any.
-    pub fn get_pq_key_registration(&self, validator_index: u64) -> Option<SignedPqKeyRegistration> {
-        self.pq_key_registrations
-            .read()
-            .get(validator_index)
-            .cloned()
+    /// The pooled post-quantum key registration of a validator or flagged builder index, if any.
+    pub fn get_pq_key_registration(&self, index: u64) -> Option<SignedPqKeyRegistration> {
+        self.pq_key_registrations.read().get(index).cloned()
     }
 
     /// Remove `registration` from the pool if the pool holds exactly it. Returns `true` if it was
@@ -802,8 +801,8 @@ impl<E: EthSpec> OperationPool<E> {
     }
 
     /// Prune post-quantum key registrations that can no longer be included in a block descending
-    /// from `finalized_state`, returning the `(validator_index, previous_change_epoch)` pairs of
-    /// the pruned registrations. See `PqKeyRegistrations::prune`.
+    /// from `finalized_state`, returning the `(index, previous_change_epoch)` pairs of the pruned
+    /// registrations. See `PqKeyRegistrations::prune`.
     pub fn prune_pq_key_registrations(
         &self,
         finalized_state: &BeaconState<E>,
@@ -816,7 +815,7 @@ impl<E: EthSpec> OperationPool<E> {
 
     /// Prune all types of transactions given the latest head state and head fork.
     ///
-    /// Returns the `(validator_index, previous_change_epoch)` pairs of the pruned post-quantum key
+    /// Returns the `(index, previous_change_epoch)` pairs of the pruned post-quantum key
     /// registrations, which the caller should forget in its gossip duplicate filter.
     #[must_use]
     pub fn prune_all<Payload: AbstractExecPayload<E>>(

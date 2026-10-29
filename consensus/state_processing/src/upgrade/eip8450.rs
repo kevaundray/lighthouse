@@ -33,6 +33,14 @@ pub fn upgrade_state_to_eip8450<E: EthSpec>(
     ))?;
     let pq_key_change_epochs =
         ProgressiveList::try_from_iter(std::iter::repeat_n(spec.far_future_epoch, num_validators))?;
+    // [New in EIP-8450] one unset registry entry per builder. A builder's deposit epoch marks a
+    // builder that has never registered, since builder indices are reused.
+    let builder_pq_public_keys = ProgressiveList::try_from_iter(std::iter::repeat_n(
+        PqPublicKeys::default(),
+        pre.builders.len(),
+    ))?;
+    let builder_pq_key_change_epochs =
+        ProgressiveList::try_from_iter(pre.builders.iter().map(|builder| builder.deposit_epoch))?;
 
     // Where possible, use something like `mem::take` to move fields from behind the &mut
     // reference. For other fields that don't have a good default value, use `clone`.
@@ -107,6 +115,8 @@ pub fn upgrade_state_to_eip8450<E: EthSpec>(
         // Eip8450
         pq_public_keys,
         pq_key_change_epochs,
+        builder_pq_public_keys,
+        builder_pq_key_change_epochs,
         // Caches
         total_active_balance: pre.total_active_balance,
         progressive_balances_cache: mem::take(&mut pre.progressive_balances_cache),

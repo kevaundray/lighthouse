@@ -1,17 +1,18 @@
-//! Post-quantum validator key registry (EIP-8450): validation of `SignedPqKeyRegistration`s.
+//! Post-quantum consensus key registry (EIP-8450): validation of `SignedPqKeyRegistration`s.
 
 use super::errors::{BlockOperationError, PqKeyRegistrationInvalid as Invalid};
 use crate::VerifySignatures;
 use crate::per_block_processing::signature_sets::{
-    get_pubkey_from_state, pq_key_registration_signature_set,
+    get_builder_pubkey_from_state, get_pubkey_from_state, pq_key_registration_signature_set,
 };
 use bls::PublicKeyBytes;
 use lean_pq::xmss;
+use safe_arith::SafeArith;
 use std::cmp::Ordering;
 use types::{
     BeaconState, BeaconStateError, ChainSpec, Domain, Epoch, EthSpec, Hash256,
-    PQ_POSSESSION_XMSS_INDEX, PQ_UNREGISTERED_CHANGE_EPOCH, PqKeyPossession,
-    SignedPqKeyRegistration, SignedRoot, XmssPublicKey, XmssSignature,
+    PQ_POSSESSION_XMSS_INDEX, PQ_UNREGISTERED_CHANGE_EPOCH, PqKeyPossession, PqPublicKeys,
+    PqRegistryIndex, SignedPqKeyRegistration, SignedRoot, VrfRoot, XmssPublicKey, XmssSignature,
 };
 
 type Result<T, E = BlockOperationError<Invalid>> = std::result::Result<T, E>;
@@ -20,48 +21,51 @@ fn error(reason: Invalid) -> BlockOperationError<Invalid> {
     BlockOperationError::invalid(reason)
 }
 
-/// Returns whether the validator at `index` has registered post-quantum keys (`is_pq_registered`):
-/// whether its `pq_key_change_epochs` entry is not `FAR_FUTURE_EPOCH`.
-pub fn is_pq_registered<E: EthSpec>(
-    state: &BeaconState<E>,
-    index: u64,
-) -> Result<bool, BeaconStateError> {
-    state
-        .pq_key_change_epochs()?
-        .get(index as usize)
-        .map(|change_epoch| *change_epoch != PQ_UNREGISTERED_CHANGE_EPOCH)
-        .ok_or(BeaconStateError::UnknownValidator(index as usize))
-}
-
-/// Returns whether any registered validator, including the one registering, holds
-/// `xmss_public_key` (`is_pq_public_key_in_use`), returning that validator's index.
+/// Returns the validator or builder, including the one registering, that holds the non-zero
+/// leanXMSS key `xmss_public_key` (`is_pq_public_key_in_use`), with builder indices flagged.
 ///
-/// Every registration therefore carries a new leanXMSS key: a validator cannot re-register its own
-/// current key, even to change only its VRF root.
+/// Every registration therefore carries a new leanXMSS key: a validator or builder cannot
+/// re-register its own current key, even to change only its VRF root.
 ///
-/// Unregistered validators are skipped, so their all-zero entries never own the all-zero key.
-/// Uses the state's `PqPubkeyCache` when it is built, and scans the registry otherwise.
+/// The all-zero key is held by every unregistered entry but owned by none here: callers reject it
+/// first (`ZeroXmssPublicKey`), as `process_pq_key_registration` does. Uses the state's
+/// `PqPubkeyCache` when it is built, and scans the registries otherwise.
 pub fn pq_public_key_owner<E: EthSpec>(
     state: &BeaconState<E>,
     xmss_public_key: &XmssPublicKey,
 ) -> Result<Option<u64>, BeaconStateError> {
-    let owner = if state.pq_pubkey_cache().is_initialized() {
-        state.pq_pubkey_cache().get(xmss_public_key)
-    } else {
-        state
-            .registered_pq_public_keys()?
-            .find(|(_, entry)| entry.xmss_public_key == *xmss_public_key)
-            .map(|(index, _)| index)
-    };
-    Ok(owner.map(|owner| owner as u64))
+    if state.pq_pubkey_cache().is_initialized() {
+        return Ok(state.pq_pubkey_cache().get(xmss_public_key));
+    }
+    Ok(state
+        .registered_pq_public_keys()?
+        .find(|(_, entry)| entry.xmss_public_key == *xmss_public_key)
+        .map(|(index, _)| index))
 }
 
-/// Compares two values of a validator's `pq_key_change_epochs` entry by the order in which a chain
-/// takes them.
+/// Compares two values of the stored change epoch of a validator or builder index by the order in
+/// which a chain takes them.
 ///
-/// The entry starts at `FAR_FUTURE_EPOCH` (never registered), and every change stores the current
-/// epoch, which is later than the previous change. So `FAR_FUTURE_EPOCH` comes before every epoch,
-/// and epochs compare numerically.
+/// A validator's entry starts at `FAR_FUTURE_EPOCH` (never registered), and every change stores
+/// the current epoch, which is later than the previous change. So `FAR_FUTURE_EPOCH` comes before
+/// every epoch, and epochs compare numerically.
+///
+/// A builder index's entry only takes real epochs, and they increase numerically along a chain,
+/// even across reuse of the index:
+///
+/// - it starts at the builder's deposit epoch `D`. A registration requires an active builder,
+///   whose `D` is before the finalized epoch, so it stores a current epoch after `D`, and later
+///   changes store later epochs;
+/// - the last value `L` of a builder is stored while it is active, i.e. before its exit is
+///   initiated at some epoch `X >= L` (a registration in the block of the exit request comes after
+///   it, and fails). Its index is reused only once `withdrawable_epoch = X +
+///   MIN_BUILDER_WITHDRAWABILITY_DELAY <= current epoch`, so the next builder's deposit epoch is
+///   at least `L + MIN_BUILDER_WITHDRAWABILITY_DELAY > L`. An exited builder never becomes active
+///   again: a deposit to it only moves its `withdrawable_epoch`, which never returns to
+///   `FAR_FUTURE_EPOCH`.
+///
+/// So the order is numeric for builders too, and `FAR_FUTURE_EPOCH`, which a builder entry never
+/// holds, sorts first.
 pub fn cmp_pq_change_epochs(a: Epoch, b: Epoch) -> Ordering {
     match (
         a == PQ_UNREGISTERED_CHANGE_EPOCH,
@@ -75,17 +79,21 @@ pub fn cmp_pq_change_epochs(a: Epoch, b: Epoch) -> Ordering {
 }
 
 /// Returns whether no state descending from a finalized state can apply a registration of a
-/// validator naming `previous_change_epoch`, where `stored` is the validator's
-/// `pq_key_change_epochs` entry in the finalized state and `finalized_epoch` its current epoch.
+/// validator or builder index naming `previous_change_epoch`, where `stored` is the index's stored
+/// change epoch in the finalized state and `finalized_epoch` its current epoch.
 ///
 /// A descendant's entry is either `stored`, or the epoch of a block applied on top of the
-/// finalized state, which is at least `finalized_epoch`. So the registration is dead if it names
-/// another value that is:
+/// finalized state, which is at least `finalized_epoch`: a change, or for a builder index the
+/// deposit epoch of a builder that reuses it. So the registration is dead if it names another
+/// value that is:
 ///
 /// - behind `stored` in the order of [`cmp_pq_change_epochs`]: the entry only moves forward along
 ///   a chain;
-/// - or a change epoch before `finalized_epoch`: a change at such an epoch on the finalized chain
-///   would be in the finalized state, so it was made on a fork that is not canonical.
+/// - or a real epoch before `finalized_epoch`: a change or builder deposit at such an epoch on the
+///   finalized chain would be in the finalized state, so it was made on a fork that is not
+///   canonical. A builder's first registration names its deposit epoch, which is before the
+///   finalized epoch of the including state by `is_active_builder`; if that deposit is canonical,
+///   it is `stored` until the builder registers.
 ///
 /// A registration naming `finalized_epoch` itself is not dead: a block of that epoch after the
 /// finalized checkpoint can still make a change at it.
@@ -100,15 +108,15 @@ pub fn is_pq_registration_dead(
                 && previous_change_epoch < finalized_epoch))
 }
 
-/// Returns the signing root of the `PqKeyPossession` of `xmss_public_key` for the validator
-/// holding `validator_pubkey` (`get_pq_possession_signing_root`).
+/// Returns the signing root of the `PqKeyPossession` of `xmss_public_key` for the validator or
+/// builder holding `pubkey` (`get_pq_possession_signing_root`).
 ///
-/// The proof binds the leanXMSS key to the validator's BLS public key, which never changes and is
-/// known before the validator has an index. The domain uses the genesis fork version, so a proof
+/// The proof binds the leanXMSS key to the registrant's BLS public key, which never changes and is
+/// known before the registrant has an index. The domain uses the genesis fork version, so a proof
 /// stays valid across forks.
 pub fn get_pq_possession_signing_root<E: EthSpec>(
     state: &BeaconState<E>,
-    validator_pubkey: &PublicKeyBytes,
+    pubkey: &PublicKeyBytes,
     xmss_public_key: &XmssPublicKey,
     spec: &ChainSpec,
 ) -> Hash256 {
@@ -118,19 +126,19 @@ pub fn get_pq_possession_signing_root<E: EthSpec>(
         state.genesis_validators_root(),
     );
     PqKeyPossession {
-        validator_pubkey: *validator_pubkey,
+        pubkey: *pubkey,
         xmss_public_key: xmss_public_key.clone(),
     }
     .signing_root(domain)
 }
 
-/// Checks if `proof` is a signature, by `xmss_public_key`, of the key itself for the validator
-/// holding `validator_pubkey` (`is_valid_pq_possession_proof`).
+/// Checks if `proof` is a signature, by `xmss_public_key`, of the key itself for the validator or
+/// builder holding `pubkey` (`is_valid_pq_possession_proof`).
 ///
 /// The proof must be at leaf index `PQ_POSSESSION_XMSS_INDEX`, which is reserved for it.
 pub fn is_valid_pq_possession_proof<E: EthSpec>(
     state: &BeaconState<E>,
-    validator_pubkey: &PublicKeyBytes,
+    pubkey: &PublicKeyBytes,
     xmss_public_key: &XmssPublicKey,
     proof: &XmssSignature,
     spec: &ChainSpec,
@@ -144,18 +152,61 @@ pub fn is_valid_pq_possession_proof<E: EthSpec>(
     let Ok(public_key) = xmss::PublicKey::from_bytes(xmss_public_key) else {
         return false;
     };
-    let signing_root =
-        get_pq_possession_signing_root(state, validator_pubkey, xmss_public_key, spec);
+    let signing_root = get_pq_possession_signing_root(state, pubkey, xmss_public_key, spec);
     public_key.verify(&signing_root.0, &signature).is_ok()
+}
+
+/// Returns the BLS public key of the validator or builder that `index` names, after the checks of
+/// `process_pq_key_registration` on the index itself: a known validator that has not initiated an
+/// exit, or a known, active builder registering a zero VRF root.
+pub fn verify_pq_registrant<E: EthSpec>(
+    state: &BeaconState<E>,
+    index: u64,
+    public_keys: &PqPublicKeys,
+    spec: &ChainSpec,
+) -> Result<PublicKeyBytes> {
+    match PqRegistryIndex::new(index) {
+        PqRegistryIndex::Builder(builder_index) => {
+            let builder = state
+                .builders()?
+                .get(builder_index as usize)
+                .ok_or_else(|| error(Invalid::BuilderUnknown(builder_index)))?;
+            // Keys are registered only for active builders, whose deposit epoch is finalized.
+            verify!(
+                state.is_active_builder(builder_index, spec)?,
+                Invalid::BuilderNotActive(builder_index)
+            );
+            // Builders make no selection proofs, so they register no VRF root.
+            verify!(
+                public_keys.vrf_root == VrfRoot::ZERO,
+                Invalid::BuilderNonZeroVrfRoot(builder_index)
+            );
+            Ok(builder.pubkey)
+        }
+        PqRegistryIndex::Validator(validator_index) => {
+            let validator = state
+                .validators()
+                .get(validator_index as usize)
+                .ok_or_else(|| error(Invalid::ValidatorUnknown(validator_index)))?;
+            // Keys are registered only for validators that have not initiated an exit.
+            verify!(
+                validator.exit_epoch == spec.far_future_epoch,
+                Invalid::ValidatorExiting {
+                    exit_epoch: validator.exit_epoch
+                }
+            );
+            Ok(validator.pubkey)
+        }
+    }
 }
 
 /// Indicates if a `SignedPqKeyRegistration` is valid to be included in a block, where the block is
 /// being applied to the given `state` at its current epoch.
 ///
-/// Evaluates every assertion of `process_pq_key_registration`, in order. With
-/// `VerifySignatures::True` it also checks the BLS authorization and the leanXMSS proof of
-/// possession; with `VerifySignatures::False` both are expected to be checked by the caller (see
-/// `BlockSignatureVerifier`).
+/// Evaluates every assertion of `process_pq_key_registration`, in order, for a validator index or
+/// a flagged builder index. With `VerifySignatures::True` it also checks the BLS authorization and
+/// the leanXMSS proof of possession; with `VerifySignatures::False` both are expected to be checked
+/// by the caller (see `BlockSignatureVerifier`).
 pub fn verify_pq_key_registration<E: EthSpec>(
     state: &BeaconState<E>,
     signed_registration: &SignedPqKeyRegistration,
@@ -163,30 +214,18 @@ pub fn verify_pq_key_registration<E: EthSpec>(
     spec: &ChainSpec,
 ) -> Result<()> {
     let registration = &signed_registration.message;
-    let index = registration.validator_index;
+    let index = registration.index;
     let public_keys = &registration.public_keys;
 
-    let pq_key_change_epochs = state
-        .pq_key_change_epochs()
-        .map_err(|_| error(Invalid::RegistryUnavailable))?;
+    if state.pq_key_change_epochs().is_err() {
+        return Err(error(Invalid::RegistryUnavailable));
+    }
 
-    let validator = state
-        .validators()
-        .get(index as usize)
-        .ok_or_else(|| error(Invalid::ValidatorUnknown(index)))?;
+    let pubkey = verify_pq_registrant(state, index, public_keys, spec)?;
 
-    // Keys are registered only for validators that have not initiated an exit.
-    verify!(
-        validator.exit_epoch == spec.far_future_epoch,
-        Invalid::ValidatorExiting {
-            exit_epoch: validator.exit_epoch
-        }
-    );
-
-    // The registration applies to the validator's current entry only.
-    let last_change_epoch = *pq_key_change_epochs
-        .get(index as usize)
-        .ok_or(BeaconStateError::UnknownValidator(index as usize))?;
+    // The registration applies to the current entry only. Every change moves the stored epoch, so
+    // a replayed registration fails here.
+    let last_change_epoch = state.get_pq_key_change_epoch(index)?;
     verify!(
         registration.previous_change_epoch == last_change_epoch,
         Invalid::PreviousChangeEpochMismatch {
@@ -195,11 +234,11 @@ pub fn verify_pq_key_registration<E: EthSpec>(
         }
     );
 
-    // Changes of registered keys are rate-limited. Only a registered validator's entry is a change
-    // epoch: an unregistered one holds `FAR_FUTURE_EPOCH`, which must not be added to.
-    if is_pq_registered(state, index)? {
+    // Changes of registered keys are rate-limited. An entry holding the all-zero key has never
+    // registered: its change epoch is its never-registered marker, which is never added to.
+    if state.is_pq_registered(index)? {
         let current_epoch = state.current_epoch();
-        let earliest_epoch = last_change_epoch.saturating_add(spec.min_pq_key_change_delay);
+        let earliest_epoch = last_change_epoch.safe_add(spec.min_pq_key_change_delay)?;
         verify!(
             current_epoch >= earliest_epoch,
             Invalid::ChangeTooSoon {
@@ -209,12 +248,13 @@ pub fn verify_pq_key_registration<E: EthSpec>(
         );
     }
 
-    // The validator's signing key authorizes the registration.
+    // The BLS signing key of the validator or builder authorizes the registration.
     if verify_signatures.is_true() {
         verify!(
             pq_key_registration_signature_set(
                 state,
                 |i| get_pubkey_from_state(state, i),
+                |i| get_builder_pubkey_from_state(state, i),
                 signed_registration,
                 spec
             )?
@@ -223,8 +263,12 @@ pub fn verify_pq_key_registration<E: EthSpec>(
         );
     }
 
-    // The key must be new: no validator, including this one, may hold it. The registrant must also
-    // prove possession of it for the validator's BLS public key.
+    // The key must be a new, non-zero key: no validator or builder, including this one, may hold
+    // it. The registrant must also prove possession of it for its BLS public key.
+    verify!(
+        public_keys.xmss_public_key != XmssPublicKey::default(),
+        Invalid::ZeroXmssPublicKey
+    );
     if let Some(owner) = pq_public_key_owner(state, &public_keys.xmss_public_key)? {
         return Err(error(Invalid::XmssPublicKeyInUse { owner }));
     }
@@ -232,7 +276,7 @@ pub fn verify_pq_key_registration<E: EthSpec>(
         verify!(
             is_valid_pq_possession_proof(
                 state,
-                &validator.pubkey,
+                &pubkey,
                 &public_keys.xmss_public_key,
                 &signed_registration.possession,
                 spec

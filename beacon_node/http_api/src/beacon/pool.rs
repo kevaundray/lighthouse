@@ -192,7 +192,7 @@ pub fn post_beacon_pool_pq_key_registrations<T: BeaconChainTypes>(
                     let mut failures = vec![];
 
                     for (index, registration) in registrations.into_iter().enumerate() {
-                        let validator_index = registration.message.validator_index;
+                        let registrant_index = registration.message.index;
                         let previous_change_epoch = registration.message.previous_change_epoch;
 
                         match chain.verify_pq_key_registration_for_http_api(registration) {
@@ -203,7 +203,7 @@ pub fn post_beacon_pool_pq_key_registrations<T: BeaconChainTypes>(
                                 let outcome = chain.import_pq_key_registration(*verified);
                                 if outcome == PqKeyRegistrationInsertOutcome::PoolFull {
                                     warn!(
-                                        validator_index,
+                                        registrant_index,
                                         %previous_change_epoch,
                                         "PQ key registration pool is full"
                                     );
@@ -216,7 +216,7 @@ pub fn post_beacon_pool_pq_key_registrations<T: BeaconChainTypes>(
                                 )?;
 
                                 info!(
-                                    validator_index,
+                                    registrant_index,
                                     %previous_change_epoch,
                                     ?outcome,
                                     "Processed PQ key registration"
@@ -224,14 +224,14 @@ pub fn post_beacon_pool_pq_key_registrations<T: BeaconChainTypes>(
                             }
                             Ok(PqKeyRegistrationOutcome::AlreadyKnown) => {
                                 debug!(
-                                    validator_index,
+                                    registrant_index,
                                     %previous_change_epoch,
                                     "PQ key registration already known"
                                 );
                             }
                             Err(PqKeyRegistrationError::PoolFull) => {
                                 warn!(
-                                    validator_index,
+                                    registrant_index,
                                     %previous_change_epoch,
                                     "PQ key registration pool is full"
                                 );
@@ -239,7 +239,7 @@ pub fn post_beacon_pool_pq_key_registrations<T: BeaconChainTypes>(
                             }
                             Err(e) => {
                                 warn!(
-                                    validator_index,
+                                    registrant_index,
                                     reason = ?e,
                                     source = "HTTP",
                                     "Invalid PQ key registration"

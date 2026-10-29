@@ -1719,8 +1719,8 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             // that a new registration for the pair is accepted again.
             let mut observed = self.observed_pq_key_registrations.lock();
             observed.prune(&new_finalized_state);
-            for (validator_index, previous_change_epoch) in pruned_pq_key_registrations {
-                observed.forget(validator_index, previous_change_epoch);
+            for (index, previous_change_epoch) in pruned_pq_key_registrations {
+                observed.forget(index, previous_change_epoch);
             }
         }
 

@@ -10,7 +10,7 @@ use bls::{PublicKey, PublicKeyBytes, SignatureSet, verify_signature_sets};
 use std::borrow::Cow;
 use types::{
     AbstractExecPayload, BeaconState, BeaconStateError, ChainSpec, EthSpec, Hash256,
-    SignedBeaconBlock, SignedPqKeyRegistration,
+    PqRegistryIndex, SignedBeaconBlock, SignedPqKeyRegistration,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -443,6 +443,7 @@ where
                 self.sets.push(pq_key_registration_signature_set(
                     self.state,
                     self.get_pubkey.clone(),
+                    |builder_index| get_builder_pubkey_from_state(self.state, builder_index),
                     signed_registration,
                     self.spec,
                 )?);
@@ -456,25 +457,39 @@ where
     /// all the signatures are valid.
     ///
     /// This includes the leanXMSS proofs of possession of post-quantum key registrations, which
-    /// are verified individually against the BLS public key of each registered validator. A
-    /// registration for an unknown validator makes its proof invalid.
+    /// are verified individually against the BLS public key of each registered validator or
+    /// builder. A registration for an unknown validator or builder makes its proof invalid.
+    ///
+    /// Builder public keys are read from the pre-state, although registrations are processed
+    /// after the parent's execution requests, whose builder deposits can reassign a builder index
+    /// to a new public key. A reassigned index holds a builder deposited at the current epoch,
+    /// which is not active, so the block is invalid whichever key is used.
     ///
     /// See `ParallelSignatureSets::verify` for more info.
     pub fn verify(self) -> Result<()> {
-        let validators = self.state.validators();
         let pq_proofs_valid = self.pq_key_registrations.iter().all(|signed_registration| {
             let registration = &signed_registration.message;
-            validators
-                .get(registration.validator_index as usize)
-                .is_some_and(|validator| {
-                    is_valid_pq_possession_proof(
-                        self.state,
-                        &validator.pubkey,
-                        &registration.public_keys.xmss_public_key,
-                        &signed_registration.possession,
-                        self.spec,
-                    )
-                })
+            let pubkey = match PqRegistryIndex::new(registration.index) {
+                PqRegistryIndex::Validator(validator_index) => self
+                    .state
+                    .validators()
+                    .get(validator_index as usize)
+                    .map(|validator| validator.pubkey),
+                PqRegistryIndex::Builder(builder_index) => self
+                    .state
+                    .get_builder(builder_index)
+                    .ok()
+                    .map(|builder| builder.pubkey),
+            };
+            pubkey.is_some_and(|pubkey| {
+                is_valid_pq_possession_proof(
+                    self.state,
+                    &pubkey,
+                    &registration.public_keys.xmss_public_key,
+                    &signed_registration.possession,
+                    self.spec,
+                )
+            })
         });
         if !pq_proofs_valid {
             return Err(Error::PqPossessionProofInvalid);

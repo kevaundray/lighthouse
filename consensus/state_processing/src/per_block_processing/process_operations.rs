@@ -697,7 +697,7 @@ pub fn process_pq_key_registrations<E: EthSpec>(
 
         let registration = &signed_registration.message;
         state.set_pq_public_keys(
-            registration.validator_index as usize,
+            registration.index,
             registration.public_keys.clone(),
             current_epoch,
         )?;

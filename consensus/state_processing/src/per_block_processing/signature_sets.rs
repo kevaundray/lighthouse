@@ -10,8 +10,8 @@ use typenum::Unsigned;
 use types::{
     AbstractExecPayload, AttesterSlashingRef, BeaconBlockRef, BeaconState, BeaconStateError,
     BuilderIndex, ChainSpec, DepositData, Domain, Epoch, EthSpec, Fork, Hash256, InconsistentFork,
-    IndexedAttestation, IndexedAttestationRef, IndexedPayloadAttestation, ProposerSlashing,
-    SignedAggregateAndProof, SignedBeaconBlock, SignedBeaconBlockHeader,
+    IndexedAttestation, IndexedAttestationRef, IndexedPayloadAttestation, PqRegistryIndex,
+    ProposerSlashing, SignedAggregateAndProof, SignedBeaconBlock, SignedBeaconBlockHeader,
     SignedBlsToExecutionChange, SignedContributionAndProof, SignedExecutionPayloadBidRef,
     SignedInclusionList, SignedPqKeyRegistration, SignedProposerPreferences, SignedRoot,
     SignedVoluntaryExit, SigningData, Slot, SyncAggregate, SyncAggregatorSelectionData,
@@ -208,24 +208,33 @@ pub fn bls_execution_change_signature_set<'a, E: EthSpec>(
 }
 
 /// Returns a signature set that is valid if the `SignedPqKeyRegistration` was authorized by the
-/// BLS signing key of the validator it names (EIP-8450).
+/// BLS signing key of the validator or builder it names (EIP-8450).
 ///
-/// The domain uses the genesis fork version, so a registration stays valid across forks.
-pub fn pq_key_registration_signature_set<'a, E, F>(
+/// `get_pubkey` returns validator public keys by validator index, `get_builder_pubkey` builder
+/// public keys by builder index, as for execution payload bids. The domain uses the genesis fork
+/// version, so a registration stays valid across forks.
+pub fn pq_key_registration_signature_set<'a, E, F, G>(
     state: &'a BeaconState<E>,
     get_pubkey: F,
+    get_builder_pubkey: G,
     signed_registration: &'a SignedPqKeyRegistration,
     spec: &'a ChainSpec,
 ) -> Result<SignatureSet<'a>>
 where
     E: EthSpec,
     F: Fn(usize) -> Option<Cow<'a, PublicKey>>,
+    G: Fn(BuilderIndex) -> Option<Cow<'a, PublicKey>>,
 {
     let registration = &signed_registration.message;
-    let validator_index = registration.validator_index;
 
-    let pubkey =
-        get_pubkey(validator_index as usize).ok_or(Error::ValidatorUnknown(validator_index))?;
+    let pubkey = match PqRegistryIndex::new(registration.index) {
+        PqRegistryIndex::Validator(validator_index) => {
+            get_pubkey(validator_index as usize).ok_or(Error::ValidatorUnknown(validator_index))?
+        }
+        PqRegistryIndex::Builder(builder_index) => {
+            get_builder_pubkey(builder_index).ok_or(Error::BuilderUnknown(builder_index))?
+        }
+    };
 
     let domain = spec.compute_domain(
         Domain::PqKeyRegistration,

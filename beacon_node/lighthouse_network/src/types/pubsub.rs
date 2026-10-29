@@ -650,8 +650,8 @@ impl<E: EthSpec> std::fmt::Display for PubsubMessage<E> {
             PubsubMessage::PqKeyRegistration(data) => {
                 write!(
                     f,
-                    "Signed PQ key registration: validator_index: {}, previous_change_epoch: {}",
-                    data.message.validator_index, data.message.previous_change_epoch
+                    "Signed PQ key registration: index: {}, previous_change_epoch: {}",
+                    data.message.index, data.message.previous_change_epoch
                 )
             }
             PubsubMessage::ExecutionPayload(data) => {
@@ -760,9 +760,10 @@ mod tests {
             Ok(GossipKind::PqKeyRegistration)
         );
         let topic_hash = TopicHash::from_raw(String::from(topic));
+        // A builder index, with `BUILDER_INDEX_FLAG` set, travels as is.
         let registration = types::SignedPqKeyRegistration {
             message: types::PqKeyRegistration {
-                validator_index: 7,
+                index: types::consts::gloas::BUILDER_INDEX_FLAG | 7,
                 public_keys: types::PqPublicKeys {
                     xmss_public_key: vec![1; 32].try_into().unwrap(),
                     vrf_root: Hash256::repeat_byte(2),

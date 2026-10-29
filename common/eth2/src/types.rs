@@ -376,11 +376,15 @@ pub struct ValidatorIdentityData {
     pub activation_epoch: Epoch,
 }
 
-/// One validator's entry in the post-quantum key registry (EIP-8450).
+/// One validator's or builder's entry in the post-quantum key registry (EIP-8450).
 ///
-/// `change_epoch` is the validator's `pq_key_change_epochs` entry. It is `FAR_FUTURE_EPOCH` exactly
-/// when the validator has never registered keys, in which case `xmss_public_key` and `vrf_root`
-/// are all zero.
+/// `index` is a validator index, or a builder index with `BUILDER_INDEX_FLAG` (`2**40`) set, as
+/// given in the query.
+///
+/// `change_epoch` is the stored change epoch of the index. An index that has never registered keys
+/// has an all-zero `xmss_public_key` and `vrf_root`, and its `change_epoch` is its never-registered
+/// marker: `FAR_FUTURE_EPOCH` for a validator, and the builder's `deposit_epoch` for a builder,
+/// since builder indices are reused.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PqPublicKeysData {
     #[serde(with = "serde_utils::quoted_u64")]
@@ -2888,6 +2892,19 @@ mod test {
         assert_eq!(json["vrf_root"], format!("0x{}", "cd".repeat(32)));
         assert_eq!(json["xmss_public_key"], format!("0x{}", "ab".repeat(32)));
         assert_eq!(json.as_object().unwrap().len(), 4);
+        // A builder's index carries `BUILDER_INDEX_FLAG`, and its never-registered change epoch
+        // is its deposit epoch.
+        let builder = PqPublicKeysData {
+            index: (1 << 40) | 2,
+            change_epoch: Epoch::new(5),
+            ..unregistered
+        };
+        let json = serde_json::to_value(&builder).unwrap();
+        assert_eq!(json["index"], "1099511627778");
+        assert_eq!(
+            serde_json::from_value::<PqPublicKeysData>(json).unwrap(),
+            builder
+        );
     }
 
     #[test]

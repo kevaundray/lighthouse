@@ -1,4 +1,5 @@
-//! Creates, and optionally submits, an EIP-8450 `SignedPqKeyRegistration`.
+//! Creates, and optionally submits, an EIP-8450 `SignedPqKeyRegistration` for a validator or a
+//! builder.
 
 use account_utils::eth2_keystore::{Keystore, keypair_from_secret};
 use account_utils::read_password;
@@ -6,26 +7,85 @@ use bls::{Keypair, PublicKeyBytes, SecretKey};
 use clap::ArgMatches;
 use clap_utils::{parse_optional, parse_required};
 use environment::Environment;
-use eth2::types::{StateId, ValidatorId};
+use eth2::types::{BuilderData, BuilderId, BuilderStatus, StateId, ValidatorId};
 use eth2::{BeaconNodeHttpClient, SensitiveUrl, Timeouts};
 use eth2_wallet::bip39::{Language, Mnemonic, Seed};
 use eth2_wallet::{KeyType, recover_validator_secret_from_mnemonic};
 use lean_pq::xmss;
 use serde::{Deserialize, Serialize};
+use state_processing::per_block_processing::builder::is_builder_index;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use types::builder::BuilderIndex;
 use types::{
     ChainSpec, Config, Domain, Epoch, EthSpec, Hash256, PQ_POSSESSION_XMSS_INDEX, PqKeyPossession,
-    PqKeyRegistration, PqPublicKeys, SignedPqKeyRegistration, SignedRoot, VrfRoot, XmssPublicKey,
-    XmssSignature,
+    PqKeyRegistration, PqPublicKeys, PqRegistryIndex, SignedPqKeyRegistration, SignedRoot, VrfRoot,
+    XmssPublicKey, XmssSignature,
 };
 use zeroize::Zeroizing;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// What the beacon node tells us about the chain and the validator.
+/// Returns the validator or builder given by exactly one of `--validator-index` and
+/// `--builder-index`. Neither may carry `BUILDER_INDEX_FLAG`: the registration's index carries it
+/// for a builder.
+fn registrant_from_indices(
+    validator_index: Option<u64>,
+    builder_index: Option<BuilderIndex>,
+) -> Result<PqRegistryIndex, String> {
+    let (name, index, registrant) = match (validator_index, builder_index) {
+        (Some(index), None) => ("Validator", index, PqRegistryIndex::Validator(index)),
+        (None, Some(index)) => ("Builder", index, PqRegistryIndex::Builder(index)),
+        _ => {
+            return Err(
+                "Exactly one of --validator-index and --builder-index is required".to_string(),
+            );
+        }
+    };
+    if is_builder_index(index) {
+        return Err(format!(
+            "{} index {} has BUILDER_INDEX_FLAG set; give a builder's index in the builder \
+             registry, without the flag, to --builder-index",
+            name, index
+        ));
+    }
+    Ok(registrant)
+}
+
+/// Names `registrant` in messages, a builder by its index in the builder registry.
+fn describe(registrant: PqRegistryIndex) -> String {
+    match registrant {
+        PqRegistryIndex::Validator(index) => format!("validator {}", index),
+        PqRegistryIndex::Builder(index) => format!("builder {}", index),
+    }
+}
+
+/// Returns the VRF root that `registrant` registers given `--vrf-root`: the given root for a
+/// validator, which must give one, and zero for a builder, which makes no selection proofs and
+/// so registers no VRF tree.
+fn registered_vrf_root(
+    registrant: PqRegistryIndex,
+    vrf_root: Option<[u8; 32]>,
+) -> Result<[u8; 32], String> {
+    match (registrant, vrf_root) {
+        (PqRegistryIndex::Validator(_), Some(vrf_root)) => Ok(vrf_root),
+        (PqRegistryIndex::Validator(_), None) => {
+            Err("--vrf-root is required for a validator".to_string())
+        }
+        (PqRegistryIndex::Builder(_), None) => Ok([0; 32]),
+        (PqRegistryIndex::Builder(_), Some(vrf_root)) if vrf_root == [0; 32] => Ok(vrf_root),
+        (PqRegistryIndex::Builder(builder_index), Some(vrf_root)) => Err(format!(
+            "Builder {} must register a zero VRF root, not 0x{}: builders make no selection \
+             proofs",
+            builder_index,
+            hex::encode(vrf_root)
+        )),
+    }
+}
+
+/// What the beacon node tells us about the chain and the validator or builder.
 struct ChainContext {
     spec: ChainSpec,
     genesis_validators_root: Hash256,
@@ -35,10 +95,15 @@ struct ChainContext {
 
 pub fn run<E: EthSpec>(env: Environment<E>, matches: &ArgMatches) -> Result<(), String> {
     let beacon_url: SensitiveUrl = parse_required(matches, "beacon-node")?;
-    let validator_index: u64 = parse_required(matches, "validator-index")?;
-    let vrf_root = parse_hex32(
-        &parse_required::<String>(matches, "vrf-root")?,
-        "--vrf-root",
+    let registrant = registrant_from_indices(
+        parse_optional(matches, "validator-index")?,
+        parse_optional(matches, "builder-index")?,
+    )?;
+    let vrf_root = registered_vrf_root(
+        registrant,
+        parse_optional::<String>(matches, "vrf-root")?
+            .map(|vrf_root| parse_hex32(&vrf_root, "--vrf-root"))
+            .transpose()?,
     )?;
     let previous_change_epoch_override: Option<Epoch> =
         parse_optional::<u64>(matches, "previous-change-epoch")?.map(Epoch::new);
@@ -57,7 +122,7 @@ pub fn run<E: EthSpec>(env: Environment<E>, matches: &ArgMatches) -> Result<(), 
         ));
     }
 
-    let bls_keypair = load_bls_keypair(matches, validator_index)?;
+    let bls_keypair = load_bls_keypair(matches, registrant)?;
 
     let client = BeaconNodeHttpClient::new(beacon_url, Timeouts::set_all(HTTP_TIMEOUT));
     let handle = env
@@ -68,16 +133,16 @@ pub fn run<E: EthSpec>(env: Environment<E>, matches: &ArgMatches) -> Result<(), 
 
     let context = handle.block_on(fetch_chain_context::<E>(
         &client,
-        validator_index,
+        registrant,
         previous_change_epoch_override,
     ))?;
 
     if context.on_chain_pubkey != bls_keypair.pk.compress() {
         return Err(format!(
-            "BLS public key {} does not match the on-chain public key {} of validator {}",
+            "BLS public key {} does not match the on-chain public key {} of {}",
             bls_keypair.pk.as_hex_string(),
             context.on_chain_pubkey.as_hex_string(),
-            validator_index
+            describe(registrant)
         ));
     }
 
@@ -86,21 +151,21 @@ pub fn run<E: EthSpec>(env: Environment<E>, matches: &ArgMatches) -> Result<(), 
     let key_start = Instant::now();
     let xmss_key = create_xmss_key(
         &xmss_seed_out,
-        validator_index,
+        registrant,
         &context.on_chain_pubkey,
         context.genesis_validators_root,
         &context.spec,
     )?;
     let key_time = key_start.elapsed();
     eprintln!(
-        "Wrote the new XMSS seed for validator {} to {}",
-        validator_index,
+        "Wrote the new XMSS seed for {} to {}",
+        describe(registrant),
         xmss_seed_out.display()
     );
 
     let sign_start = Instant::now();
     let signed_registration = build_signed_registration(
-        validator_index,
+        registrant,
         &bls_keypair,
         &xmss_key,
         vrf_root,
@@ -110,9 +175,14 @@ pub fn run<E: EthSpec>(env: Environment<E>, matches: &ArgMatches) -> Result<(), 
     )?;
     let sign_time = sign_start.elapsed();
 
+    eprintln!("index: {}", signed_registration.message.index);
     eprintln!(
         "xmss_public_key: 0x{}",
         hex::encode(&signed_registration.message.public_keys.xmss_public_key[..])
+    );
+    eprintln!(
+        "vrf_root: {:?}",
+        signed_registration.message.public_keys.vrf_root
     );
     eprintln!("xmss_leaf_index: {}", PQ_POSSESSION_XMSS_INDEX);
     eprintln!(
@@ -146,11 +216,11 @@ pub fn run<E: EthSpec>(env: Environment<E>, matches: &ArgMatches) -> Result<(), 
     Ok(())
 }
 
-/// Fetches the chain parameters, the validator's on-chain public key and the epoch of its last
-/// post-quantum key change.
+/// Fetches the chain parameters, the on-chain public key of `registrant` and the epoch of its
+/// last post-quantum key change.
 async fn fetch_chain_context<E: EthSpec>(
     client: &BeaconNodeHttpClient,
-    validator_index: u64,
+    registrant: PqRegistryIndex,
     previous_change_epoch_override: Option<Epoch>,
 ) -> Result<ChainContext, String> {
     let genesis = client
@@ -174,6 +244,77 @@ async fn fetch_chain_context<E: EthSpec>(
         ));
     }
 
+    // The public key, and the stored change epoch of an entry that has never registered keys.
+    let (on_chain_pubkey, unregistered_epoch) = match registrant {
+        PqRegistryIndex::Validator(validator_index) => (
+            fetch_validator_pubkey(client, validator_index, &spec).await?,
+            spec.far_future_epoch,
+        ),
+        PqRegistryIndex::Builder(builder_index) => {
+            let builder = fetch_builder(client, builder_index).await?;
+            check_builder_active(&builder, &spec)?;
+            (builder.builder.pubkey, builder.builder.deposit_epoch)
+        }
+    };
+
+    let previous_change_epoch = match previous_change_epoch_override {
+        Some(epoch) => epoch,
+        None => {
+            let index = registrant.as_u64();
+            let keys = client
+                .get_beacon_states_pq_public_keys(StateId::Head, Some(&[index]))
+                .await
+                .map_err(|e| {
+                    format!(
+                        "Unable to fetch the post-quantum keys of {}: {}",
+                        describe(registrant),
+                        e
+                    )
+                })?
+                .ok_or("Head state not found when fetching post-quantum keys")?
+                .data;
+            let entry = keys
+                .into_iter()
+                .find(|entry| entry.index == index)
+                .ok_or_else(|| {
+                    format!(
+                        "Beacon node returned no post-quantum keys for {}",
+                        describe(registrant)
+                    )
+                })?;
+            if entry.change_epoch == unregistered_epoch {
+                eprintln!(
+                    "The {} has no registered post-quantum keys",
+                    describe(registrant)
+                );
+            } else {
+                eprintln!(
+                    "Current post-quantum keys: xmss_public_key 0x{}, vrf_root {:?}, \
+                     change_epoch {}",
+                    hex::encode(&entry.xmss_public_key[..]),
+                    entry.vrf_root,
+                    entry.change_epoch
+                );
+            }
+            entry.change_epoch
+        }
+    };
+
+    Ok(ChainContext {
+        spec,
+        genesis_validators_root: genesis.genesis_validators_root,
+        on_chain_pubkey,
+        previous_change_epoch,
+    })
+}
+
+/// Fetches the public key of validator `validator_index` at head, which must not have initiated
+/// an exit.
+async fn fetch_validator_pubkey(
+    client: &BeaconNodeHttpClient,
+    validator_index: u64,
+    spec: &ChainSpec,
+) -> Result<PublicKeyBytes, String> {
     let validator = client
         .get_beacon_states_validator_id(StateId::Head, &ValidatorId::Index(validator_index))
         .await
@@ -192,51 +333,55 @@ async fn fetch_chain_context<E: EthSpec>(
             validator_index, validator.validator.exit_epoch
         ));
     }
+    Ok(validator.validator.pubkey)
+}
 
-    let previous_change_epoch = match previous_change_epoch_override {
-        Some(epoch) => epoch,
-        None => {
-            let keys = client
-                .get_beacon_states_pq_public_keys(StateId::Head, Some(&[validator_index]))
-                .await
-                .map_err(|e| {
-                    format!(
-                        "Unable to fetch the post-quantum keys of validator {}: {}",
-                        validator_index, e
-                    )
-                })?
-                .ok_or("Head state not found when fetching post-quantum keys")?
-                .data;
-            let entry = keys
-                .into_iter()
-                .find(|entry| entry.index == validator_index)
-                .ok_or_else(|| {
-                    format!(
-                        "Beacon node returned no post-quantum keys for validator {}",
-                        validator_index
-                    )
-                })?;
-            if entry.change_epoch == spec.far_future_epoch {
-                eprintln!("Validator {validator_index} has no registered post-quantum keys");
-            } else {
-                eprintln!(
-                    "Current post-quantum keys: xmss_public_key 0x{}, vrf_root {:?}, \
-                     change_epoch {}",
-                    hex::encode(&entry.xmss_public_key[..]),
-                    entry.vrf_root,
-                    entry.change_epoch
-                );
-            }
-            entry.change_epoch
-        }
-    };
+/// Fetches builder `builder_index` and its status at head.
+async fn fetch_builder(
+    client: &BeaconNodeHttpClient,
+    builder_index: BuilderIndex,
+) -> Result<BuilderData, String> {
+    let builder = client
+        .post_beacon_states_builders(
+            StateId::Head,
+            Some(vec![BuilderId::Index(builder_index)]),
+            None,
+        )
+        .await
+        .map_err(|e| format!("Unable to fetch builder {}: {}", builder_index, e))?
+        .ok_or("Head state not found when fetching the builder")?
+        .data
+        .into_iter()
+        .find(|builder| builder.index == builder_index)
+        .ok_or_else(|| format!("Builder {} is unknown at head", builder_index))?;
+    eprintln!(
+        "Builder {} status: {:?}, pubkey: {}, deposit epoch: {}",
+        builder_index,
+        builder.status,
+        builder.builder.pubkey.as_hex_string(),
+        builder.builder.deposit_epoch
+    );
+    Ok(builder)
+}
 
-    Ok(ChainContext {
-        spec,
-        genesis_validators_root: genesis.genesis_validators_root,
-        on_chain_pubkey: validator.validator.pubkey,
-        previous_change_epoch,
-    })
+/// Checks that `builder` is active, as a builder registration requires (`is_active_builder`):
+/// it has not initiated an exit, and its deposit epoch is finalized. Its status is computed
+/// against the finalized checkpoint of the state it was fetched from.
+fn check_builder_active(builder: &BuilderData, spec: &ChainSpec) -> Result<(), String> {
+    if builder.builder.withdrawable_epoch != spec.far_future_epoch {
+        return Err(format!(
+            "Builder {} has initiated an exit (withdrawable epoch {}) and cannot register keys",
+            builder.index, builder.builder.withdrawable_epoch
+        ));
+    }
+    if builder.status != BuilderStatus::Active {
+        return Err(format!(
+            "Builder {} is not active: its deposit epoch {} is not finalized yet. It can register \
+             keys once the finalized checkpoint is past epoch {}",
+            builder.index, builder.builder.deposit_epoch, builder.builder.deposit_epoch
+        ));
+    }
+    Ok(())
 }
 
 /// A leanXMSS public key and the proof of possession its key signed at leaf index
@@ -248,11 +393,11 @@ pub struct PossessedXmssKey {
     pub possession: XmssSignature,
 }
 
-/// Returns the signing root of the `PqKeyPossession` of `xmss_public_key` for the validator
-/// holding `validator_pubkey`, as `get_pq_possession_signing_root` in `state_processing`: the
+/// Returns the signing root of the `PqKeyPossession` of `xmss_public_key` for the validator or
+/// builder holding `pubkey`, as `get_pq_possession_signing_root` in `state_processing`: the
 /// domain uses the genesis fork version.
 fn possession_signing_root(
-    validator_pubkey: &PublicKeyBytes,
+    pubkey: &PublicKeyBytes,
     xmss_public_key: &XmssPublicKey,
     genesis_validators_root: Hash256,
     spec: &ChainSpec,
@@ -263,17 +408,17 @@ fn possession_signing_root(
         genesis_validators_root,
     );
     PqKeyPossession {
-        validator_pubkey: *validator_pubkey,
+        pubkey: *pubkey,
         xmss_public_key: xmss_public_key.clone(),
     }
     .signing_root(domain)
 }
 
 /// Checks that `possession` is a signature at leaf index `PQ_POSSESSION_XMSS_INDEX` by
-/// `xmss_public_key` of its `PqKeyPossession` for `validator_pubkey`, as
-/// `is_valid_pq_possession_proof` in `state_processing`.
+/// `xmss_public_key` of its `PqKeyPossession` for `pubkey`, as `is_valid_pq_possession_proof` in
+/// `state_processing`.
 fn verify_possession(
-    validator_pubkey: &PublicKeyBytes,
+    pubkey: &PublicKeyBytes,
     xmss_public_key: &XmssPublicKey,
     possession: &XmssSignature,
     genesis_validators_root: Hash256,
@@ -290,17 +435,13 @@ fn verify_possession(
     }
     let public_key = xmss::PublicKey::from_bytes(xmss_public_key)
         .map_err(|e| format!("Invalid XMSS public key: {}", e))?;
-    let signing_root = possession_signing_root(
-        validator_pubkey,
-        xmss_public_key,
-        genesis_validators_root,
-        spec,
-    );
+    let signing_root =
+        possession_signing_root(pubkey, xmss_public_key, genesis_validators_root, spec);
     public_key.verify(&signing_root.0, &signature).map_err(|e| {
         format!(
-            "Proof of possession does not verify for validator public key {} and XMSS \
-                 public key 0x{} on this network: {}",
-            validator_pubkey.as_hex_string(),
+            "Proof of possession does not verify for BLS public key {} and XMSS public key 0x{} \
+             on this network: {}",
+            pubkey.as_hex_string(),
             hex::encode(&xmss_public_key[..]),
             e
         )
@@ -314,30 +455,26 @@ fn encode_xmss_public_key(public_key: &xmss::PublicKey) -> Result<XmssPublicKey,
 }
 
 /// Signs, at leaf index `PQ_POSSESSION_XMSS_INDEX`, the proof of possession of
-/// `xmss_secret_key`'s public key for the validator holding `validator_pubkey`.
+/// `xmss_secret_key`'s public key for the validator or builder holding `pubkey`.
 ///
 /// A key signs at a leaf index at most once. Call this only for a key that was just created: every
 /// registration carries a new key, so this is the only proof the key ever signs.
 fn sign_possession(
     xmss_secret_key: &xmss::SecretKey,
-    validator_pubkey: &PublicKeyBytes,
+    pubkey: &PublicKeyBytes,
     genesis_validators_root: Hash256,
     spec: &ChainSpec,
 ) -> Result<PossessedXmssKey, String> {
     let xmss_public_key = encode_xmss_public_key(&xmss_secret_key.public_key())?;
-    let signing_root = possession_signing_root(
-        validator_pubkey,
-        &xmss_public_key,
-        genesis_validators_root,
-        spec,
-    );
+    let signing_root =
+        possession_signing_root(pubkey, &xmss_public_key, genesis_validators_root, spec);
     let signature = xmss_secret_key
         .sign(&signing_root.0, PQ_POSSESSION_XMSS_INDEX)
         .map_err(|e| format!("Unable to sign the proof of possession: {}", e))?;
     let possession = XmssSignature::new(signature.to_bytes().to_vec())
         .map_err(|e| format!("Invalid XMSS signature length: {:?}", e))?;
     verify_possession(
-        validator_pubkey,
+        pubkey,
         &xmss_public_key,
         &possession,
         genesis_validators_root,
@@ -349,16 +486,15 @@ fn sign_possession(
     })
 }
 
-/// Creates a leanXMSS key from OS randomness for the validator `validator_index` holding
-/// `validator_pubkey`, saves its seed to a new seed file at `path`, then signs its proof of
-/// possession.
+/// Creates a leanXMSS key from OS randomness for `registrant`, holding `pubkey`, saves its seed
+/// to a new seed file at `path`, then signs its proof of possession.
 ///
 /// The seed is saved before the key signs anything, so the signer of the key's later duties has
 /// it. If the file cannot be created, the key is discarded without having signed.
 fn create_xmss_key(
     path: &Path,
-    validator_index: u64,
-    validator_pubkey: &PublicKeyBytes,
+    registrant: PqRegistryIndex,
+    pubkey: &PublicKeyBytes,
     genesis_validators_root: Hash256,
     spec: &ChainSpec,
 ) -> Result<PossessedXmssKey, String> {
@@ -370,26 +506,23 @@ fn create_xmss_key(
                 "0x{}",
                 hex::encode(Zeroizing::new(xmss_secret_key.to_bytes()))
             )),
-            validator_index,
-            validator_pubkey: *validator_pubkey,
+            index: registrant.as_u64(),
+            pubkey: *pubkey,
         },
     )?;
-    sign_possession(
-        &xmss_secret_key,
-        validator_pubkey,
-        genesis_validators_root,
-        spec,
-    )
+    sign_possession(&xmss_secret_key, pubkey, genesis_validators_root, spec)
 }
 
-/// Builds a registration of `xmss_key` and `vrf_root` for `validator_index`, carrying the key's
-/// proof of possession and signed by `bls_keypair`, then verifies both signatures.
+/// Builds a registration of `xmss_key` and `vrf_root` for `registrant`, carrying the key's
+/// proof of possession and signed by `bls_keypair`, then verifies both signatures. A builder's
+/// `vrf_root` must be zero.
 ///
 /// The proof must be for the public key of `bls_keypair`, which the caller checks against the
-/// validator's on-chain public key. The signing root matches `pq_key_registration_signature_set`
-/// in `state_processing`: the domain uses the genesis fork version.
+/// on-chain public key of the validator or builder. The signing root matches
+/// `pq_key_registration_signature_set` in `state_processing`: the domain uses the genesis fork
+/// version.
 pub fn build_signed_registration(
-    validator_index: u64,
+    registrant: PqRegistryIndex,
     bls_keypair: &Keypair,
     xmss_key: &PossessedXmssKey,
     vrf_root: [u8; 32],
@@ -397,6 +530,7 @@ pub fn build_signed_registration(
     genesis_validators_root: Hash256,
     spec: &ChainSpec,
 ) -> Result<SignedPqKeyRegistration, String> {
+    let vrf_root = registered_vrf_root(registrant, Some(vrf_root))?;
     verify_possession(
         &bls_keypair.pk.compress(),
         &xmss_key.xmss_public_key,
@@ -406,7 +540,7 @@ pub fn build_signed_registration(
     )?;
 
     let signed_registration = PqKeyRegistration {
-        validator_index,
+        index: registrant.as_u64(),
         public_keys: PqPublicKeys {
             xmss_public_key: xmss_key.xmss_public_key.clone(),
             vrf_root: VrfRoot::from(vrf_root),
@@ -438,9 +572,10 @@ pub fn build_signed_registration(
     Ok(signed_registration)
 }
 
-/// Loads the validator's BLS signing key from exactly one of `--mnemonic`, `--mnemonic-file`,
-/// `--keystore`, `--bls-secret-key` or `--bls-secret-key-file`.
-fn load_bls_keypair(matches: &ArgMatches, validator_index: u64) -> Result<Keypair, String> {
+/// Loads the BLS signing key of `registrant` from exactly one of `--mnemonic`, `--mnemonic-file`,
+/// `--keystore`, `--bls-secret-key` or `--bls-secret-key-file`. A mnemonic derives validator
+/// keys only.
+fn load_bls_keypair(matches: &ArgMatches, registrant: PqRegistryIndex) -> Result<Keypair, String> {
     let phrase = match (
         parse_optional::<String>(matches, "mnemonic")?,
         parse_optional::<PathBuf>(matches, "mnemonic-file")?,
@@ -450,6 +585,17 @@ fn load_bls_keypair(matches: &ArgMatches, validator_index: u64) -> Result<Keypai
         (None, None) => None,
     };
     if let Some(phrase) = phrase {
+        let validator_index = match registrant {
+            PqRegistryIndex::Validator(validator_index) => validator_index,
+            PqRegistryIndex::Builder(_) => {
+                return Err(
+                    "--mnemonic is not supported for builders: Lighthouse has no mnemonic \
+                     derivation for builder keys. Use --keystore, --bls-secret-key or \
+                     --bls-secret-key-file"
+                        .to_string(),
+                );
+            }
+        };
         let derivation_index = match parse_optional::<u32>(matches, "derivation-index")? {
             Some(index) => index,
             None => u32::try_from(validator_index).map_err(|_| {
@@ -547,17 +693,19 @@ fn parse_hex32(value: &str, name: &str) -> Result<[u8; 32], String> {
         .map_err(|_| format!("{} must be 32 bytes, got {}", name, bytes.len()))
 }
 
-/// The contents of an XMSS seed file: what the validator's signer needs for the key's later
-/// duties, namely the leanXMSS seed and the validator it was created for.
+/// The contents of an XMSS seed file: what the signer of the validator or builder needs for the
+/// key's later duties, namely the leanXMSS seed and the registrant it was created for.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct XmssSeedFile {
     /// 0x-prefixed hex of the 32-byte seed.
     seed: Zeroizing<String>,
+    /// The registration's index: a validator index, or a builder index with
+    /// `BUILDER_INDEX_FLAG` set.
     #[serde(with = "serde_utils::quoted_u64")]
-    validator_index: u64,
-    /// BLS public key of the validator, which the key's proof of possession names.
-    validator_pubkey: PublicKeyBytes,
+    index: u64,
+    /// BLS public key of the validator or builder, which the key's proof of possession names.
+    pubkey: PublicKeyBytes,
 }
 
 /// Writes `registrations` to `path` as the JSON body of
@@ -613,14 +761,18 @@ mod tests {
         VerifySignatures, errors::PqKeyRegistrationInvalid, is_valid_pq_possession_proof,
         process_operations::process_pq_key_registrations, verify_pq_key_registration,
     };
+    use types::consts::gloas::{BUILDER_INDEX_FLAG, PAYLOAD_BUILDER_VERSION};
     use types::test_utils::generate_deterministic_keypair;
-    use types::{BeaconState, ForkName, MinimalEthSpec};
+    use types::{BeaconState, Checkpoint, ForkName, MinimalEthSpec, Slot};
 
     type E = MinimalEthSpec;
 
     const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
                             abandon abandon abandon about";
     const VALIDATOR_INDEX: u64 = 1;
+    const VALIDATOR: PqRegistryIndex = PqRegistryIndex::Validator(VALIDATOR_INDEX);
+    /// Deterministic keypair index of the builder's BLS key, past the genesis validators.
+    const BUILDER_KEYPAIR: usize = 100;
     const XMSS_SEED: [u8; 32] = [7; 32];
     const OTHER_XMSS_SEED: [u8; 32] = [8; 32];
 
@@ -658,9 +810,56 @@ mod tests {
         serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
     }
 
-    /// Reads a seed file as the validator's signer would.
+    /// Reads a seed file as the signer of the validator or builder would.
     fn read_seed_file(path: &Path) -> Result<XmssSeedFile, serde_json::Error> {
         serde_json::from_str(&fs::read_to_string(path).unwrap())
+    }
+
+    /// Adds a builder holding the BLS key `BUILDER_KEYPAIR`, deposited at epoch 0, to `state`,
+    /// then moves `state` to epoch 2 with epoch 1 finalized, so that the builder is active.
+    /// Returns its builder index and its BLS key, loaded from hex as `--bls-secret-key` does.
+    fn add_active_builder(state: &mut BeaconState<E>, spec: &ChainSpec) -> (BuilderIndex, Keypair) {
+        let deterministic = generate_deterministic_keypair(BUILDER_KEYPAIR);
+        let keypair = keypair_from_secret_hex(&format!(
+            "0x{}",
+            hex::encode(deterministic.sk.serialize().as_bytes())
+        ))
+        .unwrap();
+        let builder_index = state
+            .add_builder_to_registry(
+                keypair.pk.compress(),
+                PAYLOAD_BUILDER_VERSION,
+                Hash256::ZERO,
+                spec.min_deposit_amount,
+                Slot::new(0),
+                spec,
+            )
+            .unwrap();
+        *state.slot_mut() = Slot::new(2 * E::slots_per_epoch());
+        *state.finalized_checkpoint_mut() = Checkpoint {
+            epoch: Epoch::new(1),
+            root: Hash256::ZERO,
+        };
+        (builder_index, keypair)
+    }
+
+    /// The builder `builder_index` of `state`, with its status as the beacon node reports it.
+    fn builder_data(state: &BeaconState<E>, builder_index: u64, spec: &ChainSpec) -> BuilderData {
+        let builder = state
+            .builders()
+            .unwrap()
+            .get(builder_index as usize)
+            .unwrap()
+            .clone();
+        BuilderData {
+            index: builder_index,
+            status: BuilderStatus::from_builder(
+                &builder,
+                state.finalized_checkpoint().epoch,
+                spec.far_future_epoch,
+            ),
+            builder,
+        }
     }
 
     /// The stored change epoch of validator `VALIDATOR_INDEX`, which its registration names.
@@ -676,7 +875,7 @@ mod tests {
     fn new_key(path: &Path, state: &BeaconState<E>, spec: &ChainSpec) -> PossessedXmssKey {
         create_xmss_key(
             path,
-            VALIDATOR_INDEX,
+            VALIDATOR,
             &pubkey_of(state, VALIDATOR_INDEX),
             state.genesis_validators_root(),
             spec,
@@ -693,7 +892,7 @@ mod tests {
         spec: &ChainSpec,
     ) -> SignedPqKeyRegistration {
         build_signed_registration(
-            VALIDATOR_INDEX,
+            VALIDATOR,
             keypair,
             key,
             [vrf_byte; 32],
@@ -721,9 +920,9 @@ mod tests {
             .map(String::as_str)
             .collect::<Vec<_>>();
         fields.sort_unstable();
-        assert_eq!(fields, ["seed", "validator_index", "validator_pubkey"]);
-        assert_eq!(stored["validator_index"], VALIDATOR_INDEX.to_string());
-        assert_eq!(stored["validator_pubkey"], validator_pubkey.as_hex_string());
+        assert_eq!(fields, ["index", "pubkey", "seed"]);
+        assert_eq!(stored["index"], VALIDATOR_INDEX.to_string());
+        assert_eq!(stored["pubkey"], validator_pubkey.as_hex_string());
 
         // The stored seed is the seed of the created key.
         let seed_file = read_seed_file(&path).unwrap();
@@ -811,6 +1010,237 @@ mod tests {
     }
 
     #[test]
+    fn builder_registration_verifies_against_an_eip8450_state() {
+        let spec = ForkName::Eip8450.make_genesis_spec(E::default_spec());
+        let (mut state, _) = genesis_state(&spec);
+        let (builder_index, keypair) = add_active_builder(&mut state, &spec);
+        let builder = PqRegistryIndex::Builder(builder_index);
+        let data = builder_data(&state, builder_index, &spec);
+        check_builder_active(&data, &spec).unwrap();
+        assert_eq!(data.builder.pubkey, keypair.pk.compress());
+        // A builder that has never registered keys stores its deposit epoch, which a first
+        // registration names.
+        let previous_change_epoch = *state
+            .builder_pq_key_change_epochs()
+            .unwrap()
+            .get(builder_index as usize)
+            .unwrap();
+        assert_eq!(previous_change_epoch, data.builder.deposit_epoch);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("xmss_seed.json");
+        let key = create_xmss_key(
+            &path,
+            builder,
+            &data.builder.pubkey,
+            state.genesis_validators_root(),
+            &spec,
+        )
+        .unwrap();
+        // The seed file names the flagged index and the builder's public key.
+        let seed_file = read_seed_file(&path).unwrap();
+        assert_eq!(seed_file.index, builder_index | BUILDER_INDEX_FLAG);
+        assert_eq!(seed_file.pubkey, data.builder.pubkey);
+
+        let registration = build_signed_registration(
+            builder,
+            &keypair,
+            &key,
+            registered_vrf_root(builder, None).unwrap(),
+            previous_change_epoch,
+            state.genesis_validators_root(),
+            &spec,
+        )
+        .unwrap();
+        assert_eq!(
+            registration.message.index,
+            builder_index | BUILDER_INDEX_FLAG
+        );
+        assert_eq!(registration.message.public_keys.vrf_root, Hash256::ZERO);
+        assert_eq!(registration.possession, key.possession);
+        verify_pq_key_registration(&state, &registration, VerifySignatures::True, &spec).unwrap();
+
+        // The registration applies to the builder's entry.
+        let mut applied = state.clone();
+        process_pq_key_registrations(
+            &mut applied,
+            std::slice::from_ref(&registration),
+            VerifySignatures::True,
+            &spec,
+        )
+        .unwrap();
+        assert_eq!(
+            applied
+                .builder_pq_public_keys()
+                .unwrap()
+                .get(builder_index as usize)
+                .unwrap(),
+            &registration.message.public_keys
+        );
+        assert_eq!(
+            *applied
+                .builder_pq_key_change_epochs()
+                .unwrap()
+                .get(builder_index as usize)
+                .unwrap(),
+            applied.current_epoch()
+        );
+        // The change moved the stored epoch off the deposit epoch: the builder is registered.
+        assert_ne!(applied.current_epoch(), data.builder.deposit_epoch);
+    }
+
+    #[test]
+    fn builder_registration_refuses_a_non_zero_vrf_root() {
+        let spec = ForkName::Eip8450.make_genesis_spec(E::default_spec());
+        let (mut state, _) = genesis_state(&spec);
+        let (builder_index, keypair) = add_active_builder(&mut state, &spec);
+        let builder = PqRegistryIndex::Builder(builder_index);
+
+        // A builder may omit --vrf-root or give zero; any other root is refused. A validator
+        // must give one.
+        assert_eq!(registered_vrf_root(builder, None), Ok([0; 32]));
+        assert_eq!(registered_vrf_root(builder, Some([0; 32])), Ok([0; 32]));
+        let err = registered_vrf_root(builder, Some([9; 32])).unwrap_err();
+        assert!(err.contains("zero VRF root"), "{err}");
+        assert_eq!(registered_vrf_root(VALIDATOR, Some([9; 32])), Ok([9; 32]));
+        assert!(registered_vrf_root(VALIDATOR, None).is_err());
+
+        let pubkey = builder_data(&state, builder_index, &spec).builder.pubkey;
+        let previous_change_epoch = *state
+            .builder_pq_key_change_epochs()
+            .unwrap()
+            .get(builder_index as usize)
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let key = create_xmss_key(
+            &dir.path().join("xmss_seed.json"),
+            builder,
+            &pubkey,
+            state.genesis_validators_root(),
+            &spec,
+        )
+        .unwrap();
+        let err = build_signed_registration(
+            builder,
+            &keypair,
+            &key,
+            [9; 32],
+            previous_change_epoch,
+            state.genesis_validators_root(),
+            &spec,
+        )
+        .unwrap_err();
+        assert!(err.contains("zero VRF root"), "{err}");
+
+        // Consensus rejects the registration the tool refuses to build.
+        let signed = PqKeyRegistration {
+            index: builder.as_u64(),
+            public_keys: PqPublicKeys {
+                xmss_public_key: key.xmss_public_key.clone(),
+                vrf_root: Hash256::repeat_byte(9),
+            },
+            previous_change_epoch,
+        }
+        .sign(
+            key.possession.clone(),
+            &keypair.sk,
+            state.genesis_validators_root(),
+            &spec,
+        );
+        assert!(matches!(
+            verify_pq_key_registration(&state, &signed, VerifySignatures::True, &spec),
+            Err(BlockOperationError::Invalid(
+                PqKeyRegistrationInvalid::BuilderNonZeroVrfRoot(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn inactive_builders_are_refused() {
+        let spec = ForkName::Eip8450.make_genesis_spec(E::default_spec());
+        let (mut state, _) = genesis_state(&spec);
+        let (builder_index, keypair) = add_active_builder(&mut state, &spec);
+        let builder = PqRegistryIndex::Builder(builder_index);
+        let pubkey = builder_data(&state, builder_index, &spec).builder.pubkey;
+        let previous_change_epoch = *state
+            .builder_pq_key_change_epochs()
+            .unwrap()
+            .get(builder_index as usize)
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let key = create_xmss_key(
+            &dir.path().join("xmss_seed.json"),
+            builder,
+            &pubkey,
+            state.genesis_validators_root(),
+            &spec,
+        )
+        .unwrap();
+        let registration = build_signed_registration(
+            builder,
+            &keypair,
+            &key,
+            [0; 32],
+            previous_change_epoch,
+            state.genesis_validators_root(),
+            &spec,
+        )
+        .unwrap();
+        let rejected = |state: &BeaconState<E>| {
+            matches!(
+                verify_pq_key_registration(state, &registration, VerifySignatures::True, &spec),
+                Err(BlockOperationError::Invalid(
+                    PqKeyRegistrationInvalid::BuilderNotActive(_)
+                ))
+            )
+        };
+
+        // The builder's deposit epoch is not finalized yet.
+        let mut pending = state.clone();
+        *pending.finalized_checkpoint_mut() = Checkpoint {
+            epoch: Epoch::new(0),
+            root: Hash256::ZERO,
+        };
+        let err =
+            check_builder_active(&builder_data(&pending, builder_index, &spec), &spec).unwrap_err();
+        assert!(err.contains("is not finalized"), "{err}");
+        assert!(rejected(&pending));
+
+        // The builder has initiated an exit.
+        let mut exiting = state.clone();
+        exiting
+            .builders_mut()
+            .unwrap()
+            .get_mut(builder_index as usize)
+            .unwrap()
+            .withdrawable_epoch = Epoch::new(5);
+        let err =
+            check_builder_active(&builder_data(&exiting, builder_index, &spec), &spec).unwrap_err();
+        assert!(err.contains("initiated an exit"), "{err}");
+        assert!(rejected(&exiting));
+
+        // The active builder passes both.
+        check_builder_active(&builder_data(&state, builder_index, &spec), &spec).unwrap();
+        assert!(!rejected(&state));
+    }
+
+    #[test]
+    fn registrant_comes_from_one_unflagged_index() {
+        assert_eq!(
+            registrant_from_indices(Some(3), None),
+            Ok(PqRegistryIndex::Validator(3))
+        );
+        let builder = registrant_from_indices(None, Some(3)).unwrap();
+        assert_eq!(builder, PqRegistryIndex::Builder(3));
+        assert_eq!(builder.as_u64(), 3 | BUILDER_INDEX_FLAG);
+        // A given index never carries the flag: the registration adds it for a builder.
+        assert!(registrant_from_indices(Some(3 | BUILDER_INDEX_FLAG), None).is_err());
+        assert!(registrant_from_indices(None, Some(3 | BUILDER_INDEX_FLAG)).is_err());
+        assert!(registrant_from_indices(None, None).is_err());
+        assert!(registrant_from_indices(Some(3), Some(3)).is_err());
+    }
+
+    #[test]
     fn each_run_creates_a_different_key() {
         let spec = ForkName::Eip8450.make_genesis_spec(E::default_spec());
         let (state, keypair) = genesis_state(&spec);
@@ -864,8 +1294,8 @@ mod tests {
     fn xmss_seed_file_is_private_and_never_overwritten() {
         let seed_file = |seed: [u8; 32]| XmssSeedFile {
             seed: Zeroizing::new(format!("0x{}", hex::encode(seed))),
-            validator_index: VALIDATOR_INDEX,
-            validator_pubkey: generate_deterministic_keypair(1).pk.compress(),
+            index: VALIDATOR_INDEX,
+            pubkey: generate_deterministic_keypair(1).pk.compress(),
         };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("xmss_seed.json");
@@ -874,7 +1304,7 @@ mod tests {
         let contents = fs::read_to_string(&path).unwrap();
         let json = read_json(&path);
         assert_eq!(json["seed"], format!("0x{}", "07".repeat(32)));
-        assert_eq!(json["validator_index"], VALIDATOR_INDEX.to_string());
+        assert_eq!(json["index"], VALIDATOR_INDEX.to_string());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -888,7 +1318,7 @@ mod tests {
 
         let read = read_seed_file(&path).unwrap();
         assert_eq!(*read.seed, format!("0x{}", "07".repeat(32)));
-        assert_eq!(read.validator_index, VALIDATOR_INDEX);
+        assert_eq!(read.index, VALIDATOR_INDEX);
 
         // A planted symlink, even a dangling one, is not followed.
         #[cfg(unix)]

@@ -2309,15 +2309,16 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
     /// Process a post-quantum key registration (EIP-8450) received from the gossip network.
     ///
     /// Verification follows the `pq_key_registration` gossip rules. Rejections that do not depend
-    /// on our view of the chain (version, BLS signature, proof of possession) penalize the peer
-    /// more than those that do, which an honest peer on a different head can trigger.
+    /// on our view of the chain (builder VRF root, all-zero key, BLS signature, proof of possession)
+    /// penalize the peer more than those that do, which an honest peer on a different head or with
+    /// a different view of finality (builder activity) can trigger.
     pub fn process_gossip_pq_key_registration(
         self: &Arc<Self>,
         message_id: MessageId,
         peer_id: PeerId,
         registration: SignedPqKeyRegistration,
     ) {
-        let validator_index = registration.message.validator_index;
+        let index = registration.message.index;
         let previous_change_epoch = registration.message.previous_change_epoch;
 
         let verified = match self
@@ -2327,7 +2328,7 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
             Ok(verified) => verified,
             Err(e) => {
                 debug!(
-                    validator_index,
+                    index,
                     %previous_change_epoch,
                     %peer_id,
                     error = ?e,
@@ -2347,11 +2348,15 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
                     | PqKeyRegistrationError::PoolFull => None,
                     PqKeyRegistrationError::UnknownValidator(_)
                     | PqKeyRegistrationError::ValidatorExiting { .. }
+                    | PqKeyRegistrationError::UnknownBuilder(_)
+                    | PqKeyRegistrationError::BuilderNotActive(_)
                     | PqKeyRegistrationError::PreviousChangeEpochMismatch { .. }
                     | PqKeyRegistrationError::XmssPublicKeyInUse { .. } => {
                         Some(PeerAction::HighToleranceError)
                     }
-                    PqKeyRegistrationError::InvalidSignature
+                    PqKeyRegistrationError::BuilderNonZeroVrfRoot(_)
+                    | PqKeyRegistrationError::ZeroXmssPublicKey
+                    | PqKeyRegistrationError::InvalidSignature
                     | PqKeyRegistrationError::InvalidPossessionProof => {
                         Some(PeerAction::LowToleranceError)
                     }
@@ -2385,7 +2390,7 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
         }
 
         debug!(
-            validator_index,
+            index,
             %previous_change_epoch,
             ?outcome,
             "Processed PQ key registration"

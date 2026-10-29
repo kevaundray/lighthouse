@@ -669,22 +669,26 @@ fn main() {
         )
         .subcommand(
             Command::new("pq-key-registration")
-                .about("Creates an EIP-8450 post-quantum key registration for a validator and \
-                        optionally submits it to a beacon node. Every registration carries a new \
-                        leanXMSS key: each run creates one, saves its seed to --xmss-seed-out, \
-                        and signs its proof of possession at leaf index 0 once. The validator's \
-                        BLS signing key authorizes the registration. A registration that was not \
-                        included is resubmitted, never re-signed, by POSTing the --output file \
-                        unchanged to /eth/v1/beacon/pool/pq_key_registrations. A new \
-                        registration always needs a new key, from a new run.")
+                .about("Creates an EIP-8450 post-quantum key registration for a validator or a \
+                        builder and optionally submits it to a beacon node. Every registration \
+                        carries a new leanXMSS key: each run creates one, saves its seed to \
+                        --xmss-seed-out, and signs its proof of possession at leaf index 0 once. \
+                        The BLS signing key of the validator or builder authorizes the \
+                        registration. A builder registers through the same operation, under its \
+                        builder index with BUILDER_INDEX_FLAG (2**40) set, with a zero VRF root, \
+                        and only while it is active: its deposit epoch is finalized and it has \
+                        not initiated an exit. A registration that was not included is \
+                        resubmitted, never re-signed, by POSTing the --output file unchanged to \
+                        /eth/v1/beacon/pool/pq_key_registrations. A new registration always \
+                        needs a new key, from a new run.")
                 .arg(
                     Arg::new("beacon-node")
                         .long("beacon-node")
                         .value_name("URL")
                         .action(ArgAction::Set)
                         .default_value("http://localhost:5052")
-                        .help("Beacon node to fetch the genesis, spec, validator and current \
-                                post-quantum keys from, and to submit to.")
+                        .help("Beacon node to fetch the genesis, spec, validator or builder and \
+                                current post-quantum keys from, and to submit to.")
                         .display_order(0)
                 )
                 .arg(
@@ -692,9 +696,28 @@ fn main() {
                         .long("validator-index")
                         .value_name("INDEX")
                         .action(ArgAction::Set)
-                        .required(true)
                         .help("Index of the validator registering keys.")
                         .display_order(0)
+                )
+                .arg(
+                    Arg::new("builder-index")
+                        .long("builder-index")
+                        .value_name("INDEX")
+                        .action(ArgAction::Set)
+                        .conflicts_with_all(["mnemonic", "mnemonic-file", "derivation-index"])
+                        .help("Index of the builder registering keys, as in the builder \
+                                registry, without BUILDER_INDEX_FLAG; the registration carries \
+                                it with the flag set. The builder must be active. Its VRF root \
+                                is zero. Its BLS signing key comes from --keystore, \
+                                --bls-secret-key or --bls-secret-key-file: Lighthouse has no \
+                                mnemonic derivation for builder keys, so --mnemonic is not \
+                                supported for builders.")
+                        .display_order(0)
+                )
+                .group(
+                    ArgGroup::new("registrant")
+                        .args(["validator-index", "builder-index"])
+                        .required(true)
                 )
                 .arg(
                     Arg::new("mnemonic")
@@ -702,7 +725,7 @@ fn main() {
                         .value_name("PHRASE")
                         .action(ArgAction::Set)
                         .help("Mnemonic from which to derive the validator's BLS signing key \
-                                (EIP-2334 path m/12381/3600/i/0/0).")
+                                (EIP-2334 path m/12381/3600/i/0/0). Validators only.")
                         .display_order(0)
                 )
                 .arg(
@@ -734,7 +757,8 @@ fn main() {
                         .value_name("PATH")
                         .action(ArgAction::Set)
                         .requires("password-file")
-                        .help("EIP-2335 keystore holding the validator's BLS signing key.")
+                        .help("EIP-2335 keystore holding the BLS signing key of the validator \
+                                or builder.")
                         .display_order(0)
                 )
                 .arg(
@@ -751,7 +775,8 @@ fn main() {
                         .long("bls-secret-key")
                         .value_name("HEX")
                         .action(ArgAction::Set)
-                        .help("The validator's BLS signing key as 0x-prefixed hex.")
+                        .help("The BLS signing key of the validator or builder as 0x-prefixed \
+                                hex.")
                         .display_order(0)
                 )
                 .arg(
@@ -759,8 +784,8 @@ fn main() {
                         .long("bls-secret-key-file")
                         .value_name("PATH")
                         .action(ArgAction::Set)
-                        .help("File containing the validator's BLS signing key as 0x-prefixed \
-                                hex, as an alternative to --bls-secret-key.")
+                        .help("File containing the BLS signing key of the validator or builder \
+                                as 0x-prefixed hex, as an alternative to --bls-secret-key.")
                         .display_order(0)
                 )
                 .group(
@@ -781,11 +806,13 @@ fn main() {
                         .action(ArgAction::Set)
                         .required(true)
                         .help("New file (mode 0600, never overwritten) for the leanXMSS key this \
-                                run generates from OS randomness. It holds {\"seed\", \
-                                \"validator_index\", \"validator_pubkey\"}, what the validator's \
-                                signer needs for the key's later duties, and is written before \
-                                the key signs its proof of possession. Each run needs a new path: \
-                                a new registration always needs a new key.")
+                                run generates from OS randomness. It holds {\"seed\", \"index\", \
+                                \"pubkey\"}: the seed, the registration's index (a builder's \
+                                with BUILDER_INDEX_FLAG set) and the BLS public key of the \
+                                validator or builder, what its signer needs for the key's later \
+                                duties. It is written before the key signs its proof of \
+                                possession. Each run needs a new path: a new registration always \
+                                needs a new key.")
                         .display_order(0)
                 )
                 .arg(
@@ -793,8 +820,11 @@ fn main() {
                         .long("vrf-root")
                         .value_name("HEX32")
                         .action(ArgAction::Set)
-                        .required(true)
-                        .help("32-byte root of the validator's VRF tree, as 0x-prefixed hex.")
+                        .required_unless_present("builder-index")
+                        .help("32-byte root of the validator's VRF tree, as 0x-prefixed hex. \
+                                Required for a validator. A builder registers a zero VRF root, \
+                                so for a builder it may be omitted and any non-zero value is \
+                                refused.")
                         .display_order(0)
                 )
                 .arg(
@@ -802,8 +832,10 @@ fn main() {
                         .long("previous-change-epoch")
                         .value_name("EPOCH")
                         .action(ArgAction::Set)
-                        .help("Epoch of the validator's last key change. Defaults to the \
-                                change_epoch fetched from the beacon node's head state.")
+                        .help("Epoch of the last key change of the validator or builder. \
+                                Defaults to the change_epoch fetched from the beacon node's head \
+                                state, which for keys never registered is FAR_FUTURE_EPOCH for \
+                                a validator and the deposit epoch for a builder.")
                         .display_order(0)
                 )
                 .arg(

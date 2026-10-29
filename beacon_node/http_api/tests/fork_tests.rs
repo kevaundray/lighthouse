@@ -21,6 +21,7 @@ use types::{
     Address, BeaconState, ChainSpec, Epoch, EthSpec, ForkName, Hash256, PQ_POSSESSION_XMSS_INDEX,
     PqKeyRegistration, PqPublicKeys, SignedPqKeyRegistration, Slot, Spec, VrfRoot, XmssPublicKey,
     XmssSignature,
+    consts::gloas::BUILDER_INDEX_FLAG,
     test_utils::{generate_deterministic_keypair, generate_deterministic_keypairs},
 };
 
@@ -841,7 +842,7 @@ fn pq_key_registration(
         .unwrap();
 
     PqKeyRegistration {
-        validator_index,
+        index: validator_index,
         public_keys: PqPublicKeys {
             xmss_public_key,
             vrf_root: Hash256::repeat_byte(validator_index as u8),
@@ -993,4 +994,99 @@ async fn pq_key_registrations_around_eip8450_fork() {
             .unwrap()
             .is_empty()
     );
+}
+
+/// The state endpoint takes builder indices with `BUILDER_INDEX_FLAG` set and returns them as
+/// given, after every validator when no id is given. An unregistered builder's change epoch is its
+/// deposit epoch. The pool endpoint verifies a flagged index against the builder registry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pq_key_registrations_with_flagged_builder_ids() {
+    let validator_count = E::sync_committee_size();
+    let builder_validators = vec![1, 2];
+    let spec = ForkName::Eip8450.make_genesis_spec(E::default_spec());
+    let tester = InteractiveTester::<E>::new_with_initializer_and_mutator(
+        Some(spec),
+        validator_count,
+        Some(Box::new(move |builder| {
+            builder
+                .mock_execution_layer()
+                .deterministic_keypairs(validator_count)
+                .genesis_builders(builder_validators, 32_000_000_000)
+                .fresh_ephemeral_store()
+        })),
+        None,
+        Default::default(),
+        true,
+        NodeCustodyType::Fullnode,
+    )
+    .await;
+    let harness = &tester.harness;
+    let client = &tester.client;
+    let builder = |builder_index: u64| BUILDER_INDEX_FLAG | builder_index;
+    let deposit_epoch = Epoch::new(0);
+    let unregistered = |index: u64, change_epoch: Epoch| PqPublicKeysData {
+        index,
+        xmss_public_key: XmssPublicKey::default(),
+        vrf_root: VrfRoot::default(),
+        change_epoch,
+    };
+
+    // Unknown indices, including a builder outside the registry, are skipped.
+    let response = client
+        .get_beacon_states_pq_public_keys(
+            StateId::Head,
+            Some(&[builder(1), 0, builder(2), builder(0)]),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        response.data,
+        vec![
+            unregistered(0, harness.spec.far_future_epoch),
+            unregistered(builder(0), deposit_epoch),
+            unregistered(builder(1), deposit_epoch),
+        ]
+    );
+
+    let all_keys = client
+        .get_beacon_states_pq_public_keys(StateId::Head, None)
+        .await
+        .unwrap()
+        .unwrap()
+        .data;
+    let indices = all_keys.iter().map(|entry| entry.index).collect::<Vec<_>>();
+    let mut expected = (0..validator_count as u64).collect::<Vec<_>>();
+    expected.extend([builder(0), builder(1)]);
+    assert_eq!(indices, expected);
+
+    // A builder registers only once its deposit epoch is finalized.
+    let state = harness.get_current_state();
+    let builder_pubkey = state.get_builder(0).unwrap().pubkey;
+    let xmss_public_key =
+        XmssPublicKey::try_from(XMSS_KEYS[0].public_key().to_bytes().to_vec()).unwrap();
+    let possession_root =
+        get_pq_possession_signing_root(&state, &builder_pubkey, &xmss_public_key, &harness.spec);
+    let possession = XMSS_KEYS[0]
+        .sign(&possession_root.0, PQ_POSSESSION_XMSS_INDEX)
+        .unwrap();
+    let registration = PqKeyRegistration {
+        index: builder(0),
+        public_keys: PqPublicKeys {
+            xmss_public_key,
+            vrf_root: VrfRoot::default(),
+        },
+        previous_change_epoch: deposit_epoch,
+    }
+    .sign(
+        XmssSignature::try_from(possession.to_bytes().to_vec()).unwrap(),
+        &harness.validator_keypairs[1].sk,
+        state.genesis_validators_root(),
+        &harness.spec,
+    );
+    let error = client
+        .post_beacon_pool_pq_key_registrations(std::slice::from_ref(&registration))
+        .await
+        .unwrap_err();
+    assert_server_indexed_error(error, 400, vec![0]);
 }

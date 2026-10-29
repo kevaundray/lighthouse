@@ -2,7 +2,8 @@ use rpds::HashTrieMapSync as HashTrieMap;
 
 use crate::pq::XmssPublicKey;
 
-type ValidatorIndex = usize;
+/// A validator index, or a builder index with `BUILDER_INDEX_FLAG` set (`PqRegistryIndex::as_u64`).
+type RegistryIndex = u64;
 
 /// Copies a key into a fixed-size array, so map entries need no heap allocation.
 fn key_bytes(xmss_public_key: &XmssPublicKey) -> [u8; 32] {
@@ -13,23 +14,24 @@ fn key_bytes(xmss_public_key: &XmssPublicKey) -> [u8; 32] {
     bytes
 }
 
-/// Map from registered leanXMSS public keys to the index of the validator that registered them
-/// (EIP-8450).
+/// Map from registered leanXMSS public keys to the index of the validator or builder that
+/// registered them (EIP-8450), with builder indices flagged.
 ///
-/// It indexes exactly the validators that are registered (`is_pq_registered`): those whose
-/// `pq_key_change_epochs` entry is not `FAR_FUTURE_EPOCH`. The all-zero `pq_public_keys` entry of
-/// an unregistered validator is never indexed.
+/// It indexes exactly the validators and builders that are registered (`is_pq_registered`):
+/// those whose stored leanXMSS key is not all-zero. The all-zero key, held by every unregistered
+/// validator and builder, is never indexed. Exited validators and builders keep their keys until
+/// their entry is reset.
 ///
 /// The cache is not part of consensus. It is built lazily from
-/// `BeaconState::registered_pq_public_keys` and then kept exact by
-/// `BeaconState::set_pq_public_keys`, the only writer of the registry. Appending validators adds
-/// unregistered entries only, so it never invalidates the cache. The map is persistent, so cloning
-/// a state shares it cheaply.
+/// `BeaconState::registered_pq_public_keys` and then kept exact by the writers of the registry:
+/// `BeaconState::set_pq_public_keys`, and `BeaconState::add_builder_to_registry`, which releases
+/// the key of the builder whose index it reuses. Appending validators or builders adds
+/// unregistered entries only. The map is persistent, so cloning a state shares it cheaply.
 #[derive(Debug, PartialEq, Clone, Default)]
 pub struct PqPubkeyCache {
     /// `false` until the map reflects the state's registry.
     initialized: bool,
-    map: HashTrieMap<[u8; 32], ValidatorIndex>,
+    map: HashTrieMap<[u8; 32], RegistryIndex>,
 }
 
 impl PqPubkeyCache {
@@ -41,11 +43,11 @@ impl PqPubkeyCache {
         }
     }
 
-    /// Builds the cache from the keys of the registered validators, by validator index, or returns
-    /// `None` if two validators registered the same leanXMSS key (which a valid state never
+    /// Builds the cache from the keys of the registered validators and builders, by registry index,
+    /// or returns `None` if two of them registered the same leanXMSS key (which a valid state never
     /// contains).
     pub fn new<'a>(
-        registered_keys: impl IntoIterator<Item = (ValidatorIndex, &'a XmssPublicKey)>,
+        registered_keys: impl IntoIterator<Item = (RegistryIndex, &'a XmssPublicKey)>,
     ) -> Option<Self> {
         let mut cache = Self::new_initialized();
         for (index, xmss_public_key) in registered_keys {
@@ -60,15 +62,15 @@ impl PqPubkeyCache {
         self.initialized
     }
 
-    /// Returns the index of the validator that registered `xmss_public_key`.
-    pub fn get(&self, xmss_public_key: &XmssPublicKey) -> Option<ValidatorIndex> {
+    /// Returns the registry index of the validator or builder that registered `xmss_public_key`.
+    pub fn get(&self, xmss_public_key: &XmssPublicKey) -> Option<RegistryIndex> {
         self.map.get(&key_bytes(xmss_public_key)).copied()
     }
 
     /// Records that `index` registered `xmss_public_key`.
     ///
-    /// Returns `false` if another validator already holds the key.
-    pub fn insert(&mut self, xmss_public_key: &XmssPublicKey, index: ValidatorIndex) -> bool {
+    /// Returns `false` if another validator or builder already holds the key.
+    pub fn insert(&mut self, xmss_public_key: &XmssPublicKey, index: RegistryIndex) -> bool {
         let key = key_bytes(xmss_public_key);
         match self.map.get(&key) {
             Some(owner) if *owner != index => false,
@@ -80,7 +82,7 @@ impl PqPubkeyCache {
     }
 
     /// Releases `xmss_public_key` if it is held by `index`.
-    pub fn remove(&mut self, xmss_public_key: &XmssPublicKey, index: ValidatorIndex) {
+    pub fn remove(&mut self, xmss_public_key: &XmssPublicKey, index: RegistryIndex) {
         if self.get(xmss_public_key) == Some(index) {
             self.map.remove_mut(&key_bytes(xmss_public_key));
         }

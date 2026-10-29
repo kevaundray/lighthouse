@@ -14,13 +14,13 @@ use crate::{
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, Encode, Decode, TreeHash)]
 #[context_deserialize(ForkName)]
 pub struct SignedPqKeyRegistration {
-    /// Validator, keys, and last change being registered. The BLS signature signs it.
+    /// Index, keys, and last change being registered. The BLS signature signs it.
     pub message: PqKeyRegistration,
-    /// Signature of the validator's BLS public key and the leanXMSS key by that key, at leaf index
-    /// 0. It proves that the registrant holds the secret key.
+    /// Signature of the registrant's BLS public key and the leanXMSS key by that key, at leaf
+    /// index 0. It proves that the registrant holds the secret key.
     #[serde(with = "ssz_types::serde_utils::hex_fixed_vec")]
     pub possession: XmssSignature,
-    /// Signature of the registration by the validator's BLS signing key.
+    /// Signature of the registration by the registrant's BLS signing key.
     pub signature: Signature,
 }
 

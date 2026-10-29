@@ -592,16 +592,26 @@ pub enum PqKeyRegistrationInvalid {
     ValidatorUnknown(u64),
     /// The validator has initiated an exit.
     ValidatorExiting { exit_epoch: Epoch },
-    /// The registration does not name the epoch of the validator's last change.
+    /// The specified builder (index without `BUILDER_INDEX_FLAG`) is not in the builder registry.
+    BuilderUnknown(u64),
+    /// The builder is not active: its deposit epoch is not finalized, or it has initiated an exit.
+    BuilderNotActive(u64),
+    /// The builder registers a non-zero VRF root.
+    BuilderNonZeroVrfRoot(u64),
+    /// The registration does not name the epoch of the last change of the validator or builder,
+    /// or its never-registered marker.
     PreviousChangeEpochMismatch { expected: Epoch, found: Epoch },
-    /// The validator changed its keys less than `MIN_PQ_KEY_CHANGE_DELAY` epochs ago.
+    /// The validator or builder changed its keys less than `MIN_PQ_KEY_CHANGE_DELAY` epochs ago.
     ChangeTooSoon {
         current_epoch: Epoch,
         earliest_epoch: Epoch,
     },
-    /// The BLS signature of the validator's signing key is invalid.
+    /// The BLS signature of the registrant's signing key is invalid.
     BadSignature,
-    /// A validator, possibly the one registering, already registered the leanXMSS key.
+    /// The registration carries the all-zero leanXMSS key.
+    ZeroXmssPublicKey,
+    /// A validator or builder, possibly the one registering, already registered the leanXMSS key.
+    /// `owner` is flagged for a builder.
     XmssPublicKeyInUse { owner: u64 },
     /// The proof of possession of the leanXMSS key is invalid.
     BadPossessionProof,

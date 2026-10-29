@@ -3,7 +3,9 @@ use state_processing::per_block_processing::{
 };
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
-use types::{BeaconState, ChainSpec, Epoch, EthSpec, SignedPqKeyRegistration, XmssPublicKey};
+use types::{
+    BeaconState, ChainSpec, Epoch, EthSpec, PqRegistryIndex, SignedPqKeyRegistration, XmssPublicKey,
+};
 
 /// Number of epochs of full blocks worth of registrations the pool holds at most.
 ///
@@ -27,12 +29,12 @@ pub fn max_pool_len<E: EthSpec>() -> usize {
 /// Result of inserting a registration into the pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PqKeyRegistrationInsertOutcome {
-    /// The registration was added, possibly replacing the validator's older one.
+    /// The registration was added, possibly replacing the older one of its index.
     Inserted,
-    /// The pool holds a registration for the validator with the same or a later
+    /// The pool holds a registration for the index with the same or a later
     /// `previous_change_epoch`.
     NotNewer,
-    /// The pool is full and holds no registration for the validator to replace.
+    /// The pool is full and holds no registration for the index to replace.
     PoolFull,
 }
 
@@ -45,16 +47,17 @@ struct PooledRegistration {
 }
 
 /// Pool of post-quantum key registrations (EIP-8450), holding at most one registration per
-/// validator, and at most `max_len` registrations in total.
+/// validator or builder index (flagged for builders), and at most `max_len` registrations in
+/// total.
 ///
 /// Every registration in the pool has passed full verification, including its BLS signature and
 /// leanXMSS proof of possession. Neither signature depends on the fork, so they are not checked
 /// again when packing a block.
 #[derive(Debug, Default)]
 pub struct PqKeyRegistrations {
-    /// Map from validator index to its registration.
-    by_validator_index: HashMap<u64, PooledRegistration>,
-    /// Validator indices of the registrations in insertion order, keyed by sequence number.
+    /// Map from validator or flagged builder index to its registration.
+    by_index: HashMap<u64, PooledRegistration>,
+    /// Indices of the registrations in insertion order, keyed by sequence number.
     fifo: BTreeMap<u64, u64>,
     /// Sequence number of the next insertion.
     next_sequence: u64,
@@ -62,32 +65,30 @@ pub struct PqKeyRegistrations {
 
 impl PqKeyRegistrations {
     /// Returns `true` if inserting `registration` would not exceed `max_len`: the pool has room,
-    /// or `registration` would replace the validator's existing registration.
+    /// or `registration` would replace the existing registration of its index.
     pub fn has_room_for(&self, registration: &SignedPqKeyRegistration, max_len: usize) -> bool {
-        self.len() < max_len
-            || self
-                .by_validator_index
-                .contains_key(&registration.message.validator_index)
+        self.len() < max_len || self.by_index.contains_key(&registration.message.index)
     }
 
     /// Insert a verified registration, keeping at most `max_len` registrations.
     ///
-    /// A registration replaces the validator's existing one only if it names a later
+    /// A registration replaces the existing one of its index only if it names a later
     /// `previous_change_epoch` in chain order (see `cmp_pq_change_epochs`), i.e. it applies to a
-    /// later change of the validator's keys.
+    /// later change of the index's keys. For a builder index this holds across reuse of the
+    /// index, whose stored epoch only increases.
     pub fn insert(
         &mut self,
         registration: SignedPqKeyRegistration,
         max_len: usize,
     ) -> PqKeyRegistrationInsertOutcome {
-        let validator_index = registration.message.validator_index;
+        let index = registration.message.index;
         let sequence = self.next_sequence;
         let pooled = PooledRegistration {
             sequence,
             registration,
         };
-        let pool_len = self.by_validator_index.len();
-        match self.by_validator_index.entry(validator_index) {
+        let pool_len = self.by_index.len();
+        match self.by_index.entry(index) {
             Entry::Vacant(entry) => {
                 if pool_len >= max_len {
                     return PqKeyRegistrationInsertOutcome::PoolFull;
@@ -106,23 +107,21 @@ impl PqKeyRegistrations {
                 self.fifo.remove(&replaced.sequence);
             }
         }
-        self.fifo.insert(sequence, validator_index);
+        self.fifo.insert(sequence, index);
         self.next_sequence = self.next_sequence.saturating_add(1);
         PqKeyRegistrationInsertOutcome::Inserted
     }
 
     /// Number of registrations in the pool.
     fn len(&self) -> usize {
-        self.by_validator_index.len()
+        self.by_index.len()
     }
 
     /// Registrations in insertion order (oldest first), used for persistence and block packing.
     pub fn iter_fifo(&self) -> impl Iterator<Item = &SignedPqKeyRegistration> {
-        self.fifo.values().filter_map(|validator_index| {
-            self.by_validator_index
-                .get(validator_index)
-                .map(|pooled| &pooled.registration)
-        })
+        self.fifo
+            .values()
+            .filter_map(|index| self.by_index.get(index).map(|pooled| &pooled.registration))
     }
 
     /// Select up to `limit` registrations that are valid when applied in order to `state`, the
@@ -130,18 +129,18 @@ impl PqKeyRegistrations {
     ///
     /// Registrations are taken oldest first. A registration is skipped if:
     ///
-    /// - it is invalid against `state` (unknown or exiting validator, stale
-    ///   `previous_change_epoch`, change delay not elapsed, key held by any validator, including
-    ///   its own), or
-    /// - `exits_in_block` returns `true` for its validator, because an operation processed before
-    ///   registrations in the same block (slashing, voluntary exit, parent execution request) may
-    ///   initiate its exit, or
+    /// - it is invalid against `state` (unknown or exiting validator, unknown or inactive builder,
+    ///   non-zero builder VRF root, stale `previous_change_epoch`, change delay not elapsed,
+    ///   all-zero key, key held by any validator or builder, including its own), or
+    /// - `exits_in_block` returns `true` for its index (flagged for a builder), because an
+    ///   operation processed before registrations in the same block (slashing, voluntary exit,
+    ///   parent execution request) may initiate its exit, or
     /// - its leanXMSS key is registered by a registration selected earlier.
     ///
-    /// Registrations apply to distinct validators, so a selected registration only changes the
-    /// entry of its own validator, and the key uniqueness check above accounts for keys taken by
-    /// earlier registrations in the block. Keys released by earlier registrations are treated as
-    /// still in use, which is conservative.
+    /// Registrations apply to distinct indices, so a selected registration only changes the entry
+    /// of its own index, and the key uniqueness check above accounts for keys taken by earlier
+    /// registrations in the block. Keys released by earlier registrations, or by a builder deposit
+    /// reusing an index, are treated as still in use, which is conservative.
     ///
     /// The pool is walked in FIFO order without sorting and the walk stops once `limit`
     /// registrations are selected. Skipped registrations cost a cheap check each (signatures are
@@ -164,7 +163,7 @@ impl PqKeyRegistrations {
                 break;
             }
             let message = &registration.message;
-            if exits_in_block(message.validator_index)
+            if exits_in_block(message.index)
                 || verify_pq_key_registration(state, registration, VerifySignatures::False, spec)
                     .is_err()
                 || !selected_keys.insert(&message.public_keys.xmss_public_key)
@@ -176,18 +175,15 @@ impl PqKeyRegistrations {
         selected
     }
 
-    /// The pool's registration for `validator_index`, if any.
-    pub fn get(&self, validator_index: u64) -> Option<&SignedPqKeyRegistration> {
-        self.by_validator_index
-            .get(&validator_index)
-            .map(|pooled| &pooled.registration)
+    /// The pool's registration for a validator or flagged builder index, if any.
+    pub fn get(&self, index: u64) -> Option<&SignedPqKeyRegistration> {
+        self.by_index.get(&index).map(|pooled| &pooled.registration)
     }
 
     /// Remove `registration` from the pool, if the pool holds exactly it. Returns `true` if it
     /// was removed.
     pub fn remove(&mut self, registration: &SignedPqKeyRegistration) -> bool {
-        let validator_index = registration.message.validator_index;
-        let Entry::Occupied(entry) = self.by_validator_index.entry(validator_index) else {
+        let Entry::Occupied(entry) = self.by_index.entry(registration.message.index) else {
             return false;
         };
         if entry.get().registration != *registration {
@@ -199,26 +195,30 @@ impl PqKeyRegistrations {
     }
 
     /// Prune registrations that are dead or invalid against `finalized_state`, returning the
-    /// `(validator_index, previous_change_epoch)` pairs of the pruned registrations.
+    /// `(index, previous_change_epoch)` pairs of the pruned registrations.
     ///
     /// A registration is pruned if, in `finalized_state`:
     ///
-    /// - its `previous_change_epoch` is dead (`is_pq_registration_dead`): its validator's
-    ///   `pq_key_change_epochs` entry is past it, so it was applied or a later change superseded
-    ///   it, or it names a change before the finalized epoch that the finalized chain does not
-    ///   hold, made on a fork that is not canonical. No descendant can include it;
-    /// - any validator holds its leanXMSS key: another validator won a race for the key, its own
-    ///   validator applied it, or it re-registers a key its validator holds. It is invalid against
-    ///   the finalized state. It could become valid again on a descendant if the holder later
-    ///   changes away from the key, but it is pruned anyway, as EIP-8450 allows for a first-seen
-    ///   registration that is no longer valid against the finalized state: keeping it would hold
-    ///   its pool slot and its gossip pair indefinitely, and a resubmission is accepted once the
-    ///   pair is forgotten;
-    /// - its validator initiated an exit. No descendant can include it.
+    /// - its `previous_change_epoch` is dead (`is_pq_registration_dead`): its index's stored change
+    ///   epoch is past it, so it was applied or a later change superseded it, or it names a change
+    ///   (or builder deposit) before the finalized epoch that the finalized chain does not hold,
+    ///   made on a fork that is not canonical. No descendant can include it;
+    /// - any validator or builder holds its leanXMSS key: another one won a race for the key, its
+    ///   own index applied it, or it re-registers a key its index holds. It is invalid against the
+    ///   finalized state. It could become valid again on a descendant if the holder later changes
+    ///   away from the key (or a builder's index is reused), but it is pruned anyway, as EIP-8450
+    ///   allows for a first-seen registration that is no longer valid against the finalized state:
+    ///   keeping it would hold its pool slot and its gossip pair indefinitely, and a resubmission
+    ///   is accepted once the pair is forgotten;
+    /// - its validator initiated an exit, or its builder initiated an exit
+    ///   (`withdrawable_epoch != FAR_FUTURE_EPOCH`) and it names the builder's stored epoch. Neither
+    ///   becomes registrable again. A builder's index can be reused by a later builder, but every
+    ///   registration of the later builder names a later epoch (see `cmp_pq_change_epochs`), and is
+    ///   kept.
     ///
     /// The caller must forget the returned pairs in its gossip duplicate filter: a pair whose
-    /// registration lost a key race is otherwise never accepted again, since the validator's
-    /// change epoch does not move.
+    /// registration lost a key race is otherwise never accepted again, since the stored change
+    /// epoch does not move.
     ///
     /// Pruning against the finalized state rather than the head keeps registrations applied in
     /// non-finalized blocks, so they can be included again if those blocks are re-orged out.
@@ -228,51 +228,61 @@ impl PqKeyRegistrations {
         finalized_state: &BeaconState<E>,
         spec: &ChainSpec,
     ) -> Vec<(u64, Epoch)> {
-        let Ok(change_epochs) = finalized_state.pq_key_change_epochs() else {
+        if finalized_state.pq_key_change_epochs().is_err() {
             return vec![];
-        };
-        let validators = finalized_state.validators();
+        }
         let finalized_epoch = finalized_state.current_epoch();
         let held_keys = self.finalized_held_keys(finalized_state);
 
         let mut pruned = vec![];
-        self.by_validator_index.retain(
-            |&validator_index,
+        self.by_index.retain(
+            |&index,
              PooledRegistration {
                  sequence,
                  registration,
              }| {
                 let message = &registration.message;
-                let index = validator_index as usize;
-                let exited = validators
-                    .get(index)
-                    .is_some_and(|validator| validator.exit_epoch != spec.far_future_epoch);
-                let dead = change_epochs.get(index).is_some_and(|epoch| {
-                    is_pq_registration_dead(*epoch, message.previous_change_epoch, finalized_epoch)
+                let stored = finalized_state.get_pq_key_change_epoch(index).ok();
+                let dead = stored.is_some_and(|stored| {
+                    is_pq_registration_dead(stored, message.previous_change_epoch, finalized_epoch)
                 });
+                let exited = match PqRegistryIndex::new(index) {
+                    PqRegistryIndex::Validator(validator_index) => finalized_state
+                        .validators()
+                        .get(validator_index as usize)
+                        .is_some_and(|validator| validator.exit_epoch != spec.far_future_epoch),
+                    PqRegistryIndex::Builder(builder_index) => {
+                        stored == Some(message.previous_change_epoch)
+                            && finalized_state
+                                .get_builder(builder_index)
+                                .is_ok_and(|builder| {
+                                    builder.withdrawable_epoch != spec.far_future_epoch
+                                })
+                    }
+                };
                 let key_taken = held_keys.contains(&message.public_keys.xmss_public_key);
                 let keep = !exited && !dead && !key_taken;
                 if !keep {
-                    pruned.push((*sequence, validator_index, message.previous_change_epoch));
+                    pruned.push((*sequence, index, message.previous_change_epoch));
                 }
                 keep
             },
         );
         pruned
             .into_iter()
-            .map(|(sequence, validator_index, previous_change_epoch)| {
+            .map(|(sequence, index, previous_change_epoch)| {
                 self.fifo.remove(&sequence);
-                (validator_index, previous_change_epoch)
+                (index, previous_change_epoch)
             })
             .collect()
     }
 
-    /// The leanXMSS keys of the pooled registrations that a validator holds in `state`.
+    /// The leanXMSS keys of the pooled registrations that a validator or builder holds in `state`.
     ///
     /// Uses the state's `PqPubkeyCache` when it is built, and otherwise scans the registry once.
     fn finalized_held_keys<E: EthSpec>(&self, state: &BeaconState<E>) -> HashSet<XmssPublicKey> {
         let pooled_keys = self
-            .by_validator_index
+            .by_index
             .values()
             .map(|pooled| &pooled.registration.message.public_keys.xmss_public_key)
             .collect::<HashSet<_>>();
@@ -311,12 +321,15 @@ mod tests {
     use crate::OperationPool;
     use crate::persistence::{PersistedOperationPool, PersistedOperationPoolV20};
     use beacon_chain::test_utils::InteropGenesisBuilder;
+    use beacon_chain::test_utils::builder_withdrawal_credentials;
     use bls::Signature;
     use ssz::Encode;
     use store::StoreItem;
+    use types::consts::gloas::PAYLOAD_BUILDER_VERSION;
     use types::test_utils::generate_deterministic_keypairs;
     use types::{
         Epoch, ForkName, Hash256, MainnetEthSpec, MinimalEthSpec, PqKeyRegistration, PqPublicKeys,
+        PqRegistryIndex, Slot,
     };
 
     type E = MinimalEthSpec;
@@ -346,13 +359,13 @@ mod tests {
     /// A registration with dummy signatures: the pool trusts that registrations were verified on
     /// insertion and does not check signatures when packing.
     fn registration(
-        validator_index: u64,
+        index: u64,
         key_byte: u8,
         previous_change_epoch: u64,
     ) -> SignedPqKeyRegistration {
         SignedPqKeyRegistration {
             message: PqKeyRegistration {
-                validator_index,
+                index,
                 public_keys: keys(key_byte),
                 previous_change_epoch: Epoch::new(previous_change_epoch),
             },
@@ -375,7 +388,7 @@ mod tests {
     fn validator_indices(registrations: &[SignedPqKeyRegistration]) -> Vec<u64> {
         registrations
             .iter()
-            .map(|registration| registration.message.validator_index)
+            .map(|registration| registration.message.index)
             .collect()
     }
 
@@ -719,5 +732,146 @@ mod tests {
         assert_eq!(decoded, PersistedOperationPool::V20(v20));
         let restored = decoded.into_operation_pool().unwrap();
         assert!(restored.get_all_pq_key_registrations().is_empty());
+    }
+
+    /// The registry index of the builder at `builder_index`, with `BUILDER_INDEX_FLAG` set.
+    fn builder(builder_index: u64) -> u64 {
+        PqRegistryIndex::Builder(builder_index).as_u64()
+    }
+
+    /// A builder registration of key `key_byte`, with the zero VRF root.
+    fn builder_registration(
+        builder_index: u64,
+        key_byte: u8,
+        previous_change_epoch: u64,
+    ) -> SignedPqKeyRegistration {
+        let mut registration =
+            registration(builder(builder_index), key_byte, previous_change_epoch);
+        registration.message.public_keys.vrf_root = Hash256::ZERO;
+        registration
+    }
+
+    /// The genesis state at `epoch`, with `count` builders deposited at genesis (validator keys
+    /// `0..count`) and the finalized checkpoint at `epoch - 1`, so that the builders are active.
+    fn state_with_builders(spec: &ChainSpec, count: u64, epoch: u64) -> BeaconState<E> {
+        let mut state = genesis_state(spec);
+        let keypairs = generate_deterministic_keypairs(count as usize);
+        for keypair in &keypairs {
+            state
+                .add_builder_to_registry(
+                    keypair.pk.compress(),
+                    PAYLOAD_BUILDER_VERSION,
+                    builder_withdrawal_credentials(&keypair.pk, spec),
+                    spec.min_deposit_amount,
+                    Slot::new(0),
+                    spec,
+                )
+                .unwrap();
+        }
+        *state.slot_mut() = Epoch::new(epoch).start_slot(E::slots_per_epoch());
+        state.finalized_checkpoint_mut().epoch = Epoch::new(epoch - 1);
+        state
+    }
+
+    fn initiate_builder_exit(state: &mut BeaconState<E>, builder_index: u64) {
+        let withdrawable_epoch = state.current_epoch() + 2;
+        state
+            .builders_mut()
+            .unwrap()
+            .get_mut(builder_index as usize)
+            .unwrap()
+            .withdrawable_epoch = withdrawable_epoch;
+    }
+
+    #[test]
+    fn builder_registrations_are_selected_unless_invalidated_in_block() {
+        let spec = spec();
+        let mut state = state_with_builders(&spec, 4, 2);
+        // Builder 2 initiated an exit.
+        initiate_builder_exit(&mut state, 2);
+
+        let mut with_vrf_root = builder_registration(3, 4, 0);
+        with_vrf_root.message.public_keys.vrf_root = Hash256::repeat_byte(4);
+        let pool = pool_with(&[
+            builder_registration(0, 1, 0),
+            // Exited by an operation of the same block.
+            builder_registration(1, 2, 0),
+            // Exited.
+            builder_registration(2, 3, 0),
+            // Builders register no VRF root.
+            with_vrf_root,
+            // Outside the builder registry.
+            builder_registration(4, 5, 0),
+            // A validator registration is selected alongside.
+            registration(0, 6, NEVER),
+        ]);
+
+        let selected = pool.select_for_block(&state, |index| index == builder(1), 8, &spec);
+        assert_eq!(validator_indices(&selected), vec![builder(0), 0]);
+
+        // A builder's stored epoch only moves forward numerically, also from its deposit epoch.
+        let mut pool = pool;
+        assert_eq!(
+            pool.insert(builder_registration(0, 7, NEVER), usize::MAX),
+            PqKeyRegistrationInsertOutcome::NotNewer
+        );
+        assert_eq!(
+            pool.insert(builder_registration(0, 7, 3), usize::MAX),
+            PqKeyRegistrationInsertOutcome::Inserted
+        );
+    }
+
+    /// Builder registrations are pruned when dead by the builder's stored epoch (which starts at
+    /// its deposit epoch), when the builder initiated an exit and the registration names its
+    /// stored epoch, and when their key is held. A registration naming a later epoch for an exited
+    /// builder's index is kept: a builder reusing the index names its own, later, deposit epoch.
+    #[test]
+    fn prune_handles_builder_entries() {
+        let spec = spec();
+        let mut finalized_state = state_with_builders(&spec, 6, 5);
+        finalized_state
+            .set_pq_public_keys(builder(0), keys(30), Epoch::new(3))
+            .unwrap();
+        finalized_state
+            .set_pq_public_keys(5, keys(31), Epoch::new(4))
+            .unwrap();
+        initiate_builder_exit(&mut finalized_state, 2);
+        initiate_builder_exit(&mut finalized_state, 3);
+
+        let registrations = [
+            // Superseded by builder 0's registration at epoch 3.
+            builder_registration(0, 1, 0),
+            // A first registration of an active builder.
+            builder_registration(1, 2, 0),
+            // A first registration of a builder that initiated an exit.
+            builder_registration(2, 3, 0),
+            // Names a later deposit epoch at the exited builder 3's index.
+            builder_registration(3, 4, 7),
+            // Validator 5 holds the key.
+            builder_registration(4, 31, 0),
+            // Names a change before the finalized epoch that the finalized state does not hold.
+            builder_registration(5, 6, 2),
+        ];
+
+        let mut uncached_state = finalized_state.clone();
+        uncached_state.drop_pq_pubkey_cache();
+        for state in [&finalized_state, &uncached_state] {
+            let mut pool = pool_with(&registrations);
+            let mut pruned = pool.prune(state, &spec);
+            pruned.sort();
+            assert_eq!(
+                pool.iter_fifo().cloned().collect::<Vec<_>>(),
+                vec![builder_registration(1, 2, 0), builder_registration(3, 4, 7)]
+            );
+            assert_eq!(
+                pruned,
+                vec![
+                    (builder(0), Epoch::new(0)),
+                    (builder(2), Epoch::new(0)),
+                    (builder(4), Epoch::new(0)),
+                    (builder(5), Epoch::new(2)),
+                ]
+            );
+        }
     }
 }

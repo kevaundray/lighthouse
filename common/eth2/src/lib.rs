@@ -717,6 +717,9 @@ impl BeaconNodeHttpClient {
 
     /// `GET beacon/states/{state_id}/pq_public_keys?id`
     ///
+    /// `ids` are validator indices, or builder indices with `BUILDER_INDEX_FLAG` set. Without
+    /// `ids`, every validator and then every builder is returned.
+    ///
     /// Returns `Ok(None)` on a 404 error.
     pub async fn get_beacon_states_pq_public_keys(
         &self,

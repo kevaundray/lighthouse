@@ -32,12 +32,12 @@ use types::{
     BeaconBlockGloas, BeaconBlockHeze, BeaconState, BeaconStateError, BlobsList, BuilderIndex,
     Deposit, Eth1Data, EthSpec, ExecutionBlockHash, ExecutionPayloadBidGloas,
     ExecutionPayloadBidHeze, ExecutionPayloadEnvelope, ExecutionRequestsGloas, FullPayload,
-    Graffiti, Hash256, IndexedAttestation, KzgProofs, PayloadAttestation, ProgressiveTransactions,
-    ProposerSlashing, RelativeEpoch, SignedBeaconBlock, SignedBlsToExecutionChange,
-    SignedExecutionPayloadBid, SignedExecutionPayloadBidGloas, SignedExecutionPayloadBidHeze,
-    SignedExecutionPayloadEnvelope, SignedExecutionPayloadEnvelopeSummary, SignedPqKeyRegistration,
-    SignedProposerPreferences, SignedVoluntaryExit, Slot, SyncAggregate, Uint256, Withdrawal,
-    Withdrawals,
+    Graffiti, Hash256, IndexedAttestation, KzgProofs, PayloadAttestation, PqRegistryIndex,
+    ProgressiveTransactions, ProposerSlashing, RelativeEpoch, SignedBeaconBlock,
+    SignedBlsToExecutionChange, SignedExecutionPayloadBid, SignedExecutionPayloadBidGloas,
+    SignedExecutionPayloadBidHeze, SignedExecutionPayloadEnvelope,
+    SignedExecutionPayloadEnvelopeSummary, SignedPqKeyRegistration, SignedProposerPreferences,
+    SignedVoluntaryExit, Slot, SyncAggregate, Uint256, Withdrawal, Withdrawals,
 };
 
 use builder_client::BidRequestContext;
@@ -617,12 +617,12 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             .map_err(BlockProductionError::SszTypesError)?;
 
         // [New in EIP-8450] Block processing applies registrations after every other operation,
-        // so skip the validators that this block's earlier operations may exit.
+        // so skip the validators and builders that this block's earlier operations may exit.
         let pq_key_registrations = if state.fork_name_unchecked().eip8450_enabled() {
             let _guard = debug_span!("get_pq_key_registrations").entered();
             // Key uniqueness checks read the cache.
             state.update_pq_pubkey_cache()?;
-            let (exiting_indices, exiting_pubkeys) = validators_exiting_before_pq_registrations(
+            let exiting = ExitsBeforePqRegistrations::new(
                 &proposer_slashings,
                 &attester_slashings,
                 &voluntary_exits,
@@ -630,13 +630,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             );
             self.op_pool.get_pq_key_registrations(
                 &state,
-                |index| {
-                    exiting_indices.contains(&index)
-                        || state
-                            .validators()
-                            .get(index as usize)
-                            .is_none_or(|validator| exiting_pubkeys.contains(&validator.pubkey))
-                },
+                |index| exiting.may_invalidate(&state, index),
                 &self.spec,
             )
         } else {
@@ -1688,62 +1682,115 @@ fn filter_voluntary_exits_for_parent_execution_requests<E: EthSpec>(
     }
 }
 
-/// Validators whose exit an operation applied before the block's `pq_key_registrations` may
-/// initiate, as `(indices, pubkeys)`.
+/// The validators and builders whose exit an operation applied before the block's
+/// `pq_key_registrations` may initiate.
 ///
 /// Block processing applies the parent's execution requests and then the block's slashings and
 /// voluntary exits before the registrations, and a registration for a validator that initiated an
-/// exit is invalid. Withdrawal and consolidation requests identify validators by pubkey.
+/// exit, or for a builder that is not active, is invalid. Withdrawal, consolidation and builder
+/// exit requests identify validators and builders by pubkey.
 ///
 /// Like `filter_voluntary_exits_for_parent_execution_requests` this is conservative: every
-/// withdrawal request and every consolidation source counts, even if processing ignores it.
-fn validators_exiting_before_pq_registrations<E: EthSpec>(
-    proposer_slashings: &[ProposerSlashing],
-    attester_slashings: &[AttesterSlashingGloas<E>],
-    voluntary_exits: &[SignedVoluntaryExit],
-    parent_execution_requests: &ExecutionRequestsGloas<E>,
-) -> (HashSet<u64>, HashSet<PublicKeyBytes>) {
-    let mut indices = HashSet::new();
-    indices.extend(
-        proposer_slashings
-            .iter()
-            .map(|slashing| slashing.signed_header_1.message.proposer_index),
-    );
-    for slashing in attester_slashings {
-        let attesters_2 = slashing
-            .attestation_2
-            .attesting_indices
-            .iter()
-            .collect::<HashSet<_>>();
-        indices.extend(
-            slashing
-                .attestation_1
+/// withdrawal request, consolidation source and builder exit request counts, even if processing
+/// ignores it.
+///
+/// These are the only operations before the registrations that can invalidate a registration
+/// valid against the pre-state:
+///
+/// - Builder deposit requests reuse only the index of a builder whose `withdrawable_epoch` has
+///   passed, which is not active in the pre-state, and a builder they append or top up cannot
+///   register in the same block: its deposit epoch is the current epoch, which is not finalized.
+///   A builder's public key changes only through such reuse.
+/// - Voluntary exits name validators only: a flagged index is an unknown validator.
+/// - The finalized checkpoint, which builder activity depends on, changes only at epoch
+///   processing.
+/// - Registrations write only their own entry, and `select_for_block` treats keys taken by earlier
+///   registrations as in use.
+struct ExitsBeforePqRegistrations {
+    validator_indices: HashSet<u64>,
+    validator_pubkeys: HashSet<PublicKeyBytes>,
+    builder_pubkeys: HashSet<PublicKeyBytes>,
+}
+
+impl ExitsBeforePqRegistrations {
+    fn new<E: EthSpec>(
+        proposer_slashings: &[ProposerSlashing],
+        attester_slashings: &[AttesterSlashingGloas<E>],
+        voluntary_exits: &[SignedVoluntaryExit],
+        parent_execution_requests: &ExecutionRequestsGloas<E>,
+    ) -> Self {
+        let mut validator_indices = HashSet::new();
+        validator_indices.extend(
+            proposer_slashings
+                .iter()
+                .map(|slashing| slashing.signed_header_1.message.proposer_index),
+        );
+        for slashing in attester_slashings {
+            let attesters_2 = slashing
+                .attestation_2
                 .attesting_indices
                 .iter()
-                .filter(|index| attesters_2.contains(index)),
+                .collect::<HashSet<_>>();
+            validator_indices.extend(
+                slashing
+                    .attestation_1
+                    .attesting_indices
+                    .iter()
+                    .filter(|index| attesters_2.contains(index)),
+            );
+        }
+        validator_indices.extend(
+            voluntary_exits
+                .iter()
+                .map(|exit| exit.message.validator_index),
         );
-    }
-    indices.extend(
-        voluntary_exits
-            .iter()
-            .map(|exit| exit.message.validator_index),
-    );
 
-    let mut pubkeys = HashSet::new();
-    pubkeys.extend(
-        parent_execution_requests
-            .withdrawals
+        let mut validator_pubkeys = HashSet::new();
+        validator_pubkeys.extend(
+            parent_execution_requests
+                .withdrawals
+                .iter()
+                .map(|request| request.validator_pubkey),
+        );
+        validator_pubkeys.extend(
+            parent_execution_requests
+                .consolidations
+                .iter()
+                .filter(|request| request.source_pubkey != request.target_pubkey)
+                .map(|request| request.source_pubkey),
+        );
+
+        let builder_pubkeys = parent_execution_requests
+            .builder_exits
             .iter()
-            .map(|request| request.validator_pubkey),
-    );
-    pubkeys.extend(
-        parent_execution_requests
-            .consolidations
-            .iter()
-            .filter(|request| request.source_pubkey != request.target_pubkey)
-            .map(|request| request.source_pubkey),
-    );
-    (indices, pubkeys)
+            .map(|request| request.pubkey)
+            .collect();
+
+        Self {
+            validator_indices,
+            validator_pubkeys,
+            builder_pubkeys,
+        }
+    }
+
+    /// Returns `true` if the block's earlier operations may invalidate a registration of `index`,
+    /// a validator or flagged builder index of `state`, the block's pre-state. An index unknown to
+    /// `state` counts, as its registration is invalid anyway.
+    fn may_invalidate<E: EthSpec>(&self, state: &BeaconState<E>, index: u64) -> bool {
+        match PqRegistryIndex::new(index) {
+            PqRegistryIndex::Validator(validator_index) => {
+                self.validator_indices.contains(&validator_index)
+                    || state
+                        .validators()
+                        .get(validator_index as usize)
+                        .is_none_or(|validator| self.validator_pubkeys.contains(&validator.pubkey))
+            }
+            PqRegistryIndex::Builder(builder_index) => state
+                .get_builder(builder_index)
+                .ok()
+                .is_none_or(|builder| self.builder_pubkeys.contains(&builder.pubkey)),
+        }
+    }
 }
 
 #[cfg(test)]
