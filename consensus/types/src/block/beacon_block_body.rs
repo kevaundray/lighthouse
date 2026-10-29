@@ -57,10 +57,14 @@ pub const NUM_BEACON_BLOCK_BODY_HASH_TREE_ROOT_LEAVES: usize = 16;
 /// Index of the `blob_kzg_commitments` leaf in the `BeaconBlockBody` tree post-deneb.
 pub const BLOB_KZG_COMMITMENTS_INDEX: usize = 11;
 
-/// The `active_fields` of the progressive-container `BeaconBlockBody` variants (EIP-7688).
+/// The `active_fields` of the Gloas `BeaconBlockBody` progressive container (EIP-7688).
 ///
-/// Must match the `active_fields` attribute on the struct.
+/// Must match the `active_fields` attribute on the Gloas variant.
 pub const BEACON_BLOCK_BODY_ACTIVE_FIELDS: [bool; 13] = [true; 13];
+/// The `active_fields` of the Heze `BeaconBlockBody`: EIP-8015 removes `eth1_data` (1) and
+/// `deposits` (6).
+///
+/// Must match the `active_fields` attribute on the Heze variant.
 pub const BEACON_BLOCK_BODY_ACTIVE_FIELDS_HEZE: [bool; 13] = [
     true, false, true, true, true, true, false, true, true, true, true, true, true,
 ];
