@@ -2310,8 +2310,9 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
     ///
     /// Verification follows the `pq_key_registration` gossip rules. Rejections that do not depend
     /// on our view of the chain (builder VRF root, all-zero key, BLS signature, proof of possession)
-    /// penalize the peer more than those that do, which an honest peer on a different head or with
-    /// a different view of finality (builder activity) can trigger.
+    /// penalize the peer more than those that do, which an honest peer on a different head can
+    /// trigger. A builder whose deposit is not finalized in our head state is ignored, since our
+    /// view of finality may lag the peer's.
     pub fn process_gossip_pq_key_registration(
         self: &Arc<Self>,
         message_id: MessageId,
@@ -2345,11 +2346,12 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
                     | PqKeyRegistrationError::VerificationError(_)
                     | PqKeyRegistrationError::Invalid(_)
                     | PqKeyRegistrationError::ConflictsWithPool
-                    | PqKeyRegistrationError::PoolFull => None,
+                    | PqKeyRegistrationError::PoolFull
+                    | PqKeyRegistrationError::BuilderDepositNotFinalized { .. } => None,
                     PqKeyRegistrationError::UnknownValidator(_)
                     | PqKeyRegistrationError::ValidatorExiting { .. }
                     | PqKeyRegistrationError::UnknownBuilder(_)
-                    | PqKeyRegistrationError::BuilderNotActive(_)
+                    | PqKeyRegistrationError::BuilderExiting { .. }
                     | PqKeyRegistrationError::PreviousChangeEpochMismatch { .. }
                     | PqKeyRegistrationError::XmssPublicKeyInUse { .. } => {
                         Some(PeerAction::HighToleranceError)

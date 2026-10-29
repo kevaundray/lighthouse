@@ -64,14 +64,27 @@ pub enum Error {
     ///
     /// REJECT.
     UnknownBuilder(BuilderIndex),
-    /// The builder is not active in the head state: its deposit epoch is not finalized, or it has
-    /// initiated an exit.
+    /// The builder has initiated an exit in the head state.
     ///
     /// ## Peer scoring
     ///
-    /// REJECT. Activity depends on the finalized checkpoint of the head state, so a peer with a
-    /// different view of finality can trigger it.
-    BuilderNotActive(BuilderIndex),
+    /// REJECT.
+    BuilderExiting {
+        builder_index: BuilderIndex,
+        withdrawable_epoch: Epoch,
+    },
+    /// The builder's deposit epoch is not before the head state's finalized epoch, so the builder
+    /// is not active yet.
+    ///
+    /// ## Peer scoring
+    ///
+    /// IGNORE: finality can differ between nodes, so a peer that has seen finality advance
+    /// forwards it honestly.
+    BuilderDepositNotFinalized {
+        builder_index: BuilderIndex,
+        deposit_epoch: Epoch,
+        finalized_epoch: Epoch,
+    },
     /// The builder registers a non-zero VRF root.
     ///
     /// ## Peer scoring
@@ -302,7 +315,8 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         }
 
         // [REJECT] The index is a validator in the head state that has not initiated an exit, or
-        // a flagged builder index of an active builder.
+        // a flagged builder index of a builder that has not initiated an exit.
+        // [IGNORE] A builder's deposit epoch is finalized in the head state, so it is active.
         // [REJECT] A builder registers a zero VRF root.
         let pubkey = match PqRegistryIndex::new(index) {
             PqRegistryIndex::Validator(validator_index) => {
@@ -323,8 +337,19 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                     .builders()?
                     .get(builder_index as usize)
                     .ok_or(Error::UnknownBuilder(builder_index))?;
-                if !state.is_active_builder(builder_index, &self.spec)? {
-                    return Err(Error::BuilderNotActive(builder_index));
+                if builder.withdrawable_epoch != self.spec.far_future_epoch {
+                    return Err(Error::BuilderExiting {
+                        builder_index,
+                        withdrawable_epoch: builder.withdrawable_epoch,
+                    });
+                }
+                let finalized_epoch = state.finalized_checkpoint().epoch;
+                if builder.deposit_epoch >= finalized_epoch {
+                    return Err(Error::BuilderDepositNotFinalized {
+                        builder_index,
+                        deposit_epoch: builder.deposit_epoch,
+                        finalized_epoch,
+                    });
                 }
                 if public_keys.vrf_root != VrfRoot::ZERO {
                     return Err(Error::BuilderNonZeroVrfRoot(builder_index));
@@ -1145,7 +1170,7 @@ mod tests {
             registration
         };
 
-        // [REJECT] Not active: the deposit epoch is not finalized. The index rule comes before
+        // [IGNORE] Not active: the deposit epoch is not finalized. The finality rule comes before
         // the VRF root rule.
         assert!(matches!(
             chain.verify_pq_key_registration_for_gossip(with_vrf_root(builder_registration(
@@ -1154,7 +1179,10 @@ mod tests {
                 key_a,
                 deposit_epoch
             ))),
-            Err(Error::BuilderNotActive(0))
+            Err(Error::BuilderDepositNotFinalized {
+                builder_index: 0,
+                ..
+            })
         ));
         // [REJECT] Outside the builder registry.
         let mut unknown = builder_registration(&harness, 0, key_a, deposit_epoch);

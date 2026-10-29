@@ -2,7 +2,9 @@
 //! the gossip-verify → import path, across the fork upgrade, and block production of builder
 //! registrations that the block's parent execution requests invalidate.
 
-use beacon_chain::pq_key_registration_verification::PqKeyRegistrationOutcome;
+use beacon_chain::pq_key_registration_verification::{
+    Error as PqKeyRegistrationError, PqKeyRegistrationOutcome,
+};
 use beacon_chain::test_utils::{
     AttestationStrategy, BeaconChainHarness, BlockStrategy, EphemeralHarnessType,
     builder_withdrawal_credentials,
@@ -491,6 +493,19 @@ async fn registration_of_builder_exiting_in_the_same_block_is_not_packed() {
     );
     assert!(!state.is_pq_registered(builder(0)).unwrap());
     assert!(state.is_pq_registered(builder(1)).unwrap());
+
+    // On gossip, a builder that has initiated an exit is rejected, not ignored.
+    assert!(matches!(
+        harness
+            .chain
+            .verify_pq_key_registration_for_gossip(builder_registration(
+                &state, 0, &XMSS_KEY_2, &spec
+            )),
+        Err(PqKeyRegistrationError::BuilderExiting {
+            builder_index: 0,
+            withdrawable_epoch,
+        }) if withdrawable_epoch != spec.far_future_epoch
+    ));
 }
 
 /// A builder deposit among the block's parent execution requests reuses the index of a builder
