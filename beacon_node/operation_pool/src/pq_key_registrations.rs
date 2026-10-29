@@ -198,24 +198,25 @@ impl PqKeyRegistrations {
         true
     }
 
-    /// Prune registrations that can no longer be included in any block descending from
-    /// `finalized_state`, returning the `(validator_index, previous_change_epoch)` pairs of the
-    /// pruned registrations.
+    /// Prune registrations that are dead or invalid against `finalized_state`, returning the
+    /// `(validator_index, previous_change_epoch)` pairs of the pruned registrations.
     ///
     /// A registration is pruned if, in `finalized_state`:
     ///
     /// - its `previous_change_epoch` is dead (`is_pq_registration_dead`): its validator's
     ///   `pq_key_change_epochs` entry is past it, so it was applied or a later change superseded
     ///   it, or it names a change before the finalized epoch that the finalized chain does not
-    ///   hold, made on a fork that is not canonical;
-    /// - any validator holds its leanXMSS key: another validator won a race for the key, or its
-    ///   own validator holds it, because it was applied or because it re-registers the key its
-    ///   validator already holds. Either way it is invalid: every registration needs a key no
-    ///   validator holds, and a holder only releases a key by changing its own keys, which is not
-    ///   expected for a key it just won;
-    /// - its validator initiated an exit.
+    ///   hold, made on a fork that is not canonical. No descendant can include it;
+    /// - any validator holds its leanXMSS key: another validator won a race for the key, its own
+    ///   validator applied it, or it re-registers a key its validator holds. It is invalid against
+    ///   the finalized state. It could become valid again on a descendant if the holder later
+    ///   changes away from the key, but it is pruned anyway, as EIP-8450 allows for a first-seen
+    ///   registration that is no longer valid against the finalized state: keeping it would hold
+    ///   its pool slot and its gossip pair indefinitely, and a resubmission is accepted once the
+    ///   pair is forgotten;
+    /// - its validator initiated an exit. No descendant can include it.
     ///
-    /// The caller should forget the returned pairs in its gossip duplicate filter: a pair whose
+    /// The caller must forget the returned pairs in its gossip duplicate filter: a pair whose
     /// registration lost a key race is otherwise never accepted again, since the validator's
     /// change epoch does not move.
     ///
