@@ -161,10 +161,13 @@ impl<E: EthSpec, Payload: AbstractExecPayload<E>> BeaconBlock<E, Payload> {
     /// Usually it's better to prefer `from_ssz_bytes` which will decode the correct variant based
     /// on the fork slot.
     pub fn any_from_ssz_bytes(bytes: &[u8]) -> Result<Self, ssz::DecodeError> {
-        // TODO(heze): decode Heze here once it diverges from Gloas. While the two variants are
-        // SSZ-identical, trying Heze first would mis-tag every Gloas block as Heze.
+        // Variants are tried newest first. The SSZ layouts of Gloas, Heze and Eip8450 bodies
+        // differ (Heze drops `eth1_data` and `deposits` and changes the bid, Eip8450 adds
+        // `pq_key_registrations`), so their fixed parts differ in length and each decodes only as
+        // itself.
         BeaconBlockEip8450::from_ssz_bytes(bytes)
             .map(BeaconBlock::Eip8450)
+            .or_else(|_| BeaconBlockHeze::from_ssz_bytes(bytes).map(BeaconBlock::Heze))
             .or_else(|_| BeaconBlockGloas::from_ssz_bytes(bytes).map(BeaconBlock::Gloas))
             .or_else(|_| BeaconBlockFulu::from_ssz_bytes(bytes).map(BeaconBlock::Fulu))
             .or_else(|_| BeaconBlockElectra::from_ssz_bytes(bytes).map(BeaconBlock::Electra))
@@ -1174,6 +1177,23 @@ mod tests {
         test_ssz_tree_hash_pair_with(&block, &inner_block, |bytes| {
             BeaconBlock::from_ssz_bytes(bytes, spec)
         });
+    }
+
+    /// Each variant since Gloas decodes as itself without a fork schedule.
+    #[test]
+    fn any_from_ssz_bytes_decodes_post_gloas_variants() {
+        let mut u = crate::test_utils::test_unstructured();
+        let blocks = [
+            BeaconBlock::Gloas(BeaconBlockGloas::arbitrary(&mut u).unwrap()),
+            BeaconBlock::Heze(BeaconBlockHeze::arbitrary(&mut u).unwrap()),
+            BeaconBlock::Eip8450(BeaconBlockEip8450::arbitrary(&mut u).unwrap()),
+        ];
+        for block in blocks {
+            assert_eq!(
+                BeaconBlock::any_from_ssz_bytes(&block.as_ssz_bytes()).unwrap(),
+                block
+            );
+        }
     }
 
     #[test]

@@ -1,7 +1,9 @@
 //! EIP-8450 (post-quantum consensus key registry): blocks carrying `SignedPqKeyRegistration`s on
-//! the gossip-verify → import path, across the fork upgrade, and block production of builder
-//! registrations that the block's parent execution requests invalidate.
+//! the gossip-verify → import path, across the fork upgrade and through range sync, and block
+//! production of builder registrations that the block's parent execution requests invalidate.
 
+use beacon_chain::block_verification_types::RangeSyncBlock;
+use beacon_chain::payload_envelope_verification::AvailableEnvelope;
 use beacon_chain::pq_key_registration_verification::{
     Error as PqKeyRegistrationError, PqKeyRegistrationOutcome,
 };
@@ -10,7 +12,8 @@ use beacon_chain::test_utils::{
     builder_withdrawal_credentials,
 };
 use beacon_chain::{
-    AvailabilityProcessingStatus, BlockError, InvalidSignature, NotifyExecutionLayer,
+    AvailabilityProcessingStatus, BlockError, ChainSegmentResult, InvalidSignature,
+    NotifyExecutionLayer,
 };
 use bls::Keypair;
 use lean_pq::xmss;
@@ -376,9 +379,8 @@ fn builder_registration(
     )
 }
 
-/// An Eip8450-genesis chain with the builders of `BUILDER_VALIDATORS`, extended until their
-/// deposit epoch is finalized, so that they are active.
-async fn harness_with_active_builders() -> Harness {
+/// An Eip8450-genesis chain with the builders of `BUILDER_VALIDATORS`, deposited at genesis.
+fn builders_harness() -> Harness {
     let harness = BeaconChainHarness::<EphemeralHarnessType<E>>::builder(E::default())
         .spec(Arc::new(
             ForkName::Eip8450.make_genesis_spec(E::default_spec()),
@@ -389,6 +391,13 @@ async fn harness_with_active_builders() -> Harness {
         .mock_execution_layer()
         .build();
     harness.advance_slot();
+    harness
+}
+
+/// `builders_harness`, extended until the builders' deposit epoch is finalized, so that they are
+/// active.
+async fn harness_with_active_builders() -> Harness {
+    let harness = builders_harness();
     harness
         .extend_chain(
             5 * E::slots_per_epoch() as usize,
@@ -610,4 +619,172 @@ async fn registration_of_builder_whose_index_is_reused_in_the_same_block_is_not_
         Ok(state.current_epoch())
     );
     assert!(!state.is_pq_registered(builder(0)).unwrap());
+}
+
+/// A block and its payload envelope, as range sync receives them.
+type SegmentBlock = (
+    Arc<SignedBeaconBlock<E>>,
+    Option<Arc<SignedExecutionPayloadEnvelope<E>>>,
+);
+
+/// Extends the chain by `num_slots` blocks, returning each with its payload envelope.
+async fn extend_recording_segment(harness: &Harness, num_slots: usize) -> Vec<SegmentBlock> {
+    let mut segment = Vec::with_capacity(num_slots);
+    for _ in 0..num_slots {
+        let block_root = harness.extend_slots(1).await;
+        let block = harness.chain.get_block(&block_root).await.unwrap().unwrap();
+        let envelope = harness
+            .chain
+            .get_payload_envelope(&block_root)
+            .unwrap()
+            .map(Arc::new);
+        segment.push((Arc::new(block), envelope));
+    }
+    segment
+}
+
+/// A `builders_harness` source chain without blobs, so that payload envelopes are available
+/// without data columns.
+fn segment_source_harness() -> Harness {
+    let harness = builders_harness();
+    harness
+        .execution_block_generator()
+        .set_generate_blobs(false);
+    harness
+}
+
+/// Imports `segment` into `harness` with `process_chain_segment`, as range sync does.
+async fn process_segment(harness: &Harness, segment: &[SegmentBlock]) -> ChainSegmentResult {
+    let chain = &harness.chain;
+    let blocks = segment
+        .iter()
+        .map(|(block, envelope)| {
+            let bid = block
+                .message()
+                .body()
+                .signed_execution_payload_bid()
+                .unwrap();
+            let envelope = envelope.clone().map(|envelope| {
+                AvailableEnvelope::new(envelope, vec![], bid, &chain.custody_context).unwrap()
+            });
+            RangeSyncBlock::new_gloas(block.canonical_root(), block.clone(), envelope).unwrap()
+        })
+        .collect();
+    let last_slot = segment.last().unwrap().0.slot();
+    chain.slot_clock.set_slot(last_slot.as_u64());
+    chain
+        .process_chain_segment(blocks, NotifyExecutionLayer::Yes)
+        .await
+}
+
+/// A chain segment whose blocks carry a validator's and a builder's registration is imported by
+/// range sync, which verifies their proofs of possession with the segment's signatures.
+#[tokio::test]
+async fn range_sync_imports_segment_with_registrations() {
+    let source = segment_source_harness();
+    let spec = source.spec.clone();
+    // The builders are active once their deposit epoch is finalized.
+    let mut segment = extend_recording_segment(&source, 5 * E::slots_per_epoch() as usize).await;
+    let state = source.get_current_state();
+    assert!(state.is_active_builder(0, &spec).unwrap());
+    let validator_registration = registration(&state, &spec);
+    let builder_registration = builder_registration(&state, 0, &XMSS_KEY_2, &spec);
+    submit(&source, validator_registration.clone());
+    submit(&source, builder_registration.clone());
+    let registration_index = segment.len();
+    segment.extend(extend_recording_segment(&source, 2).await);
+
+    let registration_block = &segment[registration_index].0;
+    let packed = registration_block
+        .message()
+        .body()
+        .pq_key_registrations()
+        .unwrap()
+        .to_vec();
+    assert_eq!(packed.len(), 2);
+    assert!(packed.contains(&validator_registration));
+    assert!(packed.contains(&builder_registration));
+    let registration_epoch = registration_block.epoch();
+
+    let harness = builders_harness();
+    match process_segment(&harness, &segment).await {
+        ChainSegmentResult::Successful { imported_blocks } => {
+            assert_eq!(imported_blocks.len(), segment.len())
+        }
+        ChainSegmentResult::Failed { error, .. } => {
+            panic!("the segment should import: {error:?}")
+        }
+    }
+    harness.chain.recompute_head_at_current_slot().await;
+    assert_eq!(
+        harness.head_block_root(),
+        segment.last().unwrap().0.canonical_root()
+    );
+
+    let state = harness.get_current_state();
+    assert_eq!(state.get_pq_key_material(REGISTRANT), Ok(&key_material()));
+    assert_eq!(
+        state.get_pq_key_change_epoch(REGISTRANT),
+        Ok(registration_epoch)
+    );
+    assert_eq!(
+        state.get_pq_key_material(builder(0)),
+        Ok(&builder_registration.message.key_material)
+    );
+    assert_eq!(
+        state.get_pq_key_change_epoch(builder(0)),
+        Ok(registration_epoch)
+    );
+    assert!(!state.is_pq_registered(builder(1)).unwrap());
+}
+
+/// Range sync rejects a block whose registration carries an invalid proof of possession, while
+/// the blocks of the earlier epochs of the segment are imported.
+#[tokio::test]
+async fn range_sync_rejects_segment_with_invalid_possession_proof() {
+    let source = segment_source_harness();
+    let spec = source.spec.clone();
+    let mut segment = extend_recording_segment(&source, 2 * E::slots_per_epoch() as usize).await;
+    // Valid BLS authorization, corrupted proof of possession.
+    let mut invalid = registration(&source.get_current_state(), &spec);
+    invalid.possession[100] ^= 0x01;
+    let (invalid_block, _, _, _) = block_with_registrations(&source, vec![invalid]).await;
+    let invalid_root = invalid_block.canonical_root();
+    let invalid_epoch = invalid_block.epoch();
+    segment.push((invalid_block, None));
+
+    let harness = builders_harness();
+    let ChainSegmentResult::Failed {
+        imported_blocks,
+        error,
+    } = process_segment(&harness, &segment).await
+    else {
+        panic!("the segment should be rejected");
+    };
+    assert!(
+        matches!(
+            error,
+            BlockError::InvalidSignature(InvalidSignature::Unknown)
+        ),
+        "{error:?}"
+    );
+    // Signatures are verified per epoch: the earlier epochs are imported, the invalid block's
+    // epoch is not.
+    let earlier_epochs: Vec<_> = segment
+        .iter()
+        .map(|(block, _)| block)
+        .filter(|block| block.epoch() < invalid_epoch)
+        .map(|block| (block.canonical_root(), block.slot()))
+        .collect();
+    assert!(!earlier_epochs.is_empty());
+    assert_eq!(imported_blocks, earlier_epochs);
+    assert!(!harness.chain.block_is_known_to_fork_choice(&invalid_root));
+
+    harness.chain.recompute_head_at_current_slot().await;
+    assert!(
+        !harness
+            .get_current_state()
+            .is_pq_registered(REGISTRANT)
+            .unwrap()
+    );
 }

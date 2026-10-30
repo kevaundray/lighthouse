@@ -964,6 +964,11 @@ async fn prepare_payload_around_heze_boundary(prepare_slot: Slot, heze_fork_epoc
     }
     spec.gloas_fork_epoch = Some(Epoch::new(0));
     spec.heze_fork_epoch = Some(heze_fork_epoch);
+    // Under `FORK_NAME=eip8450`, EIP-8450 is at epoch 0: keep it scheduled, after Heze as on a
+    // real network, since a fork scheduled before Heze would be applied to a pre-Heze state.
+    spec.eip8450_fork_epoch = spec
+        .eip8450_fork_epoch
+        .map(|epoch| epoch.max(heze_fork_epoch + 1));
     let spec = Arc::new(spec);
 
     let prepare_slot_is_heze = spec.fork_name_at_slot::<E>(prepare_slot).heze_enabled();

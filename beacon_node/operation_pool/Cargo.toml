@@ -25,6 +25,7 @@ serde = { workspace = true }
 state_processing = { workspace = true }
 store = { workspace = true }
 superstruct = { workspace = true }
+tracing = { workspace = true }
 typenum = { workspace = true }
 types = { workspace = true }
 

@@ -7385,6 +7385,7 @@ dependencies = [
  "store",
  "superstruct",
  "tokio",
+ "tracing",
  "typenum",
  "types",
 ]

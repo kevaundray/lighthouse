@@ -47,7 +47,7 @@ pub enum Error {
     ///
     /// ## Peer scoring
     ///
-    /// REJECT.
+    /// IGNORE: a recently deposited validator may not be in every node's head state yet.
     UnknownValidator(u64),
     /// The validator has initiated an exit in the head state.
     ///
@@ -62,7 +62,7 @@ pub enum Error {
     ///
     /// ## Peer scoring
     ///
-    /// REJECT.
+    /// IGNORE: a recently deposited builder may not be in every node's head state yet.
     UnknownBuilder(BuilderIndex),
     /// The builder has initiated an exit in the head state.
     ///
@@ -104,7 +104,8 @@ pub enum Error {
     ///
     /// ## Peer scoring
     ///
-    /// REJECT.
+    /// IGNORE: a head that has not yet seen the last change, or has seen a later one, holds
+    /// another epoch.
     PreviousChangeEpochMismatch { expected: Epoch, found: Epoch },
     /// The index has registered keys, and `MIN_PQ_KEY_CHANGE_DELAY` epochs have not passed
     /// since its last change at the current (wall-clock) epoch, allowing for
@@ -134,7 +135,7 @@ pub enum Error {
     ///
     /// ## Peer scoring
     ///
-    /// REJECT.
+    /// IGNORE: the holder of a key can differ between heads.
     XmssPublicKeyInUse { owner: u64 },
     /// The leanXMSS proof of possession is invalid.
     ///
@@ -314,8 +315,8 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             return Err(Error::HeadPriorToEip8450);
         }
 
-        // [REJECT] The index is a validator in the head state that has not initiated an exit, or
-        // a flagged builder index of a builder that has not initiated an exit.
+        // [IGNORE] The index is a validator, or a flagged builder index, in the head state.
+        // [REJECT] The validator or builder has not initiated an exit.
         // [IGNORE] A builder's deposit epoch is finalized in the head state, so it is active.
         // [REJECT] A builder registers a zero VRF root.
         let pubkey = match PqRegistryIndex::new(index) {
@@ -370,7 +371,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             });
         }
 
-        // [REJECT] The registration names the stored change epoch of the index in the head state.
+        // [IGNORE] The registration names the stored change epoch of the index in the head state.
         let last_change_epoch = state.get_pq_key_change_epoch(index)?;
         if registration.previous_change_epoch != last_change_epoch {
             return Err(Error::PreviousChangeEpochMismatch {
@@ -394,8 +395,9 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
             }
         }
 
-        // [REJECT] The leanXMSS key is not all-zero and is not registered for any index in the head
-        // state, including this one. Checked before the signature, as it is cheaper.
+        // [REJECT] The leanXMSS key is not all-zero.
+        // [IGNORE] The leanXMSS key is not registered for any index in the head state, including
+        // this one. Both are checked before the signature, as they are cheaper.
         if key_material.xmss_public_key == XmssPublicKey::default() {
             return Err(Error::ZeroXmssPublicKey);
         }
@@ -644,7 +646,7 @@ mod tests {
             Err(Error::PriorRegistrationKnown { .. })
         ));
 
-        // [REJECT] Unknown validator.
+        // [IGNORE] Unknown validator.
         let mut unknown_validator = registration(&harness, 1, key_b, NEVER);
         unknown_validator.message.index = VALIDATOR_COUNT as u64;
         assert!(matches!(
@@ -652,12 +654,18 @@ mod tests {
             Err(Error::UnknownValidator(_))
         ));
 
-        // [REJECT] Stale previous change epoch: a first registration naming `GENESIS_EPOCH`.
+        // [IGNORE] Stale previous change epoch: a first registration naming `GENESIS_EPOCH`.
         assert!(matches!(
             chain.verify_pq_key_registration_for_gossip(registration(&harness, 1, key_b, 0)),
             Err(Error::PreviousChangeEpochMismatch { expected, found })
                 if expected == Epoch::new(NEVER) && found == Epoch::new(0)
         ));
+        {
+            // Ignored registrations do not mark their pair as observed.
+            let observed = chain.observed_pq_key_registrations.lock();
+            assert!(!observed.is_known(VALIDATOR_COUNT as u64, Epoch::new(NEVER)));
+            assert!(!observed.is_known(1, Epoch::new(0)));
+        }
 
         // [REJECT] The all-zero key, checked before the signature.
         let mut zero_key = registration(&harness, 1, key_b, NEVER);
@@ -683,7 +691,7 @@ mod tests {
             Err(Error::InvalidPossessionProof)
         ));
 
-        // Rejected registrations do not mark their pair as observed.
+        // Rejected and ignored registrations do not mark their pair as observed.
         assert!(
             chain
                 .verify_pq_key_registration_for_gossip(registration(&harness, 1, key_b, NEVER))
@@ -952,10 +960,11 @@ mod tests {
         assert_eq!(chain.op_pool.get_all_pq_key_registrations(), vec![retry]);
     }
 
-    /// Gossip and HTTP reject a change that re-registers the key its own validator holds: every
-    /// registration carries a key that no validator holds, including the registering one.
+    /// Gossip ignores, and HTTP rejects, a change that re-registers the key its own validator
+    /// holds: every registration carries a key that no validator holds, including the registering
+    /// one.
     #[tokio::test]
-    async fn own_current_key_is_rejected() {
+    async fn own_current_key_is_refused() {
         let mut spec = ForkName::Eip8450.make_genesis_spec(E::default_spec());
         // Changes are allowed at once, so the key check is reached.
         spec.min_pq_key_change_delay = Epoch::new(0);
@@ -987,7 +996,7 @@ mod tests {
             Err(Error::XmssPublicKeyInUse { owner: 0 })
         ));
         // On gossip the key rule comes before the signature: a key in use with a signature of
-        // another validator is rejected for its key.
+        // another validator is ignored for its key.
         let mut bad_signature = same_key.clone();
         bad_signature.signature = registration(&harness, 1, key_b, NEVER).signature;
         assert!(matches!(
@@ -1184,13 +1193,19 @@ mod tests {
                 ..
             })
         ));
-        // [REJECT] Outside the builder registry.
+        // [IGNORE] Outside the builder registry.
         let mut unknown = builder_registration(&harness, 0, key_a, deposit_epoch);
         unknown.message.index = builder(BUILDER_VALIDATORS.len() as u64);
         assert!(matches!(
             chain.verify_pq_key_registration_for_gossip(unknown),
             Err(Error::UnknownBuilder(2))
         ));
+        assert!(
+            !chain
+                .observed_pq_key_registrations
+                .lock()
+                .is_known(builder(2), Epoch::new(deposit_epoch))
+        );
 
         // Finalize the deposit epoch.
         harness
@@ -1205,7 +1220,7 @@ mod tests {
             ))),
             Err(Error::BuilderNonZeroVrfRoot(0))
         ));
-        // [REJECT] A builder's never-registered marker is its deposit epoch, not
+        // [IGNORE] A builder's never-registered marker is its deposit epoch, not
         // `FAR_FUTURE_EPOCH`.
         assert!(matches!(
             chain.verify_pq_key_registration_for_gossip(builder_registration(

@@ -1,5 +1,6 @@
 //! Known-answer tests pinning leanXMSS verification (`lean_pq::xmss`, which implements EIP-8450's
-//! `xmss.Verify` and `xmss_signature_index`) and the EIP-8450 proof of possession.
+//! `xmss.Verify`, and whose `Signature::leaf_index` implements `get_xmss_signature_index`) and the
+//! EIP-8450 proof of possession.
 //!
 //! The vectors in `xmss_known_answer.txt` come from an independent Python signer over a reference
 //! leanXMSS construction (Keccak-256), which also decided every expected outcome; see the header

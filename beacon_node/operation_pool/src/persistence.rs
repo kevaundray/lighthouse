@@ -6,13 +6,14 @@ use crate::pq_key_registrations::{PqKeyRegistrations, max_pool_len};
 use crate::sync_aggregate_id::SyncAggregateId;
 use educe::Educe;
 use parking_lot::RwLock;
-use ssz::{Decode, Encode};
+use ssz::{BYTES_PER_LENGTH_OFFSET, Decode, DecodeError, Encode};
 use ssz_derive::{Decode, Encode};
 use state_processing::SigVerifiedOp;
 use std::collections::HashSet;
 use std::mem;
 use store::{DBColumn, Error as StoreError, StoreItem};
 use superstruct::superstruct;
+use tracing::warn;
 use types::attestation::AttestationOnDisk;
 use types::*;
 
@@ -276,12 +277,60 @@ impl<E: EthSpec> StoreItem for PersistedOperationPoolV33<E> {
     }
 }
 
-/// Deserialization for `PersistedOperationPool` defaults to `PersistedOperationPool::V33`, and
-/// falls back to `PersistedOperationPool::V20` for pools written before EIP-8450.
+/// The length of the fixed part of `PersistedOperationPoolV20`: an offset for each of its 7
+/// variable-length fields.
+const V20_FIXED_LEN: usize = 7 * BYTES_PER_LENGTH_OFFSET;
+/// The length of the fixed part of `PersistedOperationPoolV33`: an offset for each of its 8
+/// variable-length fields.
+const V33_FIXED_LEN: usize = 8 * BYTES_PER_LENGTH_OFFSET;
+
+/// `PersistedOperationPoolV33` with its post-quantum key registrations left as raw bytes, so that
+/// a list in a pre-release layout can be dropped without losing the rest of the pool.
+#[derive(Decode)]
+struct PersistedOperationPoolV33RawPq<E: EthSpec> {
+    attestations: Vec<(AttestationOnDisk<E>, Vec<u64>)>,
+    sync_contributions: PersistedSyncContributions<E>,
+    attester_slashings: Vec<SigVerifiedOp<AttesterSlashing<E>, E>>,
+    proposer_slashings: Vec<SigVerifiedOp<ProposerSlashing, E>>,
+    voluntary_exits: Vec<SigVerifiedOp<SignedVoluntaryExit, E>>,
+    bls_to_execution_changes: Vec<SigVerifiedOp<SignedBlsToExecutionChange, E>>,
+    capella_bls_change_broadcast_indices: Vec<u64>,
+    pq_key_registrations: Vec<u8>,
+}
+
+/// Decode a `PersistedOperationPoolV33`. If its post-quantum key registrations do not decode
+/// (e.g. they were written by a pre-release layout), they are dropped with a warning and the
+/// rest of the pool is kept.
+fn decode_v33<E: EthSpec>(bytes: &[u8]) -> Result<PersistedOperationPoolV33<E>, DecodeError> {
+    let raw = PersistedOperationPoolV33RawPq::<E>::from_ssz_bytes(bytes)?;
+    let pq_key_registrations = Vec::<SignedPqKeyRegistration>::from_ssz_bytes(
+        &raw.pq_key_registrations,
+    )
+    .unwrap_or_else(|error| {
+        warn!(
+            ?error,
+            "Dropping persisted PQ key registrations that do not decode"
+        );
+        vec![]
+    });
+    Ok(PersistedOperationPoolV33 {
+        attestations: raw.attestations,
+        sync_contributions: raw.sync_contributions,
+        attester_slashings: raw.attester_slashings,
+        proposer_slashings: raw.proposer_slashings,
+        voluntary_exits: raw.voluntary_exits,
+        bls_to_execution_changes: raw.bls_to_execution_changes,
+        capella_bls_change_broadcast_indices: raw.capella_bls_change_broadcast_indices,
+        pq_key_registrations,
+    })
+}
+
+/// Deserialization for `PersistedOperationPool` decodes `PersistedOperationPool::V33`, or
+/// `PersistedOperationPool::V20` for pools written before EIP-8450, and reports the decoding error
+/// of the layout that was stored.
 ///
-/// The two layouts cannot be confused: every field is variable-length, so the first SSZ offset
-/// equals the length of the fixed part, which differs between `V20` (7 offsets) and `V33`
-/// (8 offsets).
+/// Every field of both layouts is variable-length, so the first SSZ offset equals the length of
+/// the fixed part, which tells the layouts apart: `V20_FIXED_LEN` or `V33_FIXED_LEN`.
 impl<E: EthSpec> StoreItem for PersistedOperationPool<E> {
     fn db_column() -> DBColumn {
         DBColumn::OpPool
@@ -292,9 +341,13 @@ impl<E: EthSpec> StoreItem for PersistedOperationPool<E> {
     }
 
     fn from_store_bytes(bytes: &[u8]) -> Result<Self, StoreError> {
-        PersistedOperationPoolV33::from_ssz_bytes(bytes)
-            .map(Self::V33)
-            .or_else(|_| PersistedOperationPoolV20::from_ssz_bytes(bytes).map(Self::V20))
-            .map_err(Into::into)
+        let pool = match ssz::read_offset(bytes)? {
+            V33_FIXED_LEN => decode_v33(bytes).map(Self::V33),
+            V20_FIXED_LEN => PersistedOperationPoolV20::from_ssz_bytes(bytes).map(Self::V20),
+            first_offset => Err(DecodeError::BytesInvalid(format!(
+                "unknown persisted op pool layout with first offset {first_offset}"
+            ))),
+        };
+        pool.map_err(Into::into)
     }
 }

@@ -1,8 +1,9 @@
 //! Post-quantum consensus key registry types (EIP-8450).
 //!
-//! EIP-8450 specifies only the interface of its hash-based primitives (`xmss.Verify`,
-//! `xmss_signature_index` and `vrf.Verify`) and the byte sizes of their values. leanXMSS
-//! verification is implemented by `lean_pq`.
+//! EIP-8450 specifies only the interface of its hash-based primitives (`xmss.Verify` and
+//! `vrf.Verify`) and the byte sizes of their values. leanXMSS verification is implemented by
+//! `lean_pq`, whose `Signature::leaf_index` reads the leaf index that EIP-8450's
+//! `get_xmss_signature_index` defines: the little-endian `u32` in the first four bytes.
 
 mod pq_key_material;
 mod pq_key_possession;

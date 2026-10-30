@@ -319,11 +319,13 @@ impl PartialEq for PqKeyRegistrations {
 mod tests {
     use super::*;
     use crate::OperationPool;
-    use crate::persistence::{PersistedOperationPool, PersistedOperationPoolV20};
+    use crate::persistence::{
+        PersistedOperationPool, PersistedOperationPoolV20, PersistedOperationPoolV33,
+    };
     use beacon_chain::test_utils::InteropGenesisBuilder;
     use beacon_chain::test_utils::builder_withdrawal_credentials;
     use bls::Signature;
-    use ssz::Encode;
+    use ssz::{Decode, DecodeError, Encode};
     use store::StoreItem;
     use types::consts::gloas::PAYLOAD_BUILDER_VERSION;
     use types::test_utils::generate_deterministic_keypairs;
@@ -734,10 +736,81 @@ mod tests {
             capella_bls_change_broadcast_indices: vec![7],
         };
 
-        let decoded = PersistedOperationPool::<E>::from_store_bytes(&v20.as_ssz_bytes()).unwrap();
+        let bytes = v20.as_ssz_bytes();
+        // The first offset is the length of the fixed part: 7 offsets.
+        assert_eq!(ssz::read_offset(&bytes).unwrap(), 28);
+        let decoded = PersistedOperationPool::<E>::from_store_bytes(&bytes).unwrap();
         assert_eq!(decoded, PersistedOperationPool::V20(v20));
         let restored = decoded.into_operation_pool().unwrap();
         assert!(restored.get_all_pq_key_registrations().is_empty());
+    }
+
+    fn v33_with_registrations() -> PersistedOperationPoolV33<E> {
+        PersistedOperationPoolV33 {
+            attestations: vec![],
+            sync_contributions: vec![],
+            attester_slashings: vec![],
+            proposer_slashings: vec![],
+            voluntary_exits: vec![],
+            bls_to_execution_changes: vec![],
+            capella_bls_change_broadcast_indices: vec![7],
+            pq_key_registrations: vec![registration(1, 1, NEVER), registration(2, 2, NEVER)],
+        }
+    }
+
+    /// A V33 pool whose registrations do not decode (e.g. a pre-release layout) keeps the rest of
+    /// the pool and starts with no registrations.
+    #[test]
+    fn v33_op_pool_with_undecodable_registrations_drops_them() {
+        let v33 = v33_with_registrations();
+        let mut bytes = v33.as_ssz_bytes();
+        // The first offset is the length of the fixed part: 8 offsets.
+        assert_eq!(ssz::read_offset(&bytes).unwrap(), 32);
+        // The registrations are the last field: a truncated list does not decode.
+        bytes.pop();
+        assert!(PersistedOperationPoolV33::<E>::from_ssz_bytes(&bytes).is_err());
+
+        let decoded = PersistedOperationPool::<E>::from_store_bytes(&bytes).unwrap();
+        assert_eq!(
+            decoded,
+            PersistedOperationPool::V33(PersistedOperationPoolV33 {
+                pq_key_registrations: vec![],
+                ..v33
+            })
+        );
+        let restored = decoded.into_operation_pool().unwrap();
+        assert!(restored.get_all_pq_key_registrations().is_empty());
+    }
+
+    /// A V33 pool that does not decode outside its registrations is an error of the V33 layout,
+    /// not of the V20 fallback.
+    #[test]
+    fn v33_op_pool_decode_error_is_reported() {
+        let mut bytes = v33_with_registrations().as_ssz_bytes();
+        // Move the offset of the registrations, the 8th, back by a byte: the broadcast indices
+        // before them are cut to 7 bytes, which is not a list of `u64`s.
+        let offset = ssz::read_offset(&bytes[28..32]).unwrap() as u32;
+        bytes[28..32].copy_from_slice(&(offset - 1).to_le_bytes());
+        let expected = PersistedOperationPoolV33::<E>::from_ssz_bytes(&bytes).unwrap_err();
+        assert_ne!(
+            PersistedOperationPoolV20::<E>::from_ssz_bytes(&bytes).unwrap_err(),
+            expected
+        );
+
+        assert!(matches!(
+            PersistedOperationPool::<E>::from_store_bytes(&bytes),
+            Err(store::Error::SszDecodeError(e)) if e == expected
+        ));
+    }
+
+    #[test]
+    fn unknown_op_pool_layout_is_an_error() {
+        let mut bytes = v33_with_registrations().as_ssz_bytes();
+        bytes[0..4].copy_from_slice(&12_u32.to_le_bytes());
+        assert!(matches!(
+            PersistedOperationPool::<E>::from_store_bytes(&bytes),
+            Err(store::Error::SszDecodeError(DecodeError::BytesInvalid(_)))
+        ));
     }
 
     /// The registry index of the builder at `builder_index`, with `BUILDER_INDEX_FLAG` set.
