@@ -27,19 +27,19 @@ pub fn upgrade_state_to_eip8450<E: EthSpec>(
 
     // [New in EIP-8450] one unset registry entry per validator. `FAR_FUTURE_EPOCH` marks a
     // validator that has never registered.
-    let pq_key_material = ProgressiveList::try_from_iter(std::iter::repeat_n(
+    let post_quantum_key_material = ProgressiveList::try_from_iter(std::iter::repeat_n(
         PqKeyMaterial::default(),
         num_validators,
     ))?;
-    let pq_key_change_epochs =
+    let post_quantum_key_change_epochs =
         ProgressiveList::try_from_iter(std::iter::repeat_n(spec.far_future_epoch, num_validators))?;
     // [New in EIP-8450] one unset registry entry per builder. A builder's deposit epoch marks a
     // builder that has never registered, since builder indices are reused.
-    let builder_pq_key_material = ProgressiveList::try_from_iter(std::iter::repeat_n(
+    let builder_post_quantum_key_material = ProgressiveList::try_from_iter(std::iter::repeat_n(
         PqKeyMaterial::default(),
         pre.builders.len(),
     ))?;
-    let builder_pq_key_change_epochs =
+    let builder_post_quantum_key_change_epochs =
         ProgressiveList::try_from_iter(pre.builders.iter().map(|builder| builder.deposit_epoch))?;
 
     // Where possible, use something like `mem::take` to move fields from behind the &mut
@@ -108,10 +108,10 @@ pub fn upgrade_state_to_eip8450<E: EthSpec>(
         payload_expected_withdrawals: mem::take(&mut pre.payload_expected_withdrawals),
         ptc_window: pre.ptc_window.clone(),
         // Eip8450
-        pq_key_material,
-        pq_key_change_epochs,
-        builder_pq_key_material,
-        builder_pq_key_change_epochs,
+        post_quantum_key_material,
+        post_quantum_key_change_epochs,
+        builder_post_quantum_key_material,
+        builder_post_quantum_key_change_epochs,
         // Caches
         total_active_balance: pre.total_active_balance,
         progressive_balances_cache: mem::take(&mut pre.progressive_balances_cache),

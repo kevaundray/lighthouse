@@ -217,7 +217,7 @@ pub fn verify_pq_key_registration<E: EthSpec>(
     let index = registration.index;
     let key_material = &registration.key_material;
 
-    if state.pq_key_change_epochs().is_err() {
+    if state.post_quantum_key_change_epochs().is_err() {
         return Err(error(Invalid::RegistryUnavailable));
     }
 

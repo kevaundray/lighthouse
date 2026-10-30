@@ -1080,7 +1080,7 @@ pub fn get_beacon_state_pq_key_material<T: BeaconChainTypes>(
                         .map_state_and_execution_optimistic_and_finalized(
                             &chain,
                             |state, execution_optimistic, finalized| {
-                                if state.pq_key_change_epochs().is_err() {
+                                if state.post_quantum_key_change_epochs().is_err() {
                                     return Err(warp_utils::reject::custom_bad_request(
                                         "the state is prior to the EIP-8450 fork and has no \
                                          post-quantum key registry"

@@ -48,7 +48,8 @@ type E = MinimalEthSpec;
 type Harness = BeaconChainHarness<EphemeralHarnessType<E>>;
 
 const VALIDATOR_COUNT: usize = 32;
-/// The `pq_key_change_epochs` entry of a validator that has never registered: `FAR_FUTURE_EPOCH`.
+/// The `post_quantum_key_change_epochs` entry of a validator that has never registered:
+/// `FAR_FUTURE_EPOCH`.
 const NEVER_REGISTERED: Epoch = Epoch::new(u64::MAX);
 /// `MAX_PQ_KEY_REGISTRATIONS + 1` leanXMSS keys, so a block can carry one registration too many.
 static XMSS_KEYS: [LazyLock<xmss::SecretKey>; 9] = [
@@ -284,20 +285,20 @@ fn assert_rejected(
         Err(invalid(expected))
     );
     assert_eq!(
-        post_state.pq_key_material().unwrap(),
-        state.pq_key_material().unwrap()
+        post_state.post_quantum_key_material().unwrap(),
+        state.post_quantum_key_material().unwrap()
     );
     assert_eq!(
-        post_state.pq_key_change_epochs().unwrap(),
-        state.pq_key_change_epochs().unwrap()
+        post_state.post_quantum_key_change_epochs().unwrap(),
+        state.post_quantum_key_change_epochs().unwrap()
     );
     assert_eq!(
-        post_state.builder_pq_key_material().unwrap(),
-        state.builder_pq_key_material().unwrap()
+        post_state.builder_post_quantum_key_material().unwrap(),
+        state.builder_post_quantum_key_material().unwrap()
     );
     assert_eq!(
-        post_state.builder_pq_key_change_epochs().unwrap(),
-        state.builder_pq_key_change_epochs().unwrap()
+        post_state.builder_post_quantum_key_change_epochs().unwrap(),
+        state.builder_post_quantum_key_change_epochs().unwrap()
     );
 }
 
@@ -341,12 +342,21 @@ fn entry(state: &BeaconState<E>, index: u64) -> (PqKeyMaterial, Epoch) {
 
 fn assert_registry_invariant(state: &BeaconState<E>) {
     let validators = state.validators().len();
-    assert_eq!(state.pq_key_material().unwrap().len(), validators);
-    assert_eq!(state.pq_key_change_epochs().unwrap().len(), validators);
-    let builders = state.builders().unwrap().len();
-    assert_eq!(state.builder_pq_key_material().unwrap().len(), builders);
+    assert_eq!(state.post_quantum_key_material().unwrap().len(), validators);
     assert_eq!(
-        state.builder_pq_key_change_epochs().unwrap().len(),
+        state.post_quantum_key_change_epochs().unwrap().len(),
+        validators
+    );
+    let builders = state.builders().unwrap().len();
+    assert_eq!(
+        state.builder_post_quantum_key_material().unwrap().len(),
+        builders
+    );
+    assert_eq!(
+        state
+            .builder_post_quantum_key_change_epochs()
+            .unwrap()
+            .len(),
         builders
     );
 }
@@ -453,11 +463,16 @@ async fn first_registration_writes_keys_and_change_epoch() {
     );
     assert_eq!(state.pq_pubkey_cache().get(&xmss_public_key(0)), Some(1));
     // No other entry changed.
-    for (index, key_material) in state.pq_key_material().unwrap().iter().enumerate() {
+    for (index, key_material) in state
+        .post_quantum_key_material()
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
         if index != 1 {
             assert_eq!(*key_material, PqKeyMaterial::default());
             assert_eq!(
-                state.pq_key_change_epochs().unwrap().get(index),
+                state.post_quantum_key_change_epochs().unwrap().get(index),
                 Some(&NEVER_REGISTERED)
             );
         }
@@ -1042,8 +1057,8 @@ async fn block_with_too_many_registrations_is_invalid() {
         })
     );
     assert_eq!(
-        state.pq_key_material().unwrap(),
-        pre_state.pq_key_material().unwrap()
+        state.post_quantum_key_material().unwrap(),
+        pre_state.post_quantum_key_material().unwrap()
     );
 }
 
@@ -1212,7 +1227,7 @@ async fn fork_upgrade_initializes_unset_entries() {
 
     let mut state = harness.get_current_state();
     assert_eq!(state.fork_name_unchecked(), ForkName::Heze);
-    assert!(state.pq_key_material().is_err());
+    assert!(state.post_quantum_key_material().is_err());
 
     let fork_slot = Epoch::new(1).start_slot(E::slots_per_epoch());
     complete_state_advance(&mut state, None, fork_slot, None, spec).unwrap();
@@ -1223,14 +1238,14 @@ async fn fork_upgrade_initializes_unset_entries() {
     assert_registry_invariant(&state);
     assert!(
         state
-            .pq_key_material()
+            .post_quantum_key_material()
             .unwrap()
             .iter()
             .all(|key_material| *key_material == PqKeyMaterial::default())
     );
     assert!(
         state
-            .pq_key_change_epochs()
+            .post_quantum_key_change_epochs()
             .unwrap()
             .iter()
             .all(|epoch| *epoch == NEVER_REGISTERED)

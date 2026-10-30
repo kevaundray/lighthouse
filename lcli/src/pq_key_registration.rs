@@ -865,7 +865,7 @@ mod tests {
     /// The stored change epoch of validator `VALIDATOR_INDEX`, which its registration names.
     fn previous_change_epoch(state: &BeaconState<E>) -> Epoch {
         *state
-            .pq_key_change_epochs()
+            .post_quantum_key_change_epochs()
             .unwrap()
             .get(VALIDATOR_INDEX as usize)
             .unwrap()
@@ -992,7 +992,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             applied
-                .pq_key_material()
+                .post_quantum_key_material()
                 .unwrap()
                 .get(VALIDATOR_INDEX as usize)
                 .unwrap(),
@@ -1021,7 +1021,7 @@ mod tests {
         // A builder that has never registered keys stores its deposit epoch, which a first
         // registration names.
         let previous_change_epoch = *state
-            .builder_pq_key_change_epochs()
+            .builder_post_quantum_key_change_epochs()
             .unwrap()
             .get(builder_index as usize)
             .unwrap();
@@ -1071,7 +1071,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             applied
-                .builder_pq_key_material()
+                .builder_post_quantum_key_material()
                 .unwrap()
                 .get(builder_index as usize)
                 .unwrap(),
@@ -1079,7 +1079,7 @@ mod tests {
         );
         assert_eq!(
             *applied
-                .builder_pq_key_change_epochs()
+                .builder_post_quantum_key_change_epochs()
                 .unwrap()
                 .get(builder_index as usize)
                 .unwrap(),
@@ -1107,7 +1107,7 @@ mod tests {
 
         let pubkey = builder_data(&state, builder_index, &spec).builder.pubkey;
         let previous_change_epoch = *state
-            .builder_pq_key_change_epochs()
+            .builder_post_quantum_key_change_epochs()
             .unwrap()
             .get(builder_index as usize)
             .unwrap();
@@ -1163,7 +1163,7 @@ mod tests {
         let builder = PqRegistryIndex::Builder(builder_index);
         let pubkey = builder_data(&state, builder_index, &spec).builder.pubkey;
         let previous_change_epoch = *state
-            .builder_pq_key_change_epochs()
+            .builder_post_quantum_key_change_epochs()
             .unwrap()
             .get(builder_index as usize)
             .unwrap();

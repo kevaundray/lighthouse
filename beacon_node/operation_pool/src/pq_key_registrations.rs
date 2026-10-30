@@ -152,7 +152,7 @@ impl PqKeyRegistrations {
         limit: usize,
         spec: &ChainSpec,
     ) -> Vec<SignedPqKeyRegistration> {
-        if state.pq_key_material().is_err() {
+        if state.post_quantum_key_material().is_err() {
             return vec![];
         }
 
@@ -228,7 +228,7 @@ impl PqKeyRegistrations {
         finalized_state: &BeaconState<E>,
         spec: &ChainSpec,
     ) -> Vec<(u64, Epoch)> {
-        if finalized_state.pq_key_change_epochs().is_err() {
+        if finalized_state.post_quantum_key_change_epochs().is_err() {
             return vec![];
         }
         let finalized_epoch = finalized_state.current_epoch();

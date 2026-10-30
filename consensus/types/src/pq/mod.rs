@@ -34,8 +34,9 @@ pub type VrfRoot = Hash256;
 /// Leaf index at which the proof of possession is signed.
 pub const PQ_POSSESSION_XMSS_INDEX: u32 = 0;
 
-/// `FAR_FUTURE_EPOCH`, the never-registered marker of a validator: the `pq_key_change_epochs`
-/// entry of a validator that has never registered keys, whose stored leanXMSS key is all-zero.
+/// `FAR_FUTURE_EPOCH`, the never-registered marker of a validator: the
+/// `post_quantum_key_change_epochs` entry of a validator that has never registered keys, whose
+/// stored leanXMSS key is all-zero.
 ///
 /// A builder's marker is its `deposit_epoch` instead, since builder indices are reused.
 ///

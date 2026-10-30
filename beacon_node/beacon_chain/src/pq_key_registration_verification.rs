@@ -251,7 +251,7 @@ impl ObservedPqKeyRegistrations {
     /// Drop the pairs that no registration can match on top of `finalized_state`. The stored
     /// change epoch of a builder index is read from the builder registry lists.
     pub fn prune<E: EthSpec>(&mut self, finalized_state: &BeaconState<E>) {
-        if finalized_state.pq_key_change_epochs().is_err() {
+        if finalized_state.post_quantum_key_change_epochs().is_err() {
             return;
         }
         let finalized_epoch = finalized_state.current_epoch();
@@ -310,7 +310,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         // [IGNORE] The head state is at or after the fork, so that it has the registry. A head
         // state prior to the fork (e.g. right after the fork boundary) has nothing to check
         // against.
-        if state.pq_key_change_epochs().is_err() {
+        if state.post_quantum_key_change_epochs().is_err() {
             return Err(Error::HeadPriorToEip8450);
         }
 
@@ -976,7 +976,7 @@ mod tests {
         );
         let change_epoch = *harness
             .get_current_state()
-            .pq_key_change_epochs()
+            .post_quantum_key_change_epochs()
             .unwrap()
             .get(0)
             .unwrap();

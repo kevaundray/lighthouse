@@ -81,7 +81,7 @@ fn registration(state: &BeaconState<E>, spec: &ChainSpec) -> SignedPqKeyRegistra
         key_material: key_material(),
         // A first registration names the stored entry, `FAR_FUTURE_EPOCH` until it registers.
         previous_change_epoch: *state
-            .pq_key_change_epochs()
+            .post_quantum_key_change_epochs()
             .unwrap()
             .get(REGISTRANT as usize)
             .unwrap(),
@@ -125,18 +125,18 @@ async fn harness_past_eip8450_fork() -> Harness {
     assert_eq!(head_state.validators().len(), VALIDATOR_COUNT);
     assert!(
         head_state
-            .pq_key_material()
+            .post_quantum_key_material()
             .unwrap()
             .iter()
             .all(|key_material| *key_material == PqKeyMaterial::default())
     );
     assert_eq!(
-        head_state.pq_key_change_epochs().unwrap().len(),
+        head_state.post_quantum_key_change_epochs().unwrap().len(),
         VALIDATOR_COUNT
     );
     assert!(
         head_state
-            .pq_key_change_epochs()
+            .post_quantum_key_change_epochs()
             .unwrap()
             .iter()
             .all(|epoch| *epoch == harness.spec.far_future_epoch)
@@ -253,14 +253,14 @@ async fn block_with_valid_registration_imports() {
     let head_state = &head.beacon_state;
     assert_eq!(
         head_state
-            .pq_key_material()
+            .post_quantum_key_material()
             .unwrap()
             .get(REGISTRANT as usize),
         Some(&key_material())
     );
     assert_eq!(
         head_state
-            .pq_key_change_epochs()
+            .post_quantum_key_change_epochs()
             .unwrap()
             .get(REGISTRANT as usize),
         Some(&registration_epoch)
@@ -279,7 +279,7 @@ async fn block_with_valid_registration_imports() {
     assert!(head.beacon_block.slot() > block.slot());
     assert_eq!(
         head.beacon_state
-            .pq_key_material()
+            .post_quantum_key_material()
             .unwrap()
             .get(REGISTRANT as usize),
         Some(&key_material())
@@ -325,7 +325,7 @@ async fn block_with_invalid_possession_proof_is_rejected() {
     );
     assert_eq!(
         head.beacon_state
-            .pq_key_material()
+            .post_quantum_key_material()
             .unwrap()
             .get(REGISTRANT as usize),
         Some(&PqKeyMaterial::default())
