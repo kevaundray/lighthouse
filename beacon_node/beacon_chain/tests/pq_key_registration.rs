@@ -30,7 +30,7 @@ use types::test_utils::{generate_deterministic_keypair, generate_deterministic_k
 use types::{
     BeaconState, BlockImportSource, BuilderDepositRequest, BuilderExitRequest, ChainSpec,
     DepositMessage, Domain, Epoch, EthSpec, ExecutionRequests, ExecutionRequestsGloas, ForkName,
-    Hash256, MinimalEthSpec, PQ_POSSESSION_XMSS_INDEX, PqKeyRegistration, PqPublicKeys,
+    Hash256, MinimalEthSpec, PQ_POSSESSION_XMSS_INDEX, PqKeyMaterial, PqKeyRegistration,
     PqRegistryIndex, SignedBeaconBlock, SignedExecutionPayloadEnvelope, SignedPqKeyRegistration,
     SignedRoot, Slot, XmssPublicKey, XmssSignature,
 };
@@ -58,8 +58,8 @@ fn xmss_public_key() -> XmssPublicKey {
     XmssPublicKey::new(XMSS_KEY.public_key().to_bytes().to_vec()).unwrap()
 }
 
-fn public_keys() -> PqPublicKeys {
-    PqPublicKeys {
+fn key_material() -> PqKeyMaterial {
+    PqKeyMaterial {
         xmss_public_key: xmss_public_key(),
         vrf_root: Hash256::repeat_byte(0xaa),
     }
@@ -78,7 +78,7 @@ fn registration(state: &BeaconState<E>, spec: &ChainSpec) -> SignedPqKeyRegistra
     eprintln!("leanXMSS possession proof signed in {:?}", start.elapsed());
     PqKeyRegistration {
         index: REGISTRANT,
-        public_keys: public_keys(),
+        key_material: key_material(),
         // A first registration names the stored entry, `FAR_FUTURE_EPOCH` until it registers.
         previous_change_epoch: *state
             .pq_key_change_epochs()
@@ -125,10 +125,10 @@ async fn harness_past_eip8450_fork() -> Harness {
     assert_eq!(head_state.validators().len(), VALIDATOR_COUNT);
     assert!(
         head_state
-            .pq_public_keys()
+            .pq_key_material()
             .unwrap()
             .iter()
-            .all(|keys| *keys == PqPublicKeys::default())
+            .all(|key_material| *key_material == PqKeyMaterial::default())
     );
     assert_eq!(
         head_state.pq_key_change_epochs().unwrap().len(),
@@ -253,10 +253,10 @@ async fn block_with_valid_registration_imports() {
     let head_state = &head.beacon_state;
     assert_eq!(
         head_state
-            .pq_public_keys()
+            .pq_key_material()
             .unwrap()
             .get(REGISTRANT as usize),
-        Some(&public_keys())
+        Some(&key_material())
     );
     assert_eq!(
         head_state
@@ -279,10 +279,10 @@ async fn block_with_valid_registration_imports() {
     assert!(head.beacon_block.slot() > block.slot());
     assert_eq!(
         head.beacon_state
-            .pq_public_keys()
+            .pq_key_material()
             .unwrap()
             .get(REGISTRANT as usize),
-        Some(&public_keys())
+        Some(&key_material())
     );
 }
 
@@ -325,10 +325,10 @@ async fn block_with_invalid_possession_proof_is_rejected() {
     );
     assert_eq!(
         head.beacon_state
-            .pq_public_keys()
+            .pq_key_material()
             .unwrap()
             .get(REGISTRANT as usize),
-        Some(&PqPublicKeys::default())
+        Some(&PqKeyMaterial::default())
     );
 }
 
@@ -362,7 +362,7 @@ fn builder_registration(
         .expect("leanXMSS signing succeeds");
     PqKeyRegistration {
         index: builder(builder_index),
-        public_keys: PqPublicKeys {
+        key_material: PqKeyMaterial {
             xmss_public_key,
             vrf_root: Hash256::ZERO,
         },

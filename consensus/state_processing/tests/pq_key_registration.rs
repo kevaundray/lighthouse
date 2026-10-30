@@ -38,7 +38,7 @@ use std::time::Instant;
 use types::test_utils::{generate_deterministic_keypair, generate_deterministic_keypairs};
 use types::{
     BeaconBlock, BeaconState, ChainSpec, DepositData, Domain, Epoch, EthSpec, ForkName, Hash256,
-    MinimalEthSpec, PQ_POSSESSION_XMSS_INDEX, PqKeyRegistration, PqPublicKeys, PqRegistryIndex,
+    MinimalEthSpec, PQ_POSSESSION_XMSS_INDEX, PqKeyMaterial, PqKeyRegistration, PqRegistryIndex,
     SignedBeaconBlock, SignedPqKeyRegistration, SignedRoot, Slot, VrfRoot, XmssPublicKey,
     XmssSignature, consts::gloas::PAYLOAD_BUILDER_VERSION,
     light_client::consts::FINALIZED_CHECKPOINT_FIELD_INDEX,
@@ -163,20 +163,20 @@ fn vrf_root(byte: u8) -> VrfRoot {
     VrfRoot::repeat_byte(byte)
 }
 
-fn public_keys(key: usize, vrf_byte: u8) -> PqPublicKeys {
-    PqPublicKeys {
+fn key_material(key: usize, vrf_byte: u8) -> PqKeyMaterial {
+    PqKeyMaterial {
         xmss_public_key: xmss_public_key(key),
         vrf_root: vrf_root(vrf_byte),
     }
 }
 
-/// A registration of `public_keys` for a validator or flagged builder `index` with a valid proof
+/// A registration of `key_material` for a validator or flagged builder `index` with a valid proof
 /// of possession (by leanXMSS key `key`) and a valid BLS authorization.
 fn registration_with_keys(
     state: &BeaconState<E>,
     index: u64,
     key: usize,
-    public_keys: PqPublicKeys,
+    key_material: PqKeyMaterial,
     previous_change_epoch: Epoch,
     spec: &ChainSpec,
 ) -> SignedPqKeyRegistration {
@@ -189,7 +189,7 @@ fn registration_with_keys(
     );
     PqKeyRegistration {
         index,
-        public_keys,
+        key_material,
         previous_change_epoch,
     }
     .sign(
@@ -213,7 +213,7 @@ fn registration(
         state,
         validator_index,
         key,
-        public_keys(key, vrf_byte),
+        key_material(key, vrf_byte),
         previous_change_epoch,
         spec,
     )
@@ -284,16 +284,16 @@ fn assert_rejected(
         Err(invalid(expected))
     );
     assert_eq!(
-        post_state.pq_public_keys().unwrap(),
-        state.pq_public_keys().unwrap()
+        post_state.pq_key_material().unwrap(),
+        state.pq_key_material().unwrap()
     );
     assert_eq!(
         post_state.pq_key_change_epochs().unwrap(),
         state.pq_key_change_epochs().unwrap()
     );
     assert_eq!(
-        post_state.builder_pq_public_keys().unwrap(),
-        state.builder_pq_public_keys().unwrap()
+        post_state.builder_pq_key_material().unwrap(),
+        state.builder_pq_key_material().unwrap()
     );
     assert_eq!(
         post_state.builder_pq_key_change_epochs().unwrap(),
@@ -332,19 +332,19 @@ fn register(
 }
 
 /// The keys and the change epoch of a validator or flagged builder index.
-fn entry(state: &BeaconState<E>, index: u64) -> (PqPublicKeys, Epoch) {
+fn entry(state: &BeaconState<E>, index: u64) -> (PqKeyMaterial, Epoch) {
     (
-        state.get_pq_public_keys(index).unwrap().clone(),
+        state.get_pq_key_material(index).unwrap().clone(),
         state.get_pq_key_change_epoch(index).unwrap(),
     )
 }
 
 fn assert_registry_invariant(state: &BeaconState<E>) {
     let validators = state.validators().len();
-    assert_eq!(state.pq_public_keys().unwrap().len(), validators);
+    assert_eq!(state.pq_key_material().unwrap().len(), validators);
     assert_eq!(state.pq_key_change_epochs().unwrap().len(), validators);
     let builders = state.builders().unwrap().len();
-    assert_eq!(state.builder_pq_public_keys().unwrap().len(), builders);
+    assert_eq!(state.builder_pq_key_material().unwrap().len(), builders);
     assert_eq!(
         state.builder_pq_key_change_epochs().unwrap().len(),
         builders
@@ -357,8 +357,8 @@ fn builder(builder_index: u64) -> u64 {
 }
 
 /// Builder keys: leanXMSS key `key` and the zero VRF root.
-fn builder_keys(key: usize) -> PqPublicKeys {
-    PqPublicKeys {
+fn builder_keys(key: usize) -> PqKeyMaterial {
+    PqKeyMaterial {
         xmss_public_key: xmss_public_key(key),
         vrf_root: VrfRoot::ZERO,
     }
@@ -435,7 +435,7 @@ async fn first_registration_writes_keys_and_change_epoch() {
     assert!(!state.is_pq_registered(1).unwrap());
     assert_eq!(
         entry(&state, 1),
-        (PqPublicKeys::default(), NEVER_REGISTERED)
+        (PqKeyMaterial::default(), NEVER_REGISTERED)
     );
 
     let signed = registration(&state, 1, 0, 0xaa, NEVER_REGISTERED, spec);
@@ -446,16 +446,16 @@ async fn first_registration_writes_keys_and_change_epoch() {
     process(&mut state, &signed, spec);
 
     assert!(state.is_pq_registered(1).unwrap());
-    assert_eq!(entry(&state, 1), (public_keys(0, 0xaa), Epoch::new(3)));
+    assert_eq!(entry(&state, 1), (key_material(0, 0xaa), Epoch::new(3)));
     assert_eq!(
         pq_public_key_owner(&state, &xmss_public_key(0)),
         Ok(Some(1))
     );
     assert_eq!(state.pq_pubkey_cache().get(&xmss_public_key(0)), Some(1));
     // No other entry changed.
-    for (index, keys) in state.pq_public_keys().unwrap().iter().enumerate() {
+    for (index, key_material) in state.pq_key_material().unwrap().iter().enumerate() {
         if index != 1 {
-            assert_eq!(*keys, PqPublicKeys::default());
+            assert_eq!(*key_material, PqKeyMaterial::default());
             assert_eq!(
                 state.pq_key_change_epochs().unwrap().get(index),
                 Some(&NEVER_REGISTERED)
@@ -496,7 +496,7 @@ async fn key_change_respects_min_delay_and_replays_are_rejected() {
     process(&mut state, &change, spec);
     assert_eq!(
         entry(&state, 1),
-        (public_keys(1, 0xbb), Epoch::new(change_epoch))
+        (key_material(1, 0xbb), Epoch::new(change_epoch))
     );
     assert_eq!(state.pq_pubkey_cache().get(&xmss_public_key(1)), Some(1));
     assert_eq!(state.pq_pubkey_cache().get(&xmss_public_key(0)), None);
@@ -537,11 +537,11 @@ async fn change_keeping_the_key_is_rejected() {
     *state.slot_mut() = Epoch::new(2 + delay).start_slot(E::slots_per_epoch());
     let vrf_change = registration(&state, 4, 0, 0xcc, Epoch::new(2), spec);
     let same_keys = registration(&state, 4, 0, 0xaa, Epoch::new(2), spec);
-    assert_eq!(same_keys.message.public_keys, entry(&state, 4).0);
+    assert_eq!(same_keys.message.key_material, entry(&state, 4).0);
     let expected = PqKeyRegistrationInvalid::XmssPublicKeyInUse { owner: 4 };
     for keeps_key in [&vrf_change, &same_keys] {
         assert_eq!(
-            keeps_key.message.public_keys.xmss_public_key,
+            keeps_key.message.key_material.xmss_public_key,
             xmss_public_key(0)
         );
         assert_rejected(&state, keeps_key, expected.clone(), spec);
@@ -558,7 +558,7 @@ async fn change_keeping_the_key_is_rejected() {
         pq_public_key_owner(&uncached, &xmss_public_key(0)),
         Ok(Some(4))
     );
-    assert_eq!(entry(&state, 4), (public_keys(0, 0xaa), Epoch::new(2)));
+    assert_eq!(entry(&state, 4), (key_material(0, 0xaa), Epoch::new(2)));
 }
 
 #[tokio::test]
@@ -574,14 +574,14 @@ async fn key_change_keeping_the_vrf_root_is_accepted() {
     *state.slot_mut() = Epoch::new(2 + delay).start_slot(E::slots_per_epoch());
     let key_change = registration(&state, 4, 1, 0xaa, Epoch::new(2), spec);
     assert_eq!(
-        key_change.message.public_keys.vrf_root,
+        key_change.message.key_material.vrf_root,
         entry(&state, 4).0.vrf_root
     );
     process(&mut state, &key_change, spec);
 
     assert_eq!(
         entry(&state, 4),
-        (public_keys(1, 0xaa), Epoch::new(2 + delay))
+        (key_material(1, 0xaa), Epoch::new(2 + delay))
     );
     assert_eq!(state.pq_pubkey_cache().get(&xmss_public_key(0)), None);
     assert_eq!(state.pq_pubkey_cache().get(&xmss_public_key(1)), Some(4));
@@ -610,7 +610,7 @@ async fn own_key_freed_by_a_change_is_registerable_again() {
     register(&mut state, 4, 0, 0xcc, Epoch::new(2 + delay), spec);
     assert_eq!(
         entry(&state, 4),
-        (public_keys(0, 0xcc), Epoch::new(2 + 2 * delay))
+        (key_material(0, 0xcc), Epoch::new(2 + 2 * delay))
     );
     assert_eq!(state.pq_pubkey_cache().get(&xmss_public_key(0)), Some(4));
     assert_eq!(state.pq_pubkey_cache().get(&xmss_public_key(1)), None);
@@ -669,7 +669,7 @@ async fn unregistered_entries_never_own_the_all_zero_key() {
     for state in [&state, &uncached, &rebuilt] {
         assert!(!state.is_pq_registered(1).unwrap());
         assert!(!state.is_pq_registered(builder(0)).unwrap());
-        assert_eq!(state.registered_pq_public_keys().unwrap().count(), 0);
+        assert_eq!(state.registered_pq_key_material().unwrap().count(), 0);
         assert_eq!(pq_public_key_owner(state, &zero_key), Ok(None));
     }
     assert!(!uncached.pq_pubkey_cache().is_initialized());
@@ -684,7 +684,7 @@ async fn all_zero_key_is_rejected_after_the_signature_and_before_the_key_check()
     let harness = eip8450_harness();
     let spec = &harness.spec;
     let mut state = state_with_builders(&harness, 3, 2);
-    let zero_keys = PqPublicKeys::default();
+    let zero_keys = PqKeyMaterial::default();
     let validator_zero =
         registration_with_keys(&state, 1, 0, zero_keys.clone(), NEVER_REGISTERED, spec);
     let builder_zero = registration_with_keys(
@@ -798,7 +798,7 @@ async fn key_freed_by_a_change_is_registerable_by_another_validator() {
     process(&mut state, &takeover, spec);
     assert_eq!(
         entry(&state, 2),
-        (public_keys(0, 0xbb), Epoch::new(1 + delay))
+        (key_material(0, 0xbb), Epoch::new(1 + delay))
     );
     assert_eq!(state.pq_pubkey_cache().get(&xmss_public_key(0)), Some(2));
     assert_eq!(state.pq_pubkey_cache().get(&xmss_public_key(1)), Some(1));
@@ -980,12 +980,12 @@ async fn block_with_max_registrations_is_valid() {
             let index = signed.message.index;
             assert_eq!(
                 entry(&state, index),
-                (signed.message.public_keys.clone(), state.current_epoch())
+                (signed.message.key_material.clone(), state.current_epoch())
             );
             assert_eq!(
                 state
                     .pq_pubkey_cache()
-                    .get(&signed.message.public_keys.xmss_public_key),
+                    .get(&signed.message.key_material.xmss_public_key),
                 Some(index)
             );
         }
@@ -1042,8 +1042,8 @@ async fn block_with_too_many_registrations_is_invalid() {
         })
     );
     assert_eq!(
-        state.pq_public_keys().unwrap(),
-        pre_state.pq_public_keys().unwrap()
+        state.pq_key_material().unwrap(),
+        pre_state.pq_key_material().unwrap()
     );
 }
 
@@ -1212,7 +1212,7 @@ async fn fork_upgrade_initializes_unset_entries() {
 
     let mut state = harness.get_current_state();
     assert_eq!(state.fork_name_unchecked(), ForkName::Heze);
-    assert!(state.pq_public_keys().is_err());
+    assert!(state.pq_key_material().is_err());
 
     let fork_slot = Epoch::new(1).start_slot(E::slots_per_epoch());
     complete_state_advance(&mut state, None, fork_slot, None, spec).unwrap();
@@ -1223,10 +1223,10 @@ async fn fork_upgrade_initializes_unset_entries() {
     assert_registry_invariant(&state);
     assert!(
         state
-            .pq_public_keys()
+            .pq_key_material()
             .unwrap()
             .iter()
-            .all(|keys| *keys == PqPublicKeys::default())
+            .all(|key_material| *key_material == PqKeyMaterial::default())
     );
     assert!(
         state
@@ -1240,7 +1240,7 @@ async fn fork_upgrade_initializes_unset_entries() {
     // Keys can be registered right after the upgrade.
     let signed = registration(&state, 3, 0, 0xaa, NEVER_REGISTERED, spec);
     process(&mut state, &signed, spec);
-    assert_eq!(entry(&state, 3), (public_keys(0, 0xaa), Epoch::new(1)));
+    assert_eq!(entry(&state, 3), (key_material(0, 0xaa), Epoch::new(1)));
 }
 
 #[tokio::test]
@@ -1265,10 +1265,10 @@ async fn deposit_after_fork_keeps_registry_lengths() {
     assert_registry_invariant(&state);
     assert_eq!(
         entry(&state, VALIDATOR_COUNT as u64),
-        (PqPublicKeys::default(), NEVER_REGISTERED)
+        (PqKeyMaterial::default(), NEVER_REGISTERED)
     );
     assert_eq!(*state.pq_pubkey_cache(), cache_before);
-    assert_eq!(entry(&state, 1), (public_keys(0, 0xaa), Epoch::new(0)));
+    assert_eq!(entry(&state, 1), (key_material(0, 0xaa), Epoch::new(0)));
 }
 
 #[tokio::test]
@@ -1342,7 +1342,10 @@ async fn registration_applied_in_genesis_epoch_cannot_be_replayed() {
 
     let first = registration(&state, 1, 0, 0xaa, NEVER_REGISTERED, spec);
     process(&mut state, &first, spec);
-    assert_eq!(entry(&state, 1), (public_keys(0, 0xaa), E::genesis_epoch()));
+    assert_eq!(
+        entry(&state, 1),
+        (key_material(0, 0xaa), E::genesis_epoch())
+    );
 
     *state.slot_mut() = Epoch::new(delay).start_slot(E::slots_per_epoch());
     assert_rejected(
@@ -1358,7 +1361,7 @@ async fn registration_applied_in_genesis_epoch_cannot_be_replayed() {
     // A change naming the genesis epoch, the stored change epoch, is the one that applies.
     let change = registration(&state, 1, 1, 0xbb, E::genesis_epoch(), spec);
     process(&mut state, &change, spec);
-    assert_eq!(entry(&state, 1), (public_keys(1, 0xbb), Epoch::new(delay)));
+    assert_eq!(entry(&state, 1), (key_material(1, 0xbb), Epoch::new(delay)));
 }
 
 /// An unregistered validator's entry is `FAR_FUTURE_EPOCH`, so a first registration naming
@@ -1396,7 +1399,7 @@ async fn builder_first_registration_stores_the_current_epoch() {
     );
     assert_eq!(
         entry(&state, builder(0)),
-        (PqPublicKeys::default(), BUILDER_DEPOSIT_EPOCH)
+        (PqKeyMaterial::default(), BUILDER_DEPOSIT_EPOCH)
     );
     assert!(!state.is_pq_registered(builder(0)).unwrap());
 
@@ -1411,7 +1414,7 @@ async fn builder_first_registration_stores_the_current_epoch() {
     );
     // The other builders and the validators are untouched.
     assert!(!state.is_pq_registered(builder(1)).unwrap());
-    assert_eq!(state.registered_pq_public_keys().unwrap().count(), 1);
+    assert_eq!(state.registered_pq_key_material().unwrap().count(), 1);
     assert_registry_invariant(&state);
 
     // The rebuilt cache indexes the builder's key under its flagged index.
@@ -1515,7 +1518,7 @@ async fn builder_registration_rejections() {
         &state,
         builder(0),
         0,
-        public_keys(0, 0xaa),
+        key_material(0, 0xaa),
         BUILDER_DEPOSIT_EPOCH,
         spec,
     );
@@ -1619,7 +1622,7 @@ async fn builder_index_reuse_resets_the_entry_and_frees_the_key() {
         assert_eq!(state.builders().unwrap().len(), BUILDER_COUNT);
         assert_eq!(
             entry(state, builder(0)),
-            (PqPublicKeys::default(), reuse_epoch)
+            (PqKeyMaterial::default(), reuse_epoch)
         );
         assert!(!state.is_pq_registered(builder(0)).unwrap());
         assert_eq!(pq_public_key_owner(state, &xmss_public_key(0)), Ok(None));
@@ -1645,7 +1648,7 @@ async fn builder_index_reuse_resets_the_entry_and_frees_the_key() {
     );
     assert_eq!(
         entry(&state, builder(0)),
-        (PqPublicKeys::default(), reentry_epoch)
+        (PqKeyMaterial::default(), reentry_epoch)
     );
 
     // Once it is active, the registrations signed before name epochs before its deposit epoch.
@@ -1698,18 +1701,18 @@ async fn fork_upgrade_initializes_builder_entries_with_their_deposit_epoch() {
     for (builder_index, deposit_epoch) in [(0, 0), (1, 1)] {
         assert_eq!(
             entry(&state, builder(builder_index)),
-            (PqPublicKeys::default(), Epoch::new(deposit_epoch))
+            (PqKeyMaterial::default(), Epoch::new(deposit_epoch))
         );
         assert!(!state.is_pq_registered(builder(builder_index)).unwrap());
     }
-    assert_eq!(state.registered_pq_public_keys().unwrap().count(), 0);
+    assert_eq!(state.registered_pq_key_material().unwrap().count(), 0);
 
     // A builder added after the upgrade gets an entry too.
     add_builder(&mut state, &BUILDER_KEYPAIRS[2], Epoch::new(2), spec);
     assert_registry_invariant(&state);
     assert_eq!(
         entry(&state, builder(2)),
-        (PqPublicKeys::default(), Epoch::new(2))
+        (PqKeyMaterial::default(), Epoch::new(2))
     );
 
     // The state is a 50-field progressive container with the EIP-8015 gaps at 8, 9, 10 and 28:

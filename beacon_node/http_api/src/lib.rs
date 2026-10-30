@@ -628,9 +628,9 @@ pub async fn serve<T: BeaconChainTypes>(
     let get_beacon_state_validator_balances =
         states::get_beacon_state_validator_balances(beacon_states_path.clone());
 
-    // GET beacon/states/{state_id}/pq_public_keys?id
-    let get_beacon_state_pq_public_keys =
-        states::get_beacon_state_pq_public_keys(beacon_states_path.clone());
+    // GET beacon/states/{state_id}/pq_key_material?id
+    let get_beacon_state_pq_key_material =
+        states::get_beacon_state_pq_key_material(beacon_states_path.clone());
 
     // POST beacon/states/{state_id}/validator_balances
     let post_beacon_state_validator_balances =
@@ -3548,7 +3548,7 @@ pub async fn serve<T: BeaconChainTypes>(
                 .uor(get_beacon_state_fork)
                 .uor(get_beacon_state_finality_checkpoints)
                 .uor(get_beacon_state_validator_balances)
-                .uor(get_beacon_state_pq_public_keys)
+                .uor(get_beacon_state_pq_key_material)
                 .uor(get_beacon_state_validators_id)
                 .uor(get_beacon_state_validators)
                 .uor(get_beacon_state_committees)

@@ -46,7 +46,7 @@ use crate::{
         FINALIZED_ROOT_INDEX, FINALIZED_ROOT_INDEX_ELECTRA, NEXT_SYNC_COMMITTEE_FIELD_INDEX,
         NEXT_SYNC_COMMITTEE_INDEX, NEXT_SYNC_COMMITTEE_INDEX_ELECTRA,
     },
-    pq::{PqPublicKeys, PqRegistryIndex, XmssPublicKey},
+    pq::{PqKeyMaterial, PqRegistryIndex, XmssPublicKey},
     state::{
         BlockRootsIter, CommitteeCache, EpochCache, EpochCacheError, ExitCache, HistoricalBatch,
         HistoricalSummary, PqPubkeyCache, ProgressiveBalancesCache, PubkeyCache, SlashingsCache,
@@ -873,7 +873,7 @@ where
     #[compare_fields(as_iter)]
     #[cfg_attr(feature = "arbitrary", arbitrary(default))]
     #[superstruct(only(Eip8450))]
-    pub pq_public_keys: ProgressiveList<PqPublicKeys>,
+    pub pq_key_material: ProgressiveList<PqKeyMaterial>,
     #[compare_fields(as_iter)]
     #[cfg_attr(feature = "arbitrary", arbitrary(default))]
     #[superstruct(only(Eip8450))]
@@ -881,7 +881,7 @@ where
     #[compare_fields(as_iter)]
     #[cfg_attr(feature = "arbitrary", arbitrary(default))]
     #[superstruct(only(Eip8450))]
-    pub builder_pq_public_keys: ProgressiveList<PqPublicKeys>,
+    pub builder_pq_key_material: ProgressiveList<PqKeyMaterial>,
     #[compare_fields(as_iter)]
     #[cfg_attr(feature = "arbitrary", arbitrary(default))]
     #[superstruct(only(Eip8450))]
@@ -2571,8 +2571,8 @@ impl<E: EthSpec> BeaconState<E> {
             inactivity_scores.push(0)?;
         }
         // Eip8450 or later initializations.
-        if let Ok(pq_public_keys) = self.pq_public_keys_mut() {
-            pq_public_keys.push(PqPublicKeys::default())?;
+        if let Ok(pq_key_material) = self.pq_key_material_mut() {
+            pq_key_material.push(PqKeyMaterial::default())?;
         }
         if let Ok(pq_key_change_epochs) = self.pq_key_change_epochs_mut() {
             pq_key_change_epochs.push(spec.far_future_epoch)?;
@@ -2597,8 +2597,8 @@ impl<E: EthSpec> BeaconState<E> {
     /// Add a builder to the registry and return the builder index that was allocated for it.
     ///
     /// [Modified in EIP-8450] The builder's post-quantum registry entry is reset to the all-zero
-    /// keys and its never-registered marker, its deposit epoch. If the index is reused, the key of
-    /// the builder that held it, if any, is released from the `pq_pubkey_cache`.
+    /// key material and its never-registered marker, its deposit epoch. If the index is reused, the
+    /// key of the builder that held it, if any, is released from the `pq_pubkey_cache`.
     pub fn add_builder_to_registry(
         &mut self,
         pubkey: PublicKeyBytes,
@@ -2630,16 +2630,16 @@ impl<E: EthSpec> BeaconState<E> {
             && (builder_index as usize) < self.builders()?.len()
         {
             let index = PqRegistryIndex::Builder(builder_index).as_u64();
-            let released = self.get_pq_public_keys(index)?.xmss_public_key.clone();
+            let released = self.get_pq_key_material(index)?.xmss_public_key.clone();
             self.pq_pubkey_cache_mut().remove(&released, index);
         }
 
         set_or_append_builder_entry(self.builders_mut()?, builder_index, builder)?;
         if has_pq_registry {
             set_or_append_builder_entry(
-                self.builder_pq_public_keys_mut()?,
+                self.builder_pq_key_material_mut()?,
                 builder_index,
-                PqPublicKeys::default(),
+                PqKeyMaterial::default(),
             )?;
             set_or_append_builder_entry(
                 self.builder_pq_key_change_epochs_mut()?,
@@ -3162,18 +3162,18 @@ impl<E: EthSpec> BeaconState<E> {
         }
     }
 
-    /// Returns the registered keys of a validator or flagged builder index, the all-zero entry if
-    /// it has never registered.
+    /// Returns the registered key material of a validator or flagged builder index, the all-zero
+    /// entry if it has never registered.
     ///
     /// Errors prior to EIP-8450, or for an index that is not in its registry.
-    pub fn get_pq_public_keys(&self, index: u64) -> Result<&PqPublicKeys, BeaconStateError> {
+    pub fn get_pq_key_material(&self, index: u64) -> Result<&PqKeyMaterial, BeaconStateError> {
         match PqRegistryIndex::new(index) {
             PqRegistryIndex::Validator(validator_index) => self
-                .pq_public_keys()?
+                .pq_key_material()?
                 .get(validator_index as usize)
                 .ok_or(BeaconStateError::UnknownValidator(validator_index as usize)),
             PqRegistryIndex::Builder(builder_index) => self
-                .builder_pq_public_keys()?
+                .builder_pq_key_material()?
                 .get(builder_index as usize)
                 .ok_or(BeaconStateError::UnknownBuilder(builder_index)),
         }
@@ -3184,32 +3184,35 @@ impl<E: EthSpec> BeaconState<E> {
     ///
     /// It does not look at exits: an exited validator or builder keeps its keys.
     pub fn is_pq_registered(&self, index: u64) -> Result<bool, BeaconStateError> {
-        Ok(self.get_pq_public_keys(index)?.xmss_public_key != XmssPublicKey::default())
+        Ok(self.get_pq_key_material(index)?.xmss_public_key != XmssPublicKey::default())
     }
 
-    /// Returns the index and keys of every validator and builder that has registered
+    /// Returns the index and key material of every validator and builder that has registered
     /// post-quantum keys (`is_pq_registered`), validators first, with builder indices flagged.
     ///
     /// The all-zero entry of an unregistered validator or builder is skipped.
-    pub fn registered_pq_public_keys(
+    pub fn registered_pq_key_material(
         &self,
-    ) -> Result<impl Iterator<Item = (u64, &PqPublicKeys)>, BeaconStateError> {
+    ) -> Result<impl Iterator<Item = (u64, &PqKeyMaterial)>, BeaconStateError> {
         let zero_key = XmssPublicKey::default();
         let validators = self
-            .pq_public_keys()?
+            .pq_key_material()?
             .iter()
             .enumerate()
-            .map(|(index, public_keys)| (index as u64, public_keys));
+            .map(|(index, key_material)| (index as u64, key_material));
         let builders =
-            self.builder_pq_public_keys()?
+            self.builder_pq_key_material()?
                 .iter()
                 .enumerate()
-                .map(|(index, public_keys)| {
-                    (PqRegistryIndex::Builder(index as u64).as_u64(), public_keys)
+                .map(|(index, key_material)| {
+                    (
+                        PqRegistryIndex::Builder(index as u64).as_u64(),
+                        key_material,
+                    )
                 });
         Ok(validators
             .chain(builders)
-            .filter(move |(_, public_keys)| public_keys.xmss_public_key != zero_key))
+            .filter(move |(_, key_material)| key_material.xmss_public_key != zero_key))
     }
 
     /// Builds the `pq_pubkey_cache` from the registered validators' and builders' keys, if it is
@@ -3223,8 +3226,8 @@ impl<E: EthSpec> BeaconState<E> {
         }
         let cache = if self.fork_name_unchecked().eip8450_enabled() {
             PqPubkeyCache::new(
-                self.registered_pq_public_keys()?
-                    .map(|(index, public_keys)| (index, &public_keys.xmss_public_key)),
+                self.registered_pq_key_material()?
+                    .map(|(index, key_material)| (index, &key_material.xmss_public_key)),
             )
             .ok_or(BeaconStateError::PqPubkeyCacheInconsistent)?
         } else {
@@ -3249,27 +3252,27 @@ impl<E: EthSpec> BeaconState<E> {
         Ok(self.pq_pubkey_cache().get(xmss_public_key))
     }
 
-    /// Writes the post-quantum keys and the change epoch of a validator or flagged builder index,
-    /// keeping the `pq_pubkey_cache` exact.
+    /// Writes the post-quantum key material and the change epoch of a validator or flagged builder
+    /// index, keeping the `pq_pubkey_cache` exact.
     ///
     /// The key previously registered at the index, if any, is released. The all-zero key is never
     /// indexed.
-    pub fn set_pq_public_keys(
+    pub fn set_pq_key_material(
         &mut self,
         index: u64,
-        public_keys: PqPublicKeys,
+        key_material: PqKeyMaterial,
         change_epoch: Epoch,
     ) -> Result<(), BeaconStateError> {
         self.update_pq_pubkey_cache()?;
 
-        let new_key = public_keys.xmss_public_key.clone();
-        let (keys_entry, change_epoch_entry) = match PqRegistryIndex::new(index) {
+        let new_key = key_material.xmss_public_key.clone();
+        let (key_material_entry, change_epoch_entry) = match PqRegistryIndex::new(index) {
             PqRegistryIndex::Validator(validator_index) => {
                 let state = self.as_eip8450_mut()?;
                 let error = || BeaconStateError::UnknownValidator(validator_index as usize);
                 (
                     state
-                        .pq_public_keys
+                        .pq_key_material
                         .get_mut(validator_index as usize)
                         .ok_or_else(error)?,
                     state
@@ -3283,7 +3286,7 @@ impl<E: EthSpec> BeaconState<E> {
                 let error = || BeaconStateError::UnknownBuilder(builder_index);
                 (
                     state
-                        .builder_pq_public_keys
+                        .builder_pq_key_material
                         .get_mut(builder_index as usize)
                         .ok_or_else(error)?,
                     state
@@ -3293,7 +3296,7 @@ impl<E: EthSpec> BeaconState<E> {
                 )
             }
         };
-        let previous = std::mem::replace(keys_entry, public_keys);
+        let previous = std::mem::replace(key_material_entry, key_material);
         *change_epoch_entry = change_epoch;
 
         let cache = self.pq_pubkey_cache_mut();

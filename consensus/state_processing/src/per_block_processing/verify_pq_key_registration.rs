@@ -11,7 +11,7 @@ use safe_arith::SafeArith;
 use std::cmp::Ordering;
 use types::{
     BeaconState, BeaconStateError, ChainSpec, Domain, Epoch, EthSpec, Hash256,
-    PQ_POSSESSION_XMSS_INDEX, PQ_UNREGISTERED_CHANGE_EPOCH, PqKeyPossession, PqPublicKeys,
+    PQ_POSSESSION_XMSS_INDEX, PQ_UNREGISTERED_CHANGE_EPOCH, PqKeyMaterial, PqKeyPossession,
     PqRegistryIndex, SignedPqKeyRegistration, SignedRoot, VrfRoot, XmssPublicKey, XmssSignature,
 };
 
@@ -38,7 +38,7 @@ pub fn pq_public_key_owner<E: EthSpec>(
         return Ok(state.pq_pubkey_cache().get(xmss_public_key));
     }
     Ok(state
-        .registered_pq_public_keys()?
+        .registered_pq_key_material()?
         .find(|(_, entry)| entry.xmss_public_key == *xmss_public_key)
         .map(|(index, _)| index))
 }
@@ -162,7 +162,7 @@ pub fn is_valid_pq_possession_proof<E: EthSpec>(
 pub fn verify_pq_registrant<E: EthSpec>(
     state: &BeaconState<E>,
     index: u64,
-    public_keys: &PqPublicKeys,
+    key_material: &PqKeyMaterial,
     spec: &ChainSpec,
 ) -> Result<PublicKeyBytes> {
     match PqRegistryIndex::new(index) {
@@ -178,7 +178,7 @@ pub fn verify_pq_registrant<E: EthSpec>(
             );
             // Builders make no selection proofs, so they register no VRF root.
             verify!(
-                public_keys.vrf_root == VrfRoot::ZERO,
+                key_material.vrf_root == VrfRoot::ZERO,
                 Invalid::BuilderNonZeroVrfRoot(builder_index)
             );
             Ok(builder.pubkey)
@@ -215,13 +215,13 @@ pub fn verify_pq_key_registration<E: EthSpec>(
 ) -> Result<()> {
     let registration = &signed_registration.message;
     let index = registration.index;
-    let public_keys = &registration.public_keys;
+    let key_material = &registration.key_material;
 
     if state.pq_key_change_epochs().is_err() {
         return Err(error(Invalid::RegistryUnavailable));
     }
 
-    let pubkey = verify_pq_registrant(state, index, public_keys, spec)?;
+    let pubkey = verify_pq_registrant(state, index, key_material, spec)?;
 
     // The registration applies to the current entry only. Every change moves the stored epoch, so
     // a replayed registration fails here.
@@ -266,10 +266,10 @@ pub fn verify_pq_key_registration<E: EthSpec>(
     // The key must be a new, non-zero key: no validator or builder, including this one, may hold
     // it. The registrant must also prove possession of it for its BLS public key.
     verify!(
-        public_keys.xmss_public_key != XmssPublicKey::default(),
+        key_material.xmss_public_key != XmssPublicKey::default(),
         Invalid::ZeroXmssPublicKey
     );
-    if let Some(owner) = pq_public_key_owner(state, &public_keys.xmss_public_key)? {
+    if let Some(owner) = pq_public_key_owner(state, &key_material.xmss_public_key)? {
         return Err(error(Invalid::XmssPublicKeyInUse { owner }));
     }
     if verify_signatures.is_true() {
@@ -277,7 +277,7 @@ pub fn verify_pq_key_registration<E: EthSpec>(
             is_valid_pq_possession_proof(
                 state,
                 &pubkey,
-                &public_keys.xmss_public_key,
+                &key_material.xmss_public_key,
                 &signed_registration.possession,
                 spec
             ),

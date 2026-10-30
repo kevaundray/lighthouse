@@ -152,7 +152,7 @@ impl PqKeyRegistrations {
         limit: usize,
         spec: &ChainSpec,
     ) -> Vec<SignedPqKeyRegistration> {
-        if state.pq_public_keys().is_err() {
+        if state.pq_key_material().is_err() {
             return vec![];
         }
 
@@ -166,7 +166,7 @@ impl PqKeyRegistrations {
             if exits_in_block(message.index)
                 || verify_pq_key_registration(state, registration, VerifySignatures::False, spec)
                     .is_err()
-                || !selected_keys.insert(&message.public_keys.xmss_public_key)
+                || !selected_keys.insert(&message.key_material.xmss_public_key)
             {
                 continue;
             }
@@ -260,7 +260,7 @@ impl PqKeyRegistrations {
                                 })
                     }
                 };
-                let key_taken = held_keys.contains(&message.public_keys.xmss_public_key);
+                let key_taken = held_keys.contains(&message.key_material.xmss_public_key);
                 let keep = !exited && !dead && !key_taken;
                 if !keep {
                     pruned.push((*sequence, index, message.previous_change_epoch));
@@ -284,7 +284,7 @@ impl PqKeyRegistrations {
         let pooled_keys = self
             .by_index
             .values()
-            .map(|pooled| &pooled.registration.message.public_keys.xmss_public_key)
+            .map(|pooled| &pooled.registration.message.key_material.xmss_public_key)
             .collect::<HashSet<_>>();
         if pooled_keys.is_empty() {
             return HashSet::new();
@@ -297,11 +297,11 @@ impl PqKeyRegistrations {
                 .cloned()
                 .collect();
         }
-        let Ok(registered) = state.registered_pq_public_keys() else {
+        let Ok(registered) = state.registered_pq_key_material() else {
             return HashSet::new();
         };
         registered
-            .map(|(_, keys)| &keys.xmss_public_key)
+            .map(|(_, key_material)| &key_material.xmss_public_key)
             .filter(|key| pooled_keys.contains(key))
             .cloned()
             .collect()
@@ -328,7 +328,7 @@ mod tests {
     use types::consts::gloas::PAYLOAD_BUILDER_VERSION;
     use types::test_utils::generate_deterministic_keypairs;
     use types::{
-        Epoch, ForkName, Hash256, MainnetEthSpec, MinimalEthSpec, PqKeyRegistration, PqPublicKeys,
+        Epoch, ForkName, Hash256, MainnetEthSpec, MinimalEthSpec, PqKeyMaterial, PqKeyRegistration,
         PqRegistryIndex, Slot,
     };
 
@@ -349,8 +349,8 @@ mod tests {
             .unwrap()
     }
 
-    fn keys(key_byte: u8) -> PqPublicKeys {
-        PqPublicKeys {
+    fn key_material(key_byte: u8) -> PqKeyMaterial {
+        PqKeyMaterial {
             xmss_public_key: vec![key_byte; 32].try_into().unwrap(),
             vrf_root: Hash256::repeat_byte(key_byte),
         }
@@ -366,7 +366,7 @@ mod tests {
         SignedPqKeyRegistration {
             message: PqKeyRegistration {
                 index,
-                public_keys: keys(key_byte),
+                key_material: key_material(key_byte),
                 previous_change_epoch: Epoch::new(previous_change_epoch),
             },
             possession: vec![0; 2404].try_into().unwrap(),
@@ -414,13 +414,19 @@ mod tests {
         // Validator 1 initiated an exit.
         state.validators_mut().get_mut(1).unwrap().exit_epoch = Epoch::new(10);
         // Validator 5 holds key 5, validators 6 and 7 registered at epoch 0.
-        state.set_pq_public_keys(5, keys(5), Epoch::new(0)).unwrap();
-        state.set_pq_public_keys(6, keys(6), Epoch::new(0)).unwrap();
-        state.set_pq_public_keys(7, keys(7), Epoch::new(0)).unwrap();
+        state
+            .set_pq_key_material(5, key_material(5), Epoch::new(0))
+            .unwrap();
+        state
+            .set_pq_key_material(6, key_material(6), Epoch::new(0))
+            .unwrap();
+        state
+            .set_pq_key_material(7, key_material(7), Epoch::new(0))
+            .unwrap();
 
         // Validator 7 re-registers the leanXMSS key it holds, with a new VRF root.
         let mut own_key = registration(7, 7, 0);
-        own_key.message.public_keys.vrf_root = Hash256::repeat_byte(0xee);
+        own_key.message.key_material.vrf_root = Hash256::repeat_byte(0xee);
 
         let pool = pool_with(&[
             // Stale: validator 0 never registered, so its change epoch is `FAR_FUTURE_EPOCH`.
@@ -556,7 +562,7 @@ mod tests {
         let spec = spec();
         let mut finalized_state = genesis_state(&spec);
         finalized_state
-            .set_pq_public_keys(0, keys(9), Epoch::new(2))
+            .set_pq_key_material(0, key_material(9), Epoch::new(2))
             .unwrap();
         pool.prune(&finalized_state, &spec);
         assert_eq!(
@@ -575,18 +581,18 @@ mod tests {
         let mut finalized_state = genesis_state(&spec);
         // Validator 0 registered keys 1 at epoch 3 in the finalized chain.
         finalized_state
-            .set_pq_public_keys(0, keys(1), Epoch::new(3))
+            .set_pq_key_material(0, key_material(1), Epoch::new(3))
             .unwrap();
         // Validator 5 registered keys 6 at epoch 0.
         finalized_state
-            .set_pq_public_keys(5, keys(6), Epoch::new(0))
+            .set_pq_key_material(5, key_material(6), Epoch::new(0))
             .unwrap();
         // Validator 7 last changed its keys at epoch 4, and validator 8 at epoch 1.
         finalized_state
-            .set_pq_public_keys(7, keys(8), Epoch::new(4))
+            .set_pq_key_material(7, key_material(8), Epoch::new(4))
             .unwrap();
         finalized_state
-            .set_pq_public_keys(8, keys(10), Epoch::new(1))
+            .set_pq_key_material(8, key_material(10), Epoch::new(1))
             .unwrap();
         // Validator 3 exited in the finalized state.
         finalized_state
@@ -597,7 +603,7 @@ mod tests {
 
         // Validator 8 re-registers the leanXMSS key it holds, with a new VRF root.
         let mut own_key = registration(8, 10, 1);
-        own_key.message.public_keys.vrf_root = Hash256::repeat_byte(0xee);
+        own_key.message.key_material.vrf_root = Hash256::repeat_byte(0xee);
 
         let registrations = [
             // A first registration of other keys, superseded by validator 0's registration.
@@ -654,7 +660,7 @@ mod tests {
         // Validators 4 and 5 last changed their keys at epoch 2 in the finalized chain.
         for index in [4, 5] {
             finalized_state
-                .set_pq_public_keys(index, keys(40 + index as u8), Epoch::new(2))
+                .set_pq_key_material(index, key_material(40 + index as u8), Epoch::new(2))
                 .unwrap();
         }
 
@@ -747,7 +753,7 @@ mod tests {
     ) -> SignedPqKeyRegistration {
         let mut registration =
             registration(builder(builder_index), key_byte, previous_change_epoch);
-        registration.message.public_keys.vrf_root = Hash256::ZERO;
+        registration.message.key_material.vrf_root = Hash256::ZERO;
         registration
     }
 
@@ -791,7 +797,7 @@ mod tests {
         initiate_builder_exit(&mut state, 2);
 
         let mut with_vrf_root = builder_registration(3, 4, 0);
-        with_vrf_root.message.public_keys.vrf_root = Hash256::repeat_byte(4);
+        with_vrf_root.message.key_material.vrf_root = Hash256::repeat_byte(4);
         let pool = pool_with(&[
             builder_registration(0, 1, 0),
             // Exited by an operation of the same block.
@@ -830,10 +836,10 @@ mod tests {
         let spec = spec();
         let mut finalized_state = state_with_builders(&spec, 6, 5);
         finalized_state
-            .set_pq_public_keys(builder(0), keys(30), Epoch::new(3))
+            .set_pq_key_material(builder(0), key_material(30), Epoch::new(3))
             .unwrap();
         finalized_state
-            .set_pq_public_keys(5, keys(31), Epoch::new(4))
+            .set_pq_key_material(5, key_material(31), Epoch::new(4))
             .unwrap();
         initiate_builder_exit(&mut finalized_state, 2);
         initiate_builder_exit(&mut finalized_state, 3);

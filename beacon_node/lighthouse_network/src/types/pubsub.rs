@@ -764,7 +764,7 @@ mod tests {
         let registration = types::SignedPqKeyRegistration {
             message: types::PqKeyRegistration {
                 index: types::consts::gloas::BUILDER_INDEX_FLAG | 7,
-                public_keys: types::PqPublicKeys {
+                key_material: types::PqKeyMaterial {
                     xmss_public_key: vec![1; 32].try_into().unwrap(),
                     vrf_root: Hash256::repeat_byte(2),
                 },

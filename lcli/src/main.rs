@@ -688,7 +688,7 @@ fn main() {
                         .action(ArgAction::Set)
                         .default_value("http://localhost:5052")
                         .help("Beacon node to fetch the genesis, spec, validator or builder and \
-                                current post-quantum keys from, and to submit to.")
+                                current post-quantum key material from, and to submit to.")
                         .display_order(0)
                 )
                 .arg(

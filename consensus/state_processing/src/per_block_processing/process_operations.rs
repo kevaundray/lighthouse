@@ -666,7 +666,7 @@ pub fn process_bls_to_execution_changes<E: EthSpec>(
     Ok(())
 }
 
-/// Validates each `SignedPqKeyRegistration` and writes the registered keys into the state
+/// Validates each `SignedPqKeyRegistration` and writes the registered key material into the state
 /// (`process_pq_key_registration`, EIP-8450).
 ///
 /// The registrations are applied in order, so a key registered earlier in `pq_key_registrations`
@@ -698,9 +698,9 @@ pub fn process_pq_key_registrations<E: EthSpec>(
             .map_err(|e| e.into_with_index(i))?;
 
         let registration = &signed_registration.message;
-        state.set_pq_public_keys(
+        state.set_pq_key_material(
             registration.index,
-            registration.public_keys.clone(),
+            registration.key_material.clone(),
             current_epoch,
         )?;
     }

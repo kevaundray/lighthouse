@@ -715,17 +715,17 @@ impl BeaconNodeHttpClient {
         self.get_opt(path).await
     }
 
-    /// `GET beacon/states/{state_id}/pq_public_keys?id`
+    /// `GET beacon/states/{state_id}/pq_key_material?id`
     ///
     /// `ids` are validator indices, or builder indices with `BUILDER_INDEX_FLAG` set. Without
     /// `ids`, every validator and then every builder is returned.
     ///
     /// Returns `Ok(None)` on a 404 error.
-    pub async fn get_beacon_states_pq_public_keys(
+    pub async fn get_beacon_states_pq_key_material(
         &self,
         state_id: StateId,
         ids: Option<&[u64]>,
-    ) -> Result<Option<ExecutionOptimisticFinalizedResponse<Vec<PqPublicKeysData>>>, Error> {
+    ) -> Result<Option<ExecutionOptimisticFinalizedResponse<Vec<PqKeyMaterialData>>>, Error> {
         let mut path = self.eth_path(V1)?;
 
         path.path_segments_mut()
@@ -733,7 +733,7 @@ impl BeaconNodeHttpClient {
             .push("beacon")
             .push("states")
             .push(&state_id.to_string())
-            .push("pq_public_keys");
+            .push("pq_key_material");
 
         if let Some(ids) = ids {
             let mut query = path.query_pairs_mut();

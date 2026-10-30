@@ -305,7 +305,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
 
         let registration = &signed_registration.message;
         let index = registration.index;
-        let public_keys = &registration.public_keys;
+        let key_material = &registration.key_material;
 
         // [IGNORE] The head state is at or after the fork, so that it has the registry. A head
         // state prior to the fork (e.g. right after the fork boundary) has nothing to check
@@ -351,7 +351,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                         finalized_epoch,
                     });
                 }
-                if public_keys.vrf_root != VrfRoot::ZERO {
+                if key_material.vrf_root != VrfRoot::ZERO {
                     return Err(Error::BuilderNonZeroVrfRoot(builder_index));
                 }
                 builder.pubkey
@@ -396,10 +396,10 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
 
         // [REJECT] The leanXMSS key is not all-zero and is not registered for any index in the head
         // state, including this one. Checked before the signature, as it is cheaper.
-        if public_keys.xmss_public_key == XmssPublicKey::default() {
+        if key_material.xmss_public_key == XmssPublicKey::default() {
             return Err(Error::ZeroXmssPublicKey);
         }
-        if let Some(owner) = pq_public_key_owner(state, &public_keys.xmss_public_key)? {
+        if let Some(owner) = pq_public_key_owner(state, &key_material.xmss_public_key)? {
             return Err(Error::XmssPublicKeyInUse { owner });
         }
 
@@ -420,7 +420,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         if !is_valid_pq_possession_proof(
             state,
             &pubkey,
-            &public_keys.xmss_public_key,
+            &key_material.xmss_public_key,
             &signed_registration.possession,
             &self.spec,
         ) {
@@ -550,8 +550,8 @@ mod tests {
     use std::sync::{Arc, LazyLock};
     use std::time::Duration;
     use types::{
-        ForkName, Hash256, MinimalEthSpec, PQ_POSSESSION_XMSS_INDEX, PqKeyRegistration,
-        PqPublicKeys, PqRegistryIndex, XmssPublicKey,
+        ForkName, Hash256, MinimalEthSpec, PQ_POSSESSION_XMSS_INDEX, PqKeyMaterial,
+        PqKeyRegistration, PqRegistryIndex, XmssPublicKey,
     };
 
     type E = MinimalEthSpec;
@@ -604,7 +604,7 @@ mod tests {
 
         PqKeyRegistration {
             index: validator_index,
-            public_keys: PqPublicKeys {
+            key_material: PqKeyMaterial {
                 xmss_public_key,
                 vrf_root: Hash256::repeat_byte(validator_index as u8),
             },
@@ -661,7 +661,7 @@ mod tests {
 
         // [REJECT] The all-zero key, checked before the signature.
         let mut zero_key = registration(&harness, 1, key_b, NEVER);
-        zero_key.message.public_keys.xmss_public_key = XmssPublicKey::default();
+        zero_key.message.key_material.xmss_public_key = XmssPublicKey::default();
         assert!(matches!(
             chain.verify_pq_key_registration_for_gossip(zero_key),
             Err(Error::ZeroXmssPublicKey)
@@ -1064,12 +1064,12 @@ mod tests {
         let harness = get_harness();
         let mut finalized_state = harness.get_current_state();
         *finalized_state.slot_mut() = Epoch::new(5).start_slot(E::slots_per_epoch());
-        let keys = registration(&harness, 0, &XMSS_KEYS[0], NEVER)
+        let key_material = registration(&harness, 0, &XMSS_KEYS[0], NEVER)
             .message
-            .public_keys;
+            .key_material;
         // Validator 0 last changed its keys at epoch 3; validator 1 never registered.
         finalized_state
-            .set_pq_public_keys(0, keys, Epoch::new(3))
+            .set_pq_key_material(0, key_material, Epoch::new(3))
             .unwrap();
 
         let mut observed = ObservedPqKeyRegistrations::default();
@@ -1145,7 +1145,7 @@ mod tests {
 
         PqKeyRegistration {
             index: builder(builder_index),
-            public_keys: PqPublicKeys {
+            key_material: PqKeyMaterial {
                 xmss_public_key,
                 vrf_root: Hash256::ZERO,
             },
@@ -1166,7 +1166,7 @@ mod tests {
         let [key_a, key_b] = [&XMSS_KEYS[0], &XMSS_KEYS[1]];
         let deposit_epoch = 0;
         let with_vrf_root = |mut registration: SignedPqKeyRegistration| {
-            registration.message.public_keys.vrf_root = Hash256::repeat_byte(1);
+            registration.message.key_material.vrf_root = Hash256::repeat_byte(1);
             registration
         };
 
@@ -1216,7 +1216,7 @@ mod tests {
         ));
         // [REJECT] The all-zero key, checked before the signature.
         let mut zero_key = builder_registration(&harness, 0, key_a, deposit_epoch);
-        zero_key.message.public_keys.xmss_public_key = XmssPublicKey::default();
+        zero_key.message.key_material.xmss_public_key = XmssPublicKey::default();
         zero_key.signature = registration(&harness, 0, key_a, NEVER).signature;
         assert!(matches!(
             chain.verify_pq_key_registration_for_gossip(zero_key),
@@ -1283,13 +1283,13 @@ mod tests {
         let harness = builder_harness();
         let mut finalized_state = harness.get_current_state();
         *finalized_state.slot_mut() = Epoch::new(5).start_slot(E::slots_per_epoch());
-        let keys = builder_registration(&harness, 0, &XMSS_KEYS[0], 0)
+        let key_material = builder_registration(&harness, 0, &XMSS_KEYS[0], 0)
             .message
-            .public_keys;
+            .key_material;
         // Builder 0 last changed its keys at epoch 3; builder 1 never registered (deposit
         // epoch 0).
         finalized_state
-            .set_pq_public_keys(builder(0), keys, Epoch::new(3))
+            .set_pq_key_material(builder(0), key_material, Epoch::new(3))
             .unwrap();
 
         let mut observed = ObservedPqKeyRegistrations::default();

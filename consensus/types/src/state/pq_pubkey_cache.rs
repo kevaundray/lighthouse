@@ -23,8 +23,8 @@ fn key_bytes(xmss_public_key: &XmssPublicKey) -> [u8; 32] {
 /// their entry is reset.
 ///
 /// The cache is not part of consensus. It is built lazily from
-/// `BeaconState::registered_pq_public_keys` and then kept exact by the writers of the registry:
-/// `BeaconState::set_pq_public_keys`, and `BeaconState::add_builder_to_registry`, which releases
+/// `BeaconState::registered_pq_key_material` and then kept exact by the writers of the registry:
+/// `BeaconState::set_pq_key_material`, and `BeaconState::add_builder_to_registry`, which releases
 /// the key of the builder whose index it reuses. Appending validators or builders adds
 /// unregistered entries only. The map is persistent, so cloning a state shares it cheaply.
 #[derive(Debug, PartialEq, Clone, Default)]

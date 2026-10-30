@@ -8,7 +8,7 @@ use crate::{
     pq::{VrfRoot, XmssPublicKey},
 };
 
-/// The post-quantum keys of one validator or builder, as stored in the registry.
+/// The post-quantum key material of one validator or builder, as stored in the registry.
 ///
 /// The default value is the all-zero entry, held by every validator and builder that has never
 /// registered keys. An entry is registered (`is_pq_registered`) exactly when its leanXMSS key is
@@ -18,7 +18,7 @@ use crate::{
     Debug, PartialEq, Eq, Hash, Clone, Default, Serialize, Deserialize, Encode, Decode, TreeHash,
 )]
 #[context_deserialize(ForkName)]
-pub struct PqPublicKeys {
+pub struct PqKeyMaterial {
     /// leanXMSS public key.
     #[serde(with = "ssz_types::serde_utils::hex_fixed_vec")]
     pub xmss_public_key: XmssPublicKey,
@@ -30,13 +30,13 @@ pub struct PqPublicKeys {
 mod tests {
     use super::*;
 
-    ssz_and_tree_hash_tests!(PqPublicKeys);
+    ssz_and_tree_hash_tests!(PqKeyMaterial);
 
     #[test]
     fn serialized_size() {
         use ssz::Encode;
         // 32 + 32 bytes, as stated by EIP-8450.
-        assert_eq!(<PqPublicKeys as Encode>::ssz_fixed_len(), 64);
-        assert_eq!(PqPublicKeys::default().as_ssz_bytes(), vec![0; 64]);
+        assert_eq!(<PqKeyMaterial as Encode>::ssz_fixed_len(), 64);
+        assert_eq!(PqKeyMaterial::default().as_ssz_bytes(), vec![0; 64]);
     }
 }

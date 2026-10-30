@@ -386,7 +386,7 @@ pub struct ValidatorIdentityData {
 /// marker: `FAR_FUTURE_EPOCH` for a validator, and the builder's `deposit_epoch` for a builder,
 /// since builder indices are reused.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PqPublicKeysData {
+pub struct PqKeyMaterialData {
     #[serde(with = "serde_utils::quoted_u64")]
     pub index: u64,
     #[serde(with = "ssz_types::serde_utils::hex_fixed_vec")]
@@ -829,7 +829,7 @@ pub struct ValidatorBalancesQuery {
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PqPublicKeysQuery {
+pub struct PqKeyMaterialQuery {
     #[serde(default, deserialize_with = "option_query_vec")]
     pub id: Option<Vec<u64>>,
 }
@@ -2862,8 +2862,8 @@ mod test {
     }
 
     #[test]
-    fn pq_public_keys_data_json() {
-        let unregistered = PqPublicKeysData {
+    fn pq_key_material_data_json() {
+        let unregistered = PqKeyMaterialData {
             index: 3,
             xmss_public_key: XmssPublicKey::default(),
             vrf_root: VrfRoot::ZERO,
@@ -2878,11 +2878,11 @@ mod test {
         });
         assert_eq!(serde_json::to_value(&unregistered).unwrap(), json);
         assert_eq!(
-            serde_json::from_value::<PqPublicKeysData>(json).unwrap(),
+            serde_json::from_value::<PqKeyMaterialData>(json).unwrap(),
             unregistered
         );
 
-        let registered = PqPublicKeysData {
+        let registered = PqKeyMaterialData {
             index: 4,
             xmss_public_key: XmssPublicKey::new(vec![0xab; 32]).unwrap(),
             vrf_root: VrfRoot::repeat_byte(0xcd),
@@ -2894,7 +2894,7 @@ mod test {
         assert_eq!(json.as_object().unwrap().len(), 4);
         // A builder's index carries `BUILDER_INDEX_FLAG`, and its never-registered change epoch
         // is its deposit epoch.
-        let builder = PqPublicKeysData {
+        let builder = PqKeyMaterialData {
             index: (1 << 40) | 2,
             change_epoch: Epoch::new(5),
             ..unregistered
@@ -2902,7 +2902,7 @@ mod test {
         let json = serde_json::to_value(&builder).unwrap();
         assert_eq!(json["index"], "1099511627778");
         assert_eq!(
-            serde_json::from_value::<PqPublicKeysData>(json).unwrap(),
+            serde_json::from_value::<PqKeyMaterialData>(json).unwrap(),
             builder
         );
     }

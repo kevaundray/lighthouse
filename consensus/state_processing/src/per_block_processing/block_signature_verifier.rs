@@ -485,7 +485,7 @@ where
                 is_valid_pq_possession_proof(
                     self.state,
                     &pubkey,
-                    &registration.public_keys.xmss_public_key,
+                    &registration.key_material.xmss_public_key,
                     &signed_registration.possession,
                     self.spec,
                 )

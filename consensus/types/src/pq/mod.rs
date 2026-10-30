@@ -4,14 +4,14 @@
 //! `xmss_signature_index` and `vrf.Verify`) and the byte sizes of their values. leanXMSS
 //! verification is implemented by `lean_pq`.
 
+mod pq_key_material;
 mod pq_key_possession;
 mod pq_key_registration;
-mod pq_public_keys;
 mod signed_pq_key_registration;
 
+pub use pq_key_material::PqKeyMaterial;
 pub use pq_key_possession::PqKeyPossession;
 pub use pq_key_registration::PqKeyRegistration;
-pub use pq_public_keys::PqPublicKeys;
 pub use signed_pq_key_registration::SignedPqKeyRegistration;
 
 use crate::{

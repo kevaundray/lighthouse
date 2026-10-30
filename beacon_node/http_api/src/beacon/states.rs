@@ -1060,20 +1060,20 @@ pub fn get_beacon_state_validator_balances<T: BeaconChainTypes>(
         .boxed()
 }
 
-// GET beacon/states/{state_id}/pq_public_keys?id
-pub fn get_beacon_state_pq_public_keys<T: BeaconChainTypes>(
+// GET beacon/states/{state_id}/pq_key_material?id
+pub fn get_beacon_state_pq_key_material<T: BeaconChainTypes>(
     beacon_states_path: BeaconStatesPath<T>,
 ) -> ResponseFilter {
     beacon_states_path
         .clone()
-        .and(warp::path("pq_public_keys"))
+        .and(warp::path("pq_key_material"))
         .and(warp::path::end())
-        .and(multi_key_query::<eth2::types::PqPublicKeysQuery>())
+        .and(multi_key_query::<eth2::types::PqKeyMaterialQuery>())
         .then(
             |state_id: StateId,
              task_spawner: TaskSpawner<T::EthSpec>,
              chain: Arc<BeaconChain<T>>,
-             query_res: Result<eth2::types::PqPublicKeysQuery, warp::Rejection>| {
+             query_res: Result<eth2::types::PqKeyMaterialQuery, warp::Rejection>| {
                 task_spawner.blocking_json_task(Priority::P1, move || {
                     let query = query_res?;
                     let (data, execution_optimistic, finalized) = state_id
@@ -1090,12 +1090,12 @@ pub fn get_beacon_state_pq_public_keys<T: BeaconChainTypes>(
                                 // A validator index, or a builder index with `BUILDER_INDEX_FLAG`
                                 // set. Unknown indices are skipped.
                                 let entry = |index: u64| {
-                                    let keys = state.get_pq_public_keys(index).ok()?;
+                                    let key_material = state.get_pq_key_material(index).ok()?;
                                     let change_epoch = state.get_pq_key_change_epoch(index).ok()?;
-                                    Some(eth2::types::PqPublicKeysData {
+                                    Some(eth2::types::PqKeyMaterialData {
                                         index,
-                                        xmss_public_key: keys.xmss_public_key.clone(),
-                                        vrf_root: keys.vrf_root,
+                                        xmss_public_key: key_material.xmss_public_key.clone(),
+                                        vrf_root: key_material.vrf_root,
                                         change_epoch,
                                     })
                                 };

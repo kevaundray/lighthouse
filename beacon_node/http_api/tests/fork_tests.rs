@@ -8,7 +8,7 @@ use beacon_chain::{
     },
 };
 use bls::PublicKey;
-use eth2::types::{IndexedErrorMessage, PqPublicKeysData, PtcDuty, StateId, SyncSubcommittee};
+use eth2::types::{IndexedErrorMessage, PqKeyMaterialData, PtcDuty, StateId, SyncSubcommittee};
 use execution_layer::test_utils::generate_genesis_header;
 use fixed_bytes::FixedBytesExtended;
 use genesis::{InteropGenesisBuilder, bls_withdrawal_credentials};
@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use std::sync::LazyLock;
 use types::{
     Address, BeaconState, ChainSpec, Epoch, EthSpec, ForkName, Hash256, PQ_POSSESSION_XMSS_INDEX,
-    PqKeyRegistration, PqPublicKeys, SignedPqKeyRegistration, Slot, Spec, VrfRoot, XmssPublicKey,
+    PqKeyMaterial, PqKeyRegistration, SignedPqKeyRegistration, Slot, Spec, VrfRoot, XmssPublicKey,
     XmssSignature,
     consts::gloas::BUILDER_INDEX_FLAG,
     test_utils::{generate_deterministic_keypair, generate_deterministic_keypairs},
@@ -843,7 +843,7 @@ fn pq_key_registration(
 
     PqKeyRegistration {
         index: validator_index,
-        public_keys: PqPublicKeys {
+        key_material: PqKeyMaterial {
             xmss_public_key,
             vrf_root: Hash256::repeat_byte(validator_index as u8),
         },
@@ -882,7 +882,7 @@ async fn pq_key_registrations_around_eip8450_fork() {
     assert_server_indexed_error(error, 400, vec![0]);
     assert_eq!(
         client
-            .get_beacon_states_pq_public_keys(StateId::Head, None)
+            .get_beacon_states_pq_key_material(StateId::Head, None)
             .await
             .unwrap_err()
             .status()
@@ -948,7 +948,7 @@ async fn pq_key_registrations_around_eip8450_fork() {
     // The head state holds the keys, changed at the block's epoch.
     let change_epoch = head_block.slot().epoch(E::slots_per_epoch());
     let response = client
-        .get_beacon_states_pq_public_keys(StateId::Head, Some(&[0, 1]))
+        .get_beacon_states_pq_key_material(StateId::Head, Some(&[0, 1]))
         .await
         .unwrap()
         .unwrap();
@@ -956,13 +956,13 @@ async fn pq_key_registrations_around_eip8450_fork() {
     assert_eq!(
         response.data,
         vec![
-            PqPublicKeysData {
+            PqKeyMaterialData {
                 index: 0,
-                xmss_public_key: registration.message.public_keys.xmss_public_key.clone(),
-                vrf_root: registration.message.public_keys.vrf_root,
+                xmss_public_key: registration.message.key_material.xmss_public_key.clone(),
+                vrf_root: registration.message.key_material.vrf_root,
                 change_epoch,
             },
-            PqPublicKeysData {
+            PqKeyMaterialData {
                 index: 1,
                 xmss_public_key: XmssPublicKey::default(),
                 vrf_root: VrfRoot::default(),
@@ -971,7 +971,7 @@ async fn pq_key_registrations_around_eip8450_fork() {
         ]
     );
     let all_keys = client
-        .get_beacon_states_pq_public_keys(StateId::Head, None)
+        .get_beacon_states_pq_key_material(StateId::Head, None)
         .await
         .unwrap()
         .unwrap()
@@ -1024,7 +1024,7 @@ async fn pq_key_registrations_with_flagged_builder_ids() {
     let client = &tester.client;
     let builder = |builder_index: u64| BUILDER_INDEX_FLAG | builder_index;
     let deposit_epoch = Epoch::new(0);
-    let unregistered = |index: u64, change_epoch: Epoch| PqPublicKeysData {
+    let unregistered = |index: u64, change_epoch: Epoch| PqKeyMaterialData {
         index,
         xmss_public_key: XmssPublicKey::default(),
         vrf_root: VrfRoot::default(),
@@ -1033,7 +1033,7 @@ async fn pq_key_registrations_with_flagged_builder_ids() {
 
     // Unknown indices, including a builder outside the registry, are skipped.
     let response = client
-        .get_beacon_states_pq_public_keys(
+        .get_beacon_states_pq_key_material(
             StateId::Head,
             Some(&[builder(1), 0, builder(2), builder(0)]),
         )
@@ -1050,7 +1050,7 @@ async fn pq_key_registrations_with_flagged_builder_ids() {
     );
 
     let all_keys = client
-        .get_beacon_states_pq_public_keys(StateId::Head, None)
+        .get_beacon_states_pq_key_material(StateId::Head, None)
         .await
         .unwrap()
         .unwrap()
@@ -1072,7 +1072,7 @@ async fn pq_key_registrations_with_flagged_builder_ids() {
         .unwrap();
     let registration = PqKeyRegistration {
         index: builder(0),
-        public_keys: PqPublicKeys {
+        key_material: PqKeyMaterial {
             xmss_public_key,
             vrf_root: VrfRoot::default(),
         },

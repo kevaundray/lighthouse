@@ -20,9 +20,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use types::builder::BuilderIndex;
 use types::{
-    ChainSpec, Config, Domain, Epoch, EthSpec, Hash256, PQ_POSSESSION_XMSS_INDEX, PqKeyPossession,
-    PqKeyRegistration, PqPublicKeys, PqRegistryIndex, SignedPqKeyRegistration, SignedRoot, VrfRoot,
-    XmssPublicKey, XmssSignature,
+    ChainSpec, Config, Domain, Epoch, EthSpec, Hash256, PQ_POSSESSION_XMSS_INDEX, PqKeyMaterial,
+    PqKeyPossession, PqKeyRegistration, PqRegistryIndex, SignedPqKeyRegistration, SignedRoot,
+    VrfRoot, XmssPublicKey, XmssSignature,
 };
 use zeroize::Zeroizing;
 
@@ -178,11 +178,11 @@ pub fn run<E: EthSpec>(env: Environment<E>, matches: &ArgMatches) -> Result<(), 
     eprintln!("index: {}", signed_registration.message.index);
     eprintln!(
         "xmss_public_key: 0x{}",
-        hex::encode(&signed_registration.message.public_keys.xmss_public_key[..])
+        hex::encode(&signed_registration.message.key_material.xmss_public_key[..])
     );
     eprintln!(
         "vrf_root: {:?}",
-        signed_registration.message.public_keys.vrf_root
+        signed_registration.message.key_material.vrf_root
     );
     eprintln!("xmss_leaf_index: {}", PQ_POSSESSION_XMSS_INDEX);
     eprintln!(
@@ -261,24 +261,24 @@ async fn fetch_chain_context<E: EthSpec>(
         Some(epoch) => epoch,
         None => {
             let index = registrant.as_u64();
-            let keys = client
-                .get_beacon_states_pq_public_keys(StateId::Head, Some(&[index]))
+            let entries = client
+                .get_beacon_states_pq_key_material(StateId::Head, Some(&[index]))
                 .await
                 .map_err(|e| {
                     format!(
-                        "Unable to fetch the post-quantum keys of {}: {}",
+                        "Unable to fetch the post-quantum key material of {}: {}",
                         describe(registrant),
                         e
                     )
                 })?
-                .ok_or("Head state not found when fetching post-quantum keys")?
+                .ok_or("Head state not found when fetching post-quantum key material")?
                 .data;
-            let entry = keys
+            let entry = entries
                 .into_iter()
                 .find(|entry| entry.index == index)
                 .ok_or_else(|| {
                     format!(
-                        "Beacon node returned no post-quantum keys for {}",
+                        "Beacon node returned no post-quantum key material for {}",
                         describe(registrant)
                     )
                 })?;
@@ -289,7 +289,7 @@ async fn fetch_chain_context<E: EthSpec>(
                 );
             } else {
                 eprintln!(
-                    "Current post-quantum keys: xmss_public_key 0x{}, vrf_root {:?}, \
+                    "Current post-quantum key material: xmss_public_key 0x{}, vrf_root {:?}, \
                      change_epoch {}",
                     hex::encode(&entry.xmss_public_key[..]),
                     entry.vrf_root,
@@ -541,7 +541,7 @@ pub fn build_signed_registration(
 
     let signed_registration = PqKeyRegistration {
         index: registrant.as_u64(),
-        public_keys: PqPublicKeys {
+        key_material: PqKeyMaterial {
             xmss_public_key: xmss_key.xmss_public_key.clone(),
             vrf_root: VrfRoot::from(vrf_root),
         },
@@ -968,11 +968,11 @@ mod tests {
         let registration = register(&key, &keypair, 9, &state, &spec);
         assert_eq!(registration.possession, key.possession);
         assert_eq!(
-            registration.message.public_keys.xmss_public_key,
+            registration.message.key_material.xmss_public_key,
             key.xmss_public_key
         );
         assert_eq!(
-            registration.message.public_keys.vrf_root,
+            registration.message.key_material.vrf_root,
             Hash256::repeat_byte(9)
         );
         assert_eq!(
@@ -992,11 +992,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             applied
-                .pq_public_keys()
+                .pq_key_material()
                 .unwrap()
                 .get(VALIDATOR_INDEX as usize)
                 .unwrap(),
-            &registration.message.public_keys
+            &registration.message.key_material
         );
 
         // Signatures are bound to the network via the genesis validators root.
@@ -1056,7 +1056,7 @@ mod tests {
             registration.message.index,
             builder_index | BUILDER_INDEX_FLAG
         );
-        assert_eq!(registration.message.public_keys.vrf_root, Hash256::ZERO);
+        assert_eq!(registration.message.key_material.vrf_root, Hash256::ZERO);
         assert_eq!(registration.possession, key.possession);
         verify_pq_key_registration(&state, &registration, VerifySignatures::True, &spec).unwrap();
 
@@ -1071,11 +1071,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             applied
-                .builder_pq_public_keys()
+                .builder_pq_key_material()
                 .unwrap()
                 .get(builder_index as usize)
                 .unwrap(),
-            &registration.message.public_keys
+            &registration.message.key_material
         );
         assert_eq!(
             *applied
@@ -1135,7 +1135,7 @@ mod tests {
         // Consensus rejects the registration the tool refuses to build.
         let signed = PqKeyRegistration {
             index: builder.as_u64(),
-            public_keys: PqPublicKeys {
+            key_material: PqKeyMaterial {
                 xmss_public_key: key.xmss_public_key.clone(),
                 vrf_root: Hash256::repeat_byte(9),
             },
@@ -1261,7 +1261,7 @@ mod tests {
         for key in [&first, &second] {
             let registration = register(key, &keypair, 9, &state, &spec);
             assert_eq!(
-                registration.message.public_keys.xmss_public_key,
+                registration.message.key_material.xmss_public_key,
                 key.xmss_public_key
             );
             assert_eq!(registration.possession, key.possession);

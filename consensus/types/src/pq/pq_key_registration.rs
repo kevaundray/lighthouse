@@ -7,7 +7,7 @@ use tree_hash_derive::TreeHash;
 use crate::{
     core::{ChainSpec, Domain, Epoch, Hash256, SignedRoot},
     fork::ForkName,
-    pq::{PqPublicKeys, SignedPqKeyRegistration, XmssSignature},
+    pq::{PqKeyMaterial, SignedPqKeyRegistration, XmssSignature},
 };
 
 /// The message of a registration: which validator or builder, which keys, and after which change.
@@ -18,7 +18,7 @@ pub struct PqKeyRegistration {
     /// Validator index, or builder index with `BUILDER_INDEX_FLAG` set (see `PqRegistryIndex`).
     #[serde(with = "serde_utils::quoted_u64")]
     pub index: u64,
-    pub public_keys: PqPublicKeys,
+    pub key_material: PqKeyMaterial,
     /// Epoch of the last change, or the never-registered marker of the index: `FAR_FUTURE_EPOCH`
     /// for a validator, the deposit epoch for a builder.
     pub previous_change_epoch: Epoch,
@@ -64,7 +64,7 @@ mod tests {
         let index = crate::core::consts::gloas::BUILDER_INDEX_FLAG | 3;
         let registration = PqKeyRegistration {
             index,
-            public_keys: PqPublicKeys::default(),
+            key_material: PqKeyMaterial::default(),
             previous_change_epoch: Epoch::new(7),
         };
         let json = serde_json::to_value(&registration).unwrap();
@@ -75,7 +75,7 @@ mod tests {
             .cloned()
             .collect::<Vec<_>>();
         fields.sort();
-        assert_eq!(fields, ["index", "previous_change_epoch", "public_keys"]);
+        assert_eq!(fields, ["index", "key_material", "previous_change_epoch"]);
         assert_eq!(json["index"], index.to_string());
         assert_eq!(
             serde_json::from_value::<PqKeyRegistration>(json).unwrap(),
