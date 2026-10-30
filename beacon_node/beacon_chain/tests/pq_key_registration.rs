@@ -71,27 +71,42 @@ fn key_material() -> PqKeyMaterial {
 /// A first registration of `XMSS_KEY` for `REGISTRANT`, with a valid proof of possession and a
 /// valid BLS authorization.
 fn registration(state: &BeaconState<E>, spec: &ChainSpec) -> SignedPqKeyRegistration {
-    let validator_pubkey = state.get_validator(REGISTRANT as usize).unwrap().pubkey;
+    validator_registration(state, REGISTRANT, &XMSS_KEY, spec)
+}
+
+/// A registration of `xmss_key`, with the VRF root of `key_material()`, for `validator_index`,
+/// naming its stored change epoch in `state`, with a valid proof of possession and a valid BLS
+/// authorization.
+fn validator_registration(
+    state: &BeaconState<E>,
+    validator_index: u64,
+    xmss_key: &xmss::SecretKey,
+    spec: &ChainSpec,
+) -> SignedPqKeyRegistration {
+    let xmss_public_key = XmssPublicKey::new(xmss_key.public_key().to_bytes().to_vec()).unwrap();
+    let validator_pubkey = state
+        .get_validator(validator_index as usize)
+        .unwrap()
+        .pubkey;
     let signing_root =
-        get_pq_possession_signing_root(state, &validator_pubkey, &xmss_public_key(), spec);
+        get_pq_possession_signing_root(state, &validator_pubkey, &xmss_public_key, spec);
     let start = Instant::now();
-    let possession = XMSS_KEY
+    let possession = xmss_key
         .sign(&signing_root.0, PQ_POSSESSION_XMSS_INDEX)
         .expect("leanXMSS signing succeeds");
     eprintln!("leanXMSS possession proof signed in {:?}", start.elapsed());
     PqKeyRegistration {
-        index: REGISTRANT,
-        key_material: key_material(),
+        index: validator_index,
+        key_material: PqKeyMaterial {
+            xmss_public_key,
+            vrf_root: key_material().vrf_root,
+        },
         // A first registration names the stored entry, `FAR_FUTURE_EPOCH` until it registers.
-        previous_change_epoch: *state
-            .post_quantum_key_change_epochs()
-            .unwrap()
-            .get(REGISTRANT as usize)
-            .unwrap(),
+        previous_change_epoch: state.get_pq_key_change_epoch(validator_index).unwrap(),
     }
     .sign(
         XmssSignature::new(possession.to_bytes().to_vec()).unwrap(),
-        &KEYPAIRS[REGISTRANT as usize].sk,
+        &KEYPAIRS[validator_index as usize].sk,
         state.genesis_validators_root(),
         spec,
     )
@@ -786,5 +801,102 @@ async fn range_sync_rejects_segment_with_invalid_possession_proof() {
             .get_current_state()
             .is_pq_registered(REGISTRANT)
             .unwrap()
+    );
+}
+
+/// A validator registers a key that another validator changed away from in a block that is not
+/// finalized yet. The registration is valid at the head, so it survives the next finalization,
+/// whose finalized state still shows the earlier holder with the key, and is included.
+#[tokio::test]
+async fn registration_of_key_freed_after_finality_survives_finalization() {
+    let mut spec = ForkName::Eip8450.make_genesis_spec(E::default_spec());
+    // The earlier holder can change away from the key at once.
+    spec.min_pq_key_change_delay = Epoch::new(0);
+    let harness = BeaconChainHarness::<EphemeralHarnessType<E>>::builder(E::default())
+        .spec(Arc::new(spec))
+        .keypairs(KEYPAIRS.clone())
+        .fresh_ephemeral_store()
+        .mock_execution_layer()
+        .build();
+    let spec = harness.spec.clone();
+    harness.advance_slot();
+    let holder = 3;
+
+    // The holder registers `XMSS_KEY` at epoch 0.
+    submit(
+        &harness,
+        validator_registration(&harness.get_current_state(), holder, &XMSS_KEY, &spec),
+    );
+    harness.extend_slots(1).await;
+    assert_eq!(
+        harness.get_current_state().get_pq_key_change_epoch(holder),
+        Ok(Epoch::new(0))
+    );
+
+    // In the last block of epoch 4, the holder changes away from `XMSS_KEY`.
+    let change_epoch = Epoch::new(4);
+    let change_slot = (change_epoch + 1).start_slot(E::slots_per_epoch()) - 1;
+    harness.extend_to_slot(change_slot - 1).await;
+    submit(
+        &harness,
+        validator_registration(&harness.get_current_state(), holder, &XMSS_KEY_2, &spec),
+    );
+    harness.extend_to_slot(change_slot).await;
+    let head_state = harness.get_current_state();
+    assert_eq!(head_state.slot(), change_slot);
+    assert_eq!(head_state.get_pq_key_change_epoch(holder), Ok(change_epoch));
+    assert!(
+        head_state
+            .get_pq_key_material(holder)
+            .unwrap()
+            .xmss_public_key
+            != xmss_public_key()
+    );
+
+    // The registrant registers `XMSS_KEY`, which is free at the head.
+    let freed_key = registration(&head_state, &spec);
+    submit(&harness, freed_key.clone());
+    let finalized_before = harness.finalized_checkpoint().epoch;
+
+    // At the start of the next epoch, fork choice pulls up the head's unrealized finality. The
+    // finalized state predates the change, so its holder still holds `XMSS_KEY`.
+    harness
+        .chain
+        .slot_clock
+        .set_slot((change_slot + 1).as_u64());
+    harness.chain.recompute_head_at_current_slot().await;
+    let finalized_epoch = harness.finalized_checkpoint().epoch;
+    assert!(finalized_epoch > finalized_before);
+    assert!(finalized_epoch >= Epoch::new(1) && finalized_epoch <= change_epoch);
+
+    // The registration is kept, with its gossip pair, and the next block includes it.
+    assert!(
+        harness
+            .chain
+            .op_pool
+            .get_all_pq_key_registrations()
+            .contains(&freed_key)
+    );
+    assert!(
+        harness
+            .chain
+            .observed_pq_key_registrations
+            .lock()
+            .is_known(REGISTRANT, freed_key.message.previous_change_epoch)
+    );
+    let block_root = harness.extend_slots(1).await;
+    let block = harness.chain.get_block(&block_root).await.unwrap().unwrap();
+    assert_eq!(
+        block
+            .message()
+            .body()
+            .pq_key_registrations()
+            .unwrap()
+            .as_slice(),
+        std::slice::from_ref(&freed_key)
+    );
+    assert_eq!(
+        harness.get_current_state().get_pq_key_material(REGISTRANT),
+        Ok(&key_material())
     );
 }

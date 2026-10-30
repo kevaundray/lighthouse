@@ -801,16 +801,18 @@ impl<E: EthSpec> OperationPool<E> {
     }
 
     /// Prune post-quantum key registrations that can no longer be included in a block descending
-    /// from `finalized_state`, returning the `(index, previous_change_epoch)` pairs of the pruned
+    /// from `finalized_state`, or whose key a finalized holder still holds and which are invalid
+    /// at `head_state`, returning the `(index, previous_change_epoch)` pairs of the pruned
     /// registrations. See `PqKeyRegistrations::prune`.
     pub fn prune_pq_key_registrations(
         &self,
+        head_state: &BeaconState<E>,
         finalized_state: &BeaconState<E>,
         spec: &ChainSpec,
     ) -> Vec<(u64, Epoch)> {
         self.pq_key_registrations
             .write()
-            .prune(finalized_state, spec)
+            .prune(head_state, finalized_state, spec)
     }
 
     /// Prune all types of transactions given the latest head state and head fork.
@@ -833,7 +835,7 @@ impl<E: EthSpec> OperationPool<E> {
         self.prune_attester_slashings(finalized_state);
         self.prune_voluntary_exits(finalized_state, spec);
         self.prune_bls_to_execution_changes(head_block, head_state, spec);
-        self.prune_pq_key_registrations(finalized_state, spec)
+        self.prune_pq_key_registrations(head_state, finalized_state, spec)
     }
 
     /// Total number of voluntary exits in the pool.

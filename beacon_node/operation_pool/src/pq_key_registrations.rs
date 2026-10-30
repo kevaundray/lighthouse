@@ -1,3 +1,6 @@
+use state_processing::per_block_processing::errors::{
+    BlockOperationError, PqKeyRegistrationInvalid,
+};
 use state_processing::per_block_processing::{
     VerifySignatures, cmp_pq_change_epochs, is_pq_registration_dead, verify_pq_key_registration,
 };
@@ -194,37 +197,42 @@ impl PqKeyRegistrations {
         true
     }
 
-    /// Prune registrations that are dead or invalid against `finalized_state`, returning the
+    /// Prune registrations that are dead or invalid against `finalized_state`, unless a key held
+    /// in `finalized_state` is free at `head_state`, returning the
     /// `(index, previous_change_epoch)` pairs of the pruned registrations.
     ///
-    /// A registration is pruned if, in `finalized_state`:
+    /// A registration is pruned if:
     ///
-    /// - its `previous_change_epoch` is dead (`is_pq_registration_dead`): its index's stored change
-    ///   epoch is past it, so it was applied or a later change superseded it, or it names a change
-    ///   (or builder deposit) before the finalized epoch that the finalized chain does not hold,
-    ///   made on a fork that is not canonical. No descendant can include it;
-    /// - any validator or builder holds its leanXMSS key: another one won a race for the key, its
-    ///   own index applied it, or it re-registers a key its index holds. It is invalid against the
-    ///   finalized state. It could become valid again on a descendant if the holder later changes
-    ///   away from the key (or a builder's index is reused), but it is pruned anyway, as EIP-8450
-    ///   allows for a first-seen registration that is no longer valid against the finalized state:
-    ///   keeping it would hold its pool slot and its gossip pair indefinitely, and a resubmission
-    ///   is accepted once the pair is forgotten;
-    /// - its validator initiated an exit, or its builder initiated an exit
-    ///   (`withdrawable_epoch != FAR_FUTURE_EPOCH`) and it names the builder's stored epoch. Neither
-    ///   becomes registrable again. A builder's index can be reused by a later builder, but every
-    ///   registration of the later builder names a later epoch (see `cmp_pq_change_epochs`), and is
-    ///   kept.
+    /// - its `previous_change_epoch` is dead in `finalized_state` (`is_pq_registration_dead`): its
+    ///   index's stored change epoch is past it, so it was applied or a later change superseded
+    ///   it, or it names a change (or builder deposit) before the finalized epoch that the
+    ///   finalized chain does not hold, made on a fork that is not canonical. No descendant can
+    ///   include it;
+    /// - a validator or builder holds its leanXMSS key in `finalized_state`, and the registration
+    ///   is also invalid at `head_state`: a validator or builder holds the key there too, or it
+    ///   fails `verify_pq_key_registration` without signatures for a reason other than the change
+    ///   delay, which only defers it on the head chain. This covers another registrant winning a
+    ///   race for the key, its own index applying it, and a re-registration of a key its index
+    ///   holds. A registration whose key a finalized holder has changed away from in a
+    ///   non-finalized block is kept, since it can be included on the head chain: block packing
+    ///   checks every candidate against the block's pre-state, and skips it while a re-org gives
+    ///   the key back to a holder;
+    /// - in `finalized_state`, its validator initiated an exit, or its builder initiated an exit
+    ///   (`withdrawable_epoch != FAR_FUTURE_EPOCH`) and it names the builder's stored epoch.
+    ///   Neither becomes registrable again. A builder's index can be reused by a later builder,
+    ///   but every registration of the later builder names a later epoch (see
+    ///   `cmp_pq_change_epochs`), and is kept.
     ///
-    /// The caller must forget the returned pairs in its gossip duplicate filter: a pair whose
-    /// registration lost a key race is otherwise never accepted again, since the stored change
-    /// epoch does not move.
+    /// The caller must forget the returned pairs, and only those, in its gossip duplicate filter:
+    /// a pair whose registration lost a key race is otherwise never accepted again, since the
+    /// stored change epoch does not move, while a kept registration still holds its pair.
     ///
     /// Pruning against the finalized state rather than the head keeps registrations applied in
     /// non-finalized blocks, so they can be included again if those blocks are re-orged out.
     /// Block packing skips them while they are applied in the head chain.
     pub fn prune<E: EthSpec>(
         &mut self,
+        head_state: &BeaconState<E>,
         finalized_state: &BeaconState<E>,
         spec: &ChainSpec,
     ) -> Vec<(u64, Epoch)> {
@@ -232,7 +240,14 @@ impl PqKeyRegistrations {
             return vec![];
         }
         let finalized_epoch = finalized_state.current_epoch();
-        let held_keys = self.finalized_held_keys(finalized_state);
+        let finalized_held_keys = held_keys(
+            finalized_state,
+            self.by_index
+                .values()
+                .map(|pooled| &pooled.registration.message.key_material.xmss_public_key)
+                .collect(),
+        );
+        let head_held_keys = held_keys(head_state, finalized_held_keys.iter().collect());
 
         let mut pruned = vec![];
         self.by_index.retain(
@@ -260,8 +275,14 @@ impl PqKeyRegistrations {
                                 })
                     }
                 };
-                let key_taken = held_keys.contains(&message.key_material.xmss_public_key);
-                let keep = !exited && !dead && !key_taken;
+                let key = &message.key_material.xmss_public_key;
+                // Verified against the head only if nothing else prunes it.
+                let key_taken = || {
+                    finalized_held_keys.contains(key)
+                        && (head_held_keys.contains(key)
+                            || is_invalid_at_head(head_state, registration, spec))
+                };
+                let keep = !exited && !dead && !key_taken();
                 if !keep {
                     pruned.push((*sequence, index, message.previous_change_epoch));
                 }
@@ -276,36 +297,54 @@ impl PqKeyRegistrations {
             })
             .collect()
     }
+}
 
-    /// The leanXMSS keys of the pooled registrations that a validator or builder holds in `state`.
-    ///
-    /// Uses the state's `PqPubkeyCache` when it is built, and otherwise scans the registry once.
-    fn finalized_held_keys<E: EthSpec>(&self, state: &BeaconState<E>) -> HashSet<XmssPublicKey> {
-        let pooled_keys = self
-            .by_index
-            .values()
-            .map(|pooled| &pooled.registration.message.key_material.xmss_public_key)
-            .collect::<HashSet<_>>();
-        if pooled_keys.is_empty() {
-            return HashSet::new();
-        }
-        let cache = state.pq_pubkey_cache();
-        if cache.is_initialized() {
-            return pooled_keys
-                .into_iter()
-                .filter(|key| cache.get(key).is_some())
-                .cloned()
-                .collect();
-        }
-        let Ok(registered) = state.registered_pq_key_material() else {
-            return HashSet::new();
-        };
-        registered
-            .map(|(_, key_material)| &key_material.xmss_public_key)
-            .filter(|key| pooled_keys.contains(key))
-            .cloned()
-            .collect()
+/// Returns `true` if `registration` cannot be included on the chain of `head_state`: it fails
+/// `verify_pq_key_registration` without signatures, other than because the change delay has not
+/// passed at the head state's epoch, which only defers it.
+///
+/// The key check comes after the change delay check, so a registration deferred by the delay is
+/// not checked for its key here. `PqKeyRegistrations::prune` checks the head's held keys itself.
+fn is_invalid_at_head<E: EthSpec>(
+    head_state: &BeaconState<E>,
+    registration: &SignedPqKeyRegistration,
+    spec: &ChainSpec,
+) -> bool {
+    !matches!(
+        verify_pq_key_registration(head_state, registration, VerifySignatures::False, spec),
+        Ok(())
+            | Err(BlockOperationError::Invalid(
+                PqKeyRegistrationInvalid::ChangeTooSoon { .. }
+            ))
+    )
+}
+
+/// The keys among `keys` that a validator or builder holds in `state`.
+///
+/// Uses the state's `PqPubkeyCache` when it is built, and otherwise scans the registry once.
+fn held_keys<E: EthSpec>(
+    state: &BeaconState<E>,
+    keys: HashSet<&XmssPublicKey>,
+) -> HashSet<XmssPublicKey> {
+    if keys.is_empty() {
+        return HashSet::new();
     }
+    let cache = state.pq_pubkey_cache();
+    if cache.is_initialized() {
+        return keys
+            .into_iter()
+            .filter(|key| cache.get(key).is_some())
+            .cloned()
+            .collect();
+    }
+    let Ok(registered) = state.registered_pq_key_material() else {
+        return HashSet::new();
+    };
+    registered
+        .map(|(_, key_material)| &key_material.xmss_public_key)
+        .filter(|key| keys.contains(key))
+        .cloned()
+        .collect()
 }
 
 /// Pools are equal if they hold the same registrations in the same order.
@@ -566,7 +605,7 @@ mod tests {
         finalized_state
             .set_pq_key_material(0, key_material(9), Epoch::new(2))
             .unwrap();
-        pool.prune(&finalized_state, &spec);
+        pool.prune(&finalized_state, &finalized_state, &spec);
         assert_eq!(
             pool.insert(registration(3, 1, NEVER), max_len),
             PqKeyRegistrationInsertOutcome::Inserted
@@ -629,12 +668,13 @@ mod tests {
             own_key,
         ];
 
-        // With the finalized state's PQ pubkey cache built, and without it.
+        // With the finalized state's PQ pubkey cache built, and without it. The head is the
+        // finalized state, so a key held in the finalized state is held at the head too.
         let mut uncached_state = finalized_state.clone();
         uncached_state.drop_pq_pubkey_cache();
         for state in [&finalized_state, &uncached_state] {
             let mut pool = pool_with(&registrations);
-            let mut pruned = pool.prune(state, &spec);
+            let mut pruned = pool.prune(state, state, &spec);
             pruned.sort();
 
             assert_eq!(
@@ -680,7 +720,7 @@ mod tests {
             registration(5, 6, 2),
         ];
         let mut pool = pool_with(&registrations);
-        let mut pruned = pool.prune(&finalized_state, &spec);
+        let mut pruned = pool.prune(&finalized_state, &finalized_state, &spec);
         pruned.sort();
 
         assert_eq!(pruned, vec![(0, Epoch::new(4)), (4, Epoch::new(3))]);
@@ -699,6 +739,102 @@ mod tests {
             pool.insert(registration(0, 1, NEVER), usize::MAX),
             PqKeyRegistrationInsertOutcome::Inserted
         );
+    }
+
+    /// A key held in the finalized state prunes a registration only if the registration is also
+    /// invalid at the head: a registration of a key that its finalized holder changed away from in
+    /// a non-finalized block is kept and included.
+    #[test]
+    fn prune_keeps_registration_of_key_freed_at_head() {
+        let spec = spec();
+        let mut finalized_state = genesis_state(&spec);
+        // Validator 0 holds key 1, validator 2 key 3, validator 8 key 9, validator 10 key 11,
+        // validator 13 key 12 and validator 12 key 15.
+        for (index, key_byte) in [(0, 1), (2, 3), (8, 9), (10, 11), (13, 12), (12, 15)] {
+            finalized_state
+                .set_pq_key_material(index, key_material(key_byte), Epoch::new(0))
+                .unwrap();
+        }
+
+        // In non-finalized blocks of the head chain, validators 0, 13 and 12 change away from
+        // keys 1, 12 and 15, validator 14 registers key 16, and validator 6 takes key 7.
+        let mut head_state = finalized_state.clone();
+        let head_epoch = Epoch::new(1);
+        *head_state.slot_mut() = head_epoch.start_slot(E::slots_per_epoch());
+        for (index, key_byte) in [(0, 2), (13, 20), (12, 21), (14, 16), (6, 7)] {
+            head_state
+                .set_pq_key_material(index, key_material(key_byte), head_epoch)
+                .unwrap();
+        }
+
+        // Validator 8 re-registers the leanXMSS key it holds, with a new VRF root.
+        let mut own_key = registration(8, 9, 0);
+        own_key.message.key_material.vrf_root = Hash256::repeat_byte(0xee);
+        // (a) Key 1 is held in the finalized state but free at the head.
+        let freed_key = registration(1, 1, NEVER);
+        // Key 12 is freed at the head too, but validator 10's change delay has not passed at the
+        // head's epoch: it is only deferred.
+        assert!(spec.min_pq_key_change_delay > head_epoch);
+        let deferred = registration(10, 12, 0);
+        // (c) Key 7 was taken at the head after validator 7 registered it.
+        let lost_race = registration(7, 7, NEVER);
+        let registrations = [
+            freed_key.clone(),
+            // (b) Key 3 is held in both.
+            registration(3, 3, NEVER),
+            lost_race.clone(),
+            // (e) Its own current key, held in both.
+            own_key,
+            deferred.clone(),
+            // Key 15 is freed at the head, but validator 14 registered other keys there, so the
+            // registration names a stale change epoch.
+            registration(14, 15, NEVER),
+        ];
+
+        let mut uncached_head = head_state.clone();
+        uncached_head.drop_pq_pubkey_cache();
+        for head in [&head_state, &uncached_head] {
+            let mut pool = pool_with(&registrations);
+            let mut pruned = pool.prune(head, &finalized_state, &spec);
+            pruned.sort();
+            // Only the pruned pairs are returned.
+            assert_eq!(
+                pruned,
+                vec![
+                    (3, Epoch::new(NEVER)),
+                    (8, Epoch::new(0)),
+                    (14, Epoch::new(NEVER)),
+                ]
+            );
+            assert_eq!(
+                pool.iter_fifo().cloned().collect::<Vec<_>>(),
+                vec![freed_key.clone(), lost_race.clone(), deferred.clone()]
+            );
+
+            // (a) The kept registration is included on the head chain. (c) The lost race stays
+            // pooled while finality does not show its key held, and is skipped meanwhile.
+            assert_eq!(
+                pool.select_for_block(head, |_| false, 8, &spec),
+                vec![freed_key.clone()]
+            );
+
+            // (c) Once finality shows key 7 held, the lost race is pruned.
+            let mut pruned = pool.prune(head, head, &spec);
+            pruned.sort();
+            assert_eq!(pruned, vec![(7, Epoch::new(NEVER))]);
+
+            // (d) A re-org back to a chain where validators 0 and 13 hold keys 1 and 12 again:
+            // packing skips their registrations, and they are pruned at the next finalization
+            // that shows the keys held.
+            assert!(
+                pool.select_for_block(&finalized_state, |_| false, 8, &spec)
+                    .is_empty()
+            );
+            let mut pruned = pool.prune(&finalized_state, &finalized_state, &spec);
+            pruned.sort();
+            assert_eq!(pruned, vec![(1, Epoch::new(NEVER)), (10, Epoch::new(0))]);
+            assert!(pool.iter_fifo().next().is_none());
+        }
     }
 
     #[test]
@@ -936,7 +1072,7 @@ mod tests {
         uncached_state.drop_pq_pubkey_cache();
         for state in [&finalized_state, &uncached_state] {
             let mut pool = pool_with(&registrations);
-            let mut pruned = pool.prune(state, &spec);
+            let mut pruned = pool.prune(state, state, &spec);
             pruned.sort();
             assert_eq!(
                 pool.iter_fifo().cloned().collect::<Vec<_>>(),
