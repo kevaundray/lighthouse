@@ -4,8 +4,8 @@
 use account_utils::eth2_keystore::{Keystore, keypair_from_secret};
 use account_utils::read_password;
 use bls::{Keypair, PublicKeyBytes, SecretKey};
-use clap::ArgMatches;
-use clap_utils::{parse_optional, parse_required};
+use clap::{Arg, ArgAction, ArgGroup, ArgMatches, Command};
+use clap_utils::{FLAG_HEADER, parse_optional, parse_required};
 use environment::Environment;
 use eth2::types::{BuilderData, BuilderId, BuilderStatus, StateId, ValidatorId};
 use eth2::{BeaconNodeHttpClient, SensitiveUrl, Timeouts};
@@ -14,8 +14,8 @@ use eth2_wallet::{KeyType, recover_validator_secret_from_mnemonic};
 use lean_pq::xmss;
 use serde::{Deserialize, Serialize};
 use state_processing::per_block_processing::builder::is_builder_index;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use types::builder::BuilderIndex;
@@ -27,6 +27,211 @@ use types::{
 use zeroize::Zeroizing;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Largest secret file read. A 24-word mnemonic takes at most 215 bytes; the rest leaves room for
+/// whitespace.
+const SECRET_FILE_MAX_LEN: usize = 4096;
+
+/// Length of the 0x-prefixed hex of a leanXMSS seed.
+const XMSS_SEED_HEX_LEN: usize = 2 + 2 * xmss::SECRET_KEY_LEN;
+
+/// Bound on the length of a seed file. The longest, with a 20-digit index, is
+/// `{"seed":"<66>","index":"<20>","pubkey":"<98>"}` and a newline: 219 bytes.
+const XMSS_SEED_FILE_MAX_LEN: usize = 256;
+
+/// The `pq-key-registration` subcommand.
+pub fn cli_app() -> Command {
+    Command::new("pq-key-registration")
+        .about(
+            "Creates an EIP-8450 post-quantum key registration for a validator or a builder and \
+             optionally submits it to a beacon node. Every registration carries a new leanXMSS \
+             key: each run creates one, saves its seed to --xmss-seed-out, and signs its proof of \
+             possession at leaf index 0 once. The BLS signing key of the validator or builder \
+             authorizes the registration; it is read only from files, never from the command \
+             line. A builder registers through the same operation, under its builder index with \
+             BUILDER_INDEX_FLAG (2**40) set, with a zero VRF root, and only while it is active: \
+             its deposit epoch is finalized and it has not initiated an exit. A registration that \
+             was not included is resubmitted, never re-signed, by POSTing the --output file \
+             unchanged to /eth/v1/beacon/pool/pq_key_registrations. A new registration always \
+             needs a new key, from a new run.",
+        )
+        .arg(
+            Arg::new("beacon-node")
+                .long("beacon-node")
+                .value_name("URL")
+                .action(ArgAction::Set)
+                .default_value("http://localhost:5052")
+                .help(
+                    "Beacon node to fetch the genesis, spec, validator or builder and current \
+                     post-quantum key material from, and to submit to.",
+                )
+                .display_order(0),
+        )
+        .arg(
+            Arg::new("validator-index")
+                .long("validator-index")
+                .value_name("INDEX")
+                .action(ArgAction::Set)
+                .help("Index of the validator registering keys.")
+                .display_order(0),
+        )
+        .arg(
+            Arg::new("builder-index")
+                .long("builder-index")
+                .value_name("INDEX")
+                .action(ArgAction::Set)
+                .conflicts_with_all(["mnemonic-file", "derivation-index"])
+                .help(
+                    "Index of the builder registering keys, as in the builder registry, without \
+                     BUILDER_INDEX_FLAG; the registration carries it with the flag set. The \
+                     builder must be active. Its VRF root is zero. Its BLS signing key comes from \
+                     --keystore or --bls-secret-key-file: Lighthouse has no mnemonic derivation \
+                     for builder keys, so --mnemonic-file is not supported for builders.",
+                )
+                .display_order(0),
+        )
+        .group(
+            ArgGroup::new("registrant")
+                .args(["validator-index", "builder-index"])
+                .required(true),
+        )
+        .arg(
+            Arg::new("mnemonic-file")
+                .long("mnemonic-file")
+                .value_name("PATH")
+                .action(ArgAction::Set)
+                .help(
+                    "File containing the mnemonic from which to derive the validator's BLS \
+                     signing key (EIP-2334 path m/12381/3600/i/0/0). Validators only.",
+                )
+                .display_order(0),
+        )
+        .arg(
+            Arg::new("derivation-index")
+                .long("derivation-index")
+                .value_name("INDEX")
+                .action(ArgAction::Set)
+                // Exactly one key source is required, so conflicting with the others requires
+                // --mnemonic-file. `requires("mnemonic-file")` is not enforced, as that argument
+                // is in the required key source group.
+                .conflicts_with_all(["keystore", "bls-secret-key-file"])
+                .help(
+                    "Index i of the EIP-2334 signing key path, with --mnemonic-file. Defaults to \
+                     the validator index.",
+                )
+                .display_order(0),
+        )
+        .arg(
+            Arg::new("keystore")
+                .long("keystore")
+                .value_name("PATH")
+                .action(ArgAction::Set)
+                .requires("password-file")
+                .help("EIP-2335 keystore holding the BLS signing key of the validator or builder.")
+                .display_order(0),
+        )
+        .arg(
+            Arg::new("password-file")
+                .long("password-file")
+                .value_name("PATH")
+                .action(ArgAction::Set)
+                .requires("keystore")
+                .help("File containing the password of --keystore.")
+                .display_order(0),
+        )
+        .arg(
+            Arg::new("bls-secret-key-file")
+                .long("bls-secret-key-file")
+                .value_name("PATH")
+                .action(ArgAction::Set)
+                .help(
+                    "File containing the BLS signing key of the validator or builder as \
+                     0x-prefixed hex.",
+                )
+                .display_order(0),
+        )
+        .group(
+            ArgGroup::new("bls-key-source")
+                .args(["mnemonic-file", "keystore", "bls-secret-key-file"])
+                .required(true),
+        )
+        .arg(
+            Arg::new("xmss-seed-out")
+                .long("xmss-seed-out")
+                .value_name("PATH")
+                .action(ArgAction::Set)
+                .required(true)
+                .help(
+                    "New file (mode 0600, never overwritten) for the leanXMSS key this run \
+                     generates from OS randomness. It holds {\"seed\", \"index\", \"pubkey\"}: \
+                     the seed, the registration's index (a builder's with BUILDER_INDEX_FLAG \
+                     set) and the BLS public key of the validator or builder, what its signer \
+                     needs for the key's later duties. It is written before the key signs its \
+                     proof of possession. Each run needs a new path: a new registration always \
+                     needs a new key. The copies of the seed this tool makes are zeroized, but \
+                     the leanXMSS secret key that lean-pq holds in memory is not zeroized on \
+                     drop, an upstream limitation.",
+                )
+                .display_order(0),
+        )
+        .arg(
+            Arg::new("vrf-root")
+                .long("vrf-root")
+                .value_name("HEX32")
+                .action(ArgAction::Set)
+                .required_unless_present("builder-index")
+                .help(
+                    "32-byte root of the validator's VRF tree, as 0x-prefixed hex. Required for a \
+                     validator. A builder registers a zero VRF root, so for a builder it may be \
+                     omitted and any non-zero value is refused.",
+                )
+                .display_order(0),
+        )
+        .arg(
+            Arg::new("previous-change-epoch")
+                .long("previous-change-epoch")
+                .value_name("EPOCH")
+                .action(ArgAction::Set)
+                .help(
+                    "Epoch of the last key change of the validator or builder. Defaults to the \
+                     change_epoch fetched from the beacon node's head state, which for keys never \
+                     registered is FAR_FUTURE_EPOCH for a validator and the deposit epoch for a \
+                     builder.",
+                )
+                .display_order(0),
+        )
+        .arg(
+            Arg::new("output")
+                .long("output")
+                .value_name("PATH")
+                .action(ArgAction::Set)
+                .help(
+                    "Path to write the registration to, as a JSON array suitable for POST \
+                     /eth/v1/beacon/pool/pq_key_registrations. A registration that was not \
+                     included is resubmitted by POSTing this file unchanged to that endpoint. At \
+                     least one of --output and --submit is required.",
+                )
+                .display_order(0),
+        )
+        .arg(
+            Arg::new("submit")
+                .long("submit")
+                .action(ArgAction::SetTrue)
+                .help_heading(FLAG_HEADER)
+                .help(
+                    "Submit the registration to the beacon node's pool. Without --output, a \
+                     registration that was not included cannot be resubmitted, and a new run \
+                     with a new key replaces it.",
+                )
+                .display_order(0),
+        )
+        .group(
+            ArgGroup::new("destination")
+                .args(["output", "submit"])
+                .multiple(true)
+                .required(true),
+        )
+}
 
 /// Returns the validator or builder given by exactly one of `--validator-index` and
 /// `--builder-index`. Neither may carry `BUILDER_INDEX_FLAG`: the registration's index carries it
@@ -102,7 +307,7 @@ pub fn run<E: EthSpec>(env: Environment<E>, matches: &ArgMatches) -> Result<(), 
     let vrf_root = registered_vrf_root(
         registrant,
         parse_optional::<String>(matches, "vrf-root")?
-            .map(|vrf_root| parse_hex32(&vrf_root, "--vrf-root"))
+            .map(|vrf_root| parse_hex32(&vrf_root, "--vrf-root").map(|root| *root))
             .transpose()?,
     )?;
     let previous_change_epoch_override: Option<Epoch> =
@@ -502,10 +707,7 @@ fn create_xmss_key(
     write_xmss_seed_file(
         path,
         &XmssSeedFile {
-            seed: Zeroizing::new(format!(
-                "0x{}",
-                hex::encode(Zeroizing::new(xmss_secret_key.to_bytes()))
-            )),
+            seed: encode_xmss_seed(&Zeroizing::new(xmss_secret_key.to_bytes()))?,
             index: registrant.as_u64(),
             pubkey: *pubkey,
         },
@@ -572,26 +774,16 @@ pub fn build_signed_registration(
     Ok(signed_registration)
 }
 
-/// Loads the BLS signing key of `registrant` from exactly one of `--mnemonic`, `--mnemonic-file`,
-/// `--keystore`, `--bls-secret-key` or `--bls-secret-key-file`. A mnemonic derives validator
-/// keys only.
+/// Loads the BLS signing key of `registrant` from exactly one of `--mnemonic-file`, `--keystore`
+/// or `--bls-secret-key-file`. A mnemonic derives validator keys only.
 fn load_bls_keypair(matches: &ArgMatches, registrant: PqRegistryIndex) -> Result<Keypair, String> {
-    let phrase = match (
-        parse_optional::<String>(matches, "mnemonic")?,
-        parse_optional::<PathBuf>(matches, "mnemonic-file")?,
-    ) {
-        (Some(phrase), _) => Some(Zeroizing::new(phrase)),
-        (None, Some(path)) => Some(read_mnemonic_file(&path)?),
-        (None, None) => None,
-    };
-    if let Some(phrase) = phrase {
+    if let Some(mnemonic_path) = parse_optional::<PathBuf>(matches, "mnemonic-file")? {
         let validator_index = match registrant {
             PqRegistryIndex::Validator(validator_index) => validator_index,
             PqRegistryIndex::Builder(_) => {
                 return Err(
-                    "--mnemonic is not supported for builders: Lighthouse has no mnemonic \
-                     derivation for builder keys. Use --keystore, --bls-secret-key or \
-                     --bls-secret-key-file"
+                    "--mnemonic-file is not supported for builders: Lighthouse has no mnemonic \
+                     derivation for builder keys. Use --keystore or --bls-secret-key-file"
                         .to_string(),
                 );
             }
@@ -605,7 +797,7 @@ fn load_bls_keypair(matches: &ArgMatches, registrant: PqRegistryIndex) -> Result
                 )
             })?,
         };
-        return keypair_from_mnemonic(&phrase, derivation_index);
+        return keypair_from_mnemonic(&read_mnemonic_file(&mnemonic_path)?, derivation_index);
     }
 
     if let Some(keystore_path) = parse_optional::<PathBuf>(matches, "keystore")? {
@@ -629,46 +821,66 @@ fn load_bls_keypair(matches: &ArgMatches, registrant: PqRegistryIndex) -> Result
             .map_err(|e| format!("Unable to decrypt keystore: {:?}", e));
     }
 
-    let secret_hex = match (
-        parse_optional::<String>(matches, "bls-secret-key")?,
-        parse_optional::<PathBuf>(matches, "bls-secret-key-file")?,
-    ) {
-        (Some(secret_hex), _) => Zeroizing::new(secret_hex),
-        (None, Some(path)) => read_secret_file(&path)?,
-        (None, None) => {
-            return Err(
-                "One of --mnemonic, --mnemonic-file, --keystore, --bls-secret-key or \
-                 --bls-secret-key-file is required"
-                    .to_string(),
-            );
-        }
-    };
-    keypair_from_secret_hex(&secret_hex)
+    let secret_path = parse_optional::<PathBuf>(matches, "bls-secret-key-file")?.ok_or(
+        "One of --mnemonic-file, --keystore or --bls-secret-key-file is required".to_string(),
+    )?;
+    keypair_from_secret_hex(&read_secret_file(&secret_path)?)
 }
 
 /// Builds a keypair from a 0x-prefixed hex BLS secret key.
 fn keypair_from_secret_hex(secret_hex: &str) -> Result<Keypair, String> {
-    let secret = Zeroizing::new(parse_hex32(secret_hex, "BLS secret key")?);
+    let secret = parse_hex32(secret_hex, "BLS secret key")?;
     let sk =
         SecretKey::deserialize(&*secret).map_err(|e| format!("Invalid BLS secret key: {:?}", e))?;
     Ok(Keypair::from_components(sk.public_key(), sk))
 }
 
-/// Reads a secret from a file, with surrounding whitespace removed.
+/// Reads a secret of at most `SECRET_FILE_MAX_LEN` bytes from a file, which may be a pipe, with
+/// surrounding whitespace removed.
+///
+/// The file is read into a zeroized buffer allocated once: a buffer that grew would leave
+/// unzeroized copies of the secret behind.
 fn read_secret_file(path: &Path) -> Result<Zeroizing<String>, String> {
-    let contents = Zeroizing::new(
-        fs::read_to_string(path)
-            .map_err(|e| format!("Unable to read {}: {:?}", path.display(), e))?,
-    );
-    Ok(Zeroizing::new(contents.trim().to_string()))
+    let read_error = |e| format!("Unable to read {}: {:?}", path.display(), e);
+    let mut file = File::open(path).map_err(read_error)?;
+    // One byte past the limit tells a file at the limit from a longer one.
+    let mut buf = Zeroizing::new(vec![0u8; SECRET_FILE_MAX_LEN.saturating_add(1)]);
+    let mut len = 0usize;
+    while let Some(free) = buf.get_mut(len..).filter(|free| !free.is_empty()) {
+        match file.read(free) {
+            Ok(0) => break,
+            Ok(read) => len = len.saturating_add(read),
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(read_error(e)),
+        }
+    }
+    let contents = buf
+        .get(..len)
+        .filter(|contents| contents.len() <= SECRET_FILE_MAX_LEN)
+        .ok_or_else(|| {
+            format!(
+                "{} is longer than {} bytes",
+                path.display(),
+                SECRET_FILE_MAX_LEN
+            )
+        })?;
+    let contents = std::str::from_utf8(contents)
+        .map_err(|e| format!("{} is not valid UTF-8: {}", path.display(), e))?;
+    Ok(Zeroizing::new(contents.trim().to_owned()))
 }
 
 /// Reads a mnemonic phrase from a file, normalizing whitespace between its words.
 fn read_mnemonic_file(path: &Path) -> Result<Zeroizing<String>, String> {
     let contents = read_secret_file(path)?;
-    Ok(Zeroizing::new(
-        contents.split_whitespace().collect::<Vec<_>>().join(" "),
-    ))
+    // Normalizing never lengthens the phrase, so the buffer is never reallocated.
+    let mut phrase = Zeroizing::new(String::with_capacity(contents.len()));
+    for word in contents.split_whitespace() {
+        if !phrase.is_empty() {
+            phrase.push(' ');
+        }
+        phrase.push_str(word);
+    }
+    Ok(phrase)
 }
 
 /// Derives the EIP-2334 signing key `m/12381/3600/{derivation_index}/0/0` from `phrase`.
@@ -684,13 +896,37 @@ pub fn keypair_from_mnemonic(phrase: &str, derivation_index: u32) -> Result<Keyp
         .map_err(|e| format!("Unable to build the BLS keypair: {:?}", e))
 }
 
-fn parse_hex32(value: &str, name: &str) -> Result<[u8; 32], String> {
-    let bytes = Zeroizing::new(
-        hex::decode(value.strip_prefix("0x").unwrap_or(value))
-            .map_err(|e| format!("{} is not valid hex: {}", name, e))?,
-    );
-    <[u8; 32]>::try_from(bytes.as_slice())
-        .map_err(|_| format!("{} must be 32 bytes, got {}", name, bytes.len()))
+/// Parses 32 bytes of hex, optionally 0x-prefixed, straight into a zeroized buffer. Errors never
+/// quote the input, which may be secret.
+fn parse_hex32(value: &str, name: &str) -> Result<Zeroizing<[u8; 32]>, String> {
+    let hex = value.strip_prefix("0x").unwrap_or(value);
+    let mut bytes = Zeroizing::new([0u8; 32]);
+    hex::decode_to_slice(hex, &mut *bytes).map_err(|e| match e {
+        hex::FromHexError::OddLength | hex::FromHexError::InvalidStringLength => format!(
+            "{} must be 32 bytes (64 hex digits), got {} hex digits",
+            name,
+            hex.len()
+        ),
+        hex::FromHexError::InvalidHexCharacter { index, .. } => format!(
+            "{} is not valid hex: invalid character at index {}",
+            name, index
+        ),
+    })?;
+    Ok(bytes)
+}
+
+/// Returns the 0x-prefixed hex of a leanXMSS seed. The hex is built in zeroized buffers sized up
+/// front, so no unzeroized copy of the seed or its hex is left behind.
+fn encode_xmss_seed(seed: &[u8; xmss::SECRET_KEY_LEN]) -> Result<Zeroizing<String>, String> {
+    let mut digits = Zeroizing::new([0u8; 2 * xmss::SECRET_KEY_LEN]);
+    hex::encode_to_slice(seed, &mut *digits)
+        .map_err(|e| format!("Unable to encode the XMSS seed: {}", e))?;
+    let digits = std::str::from_utf8(&*digits)
+        .map_err(|e| format!("Unable to encode the XMSS seed: {}", e))?;
+    let mut encoded = Zeroizing::new(String::with_capacity(XMSS_SEED_HEX_LEN));
+    encoded.push_str("0x");
+    encoded.push_str(digits);
+    Ok(encoded)
 }
 
 /// The contents of an XMSS seed file: what the signer of the validator or builder needs for the
@@ -722,11 +958,20 @@ fn write_registration_output(
 
 /// Writes `seed_file` to a new file at `path` that only the owner can read. Fails if `path`
 /// already exists, so an existing seed is never overwritten.
+///
+/// The file is serialized into a fixed zeroized buffer: a buffer that grew would leave
+/// unzeroized copies of the seed behind.
 fn write_xmss_seed_file(path: &Path, seed_file: &XmssSeedFile) -> Result<(), String> {
-    let contents = Zeroizing::new(
-        serde_json::to_string(seed_file)
-            .map_err(|e| format!("Unable to serialize XMSS seed: {:?}", e))?,
-    );
+    let mut buf = Zeroizing::new([0u8; XMSS_SEED_FILE_MAX_LEN]);
+    let mut free: &mut [u8] = &mut *buf;
+    serde_json::to_writer(&mut free, seed_file)
+        .map_err(|e| format!("Unable to serialize XMSS seed: {:?}", e))?;
+    free.write_all(b"\n")
+        .map_err(|e| format!("Unable to serialize XMSS seed: {:?}", e))?;
+    let len = XMSS_SEED_FILE_MAX_LEN.saturating_sub(free.len());
+    let contents = buf
+        .get(..len)
+        .ok_or("Unable to serialize XMSS seed: too long")?;
 
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -747,8 +992,7 @@ fn write_xmss_seed_file(path: &Path, seed_file: &XmssSeedFile) -> Result<(), Str
             e
         )
     })?;
-    file.write_all(contents.as_bytes())
-        .and_then(|()| file.write_all(b"\n"))
+    file.write_all(contents)
         .and_then(|()| file.sync_all())
         .map_err(|e| format!("Unable to write XMSS seed to {}: {:?}", path.display(), e))
 }
@@ -817,7 +1061,7 @@ mod tests {
 
     /// Adds a builder holding the BLS key `BUILDER_KEYPAIR`, deposited at epoch 0, to `state`,
     /// then moves `state` to epoch 2 with epoch 1 finalized, so that the builder is active.
-    /// Returns its builder index and its BLS key, loaded from hex as `--bls-secret-key` does.
+    /// Returns its builder index and its BLS key, loaded from hex as `--bls-secret-key-file` does.
     fn add_active_builder(state: &mut BeaconState<E>, spec: &ChainSpec) -> (BuilderIndex, Keypair) {
         let deterministic = generate_deterministic_keypair(BUILDER_KEYPAIR);
         let keypair = keypair_from_secret_hex(&format!(
@@ -926,7 +1170,7 @@ mod tests {
 
         // The stored seed is the seed of the created key.
         let seed_file = read_seed_file(&path).unwrap();
-        let seed = Zeroizing::new(parse_hex32(&seed_file.seed, "XMSS seed").unwrap());
+        let seed = parse_hex32(&seed_file.seed, "XMSS seed").unwrap();
         assert_eq!(
             encode_xmss_public_key(&xmss::SecretKey::from_seed(*seed).public_key()).unwrap(),
             created.xmss_public_key
@@ -1293,7 +1537,7 @@ mod tests {
     #[test]
     fn xmss_seed_file_is_private_and_never_overwritten() {
         let seed_file = |seed: [u8; 32]| XmssSeedFile {
-            seed: Zeroizing::new(format!("0x{}", hex::encode(seed))),
+            seed: encode_xmss_seed(&seed).unwrap(),
             index: VALIDATOR_INDEX,
             pubkey: generate_deterministic_keypair(1).pk.compress(),
         };
@@ -1340,7 +1584,32 @@ mod tests {
     }
 
     #[test]
-    fn secret_files_match_command_line_values() {
+    fn xmss_seed_file_fits_its_buffer() {
+        let seed = encode_xmss_seed(&XMSS_SEED).unwrap();
+        assert_eq!(*seed, format!("0x{}", "07".repeat(32)));
+        assert_eq!(seed.len(), XMSS_SEED_HEX_LEN);
+
+        // The longest seed file, with a 20-digit index, fits the serialization buffer.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("xmss_seed.json");
+        write_xmss_seed_file(
+            &path,
+            &XmssSeedFile {
+                seed,
+                index: u64::MAX,
+                pubkey: generate_deterministic_keypair(1).pk.compress(),
+            },
+        )
+        .unwrap();
+        let contents = fs::read_to_string(&path).unwrap();
+        assert_eq!(contents.len(), 219);
+        assert!(contents.len() <= XMSS_SEED_FILE_MAX_LEN);
+        assert!(contents.ends_with("}\n"));
+        assert_eq!(read_seed_file(&path).unwrap().index, u64::MAX);
+    }
+
+    #[test]
+    fn secret_files_load_the_expected_keys() {
         let dir = tempfile::tempdir().unwrap();
 
         let mnemonic_path = dir.path().join("mnemonic");
@@ -1349,8 +1618,12 @@ mod tests {
             format!("  {}\n\n", MNEMONIC.replace(' ', "  \n")),
         )
         .unwrap();
-        let from_file =
-            keypair_from_mnemonic(&read_mnemonic_file(&mnemonic_path).unwrap(), 3).unwrap();
+        let phrase = read_mnemonic_file(&mnemonic_path).unwrap();
+        assert_eq!(
+            *phrase,
+            MNEMONIC.split_whitespace().collect::<Vec<_>>().join(" ")
+        );
+        let from_file = keypair_from_mnemonic(&phrase, 3).unwrap();
         assert_eq!(from_file.pk, keypair_from_mnemonic(MNEMONIC, 3).unwrap().pk);
 
         let expected = generate_deterministic_keypair(3);
@@ -1359,20 +1632,106 @@ mod tests {
         fs::write(&secret_path, format!("{secret_hex}\r\n")).unwrap();
         let from_file = keypair_from_secret_hex(&read_secret_file(&secret_path).unwrap()).unwrap();
         assert_eq!(from_file.pk, expected.pk);
-        assert_eq!(
-            keypair_from_secret_hex(&secret_hex).unwrap().pk,
-            expected.pk
-        );
+
+        // A file at the size limit is read; a longer one is refused.
+        let padded = format!("{secret_hex:<width$}", width = SECRET_FILE_MAX_LEN);
+        fs::write(&secret_path, &padded).unwrap();
+        assert_eq!(*read_secret_file(&secret_path).unwrap(), secret_hex);
+        fs::write(&secret_path, format!("{padded} ")).unwrap();
+        let err = read_secret_file(&secret_path).unwrap_err();
+        assert!(err.contains("is longer than"), "{err}");
+        assert!(!err.contains(&secret_hex), "{err}");
     }
 
     #[test]
     fn parse_hex32_checks_length() {
         assert_eq!(
-            parse_hex32(&format!("0x{}", "ab".repeat(32)), "x").unwrap(),
+            *parse_hex32(&format!("0x{}", "ab".repeat(32)), "x").unwrap(),
             [0xab; 32]
         );
-        assert_eq!(parse_hex32(&"cd".repeat(32), "x").unwrap(), [0xcd; 32]);
+        assert_eq!(*parse_hex32(&"cd".repeat(32), "x").unwrap(), [0xcd; 32]);
         assert!(parse_hex32("0xabcd", "x").is_err());
         assert!(parse_hex32("0xzz", "x").is_err());
+        assert!(parse_hex32(&"cd".repeat(33), "x").is_err());
+        // Errors do not quote the input, which may be a secret.
+        let err = parse_hex32(&format!("0x{}zq", "ab".repeat(31)), "x").unwrap_err();
+        assert!(err.contains("invalid character at index 62"), "{err}");
+        assert!(!err.contains("zq") && !err.contains("abab"), "{err}");
+    }
+
+    /// Arguments every parse below shares.
+    const SEED_AND_OUTPUT: [&str; 4] = ["--xmss-seed-out", "seed.json", "--output", "out.json"];
+    const AS_VALIDATOR: [&str; 4] = ["--validator-index", "1", "--vrf-root", "0x00"];
+    const AS_BUILDER: [&str; 2] = ["--builder-index", "0"];
+
+    fn parse_cli(registrant: &[&str], key_source: &[&str]) -> Result<ArgMatches, clap::Error> {
+        cli_app().try_get_matches_from(
+            std::iter::once("pq-key-registration")
+                .chain(registrant.iter().copied())
+                .chain(SEED_AND_OUTPUT)
+                .chain(key_source.iter().copied()),
+        )
+    }
+
+    #[test]
+    fn cli_rejects_secrets_on_the_command_line() {
+        use clap::error::ErrorKind as ClapErrorKind;
+        let secret_hex = format!("0x{}", "11".repeat(32));
+
+        // The mnemonic and the BLS secret key are never taken from argv.
+        for key_source in [
+            vec!["--mnemonic", MNEMONIC],
+            vec!["--bls-secret-key", secret_hex.as_str()],
+        ] {
+            for registrant in [AS_VALIDATOR.as_slice(), AS_BUILDER.as_slice()] {
+                let err = parse_cli(registrant, &key_source).unwrap_err();
+                assert_eq!(err.kind(), ClapErrorKind::UnknownArgument, "{err}");
+            }
+        }
+        let mnemonic_arg = format!("--mnemonic={MNEMONIC}");
+        let secret_arg = format!("--bls-secret-key={secret_hex}");
+        for key_source in [mnemonic_arg, secret_arg] {
+            let err = parse_cli(&AS_VALIDATOR, &[key_source.as_str()]).unwrap_err();
+            assert_eq!(err.kind(), ClapErrorKind::UnknownArgument, "{err}");
+        }
+
+        // The file and keystore sources are accepted, exactly one of them.
+        for key_source in [
+            ["--mnemonic-file", "mnemonic"].as_slice(),
+            &["--mnemonic-file", "mnemonic", "--derivation-index", "3"],
+            &["--keystore", "keystore.json", "--password-file", "password"],
+            &["--bls-secret-key-file", "secret"],
+        ] {
+            parse_cli(&AS_VALIDATOR, key_source).unwrap();
+        }
+        let err = parse_cli(&AS_VALIDATOR, &[]).unwrap_err();
+        assert_eq!(err.kind(), ClapErrorKind::MissingRequiredArgument, "{err}");
+        let err = parse_cli(
+            &AS_VALIDATOR,
+            &[
+                "--mnemonic-file",
+                "mnemonic",
+                "--bls-secret-key-file",
+                "secret",
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ClapErrorKind::ArgumentConflict, "{err}");
+        let err = parse_cli(
+            &AS_VALIDATOR,
+            &["--derivation-index", "3", "--bls-secret-key-file", "secret"],
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ClapErrorKind::ArgumentConflict, "{err}");
+
+        // A builder has no mnemonic derivation.
+        parse_cli(&AS_BUILDER, &["--bls-secret-key-file", "secret"]).unwrap();
+        parse_cli(
+            &AS_BUILDER,
+            &["--keystore", "keystore.json", "--password-file", "password"],
+        )
+        .unwrap();
+        let err = parse_cli(&AS_BUILDER, &["--mnemonic-file", "mnemonic"]).unwrap_err();
+        assert_eq!(err.kind(), ClapErrorKind::ArgumentConflict, "{err}");
     }
 }
