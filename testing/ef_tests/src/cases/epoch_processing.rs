@@ -433,11 +433,34 @@ impl<E: EthSpec, T: EpochTransition<E>> Case for EpochProcessing<E, T> {
             return false;
         }
 
+        // EIP-8015 removes `process_eth1_data_reset` in Heze.
+        if fork_name.heze_enabled() && T::name() == "eth1_data_reset" {
+            return false;
+        }
+
         true
     }
 
     fn result(&self, _case_index: usize, fork_name: ForkName) -> Result<(), Error> {
         self.metadata.bls_setting.unwrap_or_default().check()?;
+
+        // Lighthouse does not implement EIP-8365 (Heze: `apply_pending_deposit` drops deposits
+        // that would create validators with 0x00 BLS withdrawal credentials).
+        const IGNORED_EIP8365_PENDING_DEPOSITS_CASES: &[&str] = &[
+            "new_bls_withdrawal_credentials_valid_signature",
+            "bls_withdrawal_credentials_queued_before_heze",
+            "bls_withdrawal_credentials_followed_by_eth1_deposit",
+        ];
+        if fork_name.heze_enabled()
+            && T::name() == "pending_deposits"
+            && self.path.file_name().is_some_and(|case_name| {
+                IGNORED_EIP8365_PENDING_DEPOSITS_CASES
+                    .iter()
+                    .any(|ignored| case_name == *ignored)
+            })
+        {
+            return Err(Error::SkippedKnownFailure);
+        }
 
         let spec = &testing_spec_with_config::<E>(fork_name, self.config.as_ref())?;
         let mut pre_state = self.pre.clone();

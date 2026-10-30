@@ -139,6 +139,11 @@ fn operations_voluntary_exit_churn() {
 }
 
 #[test]
+fn operations_pq_key_registration() {
+    OperationsHandler::<Spec, SignedPqKeyRegistration>::default().run();
+}
+
+#[test]
 fn sanity_blocks() {
     SanityBlocksHandler::<Spec>::default().run();
 }
@@ -351,6 +356,7 @@ mod ssz_static {
         SszStaticHandler::<BeaconBlockBodyFulu<Spec>, Spec>::fulu_only().run();
         SszStaticHandler::<BeaconBlockBodyGloas<Spec>, Spec>::gloas_only().run();
         SszStaticHandler::<BeaconBlockBodyHeze<Spec>, Spec>::heze_only().run();
+        SszStaticHandler::<BeaconBlockBodyEip8450<Spec>, Spec>::eip8450_only().run();
     }
 
     // Altair and later
@@ -460,7 +466,7 @@ mod ssz_static {
         SszStaticHandler::<ExecutionPayloadElectra<Spec>, Spec>::electra_only().run();
         SszStaticHandler::<ExecutionPayloadFulu<Spec>, Spec>::fulu_only().run();
         SszStaticHandler::<ExecutionPayloadGloas<Spec>, Spec>::gloas_only().run();
-        SszStaticHandler::<ExecutionPayloadHeze<Spec>, Spec>::heze_only().run();
+        SszStaticHandler::<ExecutionPayloadHeze<Spec>, Spec>::heze_and_later().run();
     }
 
     #[test]
@@ -475,13 +481,13 @@ mod ssz_static {
     #[test]
     fn execution_payload_bid() {
         SszStaticHandler::<ExecutionPayloadBidGloas<Spec>, Spec>::gloas_only().run();
-        SszStaticHandler::<ExecutionPayloadBidHeze<Spec>, Spec>::heze_only().run();
+        SszStaticHandler::<ExecutionPayloadBidHeze<Spec>, Spec>::heze_and_later().run();
     }
 
     #[test]
     fn signed_execution_payload_bid() {
         SszStaticHandler::<SignedExecutionPayloadBidGloas<Spec>, Spec>::gloas_only().run();
-        SszStaticHandler::<SignedExecutionPayloadBidHeze<Spec>, Spec>::heze_only().run();
+        SszStaticHandler::<SignedExecutionPayloadBidHeze<Spec>, Spec>::heze_and_later().run();
     }
 
     #[test]
@@ -520,7 +526,7 @@ mod ssz_static {
     fn data_column_sidecar() {
         SszStaticHandler::<DataColumnSidecarFulu<Spec>, Spec>::fulu_only().run();
         SszStaticHandler::<DataColumnSidecarGloas<Spec>, Spec>::gloas_only().run();
-        SszStaticHandler::<DataColumnSidecarGloas<Spec>, Spec>::heze_only().run();
+        SszStaticHandler::<DataColumnSidecarGloas<Spec>, Spec>::heze_and_later().run();
     }
 
     #[test]
@@ -562,7 +568,7 @@ mod ssz_static {
     fn execution_requests() {
         SszStaticHandler::<ExecutionRequestsElectra<Spec>, Spec>::electra_only().run();
         SszStaticHandler::<ExecutionRequestsElectra<Spec>, Spec>::fulu_only().run();
-        SszStaticHandler::<ExecutionRequestsGloas<Spec>, Spec>::gloas_only().run();
+        SszStaticHandler::<ExecutionRequestsGloas<Spec>, Spec>::gloas_and_later().run();
     }
 
     // Gloas and later
@@ -629,6 +635,36 @@ mod ssz_static {
     #[test]
     fn signed_proposer_preferences() {
         SszStaticHandler::<SignedProposerPreferences, Spec>::gloas_and_later().run();
+    }
+
+    #[test]
+    fn inclusion_list() {
+        SszStaticHandler::<InclusionList, Spec>::heze_and_later().run();
+    }
+
+    #[test]
+    fn signed_inclusion_list() {
+        SszStaticHandler::<SignedInclusionList, Spec>::heze_and_later().run();
+    }
+
+    #[test]
+    fn pq_key_material() {
+        SszStaticHandler::<PqKeyMaterial, Spec>::eip8450_only().run();
+    }
+
+    #[test]
+    fn pq_key_possession() {
+        SszStaticHandler::<PqKeyPossession, Spec>::eip8450_only().run();
+    }
+
+    #[test]
+    fn pq_key_registration() {
+        SszStaticHandler::<PqKeyRegistration, Spec>::eip8450_only().run();
+    }
+
+    #[test]
+    fn signed_pq_key_registration() {
+        SszStaticHandler::<SignedPqKeyRegistration, Spec>::eip8450_only().run();
     }
 }
 

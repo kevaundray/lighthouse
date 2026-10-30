@@ -143,6 +143,10 @@ impl<E: EthSpec> Case for TransitionTest<E> {
         let spec = &self.spec;
         let mut processed_blocks = 0;
 
+        // Post-Gloas epoch processing reads the slashings cache when it computes the proposer
+        // lookahead, so a Gloas pre-state needs its caches built before advancing.
+        state.build_caches(spec).unwrap();
+
         let mut result: Result<_, String> = self
             .blocks
             .iter()

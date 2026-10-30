@@ -37,6 +37,8 @@ excluded_paths = [
     "tests/.*/.*/ssz_static/LightClientSnapshot",
     # LightClientDataCollection
     "tests/minimal/.*/light_client/data_collection",
+    # TODO(heze): Lighthouse has no Heze light client types (`LightClientError::HezeNotImplemented`).
+    "tests/.*/heze/ssz_static/LightClient(Bootstrap|FinalityUpdate|Header|OptimisticUpdate|Update)/.*",
     # One of the EF researchers likes to pack the tarballs on a Mac
     ".*\\.DS_Store.*",
     # More Mac weirdness.
@@ -51,8 +53,11 @@ excluded_paths = [
     "tests/.*/eip7805",
     # TODO(gloas): Add production-backed handlers for the new Gloas gossip test suites.
     "tests/.*/gloas/networking/gossip_.*",
-    # Heze fork is not implemented
-    "tests/.*/heze/.*",
+    # TODO(gloas): Add production-backed handlers for the Gloas ePBS gossip test suites, which
+    # Heze inherits.
+    "tests/.*/heze/networking/gossip_(execution_payload_bid|execution_payload_envelope|payload_attestation_message|proposer_preferences)/.*",
+    # TODO(heze): Add a gossip handler for FOCIL (EIP-7805) inclusion lists.
+    "tests/.*/heze/networking/gossip_inclusion_list/.*",
     # Ignore MatrixEntry SSZ tests for now.
     "tests/.*/.*/ssz_static/MatrixEntry/.*",
     # TODO: partial data column not implemented yet
@@ -72,13 +77,16 @@ excluded_paths = [
     "tests/.*/.*/networking/gossip_beacon_block/.*/gossip_beacon_block__ignore_parent_consensus_failed_execution_known/.*",
     "tests/.*/.*/networking/gossip_beacon_block/.*/gossip_beacon_block__reject_parent_consensus_failed_execution_not_verified/.*",
     "tests/.*/.*/networking/gossip_beacon_block/.*/gossip_beacon_block__reject_parent_failed_validation/.*",
+    # Returns SkippedKnownFailure before its setup payload envelope is loaded. Keep synchronized
+    # with GossipValidation::has_known_harness_limitation.
+    "tests/.*/heze/networking/gossip_beacon_block/.*/gossip_beacon_block__valid_parent_full/.*",
     # Gossip validation tests target the latest stable fork.
-    "tests/.*/(phase0|altair|bellatrix|capella|deneb|electra|gloas)/networking/gossip_beacon_attestation/.*",
-    "tests/.*/(phase0|altair|bellatrix|capella|deneb|electra|gloas)/networking/gossip_beacon_aggregate_and_proof/.*",
-    "tests/.*/(phase0|altair|bellatrix|capella|deneb|electra|gloas)/networking/gossip_voluntary_exit/.*",
-    "tests/.*/(phase0|altair|bellatrix|capella|deneb|electra|gloas)/networking/gossip_bls_to_execution_change/.*",
-    "tests/.*/(phase0|altair|bellatrix|capella|deneb|electra|gloas)/networking/gossip_sync_committee_message/.*",
-    "tests/.*/(phase0|altair|bellatrix|capella|deneb|electra|gloas)/networking/gossip_sync_committee_contribution_and_proof/.*",
+    "tests/.*/(phase0|altair|bellatrix|capella|deneb|electra|gloas|heze)/networking/gossip_beacon_attestation/.*",
+    "tests/.*/(phase0|altair|bellatrix|capella|deneb|electra|gloas|heze)/networking/gossip_beacon_aggregate_and_proof/.*",
+    "tests/.*/(phase0|altair|bellatrix|capella|deneb|electra|gloas|heze)/networking/gossip_voluntary_exit/.*",
+    "tests/.*/(phase0|altair|bellatrix|capella|deneb|electra|gloas|heze)/networking/gossip_bls_to_execution_change/.*",
+    "tests/.*/(phase0|altair|bellatrix|capella|deneb|electra|gloas|heze)/networking/gossip_sync_committee_message/.*",
+    "tests/.*/(phase0|altair|bellatrix|capella|deneb|electra|gloas|heze)/networking/gossip_sync_committee_contribution_and_proof/.*",
     # The production-backed harness cannot construct these synthetic fixture histories.
     # Keep these patterns synchronized with GossipValidation::has_known_harness_limitation.
     "tests/.*/fulu/networking/gossip_(beacon_attestation|beacon_aggregate_and_proof)/.*/gossip_.*__accepts_.*/.*",
