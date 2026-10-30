@@ -174,6 +174,7 @@ initialized_validators = { path = "validator_client/initialized_validators" }
 int_to_bytes = { path = "consensus/int_to_bytes" }
 itertools = "0.14"
 kzg = { path = "crypto/kzg" }
+lean-pq = { git = "https://github.com/ethereum/lean-pq-bindings.git", tag = "v0.8.0" }
 libp2p = { git = "https://github.com/sigp/rust-libp2p", rev = "accba72bb4eafc692ac518339ef2c4080b6f8461", default-features = false, features = ["identify", "yamux", "noise", "dns", "tcp", "tokio", "secp256k1", "macros", "metrics", "quic", "upnp", "gossipsub", "gossipsub-partial-messages"] }
 libsecp256k1 = "0.7"
 lighthouse_network = { path = "beacon_node/lighthouse_network" }
@@ -282,6 +283,17 @@ yaml_serde = "0.10"
 zeroize = { version = "1", features = ["zeroize_derive", "serde"] }
 zip = { version = "9.0", default-features = false, features = ["deflate"] }
 zstd = "0.14"
+
+# leanXMSS (EIP-8450, via `lean-pq`) key generation, signing and verification are prohibitively
+# slow without optimisations, so optimise the leanVM crates that implement them in dev/test builds.
+[profile.dev.package.signatures]
+opt-level = 3
+
+[profile.dev.package.primitives]
+opt-level = 3
+
+[profile.dev.package.parallel]
+opt-level = 3
 
 [profile.maxperf]
 inherits = "release"

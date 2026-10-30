@@ -208,10 +208,8 @@ pub async fn handle_rpc<E: EthSpec>(
                         ));
                     }
                 }
-                ForkName::Heze => {
-                    // TODO(heze): drop V5 here once `NewPayloadRequest::Heze` is constructed. The
-                    // payload notifier still builds the Gloas request, so Heze blocks send V5.
-                    if method != ENGINE_NEW_PAYLOAD_V5 && method != ENGINE_NEW_PAYLOAD_V6 {
+                ForkName::Heze | ForkName::Eip8450 => {
+                    if method != ENGINE_NEW_PAYLOAD_V6 {
                         return Err((
                             format!("{} called after Heze fork!", method),
                             GENERIC_ERROR_CODE,
@@ -371,7 +369,7 @@ pub async fn handle_rpc<E: EthSpec>(
                 .execution_block_generator
                 .read()
                 .get_fork_at_timestamp(response.timestamp())
-                == ForkName::Heze
+                .heze_enabled()
                 && (method == ENGINE_GET_PAYLOAD_V1
                     || method == ENGINE_GET_PAYLOAD_V2
                     || method == ENGINE_GET_PAYLOAD_V3
@@ -717,7 +715,7 @@ pub async fn handle_rpc<E: EthSpec>(
                             ));
                         }
                     }
-                    ForkName::Heze => {
+                    ForkName::Heze | ForkName::Eip8450 => {
                         if method != ENGINE_FORKCHOICE_UPDATED_V5 {
                             return Err((
                                 format!("{} called after Heze fork! Use V5.", method),

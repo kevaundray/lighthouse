@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use execution_layer::{NewPayloadRequest, NewPayloadRequestGloas};
+use execution_layer::{NewPayloadRequest, NewPayloadRequestGloas, NewPayloadRequestHeze};
 use fork_choice::PayloadVerificationStatus;
 use state_processing::per_block_processing::deneb::kzg_commitment_to_versioned_hash;
 use tracing::warn;
-use types::{SignedBeaconBlock, SignedExecutionPayloadEnvelope};
+use types::{ProgressiveTransactions, SignedBeaconBlock, SignedExecutionPayloadEnvelope};
 
 use crate::{
     BeaconChain, BeaconChainTypes, NotifyExecutionLayer, PayloadVerificationError,
@@ -90,11 +90,22 @@ impl<T: BeaconChainTypes> PayloadNotifier<T> {
             .map(kzg_commitment_to_versioned_hash)
             .collect();
 
-        Ok(NewPayloadRequest::Gloas(NewPayloadRequestGloas {
-            execution_payload: &envelope.message.payload,
-            versioned_hashes,
-            parent_beacon_block_root: envelope.message.parent_beacon_block_root,
-            execution_requests: &envelope.message.execution_requests,
-        }))
+        if block.fork_name_unchecked().heze_enabled() {
+            Ok(NewPayloadRequest::Heze(NewPayloadRequestHeze {
+                execution_payload: &envelope.message.payload,
+                versioned_hashes,
+                parent_beacon_block_root: envelope.message.parent_beacon_block_root,
+                execution_requests: &envelope.message.execution_requests,
+                // Matches `prepare_beacon_proposer`, which also passes no inclusion lists yet.
+                inclusion_list_transactions: ProgressiveTransactions::empty(),
+            }))
+        } else {
+            Ok(NewPayloadRequest::Gloas(NewPayloadRequestGloas {
+                execution_payload: &envelope.message.payload,
+                versioned_hashes,
+                parent_beacon_block_root: envelope.message.parent_beacon_block_root,
+                execution_requests: &envelope.message.execution_requests,
+            }))
+        }
     }
 }

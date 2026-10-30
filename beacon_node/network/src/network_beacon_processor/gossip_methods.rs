@@ -18,6 +18,7 @@ use beacon_chain::payload_bid_verification::PayloadBidError;
 use beacon_chain::payload_envelope_verification::{
     EnvelopeError, EnvelopeSource, gossip_verified_envelope::GossipVerifiedEnvelope,
 };
+use beacon_chain::pq_key_registration_verification::Error as PqKeyRegistrationError;
 use beacon_chain::proposer_preferences_verification::ProposerPreferencesError;
 use beacon_chain::store::Error;
 use beacon_chain::{
@@ -40,7 +41,7 @@ use lighthouse_network::{
     PubsubPartialMessage, ReportSource,
 };
 use logging::crit;
-use operation_pool::ReceivedPreCapella;
+use operation_pool::{PqKeyRegistrationInsertOutcome, ReceivedPreCapella};
 use slot_clock::SlotClock;
 use ssz::Encode;
 use std::fs;
@@ -56,9 +57,9 @@ use types::{
     LightClientOptimisticUpdate, PartialDataColumn, PayloadAttestationMessage, ProposerSlashing,
     SignedAggregateAndProof, SignedBeaconBlock, SignedBlsToExecutionChange,
     SignedContributionAndProof, SignedExecutionPayloadBid, SignedExecutionPayloadEnvelope,
-    SignedInclusionList, SignedProposerPreferences, SignedVoluntaryExit, SingleAttestation, Slot,
-    SubnetId, SyncCommitteeMessage, SyncSubnetId, block::BlockImportSource, data::CellBitmap,
-    execution::SignedExecutionProofEnvelope,
+    SignedInclusionList, SignedPqKeyRegistration, SignedProposerPreferences, SignedVoluntaryExit,
+    SingleAttestation, Slot, SubnetId, SyncCommitteeMessage, SyncSubnetId,
+    block::BlockImportSource, data::CellBitmap, execution::SignedExecutionProofEnvelope,
 };
 
 use beacon_processor::work_reprocessing_queue::QueuedColumnReconstruction;
@@ -1778,7 +1779,8 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
             | Err(e @ BlockError::KnownInvalidExecutionPayload(_))
             | Err(e @ BlockError::GenesisBlock)
             | Err(e @ BlockError::InvalidBlobCount { .. })
-            | Err(e @ BlockError::BidParentRootMismatch { .. }) => {
+            | Err(e @ BlockError::BidParentRootMismatch { .. })
+            | Err(e @ BlockError::BidParentBlockHashMismatch { .. }) => {
                 warn!(error = %e, "Could not verify block for gossip. Rejecting the block");
                 self.propagate_validation_result(message_id, peer_id, MessageAcceptance::Reject);
                 self.gossip_penalize_peer(
@@ -2303,6 +2305,68 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
         );
 
         metrics::inc_counter(&metrics::BEACON_PROCESSOR_BLS_TO_EXECUTION_CHANGE_IMPORTED_TOTAL);
+    }
+
+    /// Process a post-quantum key registration (EIP-8450) received from the gossip network.
+    ///
+    /// Verification follows the `pq_key_registration` gossip rules; see
+    /// `pq_key_registration_penalty` for how failures are scored.
+    pub fn process_gossip_pq_key_registration(
+        self: &Arc<Self>,
+        message_id: MessageId,
+        peer_id: PeerId,
+        registration: SignedPqKeyRegistration,
+    ) {
+        let index = registration.message.index;
+        let previous_change_epoch = registration.message.previous_change_epoch;
+
+        let verified = match self
+            .chain
+            .verify_pq_key_registration_for_gossip(registration)
+        {
+            Ok(verified) => verified,
+            Err(e) => {
+                debug!(
+                    index,
+                    %previous_change_epoch,
+                    %peer_id,
+                    error = ?e,
+                    "Dropping PQ key registration"
+                );
+                match pq_key_registration_penalty(&e) {
+                    None => self.propagate_validation_result(
+                        message_id,
+                        peer_id,
+                        MessageAcceptance::Ignore,
+                    ),
+                    Some(action) => {
+                        self.propagate_validation_result(
+                            message_id,
+                            peer_id,
+                            MessageAcceptance::Reject,
+                        );
+                        self.gossip_penalize_peer(peer_id, action, "invalid_pq_key_registration");
+                    }
+                }
+                return;
+            }
+        };
+
+        metrics::inc_counter(&metrics::BEACON_PROCESSOR_PQ_KEY_REGISTRATION_VERIFIED_TOTAL);
+
+        self.propagate_validation_result(message_id, peer_id, MessageAcceptance::Accept);
+
+        let outcome = self.chain.import_pq_key_registration(verified);
+        if outcome == PqKeyRegistrationInsertOutcome::Inserted {
+            metrics::inc_counter(&metrics::BEACON_PROCESSOR_PQ_KEY_REGISTRATION_IMPORTED_TOTAL);
+        }
+
+        debug!(
+            index,
+            %previous_change_epoch,
+            ?outcome,
+            "Processed PQ key registration"
+        );
     }
 
     /// Process the sync committee signature received from the gossip network and:
@@ -4625,6 +4689,42 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
     }
 }
 
+/// The penalty for a `pq_key_registration` gossip message that failed verification, or `None` to
+/// ignore it.
+///
+/// Conditions that depend on our view of the chain are ignored without penalty, since an honest
+/// peer on a different head can trigger them: an index not in our head state, a previous change
+/// epoch that does not match our head, a leanXMSS key registered in our head, and a builder whose
+/// deposit is not finalized in our head. An exiting validator or builder is rejected with a high
+/// tolerance penalty; faults that do not depend on our view (builder VRF root, all-zero key, BLS
+/// signature, proof of possession) are rejected with a low tolerance penalty.
+fn pq_key_registration_penalty(error: &PqKeyRegistrationError) -> Option<PeerAction> {
+    match error {
+        PqKeyRegistrationError::PriorToEip8450 { .. }
+        | PqKeyRegistrationError::HeadPriorToEip8450
+        | PqKeyRegistrationError::PriorRegistrationKnown { .. }
+        | PqKeyRegistrationError::ChangeTooSoon { .. }
+        | PqKeyRegistrationError::BeaconChainError(_)
+        | PqKeyRegistrationError::BeaconStateError(_)
+        | PqKeyRegistrationError::SignatureSetError(_)
+        | PqKeyRegistrationError::VerificationError(_)
+        | PqKeyRegistrationError::Invalid(_)
+        | PqKeyRegistrationError::ConflictsWithPool
+        | PqKeyRegistrationError::PoolFull
+        | PqKeyRegistrationError::BuilderDepositNotFinalized { .. }
+        | PqKeyRegistrationError::UnknownValidator(_)
+        | PqKeyRegistrationError::UnknownBuilder(_)
+        | PqKeyRegistrationError::PreviousChangeEpochMismatch { .. }
+        | PqKeyRegistrationError::XmssPublicKeyInUse { .. } => None,
+        PqKeyRegistrationError::ValidatorExiting { .. }
+        | PqKeyRegistrationError::BuilderExiting { .. } => Some(PeerAction::HighToleranceError),
+        PqKeyRegistrationError::BuilderNonZeroVrfRoot(_)
+        | PqKeyRegistrationError::ZeroXmssPublicKey
+        | PqKeyRegistrationError::InvalidSignature
+        | PqKeyRegistrationError::InvalidPossessionProof => Some(PeerAction::LowToleranceError),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ReprocessAllowance::{BlockAndPayload, BlockOnly, None, PayloadOnly};
@@ -4662,6 +4762,73 @@ mod tests {
                 start.next_requeue().next_requeue(),
                 None,
                 "re-queuing twice from {start:?} should be terminal"
+            );
+        }
+    }
+
+    /// Conditions that depend on the head are ignored without penalty (EIP-8450 gossip rules).
+    #[test]
+    fn pq_key_registration_head_dependent_failures_are_ignored() {
+        use super::{PqKeyRegistrationError as Error, pq_key_registration_penalty};
+        use lighthouse_network::PeerAction;
+        use types::Epoch;
+
+        for error in [
+            Error::UnknownValidator(8),
+            Error::UnknownBuilder(2),
+            Error::PreviousChangeEpochMismatch {
+                expected: Epoch::new(0),
+                found: Epoch::new(1),
+            },
+            Error::XmssPublicKeyInUse { owner: 0 },
+            Error::BuilderDepositNotFinalized {
+                builder_index: 0,
+                deposit_epoch: Epoch::new(1),
+                finalized_epoch: Epoch::new(1),
+            },
+            Error::PriorRegistrationKnown {
+                index: 0,
+                previous_change_epoch: Epoch::new(0),
+            },
+            Error::ChangeTooSoon {
+                current_epoch: Epoch::new(0),
+                earliest_epoch: Epoch::new(1),
+            },
+        ] {
+            assert!(pq_key_registration_penalty(&error).is_none(), "{error:?}");
+        }
+
+        for error in [
+            Error::ValidatorExiting {
+                validator_index: 0,
+                exit_epoch: Epoch::new(1),
+            },
+            Error::BuilderExiting {
+                builder_index: 0,
+                withdrawable_epoch: Epoch::new(1),
+            },
+        ] {
+            assert!(
+                matches!(
+                    pq_key_registration_penalty(&error),
+                    Some(PeerAction::HighToleranceError)
+                ),
+                "{error:?}"
+            );
+        }
+
+        for error in [
+            Error::BuilderNonZeroVrfRoot(0),
+            Error::ZeroXmssPublicKey,
+            Error::InvalidSignature,
+            Error::InvalidPossessionProof,
+        ] {
+            assert!(
+                matches!(
+                    pq_key_registration_penalty(&error),
+                    Some(PeerAction::LowToleranceError)
+                ),
+                "{error:?}"
             );
         }
     }

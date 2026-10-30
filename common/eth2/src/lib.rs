@@ -715,6 +715,36 @@ impl BeaconNodeHttpClient {
         self.get_opt(path).await
     }
 
+    /// `GET beacon/states/{state_id}/pq_key_material?id`
+    ///
+    /// `ids` are validator indices, or builder indices with `BUILDER_INDEX_FLAG` set. Without
+    /// `ids`, every validator and then every builder is returned.
+    ///
+    /// Returns `Ok(None)` on a 404 error.
+    pub async fn get_beacon_states_pq_key_material(
+        &self,
+        state_id: StateId,
+        ids: Option<&[u64]>,
+    ) -> Result<Option<ExecutionOptimisticFinalizedResponse<Vec<PqKeyMaterialData>>>, Error> {
+        let mut path = self.eth_path(V1)?;
+
+        path.path_segments_mut()
+            .map_err(|()| Error::InvalidUrl(self.server.clone()))?
+            .push("beacon")
+            .push("states")
+            .push(&state_id.to_string())
+            .push("pq_key_material");
+
+        if let Some(ids) = ids {
+            let mut query = path.query_pairs_mut();
+            for id in ids {
+                query.append_pair("id", &id.to_string());
+            }
+        }
+
+        self.get_opt(path).await
+    }
+
     /// `GET beacon/states/{state_id}/validator_balances?id`
     ///
     /// Returns `Ok(None)` on a 404 error.
@@ -2299,6 +2329,39 @@ impl BeaconNodeHttpClient {
         self.post(path, &address_changes).await?;
 
         Ok(())
+    }
+
+    /// `POST beacon/pool/pq_key_registrations`
+    pub async fn post_beacon_pool_pq_key_registrations(
+        &self,
+        registrations: &[SignedPqKeyRegistration],
+    ) -> Result<(), Error> {
+        let mut path = self.eth_path(V1)?;
+
+        path.path_segments_mut()
+            .map_err(|()| Error::InvalidUrl(self.server.clone()))?
+            .push("beacon")
+            .push("pool")
+            .push("pq_key_registrations");
+
+        self.post(path, &registrations).await?;
+
+        Ok(())
+    }
+
+    /// `GET beacon/pool/pq_key_registrations`
+    pub async fn get_beacon_pool_pq_key_registrations(
+        &self,
+    ) -> Result<GenericResponse<Vec<SignedPqKeyRegistration>>, Error> {
+        let mut path = self.eth_path(V1)?;
+
+        path.path_segments_mut()
+            .map_err(|()| Error::InvalidUrl(self.server.clone()))?
+            .push("beacon")
+            .push("pool")
+            .push("pq_key_registrations");
+
+        self.get(path).await
     }
 
     /// `GET beacon/proposer_preferences?slot,dependent_root`

@@ -25,6 +25,7 @@ pub struct ServerSentEventHandler<E: EthSpec> {
     proposer_slashing_tx: Sender<EventKind<E>>,
     attester_slashing_tx: Sender<EventKind<E>>,
     bls_to_execution_change_tx: Sender<EventKind<E>>,
+    pq_key_registration_tx: Sender<EventKind<E>>,
     block_gossip_tx: Sender<EventKind<E>>,
     execution_payload_tx: Sender<EventKind<E>>,
     execution_payload_gossip_tx: Sender<EventKind<E>>,
@@ -59,6 +60,7 @@ impl<E: EthSpec> ServerSentEventHandler<E> {
         let (proposer_slashing_tx, _) = broadcast::channel(capacity);
         let (attester_slashing_tx, _) = broadcast::channel(capacity);
         let (bls_to_execution_change_tx, _) = broadcast::channel(capacity);
+        let (pq_key_registration_tx, _) = broadcast::channel(capacity);
         let (block_gossip_tx, _) = broadcast::channel(capacity);
         let (execution_payload_tx, _) = broadcast::channel(capacity);
         let (execution_payload_gossip_tx, _) = broadcast::channel(capacity);
@@ -87,6 +89,7 @@ impl<E: EthSpec> ServerSentEventHandler<E> {
             proposer_slashing_tx,
             attester_slashing_tx,
             bls_to_execution_change_tx,
+            pq_key_registration_tx,
             block_gossip_tx,
             execution_payload_tx,
             execution_payload_gossip_tx,
@@ -176,6 +179,10 @@ impl<E: EthSpec> ServerSentEventHandler<E> {
                 .bls_to_execution_change_tx
                 .send(kind)
                 .map(|count| log_count("bls to execution change", count)),
+            EventKind::PqKeyRegistration(_) => self
+                .pq_key_registration_tx
+                .send(kind)
+                .map(|count| log_count("pq key registration", count)),
             EventKind::BlockGossip(_) => self
                 .block_gossip_tx
                 .send(kind)
@@ -286,6 +293,10 @@ impl<E: EthSpec> ServerSentEventHandler<E> {
         self.bls_to_execution_change_tx.subscribe()
     }
 
+    pub fn subscribe_pq_key_registration(&self) -> Receiver<EventKind<E>> {
+        self.pq_key_registration_tx.subscribe()
+    }
+
     pub fn subscribe_block_gossip(&self) -> Receiver<EventKind<E>> {
         self.block_gossip_tx.subscribe()
     }
@@ -380,6 +391,10 @@ impl<E: EthSpec> ServerSentEventHandler<E> {
 
     pub fn has_bls_to_execution_change_subscribers(&self) -> bool {
         self.bls_to_execution_change_tx.receiver_count() > 0
+    }
+
+    pub fn has_pq_key_registration_subscribers(&self) -> bool {
+        self.pq_key_registration_tx.receiver_count() > 0
     }
 
     pub fn has_block_gossip_subscribers(&self) -> bool {

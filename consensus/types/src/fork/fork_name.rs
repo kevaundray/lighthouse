@@ -24,6 +24,7 @@ pub enum ForkName {
     Fulu,
     Gloas,
     Heze,
+    Eip8450,
 }
 
 impl ForkName {
@@ -38,6 +39,7 @@ impl ForkName {
             ForkName::Fulu,
             ForkName::Gloas,
             ForkName::Heze,
+            ForkName::Eip8450,
         ]
     }
 
@@ -74,6 +76,7 @@ impl ForkName {
                 spec.fulu_fork_epoch = None;
                 spec.gloas_fork_epoch = None;
                 spec.heze_fork_epoch = None;
+                spec.eip8450_fork_epoch = None;
                 spec
             }
             ForkName::Altair => {
@@ -85,6 +88,7 @@ impl ForkName {
                 spec.fulu_fork_epoch = None;
                 spec.gloas_fork_epoch = None;
                 spec.heze_fork_epoch = None;
+                spec.eip8450_fork_epoch = None;
                 spec
             }
             ForkName::Bellatrix => {
@@ -96,6 +100,7 @@ impl ForkName {
                 spec.fulu_fork_epoch = None;
                 spec.gloas_fork_epoch = None;
                 spec.heze_fork_epoch = None;
+                spec.eip8450_fork_epoch = None;
                 spec
             }
             ForkName::Capella => {
@@ -107,6 +112,7 @@ impl ForkName {
                 spec.fulu_fork_epoch = None;
                 spec.gloas_fork_epoch = None;
                 spec.heze_fork_epoch = None;
+                spec.eip8450_fork_epoch = None;
                 spec
             }
             ForkName::Deneb => {
@@ -118,6 +124,7 @@ impl ForkName {
                 spec.fulu_fork_epoch = None;
                 spec.gloas_fork_epoch = None;
                 spec.heze_fork_epoch = None;
+                spec.eip8450_fork_epoch = None;
                 spec
             }
             ForkName::Electra => {
@@ -129,6 +136,7 @@ impl ForkName {
                 spec.fulu_fork_epoch = None;
                 spec.gloas_fork_epoch = None;
                 spec.heze_fork_epoch = None;
+                spec.eip8450_fork_epoch = None;
                 spec
             }
             ForkName::Fulu => {
@@ -140,6 +148,7 @@ impl ForkName {
                 spec.fulu_fork_epoch = Some(Epoch::new(0));
                 spec.gloas_fork_epoch = None;
                 spec.heze_fork_epoch = None;
+                spec.eip8450_fork_epoch = None;
                 spec
             }
             ForkName::Gloas => {
@@ -151,6 +160,7 @@ impl ForkName {
                 spec.fulu_fork_epoch = Some(Epoch::new(0));
                 spec.gloas_fork_epoch = Some(Epoch::new(0));
                 spec.heze_fork_epoch = None;
+                spec.eip8450_fork_epoch = None;
                 spec
             }
             ForkName::Heze => {
@@ -162,6 +172,19 @@ impl ForkName {
                 spec.fulu_fork_epoch = Some(Epoch::new(0));
                 spec.gloas_fork_epoch = Some(Epoch::new(0));
                 spec.heze_fork_epoch = Some(Epoch::new(0));
+                spec.eip8450_fork_epoch = None;
+                spec
+            }
+            ForkName::Eip8450 => {
+                spec.altair_fork_epoch = Some(Epoch::new(0));
+                spec.bellatrix_fork_epoch = Some(Epoch::new(0));
+                spec.capella_fork_epoch = Some(Epoch::new(0));
+                spec.deneb_fork_epoch = Some(Epoch::new(0));
+                spec.electra_fork_epoch = Some(Epoch::new(0));
+                spec.fulu_fork_epoch = Some(Epoch::new(0));
+                spec.gloas_fork_epoch = Some(Epoch::new(0));
+                spec.heze_fork_epoch = Some(Epoch::new(0));
+                spec.eip8450_fork_epoch = Some(Epoch::new(0));
                 spec
             }
         }
@@ -181,6 +204,7 @@ impl ForkName {
             ForkName::Fulu => Some(ForkName::Electra),
             ForkName::Gloas => Some(ForkName::Fulu),
             ForkName::Heze => Some(ForkName::Gloas),
+            ForkName::Eip8450 => Some(ForkName::Heze),
         }
     }
 
@@ -197,7 +221,8 @@ impl ForkName {
             ForkName::Electra => Some(ForkName::Fulu),
             ForkName::Fulu => Some(ForkName::Gloas),
             ForkName::Gloas => Some(ForkName::Heze),
-            ForkName::Heze => None,
+            ForkName::Heze => Some(ForkName::Eip8450),
+            ForkName::Eip8450 => None,
         }
     }
 
@@ -231,6 +256,22 @@ impl ForkName {
 
     pub fn heze_enabled(self) -> bool {
         self >= ForkName::Heze
+    }
+
+    pub fn eip8450_enabled(self) -> bool {
+        self >= ForkName::Eip8450
+    }
+
+    /// The fork whose execution-layer type variants (`ExecutionPayload`, `ExecutionPayloadBid`)
+    /// this fork uses.
+    ///
+    /// Forks after Heze (Eip8450) change no execution-layer type, so they reuse Heze's.
+    pub fn execution_types_fork(self) -> ForkName {
+        if self.heze_enabled() {
+            ForkName::Heze
+        } else {
+            self
+        }
     }
 
     pub fn fork_ascii(self) {
@@ -288,6 +329,7 @@ impl FromStr for ForkName {
             "fulu" => ForkName::Fulu,
             "gloas" => ForkName::Gloas,
             "heze" => ForkName::Heze,
+            "eip8450" => ForkName::Eip8450,
             _ => return Err(format!("unknown fork name: {}", fork_name)),
         })
     }
@@ -305,6 +347,7 @@ impl Display for ForkName {
             ForkName::Fulu => "fulu".fmt(f),
             ForkName::Gloas => "gloas".fmt(f),
             ForkName::Heze => "heze".fmt(f),
+            ForkName::Eip8450 => "eip8450".fmt(f),
         }
     }
 }

@@ -45,9 +45,10 @@ pub trait Handler {
 
     fn run(&self) {
         for fork_name in ForkName::list_all() {
-            // TODO(heze): remove this skip once Heze spec test vectors are published in
-            // consensus-spec-tests.
-            if fork_name == ForkName::Heze {
+            // EIP-8450 vectors are not in a consensus-spec-tests release yet. Run locally
+            // generated ones (consensus-specs `kw/8450`) only where they have been added.
+            if fork_name == ForkName::Eip8450 && !self.handler_path(&fork_name.to_string()).exists()
+            {
                 continue;
             }
             if !self.disabled_forks().contains(&fork_name) && self.is_enabled_for_fork(fork_name) {
@@ -312,6 +313,10 @@ impl<T, E> SszStaticHandler<T, E> {
 
     pub fn heze_only() -> Self {
         Self::for_forks(vec![ForkName::Heze])
+    }
+
+    pub fn eip8450_only() -> Self {
+        Self::for_forks(vec![ForkName::Eip8450])
     }
 
     pub fn altair_and_later() -> Self {
@@ -796,7 +801,8 @@ impl<E: EthSpec + TypeName> Handler for ForkChoiceComplianceHandler<E> {
     }
 
     fn disabled_forks(&self) -> Vec<ForkName> {
-        vec![]
+        // The v1.7.0-beta.4 `comptests.tar.gz` has no Heze fork choice compliance vectors.
+        vec![ForkName::Heze]
     }
 }
 
@@ -1281,11 +1287,6 @@ impl<E: EthSpec + TypeName> Handler for MerkleProofValidityHandler<E> {
 
     fn is_enabled_for_fork(&self, fork_name: ForkName) -> bool {
         fork_name.altair_enabled()
-    }
-
-    fn disabled_forks(&self) -> Vec<ForkName> {
-        // TODO(gloas): remove once we have Heze light client tests
-        vec![ForkName::Heze]
     }
 }
 

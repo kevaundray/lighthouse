@@ -447,6 +447,13 @@ impl CandidateBeaconNode {
             hint = UPDATE_REQUIRED_LOG_HINT,
             "Beacon node has mismatched Heze fork epoch"
             );
+        } else if beacon_node_spec.eip8450_fork_epoch != spec.eip8450_fork_epoch {
+            warn!(
+            endpoint = %self.beacon_node,
+            endpoint_eip8450_fork_epoch = ?beacon_node_spec.eip8450_fork_epoch,
+            hint = UPDATE_REQUIRED_LOG_HINT,
+            "Beacon node has mismatched Eip8450 fork epoch"
+            );
         }
 
         Ok(())

@@ -1,0 +1,902 @@
+//! EIP-8450 (post-quantum consensus key registry): blocks carrying `SignedPqKeyRegistration`s on
+//! the gossip-verify → import path, across the fork upgrade and through range sync, and block
+//! production of builder registrations that the block's parent execution requests invalidate.
+
+use beacon_chain::block_verification_types::RangeSyncBlock;
+use beacon_chain::payload_envelope_verification::AvailableEnvelope;
+use beacon_chain::pq_key_registration_verification::{
+    Error as PqKeyRegistrationError, PqKeyRegistrationOutcome,
+};
+use beacon_chain::test_utils::{
+    AttestationStrategy, BeaconChainHarness, BlockStrategy, EphemeralHarnessType,
+    builder_withdrawal_credentials,
+};
+use beacon_chain::{
+    AvailabilityProcessingStatus, BlockError, ChainSegmentResult, InvalidSignature,
+    NotifyExecutionLayer,
+};
+use bls::Keypair;
+use lean_pq::xmss;
+use ssz_types::ProgressiveVariableList;
+use state_processing::{
+    BlockSignatureStrategy, ConsensusContext, VerifyBlockRoot, VerifySignatures,
+    per_block_processing,
+    per_block_processing::{
+        errors::{BlockOperationError, PqKeyRegistrationInvalid},
+        get_pq_possession_signing_root, verify_pq_key_registration,
+    },
+    state_advance::complete_state_advance,
+};
+use std::sync::{Arc, LazyLock};
+use std::time::Instant;
+use types::test_utils::{generate_deterministic_keypair, generate_deterministic_keypairs};
+use types::{
+    BeaconState, BlockImportSource, BuilderDepositRequest, BuilderExitRequest, ChainSpec,
+    DepositMessage, Domain, Epoch, EthSpec, ExecutionRequests, ExecutionRequestsGloas, ForkName,
+    Hash256, MinimalEthSpec, PQ_POSSESSION_XMSS_INDEX, PqKeyMaterial, PqKeyRegistration,
+    PqRegistryIndex, SignedBeaconBlock, SignedExecutionPayloadEnvelope, SignedPqKeyRegistration,
+    SignedRoot, Slot, XmssPublicKey, XmssSignature,
+};
+
+type E = MinimalEthSpec;
+type Harness = BeaconChainHarness<EphemeralHarnessType<E>>;
+
+const VALIDATOR_COUNT: usize = 32;
+const EIP8450_FORK_EPOCH: u64 = 1;
+/// The validator that registers keys in these tests.
+const REGISTRANT: u64 = 5;
+
+static KEYPAIRS: LazyLock<Vec<Keypair>> =
+    LazyLock::new(|| generate_deterministic_keypairs(VALIDATOR_COUNT));
+
+/// A leanXMSS key from a fixed seed.
+static XMSS_KEY: LazyLock<xmss::SecretKey> = LazyLock::new(|| {
+    let start = Instant::now();
+    let secret_key = xmss::SecretKey::from_seed([0x51; xmss::SEED_LEN]);
+    eprintln!("leanXMSS key generated in {:?}", start.elapsed());
+    secret_key
+});
+
+fn xmss_public_key() -> XmssPublicKey {
+    XmssPublicKey::new(XMSS_KEY.public_key().to_bytes().to_vec()).unwrap()
+}
+
+fn key_material() -> PqKeyMaterial {
+    PqKeyMaterial {
+        xmss_public_key: xmss_public_key(),
+        vrf_root: Hash256::repeat_byte(0xaa),
+    }
+}
+
+/// A first registration of `XMSS_KEY` for `REGISTRANT`, with a valid proof of possession and a
+/// valid BLS authorization.
+fn registration(state: &BeaconState<E>, spec: &ChainSpec) -> SignedPqKeyRegistration {
+    validator_registration(state, REGISTRANT, &XMSS_KEY, spec)
+}
+
+/// A registration of `xmss_key`, with the VRF root of `key_material()`, for `validator_index`,
+/// naming its stored change epoch in `state`, with a valid proof of possession and a valid BLS
+/// authorization.
+fn validator_registration(
+    state: &BeaconState<E>,
+    validator_index: u64,
+    xmss_key: &xmss::SecretKey,
+    spec: &ChainSpec,
+) -> SignedPqKeyRegistration {
+    let xmss_public_key = XmssPublicKey::new(xmss_key.public_key().to_bytes().to_vec()).unwrap();
+    let validator_pubkey = state
+        .get_validator(validator_index as usize)
+        .unwrap()
+        .pubkey;
+    let signing_root =
+        get_pq_possession_signing_root(state, &validator_pubkey, &xmss_public_key, spec);
+    let start = Instant::now();
+    let possession = xmss_key
+        .sign(&signing_root.0, PQ_POSSESSION_XMSS_INDEX)
+        .expect("leanXMSS signing succeeds");
+    eprintln!("leanXMSS possession proof signed in {:?}", start.elapsed());
+    PqKeyRegistration {
+        index: validator_index,
+        key_material: PqKeyMaterial {
+            xmss_public_key,
+            vrf_root: key_material().vrf_root,
+        },
+        // A first registration names the stored entry, `FAR_FUTURE_EPOCH` until it registers.
+        previous_change_epoch: state.get_pq_key_change_epoch(validator_index).unwrap(),
+    }
+    .sign(
+        XmssSignature::new(possession.to_bytes().to_vec()).unwrap(),
+        &KEYPAIRS[validator_index as usize].sk,
+        state.genesis_validators_root(),
+        spec,
+    )
+}
+
+/// A chain with every fork up to Heze at genesis and Eip8450 at `EIP8450_FORK_EPOCH`, extended
+/// into the first Eip8450 epoch.
+async fn harness_past_eip8450_fork() -> Harness {
+    let mut spec = ForkName::Heze.make_genesis_spec(E::default_spec());
+    spec.eip8450_fork_epoch = Some(Epoch::new(EIP8450_FORK_EPOCH));
+    let harness = BeaconChainHarness::<EphemeralHarnessType<E>>::builder(E::default())
+        .spec(Arc::new(spec))
+        .keypairs(KEYPAIRS.clone())
+        .fresh_ephemeral_store()
+        .mock_execution_layer()
+        .build();
+    assert_eq!(
+        harness.get_current_state().fork_name_unchecked(),
+        ForkName::Heze
+    );
+
+    harness.advance_slot();
+    harness
+        .extend_chain(
+            (EIP8450_FORK_EPOCH * E::slots_per_epoch()) as usize,
+            BlockStrategy::OnCanonicalHead,
+            AttestationStrategy::AllValidators,
+        )
+        .await;
+
+    // The fork upgrade initialized one unset entry per validator.
+    let head_state = harness.get_current_state();
+    assert_eq!(head_state.fork_name_unchecked(), ForkName::Eip8450);
+    assert_eq!(head_state.validators().len(), VALIDATOR_COUNT);
+    assert!(
+        head_state
+            .post_quantum_key_material()
+            .unwrap()
+            .iter()
+            .all(|key_material| *key_material == PqKeyMaterial::default())
+    );
+    assert_eq!(
+        head_state.post_quantum_key_change_epochs().unwrap().len(),
+        VALIDATOR_COUNT
+    );
+    assert!(
+        head_state
+            .post_quantum_key_change_epochs()
+            .unwrap()
+            .iter()
+            .all(|epoch| *epoch == harness.spec.far_future_epoch)
+    );
+    harness
+}
+
+/// A block for the next slot carrying `registrations`, with a correct state root and proposer
+/// signature, together with its re-targeted payload envelope, post-state and state root.
+async fn block_with_registrations(
+    harness: &Harness,
+    registrations: Vec<SignedPqKeyRegistration>,
+) -> (
+    Arc<SignedBeaconBlock<E>>,
+    SignedExecutionPayloadEnvelope<E>,
+    BeaconState<E>,
+    Hash256,
+) {
+    let spec = &harness.spec;
+    harness.advance_slot();
+    let slot = harness.get_current_slot();
+    let state = harness.get_current_state();
+
+    let mut pre_state = state.clone();
+    complete_state_advance(&mut pre_state, None, slot, None, spec).unwrap();
+    pre_state.build_caches(spec).unwrap();
+
+    let ((block, _), envelope, _) = harness.make_block_with_envelope(state, slot).await;
+    let mut envelope = envelope.expect("Eip8450 blocks have an envelope");
+    let (mut block, _) = Arc::unwrap_or_clone(block).deconstruct();
+    *block.body_mut().pq_key_registrations_mut().unwrap() =
+        ProgressiveVariableList::new(registrations).unwrap();
+
+    // Signatures are irrelevant to the post-state, so process without them to find its root.
+    let mut post_state = pre_state.clone();
+    let unsigned = harness.sign_beacon_block(block.clone(), &pre_state);
+    per_block_processing(
+        &mut post_state,
+        &unsigned,
+        BlockSignatureStrategy::NoVerification,
+        VerifyBlockRoot::True,
+        &mut ConsensusContext::new(slot),
+        spec,
+    )
+    .unwrap();
+    let state_root = post_state.update_tree_hash_cache().unwrap();
+    *block.state_root_mut() = state_root;
+    let block = Arc::new(harness.sign_beacon_block(block, &pre_state));
+
+    // The self-built payload now belongs to the modified block.
+    let proposer = block.message().proposer_index() as usize;
+    envelope.message.beacon_block_root = block.canonical_root();
+    let domain = spec.get_domain(
+        slot.epoch(E::slots_per_epoch()),
+        Domain::BeaconBuilder,
+        &post_state.fork(),
+        post_state.genesis_validators_root(),
+    );
+    envelope.signature = KEYPAIRS[proposer]
+        .sk
+        .sign(envelope.message.signing_root(domain));
+
+    (block, envelope, post_state, state_root)
+}
+
+/// Gossip-verifies `block`, then imports it.
+async fn gossip_verify_and_import(
+    harness: &Harness,
+    block: Arc<SignedBeaconBlock<E>>,
+) -> Result<AvailabilityProcessingStatus, BlockError> {
+    let gossip_verified = harness
+        .chain
+        .verify_block_for_gossip(block)
+        .await
+        .map_err(|e| e.into_block_error())?;
+    let block_root = gossip_verified.block_root;
+    harness
+        .chain
+        .process_block(
+            block_root,
+            gossip_verified,
+            NotifyExecutionLayer::Yes,
+            BlockImportSource::Gossip,
+            || Ok(()),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn block_with_valid_registration_imports() {
+    let harness = harness_past_eip8450_fork().await;
+    let spec = harness.spec.clone();
+    let signed = registration(&harness.get_current_state(), &spec);
+
+    let (block, envelope, post_state, state_root) =
+        block_with_registrations(&harness, vec![signed]).await;
+    let block_root = block.canonical_root();
+    let status = gossip_verify_and_import(&harness, block.clone()).await;
+    assert!(
+        matches!(
+            status,
+            Ok(AvailabilityProcessingStatus::Imported(slot, root))
+                if slot == block.slot() && root == block_root
+        ),
+        "{status:?}"
+    );
+    harness
+        .process_envelope(block_root, envelope, &post_state, state_root)
+        .await;
+
+    let head = harness.chain.head_snapshot();
+    assert_eq!(head.beacon_block_root, block_root);
+    let registration_epoch = block.slot().epoch(E::slots_per_epoch());
+    let head_state = &head.beacon_state;
+    assert_eq!(
+        head_state
+            .post_quantum_key_material()
+            .unwrap()
+            .get(REGISTRANT as usize),
+        Some(&key_material())
+    );
+    assert_eq!(
+        head_state
+            .post_quantum_key_change_epochs()
+            .unwrap()
+            .get(REGISTRANT as usize),
+        Some(&registration_epoch)
+    );
+
+    // The chain builds on the block, and the registration persists.
+    harness.advance_slot();
+    harness
+        .extend_chain(
+            E::slots_per_epoch() as usize,
+            BlockStrategy::OnCanonicalHead,
+            AttestationStrategy::AllValidators,
+        )
+        .await;
+    let head = harness.chain.head_snapshot();
+    assert!(head.beacon_block.slot() > block.slot());
+    assert_eq!(
+        head.beacon_state
+            .post_quantum_key_material()
+            .unwrap()
+            .get(REGISTRANT as usize),
+        Some(&key_material())
+    );
+}
+
+#[tokio::test]
+async fn block_with_invalid_possession_proof_is_rejected() {
+    let harness = harness_past_eip8450_fork().await;
+    let spec = harness.spec.clone();
+    // Valid BLS authorization, corrupted proof of possession.
+    let mut signed = registration(&harness.get_current_state(), &spec);
+    signed.possession[100] ^= 0x01;
+
+    let head_before = harness.chain.head_snapshot().beacon_block_root;
+    let (block, _, _, _) = block_with_registrations(&harness, vec![signed]).await;
+    let block_root = block.canonical_root();
+
+    // Gossip verification checks the proposal only; import verifies every signature in the body.
+    assert!(matches!(
+        gossip_verify_and_import(&harness, block).await,
+        Err(BlockError::InvalidSignature(
+            InvalidSignature::BlockBodySignatures
+        ))
+    ));
+    assert!(!harness.chain.block_is_known_to_fork_choice(&block_root));
+    assert_eq!(harness.chain.head_snapshot().beacon_block_root, head_before);
+
+    // The chain still advances, without the registration.
+    harness.advance_slot();
+    harness
+        .extend_chain(
+            E::slots_per_epoch() as usize,
+            BlockStrategy::OnCanonicalHead,
+            AttestationStrategy::AllValidators,
+        )
+        .await;
+    let head = harness.chain.head_snapshot();
+    assert_ne!(head.beacon_block_root, head_before);
+    assert!(
+        head.beacon_block.slot()
+            >= Epoch::new(EIP8450_FORK_EPOCH + 1).start_slot(E::slots_per_epoch())
+    );
+    assert_eq!(
+        head.beacon_state
+            .post_quantum_key_material()
+            .unwrap()
+            .get(REGISTRANT as usize),
+        Some(&PqKeyMaterial::default())
+    );
+}
+
+/// Validators whose keys the genesis builders use, by builder index.
+const BUILDER_VALIDATORS: [usize; 2] = [10, 11];
+const BUILDER_BALANCE: u64 = 32_000_000_000;
+
+/// A second leanXMSS key from a fixed seed.
+static XMSS_KEY_2: LazyLock<xmss::SecretKey> =
+    LazyLock::new(|| xmss::SecretKey::from_seed([0x52; xmss::SEED_LEN]));
+
+/// The registry index of the builder at `builder_index`, with `BUILDER_INDEX_FLAG` set.
+fn builder(builder_index: u64) -> u64 {
+    PqRegistryIndex::Builder(builder_index).as_u64()
+}
+
+/// A first registration of `xmss_key` for the genesis builder at `builder_index`, with a valid
+/// proof of possession and BLS authorization.
+fn builder_registration(
+    state: &BeaconState<E>,
+    builder_index: u64,
+    xmss_key: &xmss::SecretKey,
+    spec: &ChainSpec,
+) -> SignedPqKeyRegistration {
+    let xmss_public_key = XmssPublicKey::new(xmss_key.public_key().to_bytes().to_vec()).unwrap();
+    let builder_state = state.get_builder(builder_index).unwrap();
+    let signing_root =
+        get_pq_possession_signing_root(state, &builder_state.pubkey, &xmss_public_key, spec);
+    let possession = xmss_key
+        .sign(&signing_root.0, PQ_POSSESSION_XMSS_INDEX)
+        .expect("leanXMSS signing succeeds");
+    PqKeyRegistration {
+        index: builder(builder_index),
+        key_material: PqKeyMaterial {
+            xmss_public_key,
+            vrf_root: Hash256::ZERO,
+        },
+        previous_change_epoch: builder_state.deposit_epoch,
+    }
+    .sign(
+        XmssSignature::new(possession.to_bytes().to_vec()).unwrap(),
+        &KEYPAIRS[BUILDER_VALIDATORS[builder_index as usize]].sk,
+        state.genesis_validators_root(),
+        spec,
+    )
+}
+
+/// An Eip8450-genesis chain with the builders of `BUILDER_VALIDATORS`, deposited at genesis.
+fn builders_harness() -> Harness {
+    let harness = BeaconChainHarness::<EphemeralHarnessType<E>>::builder(E::default())
+        .spec(Arc::new(
+            ForkName::Eip8450.make_genesis_spec(E::default_spec()),
+        ))
+        .keypairs(KEYPAIRS.clone())
+        .genesis_builders(BUILDER_VALIDATORS.to_vec(), BUILDER_BALANCE)
+        .fresh_ephemeral_store()
+        .mock_execution_layer()
+        .build();
+    harness.advance_slot();
+    harness
+}
+
+/// `builders_harness`, extended until the builders' deposit epoch is finalized, so that they are
+/// active.
+async fn harness_with_active_builders() -> Harness {
+    let harness = builders_harness();
+    harness
+        .extend_chain(
+            5 * E::slots_per_epoch() as usize,
+            BlockStrategy::OnCanonicalHead,
+            AttestationStrategy::AllValidators,
+        )
+        .await;
+    let state = harness.get_current_state();
+    for builder_index in 0..BUILDER_VALIDATORS.len() as u64 {
+        assert!(
+            state
+                .is_active_builder(builder_index, &harness.spec)
+                .unwrap()
+        );
+    }
+    harness
+}
+
+/// Verifies `registration` as the HTTP API does and adds it to the op pool.
+fn submit(harness: &Harness, registration: SignedPqKeyRegistration) {
+    let PqKeyRegistrationOutcome::New(verified) = harness
+        .chain
+        .verify_pq_key_registration_for_http_api(registration)
+        .unwrap()
+    else {
+        panic!("registration should be new");
+    };
+    harness.chain.import_pq_key_registration(*verified);
+}
+
+/// Makes the next payload carry `requests`, and imports the block and envelope carrying it. The
+/// next block applies the requests as its parent execution requests.
+async fn import_parent_with_requests(harness: &Harness, requests: &ExecutionRequestsGloas<E>) {
+    harness
+        .execution_block_generator()
+        .set_next_execution_requests(ExecutionRequests::Gloas(requests.clone()));
+    harness
+        .extend_to_slot(harness.get_current_slot() + Slot::new(1))
+        .await;
+}
+
+/// Produces and imports the next block on the head, returning the registrations it packed. It
+/// must apply `parent_requests`.
+async fn produce_and_import_child(
+    harness: &Harness,
+    parent_requests: &ExecutionRequestsGloas<E>,
+) -> Vec<SignedPqKeyRegistration> {
+    let parent_state = harness.get_current_state();
+    harness.advance_slot();
+    let slot = harness.get_current_slot();
+    let (block_contents, _, _) = harness.make_block_with_envelope(parent_state, slot).await;
+    let body = block_contents.0.message().body();
+    assert_eq!(body.parent_execution_requests().unwrap(), parent_requests);
+    let packed = body.pq_key_registrations().unwrap().to_vec();
+
+    // Import runs block processing with every signature: the packed registrations are valid
+    // after the parent's requests.
+    let block_root = block_contents.0.canonical_root();
+    harness
+        .process_block(slot, block_root, block_contents)
+        .await
+        .expect("the produced block should import");
+    assert_eq!(
+        harness.chain.head_beacon_block().canonical_root(),
+        block_root
+    );
+    packed
+}
+
+/// A builder whose exit request is among the block's parent execution requests is exited before
+/// the block's registrations, so its registration is not packed, while another builder's is.
+#[tokio::test]
+async fn registration_of_builder_exiting_in_the_same_block_is_not_packed() {
+    let harness = harness_with_active_builders().await;
+    let spec = harness.spec.clone();
+
+    let exiting_builder = harness.get_current_state().get_builder(0).unwrap().clone();
+    let mut requests = ExecutionRequestsGloas::<E>::default();
+    requests
+        .builder_exits
+        .push(BuilderExitRequest {
+            source_address: exiting_builder.execution_address,
+            pubkey: exiting_builder.pubkey,
+        })
+        .unwrap();
+    import_parent_with_requests(&harness, &requests).await;
+
+    // Both registrations are valid against the head, where builder 0 is still active.
+    let state = harness.get_current_state();
+    let exiting = builder_registration(&state, 0, &XMSS_KEY, &spec);
+    let staying = builder_registration(&state, 1, &XMSS_KEY_2, &spec);
+    submit(&harness, exiting);
+    submit(&harness, staying.clone());
+
+    let packed = produce_and_import_child(&harness, &requests).await;
+    assert_eq!(packed, vec![staying]);
+
+    let state = harness.get_current_state();
+    assert_ne!(
+        state.get_builder(0).unwrap().withdrawable_epoch,
+        spec.far_future_epoch
+    );
+    assert!(!state.is_pq_registered(builder(0)).unwrap());
+    assert!(state.is_pq_registered(builder(1)).unwrap());
+
+    // On gossip, a builder that has initiated an exit is rejected, not ignored.
+    assert!(matches!(
+        harness
+            .chain
+            .verify_pq_key_registration_for_gossip(builder_registration(
+                &state, 0, &XMSS_KEY_2, &spec
+            )),
+        Err(PqKeyRegistrationError::BuilderExiting {
+            builder_index: 0,
+            withdrawable_epoch,
+        }) if withdrawable_epoch != spec.far_future_epoch
+    ));
+}
+
+/// A builder deposit among the block's parent execution requests reuses the index of a builder
+/// that exited and was swept. A registration of the earlier builder is not packed.
+#[tokio::test]
+async fn registration_of_builder_whose_index_is_reused_in_the_same_block_is_not_packed() {
+    let harness = harness_with_active_builders().await;
+    let spec = harness.spec.clone();
+    let state = harness.get_current_state();
+    // Signed while builder 0 is active.
+    let stale = builder_registration(&state, 0, &XMSS_KEY, &spec);
+
+    // Builder 0 exits, becomes withdrawable and is swept.
+    let exiting_builder = state.get_builder(0).unwrap().clone();
+    let mut exit_requests = ExecutionRequestsGloas::<E>::default();
+    exit_requests
+        .builder_exits
+        .push(BuilderExitRequest {
+            source_address: exiting_builder.execution_address,
+            pubkey: exiting_builder.pubkey,
+        })
+        .unwrap();
+    import_parent_with_requests(&harness, &exit_requests).await;
+    harness
+        .extend_to_slot(harness.get_current_slot() + Slot::new(1))
+        .await;
+    let withdrawable_epoch = harness
+        .get_current_state()
+        .get_builder(0)
+        .unwrap()
+        .withdrawable_epoch;
+    assert_ne!(withdrawable_epoch, spec.far_future_epoch);
+    harness
+        .extend_to_slot((withdrawable_epoch + 1).start_slot(E::slots_per_epoch()))
+        .await;
+    let state = harness.get_current_state();
+    assert_eq!(state.get_builder(0).unwrap().balance, 0);
+    assert_eq!(state.get_index_for_new_builder(), Ok(0));
+
+    // A new builder's deposit.
+    let new_keypair = generate_deterministic_keypair(VALIDATOR_COUNT);
+    let mut deposit = BuilderDepositRequest {
+        pubkey: new_keypair.pk.compress(),
+        withdrawal_credentials: builder_withdrawal_credentials(&new_keypair.pk, &spec),
+        amount: BUILDER_BALANCE,
+        signature: bls::SignatureBytes::empty(),
+    };
+    let domain = spec.compute_domain(
+        Domain::BuilderDeposit,
+        spec.genesis_fork_version,
+        Hash256::ZERO,
+    );
+    let deposit_message = DepositMessage {
+        pubkey: deposit.pubkey,
+        withdrawal_credentials: deposit.withdrawal_credentials,
+        amount: deposit.amount,
+    };
+    deposit.signature = new_keypair
+        .sk
+        .sign(deposit_message.signing_root(domain))
+        .into();
+    assert!(deposit.is_valid_builder_deposit_signature(&spec));
+    let mut deposit_requests = ExecutionRequestsGloas::<E>::default();
+    deposit_requests.builder_deposits.push(deposit).unwrap();
+    import_parent_with_requests(&harness, &deposit_requests).await;
+
+    // The pool still offers the earlier builder's registration. It is invalid against the
+    // block's pre-state already: a reusable index belongs to a builder that is not active.
+    assert_eq!(
+        harness
+            .chain
+            .op_pool
+            .insert_pq_key_registration(stale.clone()),
+        operation_pool::PqKeyRegistrationInsertOutcome::Inserted
+    );
+    let mut pre_state = harness.get_current_state();
+    complete_state_advance(
+        &mut pre_state,
+        None,
+        harness.get_current_slot() + Slot::new(1),
+        None,
+        &spec,
+    )
+    .unwrap();
+    assert_eq!(
+        verify_pq_key_registration(&pre_state, &stale, VerifySignatures::False, &spec),
+        Err(BlockOperationError::Invalid(
+            PqKeyRegistrationInvalid::BuilderNotActive(0)
+        ))
+    );
+
+    let packed = produce_and_import_child(&harness, &deposit_requests).await;
+    assert!(packed.is_empty());
+
+    // The new builder took index 0, with a fresh entry starting at its deposit epoch.
+    let state = harness.get_current_state();
+    let new_builder = state.get_builder(0).unwrap();
+    assert_eq!(new_builder.pubkey, new_keypair.pk.compress());
+    assert_eq!(new_builder.deposit_epoch, state.current_epoch());
+    assert_eq!(
+        state.get_pq_key_change_epoch(builder(0)),
+        Ok(state.current_epoch())
+    );
+    assert!(!state.is_pq_registered(builder(0)).unwrap());
+}
+
+/// A block and its payload envelope, as range sync receives them.
+type SegmentBlock = (
+    Arc<SignedBeaconBlock<E>>,
+    Option<Arc<SignedExecutionPayloadEnvelope<E>>>,
+);
+
+/// Extends the chain by `num_slots` blocks, returning each with its payload envelope.
+async fn extend_recording_segment(harness: &Harness, num_slots: usize) -> Vec<SegmentBlock> {
+    let mut segment = Vec::with_capacity(num_slots);
+    for _ in 0..num_slots {
+        let block_root = harness.extend_slots(1).await;
+        let block = harness.chain.get_block(&block_root).await.unwrap().unwrap();
+        let envelope = harness
+            .chain
+            .get_payload_envelope(&block_root)
+            .unwrap()
+            .map(Arc::new);
+        segment.push((Arc::new(block), envelope));
+    }
+    segment
+}
+
+/// A `builders_harness` source chain without blobs, so that payload envelopes are available
+/// without data columns.
+fn segment_source_harness() -> Harness {
+    let harness = builders_harness();
+    harness
+        .execution_block_generator()
+        .set_generate_blobs(false);
+    harness
+}
+
+/// Imports `segment` into `harness` with `process_chain_segment`, as range sync does.
+async fn process_segment(harness: &Harness, segment: &[SegmentBlock]) -> ChainSegmentResult {
+    let chain = &harness.chain;
+    let blocks = segment
+        .iter()
+        .map(|(block, envelope)| {
+            let bid = block
+                .message()
+                .body()
+                .signed_execution_payload_bid()
+                .unwrap();
+            let envelope = envelope.clone().map(|envelope| {
+                AvailableEnvelope::new(envelope, vec![], bid, &chain.custody_context).unwrap()
+            });
+            RangeSyncBlock::new_gloas(block.canonical_root(), block.clone(), envelope).unwrap()
+        })
+        .collect();
+    let last_slot = segment.last().unwrap().0.slot();
+    chain.slot_clock.set_slot(last_slot.as_u64());
+    chain
+        .process_chain_segment(blocks, NotifyExecutionLayer::Yes)
+        .await
+}
+
+/// A chain segment whose blocks carry a validator's and a builder's registration is imported by
+/// range sync, which verifies their proofs of possession with the segment's signatures.
+#[tokio::test]
+async fn range_sync_imports_segment_with_registrations() {
+    let source = segment_source_harness();
+    let spec = source.spec.clone();
+    // The builders are active once their deposit epoch is finalized.
+    let mut segment = extend_recording_segment(&source, 5 * E::slots_per_epoch() as usize).await;
+    let state = source.get_current_state();
+    assert!(state.is_active_builder(0, &spec).unwrap());
+    let validator_registration = registration(&state, &spec);
+    let builder_registration = builder_registration(&state, 0, &XMSS_KEY_2, &spec);
+    submit(&source, validator_registration.clone());
+    submit(&source, builder_registration.clone());
+    let registration_index = segment.len();
+    segment.extend(extend_recording_segment(&source, 2).await);
+
+    let registration_block = &segment[registration_index].0;
+    let packed = registration_block
+        .message()
+        .body()
+        .pq_key_registrations()
+        .unwrap()
+        .to_vec();
+    assert_eq!(packed.len(), 2);
+    assert!(packed.contains(&validator_registration));
+    assert!(packed.contains(&builder_registration));
+    let registration_epoch = registration_block.epoch();
+
+    let harness = builders_harness();
+    match process_segment(&harness, &segment).await {
+        ChainSegmentResult::Successful { imported_blocks } => {
+            assert_eq!(imported_blocks.len(), segment.len())
+        }
+        ChainSegmentResult::Failed { error, .. } => {
+            panic!("the segment should import: {error:?}")
+        }
+    }
+    harness.chain.recompute_head_at_current_slot().await;
+    assert_eq!(
+        harness.head_block_root(),
+        segment.last().unwrap().0.canonical_root()
+    );
+
+    let state = harness.get_current_state();
+    assert_eq!(state.get_pq_key_material(REGISTRANT), Ok(&key_material()));
+    assert_eq!(
+        state.get_pq_key_change_epoch(REGISTRANT),
+        Ok(registration_epoch)
+    );
+    assert_eq!(
+        state.get_pq_key_material(builder(0)),
+        Ok(&builder_registration.message.key_material)
+    );
+    assert_eq!(
+        state.get_pq_key_change_epoch(builder(0)),
+        Ok(registration_epoch)
+    );
+    assert!(!state.is_pq_registered(builder(1)).unwrap());
+}
+
+/// Range sync rejects a block whose registration carries an invalid proof of possession, while
+/// the blocks of the earlier epochs of the segment are imported.
+#[tokio::test]
+async fn range_sync_rejects_segment_with_invalid_possession_proof() {
+    let source = segment_source_harness();
+    let spec = source.spec.clone();
+    let mut segment = extend_recording_segment(&source, 2 * E::slots_per_epoch() as usize).await;
+    // Valid BLS authorization, corrupted proof of possession.
+    let mut invalid = registration(&source.get_current_state(), &spec);
+    invalid.possession[100] ^= 0x01;
+    let (invalid_block, _, _, _) = block_with_registrations(&source, vec![invalid]).await;
+    let invalid_root = invalid_block.canonical_root();
+    let invalid_epoch = invalid_block.epoch();
+    segment.push((invalid_block, None));
+
+    let harness = builders_harness();
+    let ChainSegmentResult::Failed {
+        imported_blocks,
+        error,
+    } = process_segment(&harness, &segment).await
+    else {
+        panic!("the segment should be rejected");
+    };
+    assert!(
+        matches!(
+            error,
+            BlockError::InvalidSignature(InvalidSignature::Unknown)
+        ),
+        "{error:?}"
+    );
+    // Signatures are verified per epoch: the earlier epochs are imported, the invalid block's
+    // epoch is not.
+    let earlier_epochs: Vec<_> = segment
+        .iter()
+        .map(|(block, _)| block)
+        .filter(|block| block.epoch() < invalid_epoch)
+        .map(|block| (block.canonical_root(), block.slot()))
+        .collect();
+    assert!(!earlier_epochs.is_empty());
+    assert_eq!(imported_blocks, earlier_epochs);
+    assert!(!harness.chain.block_is_known_to_fork_choice(&invalid_root));
+
+    harness.chain.recompute_head_at_current_slot().await;
+    assert!(
+        !harness
+            .get_current_state()
+            .is_pq_registered(REGISTRANT)
+            .unwrap()
+    );
+}
+
+/// A validator registers a key that another validator changed away from in a block that is not
+/// finalized yet. The registration is valid at the head, so it survives the next finalization,
+/// whose finalized state still shows the earlier holder with the key, and is included.
+#[tokio::test]
+async fn registration_of_key_freed_after_finality_survives_finalization() {
+    let mut spec = ForkName::Eip8450.make_genesis_spec(E::default_spec());
+    // The earlier holder can change away from the key at once.
+    spec.min_pq_key_change_delay = Epoch::new(0);
+    let harness = BeaconChainHarness::<EphemeralHarnessType<E>>::builder(E::default())
+        .spec(Arc::new(spec))
+        .keypairs(KEYPAIRS.clone())
+        .fresh_ephemeral_store()
+        .mock_execution_layer()
+        .build();
+    let spec = harness.spec.clone();
+    harness.advance_slot();
+    let holder = 3;
+
+    // The holder registers `XMSS_KEY` at epoch 0.
+    submit(
+        &harness,
+        validator_registration(&harness.get_current_state(), holder, &XMSS_KEY, &spec),
+    );
+    harness.extend_slots(1).await;
+    assert_eq!(
+        harness.get_current_state().get_pq_key_change_epoch(holder),
+        Ok(Epoch::new(0))
+    );
+
+    // In the last block of epoch 4, the holder changes away from `XMSS_KEY`.
+    let change_epoch = Epoch::new(4);
+    let change_slot = (change_epoch + 1).start_slot(E::slots_per_epoch()) - 1;
+    harness.extend_to_slot(change_slot - 1).await;
+    submit(
+        &harness,
+        validator_registration(&harness.get_current_state(), holder, &XMSS_KEY_2, &spec),
+    );
+    harness.extend_to_slot(change_slot).await;
+    let head_state = harness.get_current_state();
+    assert_eq!(head_state.slot(), change_slot);
+    assert_eq!(head_state.get_pq_key_change_epoch(holder), Ok(change_epoch));
+    assert!(
+        head_state
+            .get_pq_key_material(holder)
+            .unwrap()
+            .xmss_public_key
+            != xmss_public_key()
+    );
+
+    // The registrant registers `XMSS_KEY`, which is free at the head.
+    let freed_key = registration(&head_state, &spec);
+    submit(&harness, freed_key.clone());
+    let finalized_before = harness.finalized_checkpoint().epoch;
+
+    // At the start of the next epoch, fork choice pulls up the head's unrealized finality. The
+    // finalized state predates the change, so its holder still holds `XMSS_KEY`.
+    harness
+        .chain
+        .slot_clock
+        .set_slot((change_slot + 1).as_u64());
+    harness.chain.recompute_head_at_current_slot().await;
+    let finalized_epoch = harness.finalized_checkpoint().epoch;
+    assert!(finalized_epoch > finalized_before);
+    assert!(finalized_epoch >= Epoch::new(1) && finalized_epoch <= change_epoch);
+
+    // The registration is kept, with its gossip pair, and the next block includes it.
+    assert!(
+        harness
+            .chain
+            .op_pool
+            .get_all_pq_key_registrations()
+            .contains(&freed_key)
+    );
+    assert!(
+        harness
+            .chain
+            .observed_pq_key_registrations
+            .lock()
+            .is_known(REGISTRANT, freed_key.message.previous_change_epoch)
+    );
+    let block_root = harness.extend_slots(1).await;
+    let block = harness.chain.get_block(&block_root).await.unwrap().unwrap();
+    assert_eq!(
+        block
+            .message()
+            .body()
+            .pq_key_registrations()
+            .unwrap()
+            .as_slice(),
+        std::slice::from_ref(&freed_key)
+    );
+    assert_eq!(
+        harness.get_current_state().get_pq_key_material(REGISTRANT),
+        Ok(&key_material())
+    );
+}

@@ -440,6 +440,24 @@ impl<T: BeaconChainTypes> NetworkBeaconProcessor<T> {
         })
     }
 
+    /// Create a new `Work` event for some post-quantum key registration.
+    pub fn send_gossip_pq_key_registration(
+        self: &Arc<Self>,
+        message_id: MessageId,
+        peer_id: PeerId,
+        registration: Box<SignedPqKeyRegistration>,
+    ) -> Result<(), Error<T::EthSpec>> {
+        let processor = self.clone();
+        let process_fn = move || {
+            processor.process_gossip_pq_key_registration(message_id, peer_id, *registration)
+        };
+
+        self.try_send(BeaconWorkEvent {
+            drop_during_sync: false,
+            work: Work::GossipPqKeyRegistration(Box::new(process_fn)),
+        })
+    }
+
     /// Create a new `Work` event for some execution payload envelope.
     pub fn send_gossip_execution_payload(
         self: &Arc<Self>,

@@ -18,8 +18,9 @@ use crate::{
         BLOB_KZG_COMMITMENTS_INDEX, BeaconBlock, BeaconBlockAltair, BeaconBlockBase,
         BeaconBlockBellatrix, BeaconBlockBodyBellatrix, BeaconBlockBodyCapella,
         BeaconBlockBodyDeneb, BeaconBlockBodyElectra, BeaconBlockBodyFulu, BeaconBlockCapella,
-        BeaconBlockDeneb, BeaconBlockElectra, BeaconBlockFulu, BeaconBlockGloas, BeaconBlockHeader,
-        BeaconBlockHeze, BeaconBlockRef, BeaconBlockRefMut, SignedBeaconBlockHeader,
+        BeaconBlockDeneb, BeaconBlockEip8450, BeaconBlockElectra, BeaconBlockFulu,
+        BeaconBlockGloas, BeaconBlockHeader, BeaconBlockHeze, BeaconBlockRef, BeaconBlockRefMut,
+        SignedBeaconBlockHeader,
     },
     core::{ChainSpec, Domain, Epoch, EthSpec, Hash256, SignedRoot, SigningData, Slot},
     execution::{
@@ -64,7 +65,7 @@ impl From<SignedBeaconBlockHash> for Hash256 {
 
 /// A `BeaconBlock` and a signature from its proposer.
 #[superstruct(
-    variants(Base, Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze),
+    variants(Base, Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Heze, Eip8450),
     variant_attributes(
         derive(
             Debug,
@@ -118,6 +119,8 @@ pub struct SignedBeaconBlock<E: EthSpec, Payload: AbstractExecPayload<E> = FullP
     pub message: BeaconBlockGloas<E, Payload>,
     #[superstruct(only(Heze), partial_getter(rename = "message_heze"))]
     pub message: BeaconBlockHeze<E, Payload>,
+    #[superstruct(only(Eip8450), partial_getter(rename = "message_eip8450"))]
+    pub message: BeaconBlockEip8450<E, Payload>,
     pub signature: Signature,
 }
 
@@ -209,6 +212,9 @@ impl<E: EthSpec, Payload: AbstractExecPayload<E>> SignedBeaconBlock<E, Payload> 
             }
             BeaconBlock::Heze(message) => {
                 SignedBeaconBlock::Heze(SignedBeaconBlockHeze { message, signature })
+            }
+            BeaconBlock::Eip8450(message) => {
+                SignedBeaconBlock::Eip8450(SignedBeaconBlockEip8450 { message, signature })
             }
         }
     }
@@ -553,6 +559,18 @@ impl<E: EthSpec> From<SignedBeaconBlockHeze<E, BlindedPayload<E>>>
     }
 }
 
+impl<E: EthSpec> From<SignedBeaconBlockEip8450<E, BlindedPayload<E>>>
+    for SignedBeaconBlockEip8450<E, FullPayload<E>>
+{
+    fn from(signed_block: SignedBeaconBlockEip8450<E, BlindedPayload<E>>) -> Self {
+        let SignedBeaconBlockEip8450 { message, signature } = signed_block;
+        SignedBeaconBlockEip8450 {
+            message: message.into(),
+            signature,
+        }
+    }
+}
+
 impl<E: EthSpec> SignedBeaconBlock<E, BlindedPayload<E>> {
     pub fn try_into_full_block(
         self,
@@ -578,6 +596,7 @@ impl<E: EthSpec> SignedBeaconBlock<E, BlindedPayload<E>> {
             }
             (SignedBeaconBlock::Gloas(block), _) => SignedBeaconBlock::Gloas(block.into()),
             (SignedBeaconBlock::Heze(block), _) => SignedBeaconBlock::Heze(block.into()),
+            (SignedBeaconBlock::Eip8450(block), _) => SignedBeaconBlock::Eip8450(block.into()),
             // avoid wildcard matching forks so that compiler will
             // direct us here when a new fork has been added
             (SignedBeaconBlock::Bellatrix(_), _) => return None,
@@ -791,6 +810,7 @@ mod test {
         chain_spec.fulu_fork_epoch = Some(Epoch::new(6));
         chain_spec.gloas_fork_epoch = Some(Epoch::new(7));
         chain_spec.heze_fork_epoch = Some(Epoch::new(8));
+        chain_spec.eip8450_fork_epoch = Some(Epoch::new(9));
 
         // check that we have all forks covered
         assert!(chain_spec.fork_epoch(ForkName::latest()).is_some());
@@ -836,7 +856,14 @@ mod test {
                 BeaconBlock::Gloas(BeaconBlockGloas::empty(spec)),
                 sig.clone(),
             ),
-            SignedBeaconBlock::from_block(BeaconBlock::Heze(BeaconBlockHeze::empty(spec)), sig),
+            SignedBeaconBlock::from_block(
+                BeaconBlock::Heze(BeaconBlockHeze::empty(spec)),
+                sig.clone(),
+            ),
+            SignedBeaconBlock::from_block(
+                BeaconBlock::Eip8450(BeaconBlockEip8450::empty(spec)),
+                sig,
+            ),
         ];
 
         for block in blocks {

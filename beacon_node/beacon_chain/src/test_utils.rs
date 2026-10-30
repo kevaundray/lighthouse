@@ -30,7 +30,7 @@ use bls::{
 use eth2::types::{GraffitiPolicy, SignedBlockContentsTuple};
 use execution_layer::test_utils::generate_genesis_header;
 use execution_layer::{
-    ExecutionLayer, NewPayloadRequest, NewPayloadRequestGloas,
+    ExecutionLayer, NewPayloadRequest, NewPayloadRequestGloas, NewPayloadRequestHeze,
     auth::JwtKey,
     test_utils::{DEFAULT_JWT_SECRET, ExecutionBlockGenerator, MockBuilder, MockExecutionLayer},
 };
@@ -805,6 +805,10 @@ pub fn mock_execution_layer_from_parts<E: EthSpec>(
         HARNESS_GENESIS_TIME
             + (spec.get_slot_duration().as_secs()) * E::slots_per_epoch() * epoch.as_u64()
     });
+    let eip8450_time = spec.eip8450_fork_epoch.map(|epoch| {
+        HARNESS_GENESIS_TIME
+            + (spec.get_slot_duration().as_secs()) * E::slots_per_epoch() * epoch.as_u64()
+    });
 
     let kzg = get_kzg(&spec);
 
@@ -816,6 +820,7 @@ pub fn mock_execution_layer_from_parts<E: EthSpec>(
         osaka_time,
         amsterdam_time,
         heze_time,
+        eip8450_time,
         Some(JwtKey::from_slice(&DEFAULT_JWT_SECRET).unwrap()),
         spec,
         Some(kzg),
@@ -1361,22 +1366,25 @@ where
         ));
 
         let bid = match &state {
-            BeaconState::Heze(_) => ExecutionPayloadBid::Heze(ExecutionPayloadBidHeze {
-                parent_block_hash,
-                parent_block_root,
-                block_hash,
-                prev_randao,
-                fee_recipient: Address::zero(),
-                gas_limit: 30_000_000,
-                builder_index,
-                slot,
-                value,
-                execution_payment: 0,
-                blob_kzg_commitments: Default::default(),
-                // Commit to empty execution requests so an envelope answering this bid can exist.
-                execution_requests_root: ExecutionRequestsGloas::<E>::default().tree_hash_root(),
-                inclusion_list_bits: BitVector::new(),
-            }),
+            BeaconState::Heze(_) | BeaconState::Eip8450(_) => {
+                ExecutionPayloadBid::Heze(ExecutionPayloadBidHeze {
+                    parent_block_hash,
+                    parent_block_root,
+                    block_hash,
+                    prev_randao,
+                    fee_recipient: Address::zero(),
+                    gas_limit: 30_000_000,
+                    builder_index,
+                    slot,
+                    value,
+                    execution_payment: 0,
+                    blob_kzg_commitments: Default::default(),
+                    // Commit to empty execution requests so an envelope answering this bid can exist.
+                    execution_requests_root: ExecutionRequestsGloas::<E>::default()
+                        .tree_hash_root(),
+                    inclusion_list_bits: BitVector::new(),
+                })
+            }
             _ => ExecutionPayloadBid::Gloas(ExecutionPayloadBidGloas {
                 parent_block_hash,
                 parent_block_root,
@@ -1844,7 +1852,7 @@ where
             state_root: Hash256::zero(),
             body: BeaconBlockBodyBellatrix {
                 randao_reveal,
-                eth1_data: state.eth1_data().clone(),
+                eth1_data: state.eth1_data().unwrap().clone(),
                 graffiti: Graffiti::default(),
                 proposer_slashings: VariableList::empty(),
                 attester_slashings: VariableList::empty(),
@@ -3301,9 +3309,9 @@ where
         let deposit_data_list = VariableList::<_, U4294967296>::try_from(leaves.clone()).unwrap();
 
         // Setting the deposit_root to be the tree_hash_root of the VarList
-        state.eth1_data_mut().deposit_root = deposit_data_list.tree_hash_root();
-        state.eth1_data_mut().deposit_count = num_deposits as u64;
-        *state.eth1_deposit_index_mut() = 0;
+        state.eth1_data_mut().unwrap().deposit_root = deposit_data_list.tree_hash_root();
+        state.eth1_data_mut().unwrap().deposit_count = num_deposits as u64;
+        *state.eth1_deposit_index_mut().unwrap() = 0;
 
         // Building the merkle tree used for generating proofs
         let tree = MerkleTree::create(&leaves[..], self.spec.deposit_contract_tree_depth as usize);
@@ -3477,12 +3485,22 @@ where
             .map(kzg_commitment_to_versioned_hash)
             .collect();
 
-        let request = NewPayloadRequest::Gloas(NewPayloadRequestGloas {
-            execution_payload: &signed_envelope.message.payload,
-            versioned_hashes,
-            parent_beacon_block_root: block.message().parent_root(),
-            execution_requests: &signed_envelope.message.execution_requests,
-        });
+        let request = if block.fork_name_unchecked().heze_enabled() {
+            NewPayloadRequest::Heze(NewPayloadRequestHeze {
+                execution_payload: &signed_envelope.message.payload,
+                versioned_hashes,
+                parent_beacon_block_root: block.message().parent_root(),
+                execution_requests: &signed_envelope.message.execution_requests,
+                inclusion_list_transactions: ProgressiveTransactions::empty(),
+            })
+        } else {
+            NewPayloadRequest::Gloas(NewPayloadRequestGloas {
+                execution_payload: &signed_envelope.message.payload,
+                versioned_hashes,
+                parent_beacon_block_root: block.message().parent_root(),
+                execution_requests: &signed_envelope.message.execution_requests,
+            })
+        };
 
         self.chain
             .execution_layer

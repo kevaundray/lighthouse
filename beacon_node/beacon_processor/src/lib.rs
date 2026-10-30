@@ -467,6 +467,7 @@ pub enum Work<E: EthSpec> {
     DataColumnsByRootsRequest(BlockingFn),
     DataColumnsByRangeRequest(BlockingFn),
     GossipBlsToExecutionChange(BlockingFn),
+    GossipPqKeyRegistration(BlockingFn),
     GossipExecutionPayload(AsyncFn),
     GossipExecutionProof(AsyncFn),
     GossipExecutionPayloadBid(BlockingFn),
@@ -531,6 +532,7 @@ pub enum WorkType {
     DataColumnsByRootsRequest,
     DataColumnsByRangeRequest,
     GossipBlsToExecutionChange,
+    GossipPqKeyRegistration,
     GossipExecutionPayload,
     GossipExecutionProof,
     GossipExecutionPayloadBid,
@@ -573,6 +575,7 @@ impl<E: EthSpec> Work<E> {
                 WorkType::GossipLightClientOptimisticUpdate
             }
             Work::GossipBlsToExecutionChange(_) => WorkType::GossipBlsToExecutionChange,
+            Work::GossipPqKeyRegistration(_) => WorkType::GossipPqKeyRegistration,
             Work::GossipExecutionPayload(_) => WorkType::GossipExecutionPayload,
             Work::GossipExecutionProof(_) => WorkType::GossipExecutionProof,
             Work::GossipExecutionPayloadBid(_) => WorkType::GossipExecutionPayloadBid,
@@ -1125,6 +1128,10 @@ impl<E: EthSpec> BeaconProcessor<E> {
                             work_queues.gossip_bls_to_execution_change_queue.pop()
                         {
                             Some(item)
+                        } else if let Some(item) =
+                            work_queues.gossip_pq_key_registration_queue.pop()
+                        {
+                            Some(item)
                         // Check the priority 1 API requests after we've
                         // processed all the interesting things from the network
                         // and things required for us to stay in good repute
@@ -1388,6 +1395,9 @@ impl<E: EthSpec> BeaconProcessor<E> {
                             Work::GossipBlsToExecutionChange { .. } => work_queues
                                 .gossip_bls_to_execution_change_queue
                                 .push(work, work_id),
+                            Work::GossipPqKeyRegistration { .. } => work_queues
+                                .gossip_pq_key_registration_queue
+                                .push(work, work_id),
                             Work::GossipExecutionPayload { .. } => work_queues
                                 .gossip_execution_payload_queue
                                 .push(work, work_id),
@@ -1504,6 +1514,9 @@ impl<E: EthSpec> BeaconProcessor<E> {
                         WorkType::DataColumnsByRangeRequest => work_queues.dcbrange_queue.len(),
                         WorkType::GossipBlsToExecutionChange => {
                             work_queues.gossip_bls_to_execution_change_queue.len()
+                        }
+                        WorkType::GossipPqKeyRegistration => {
+                            work_queues.gossip_pq_key_registration_queue.len()
                         }
                         WorkType::GossipExecutionPayload => {
                             work_queues.gossip_execution_payload_queue.len()
@@ -1729,6 +1742,7 @@ impl<E: EthSpec> BeaconProcessor<E> {
             | Work::GossipLightClientOptimisticUpdate(process_fn)
             | Work::Status(process_fn)
             | Work::GossipBlsToExecutionChange(process_fn)
+            | Work::GossipPqKeyRegistration(process_fn)
             | Work::GossipExecutionPayloadBid(process_fn)
             | Work::GossipPayloadAttestation(process_fn)
             | Work::GossipProposerPreferences(process_fn)

@@ -31,6 +31,7 @@ fixed_bytes = { workspace = true }
 int_to_bytes = { workspace = true }
 integer-sqrt = "0.1.5"
 itertools = { workspace = true }
+lean-pq = { workspace = true }
 lru = { workspace = true }
 merkle_proof = { workspace = true }
 metrics = { workspace = true }

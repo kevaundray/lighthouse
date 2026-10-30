@@ -1,6 +1,8 @@
 use super::*;
 use crate::bls_setting::BlsSetting;
-use crate::decode::{ssz_decode_file, ssz_decode_file_with, ssz_decode_state, yaml_decode_file};
+use crate::decode::{
+    snappy_decode_file, ssz_decode_file, ssz_decode_file_with, ssz_decode_state, yaml_decode_file,
+};
 use crate::type_name::TypeName;
 use ::fork_choice::InvalidationOperation;
 use beacon_chain::block_verification_types::LookupBlock;
@@ -72,6 +74,9 @@ struct SetupBlock {
     failed: bool,
     #[serde(default)]
     payload_status: Option<PayloadStatus>,
+    /// Gloas and later: the execution payload envelope revealed for this block.
+    #[serde(default)]
+    payload: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -344,7 +349,13 @@ impl<E: EthSpec> GossipTester<E> {
                 peer_id,
             )?,
             Topic::BeaconBlock => {
-                self.process_beacon_block(path, message_meta, message_id.clone(), peer_id)?
+                let bytes =
+                    snappy_decode_file(&path.join(format!("{}.ssz_snappy", message_meta.message)))?;
+                let Ok(block) = SignedBeaconBlock::from_ssz_bytes(&bytes, &self.spec) else {
+                    // The network service rejects SSZ decode failures before gossip processing.
+                    return Ok(MessageAcceptance::Reject);
+                };
+                self.process_beacon_block(block, message_meta, message_id.clone(), peer_id)?
             }
             Topic::VoluntaryExit => {
                 self.process_voluntary_exit(path, message_meta, message_id.clone(), peer_id)?
@@ -429,12 +440,12 @@ impl<E: EthSpec> GossipTester<E> {
 
     fn process_beacon_block(
         &self,
-        path: &Path,
+        block: SignedBeaconBlock<E>,
         message_meta: &MessageMeta,
         message_id: MessageId,
         peer_id: PeerId,
     ) -> Result<(), Error> {
-        let block = Arc::new(load_beacon_block(path, &message_meta.message, &self.spec)?);
+        let block = Arc::new(block);
         let time_ms = self.message_time_ms(message_meta);
         let seen_duration = self.set_time_ms(time_ms)?;
 
@@ -795,7 +806,12 @@ impl<E: EthSpec> GossipValidation<E> {
         };
 
         match self.meta.topic {
-            Topic::BeaconBlock => IGNORED_BEACON_BLOCK_CASES.contains(&case_name),
+            // TODO(gloas): the harness cannot import execution payload envelopes, so setup
+            // blocks with a revealed `payload` cannot be made full.
+            Topic::BeaconBlock => {
+                IGNORED_BEACON_BLOCK_CASES.contains(&case_name)
+                    || self.meta.blocks.iter().any(|block| block.payload.is_some())
+            }
             Topic::BeaconAttestation | Topic::BeaconAggregateAndProof => {
                 // These vectors require fixture history that the production-backed harness cannot
                 // construct: a retained consensus-invalid block, an unknown finalized root, or a
@@ -889,13 +905,6 @@ impl<E: EthSpec> GossipValidation<E> {
     ) -> Result<HashMap<String, SignedBeaconBlock<E>>, Error> {
         let mut block_names = HashSet::new();
         block_names.extend(self.meta.blocks.iter().map(|block| block.block.clone()));
-        block_names.extend(
-            self.meta
-                .messages
-                .iter()
-                .filter(|_| self.meta.topic == Topic::BeaconBlock)
-                .map(|message| message.message.clone()),
-        );
         if let Some(FinalizedCheckpoint::Block { block, .. }) = &self.meta.finalized_checkpoint {
             block_names.insert(block.clone());
         }

@@ -21,6 +21,7 @@ pub fn run<E: EthSpec>(mut env: Environment<E>, matches: &ArgMatches) -> Result<
     let osaka_time = parse_optional(matches, "osaka-time")?;
     let amsterdam_time = parse_optional(matches, "amsterdam-time")?;
     let heze_time = parse_optional(matches, "heze-time")?;
+    let eip8450_time = parse_optional(matches, "eip8450-time")?;
 
     let handle = env.core_context().executor.handle().unwrap();
 
@@ -53,6 +54,7 @@ pub fn run<E: EthSpec>(mut env: Environment<E>, matches: &ArgMatches) -> Result<
         osaka_time,
         amsterdam_time,
         heze_time,
+        eip8450_time,
     };
     let kzg = None;
     let server: MockServer<E> = MockServer::new_with_config(&handle, config, kzg);

@@ -63,6 +63,11 @@ pub enum BlockProcessingError {
         index: usize,
         reason: BlsExecutionChangeInvalid,
     },
+    /// [New in EIP-8450] A post-quantum key registration is invalid.
+    PqKeyRegistrationInvalid {
+        index: usize,
+        reason: PqKeyRegistrationInvalid,
+    },
     SyncAggregateInvalid {
         reason: SyncAggregateInvalid,
     },
@@ -237,7 +242,8 @@ impl_into_block_processing_error_with_index!(
     PayloadAttestationInvalid,
     DepositInvalid,
     ExitInvalid,
-    BlsExecutionChangeInvalid
+    BlsExecutionChangeInvalid,
+    PqKeyRegistrationInvalid
 );
 
 pub type HeaderValidationError = BlockOperationError<HeaderInvalid>;
@@ -248,6 +254,7 @@ pub type SyncCommitteeMessageValidationError = BlockOperationError<SyncAggregate
 pub type DepositValidationError = BlockOperationError<DepositInvalid>;
 pub type ExitValidationError = BlockOperationError<ExitInvalid>;
 pub type BlsExecutionChangeValidationError = BlockOperationError<BlsExecutionChangeInvalid>;
+pub type PqKeyRegistrationValidationError = BlockOperationError<PqKeyRegistrationInvalid>;
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum BlockOperationError<T> {
@@ -573,6 +580,41 @@ pub enum BlsExecutionChangeInvalid {
     WithdrawalCredentialsMismatch,
     /// The signature is invalid.
     BadSignature,
+}
+
+/// The reasons a `SignedPqKeyRegistration` is invalid, in the order `process_pq_key_registration`
+/// checks them (EIP-8450).
+#[derive(Debug, PartialEq, Clone)]
+pub enum PqKeyRegistrationInvalid {
+    /// The state is prior to EIP-8450 and has no post-quantum key registry.
+    RegistryUnavailable,
+    /// The specified validator is not in the state's validator registry.
+    ValidatorUnknown(u64),
+    /// The validator has initiated an exit.
+    ValidatorExiting { exit_epoch: Epoch },
+    /// The specified builder (index without `BUILDER_INDEX_FLAG`) is not in the builder registry.
+    BuilderUnknown(u64),
+    /// The builder is not active: its deposit epoch is not finalized, or it has initiated an exit.
+    BuilderNotActive(u64),
+    /// The builder registers a non-zero VRF root.
+    BuilderNonZeroVrfRoot(u64),
+    /// The registration does not name the epoch of the last change of the validator or builder,
+    /// or its never-registered marker.
+    PreviousChangeEpochMismatch { expected: Epoch, found: Epoch },
+    /// The validator or builder changed its keys less than `MIN_PQ_KEY_CHANGE_DELAY` epochs ago.
+    ChangeTooSoon {
+        current_epoch: Epoch,
+        earliest_epoch: Epoch,
+    },
+    /// The BLS signature of the registrant's signing key is invalid.
+    BadSignature,
+    /// The registration carries the all-zero leanXMSS key.
+    ZeroXmssPublicKey,
+    /// A validator or builder, possibly the one registering, already registered the leanXMSS key.
+    /// `owner` is flagged for a builder.
+    XmssPublicKeyInUse { owner: u64 },
+    /// The proof of possession of the leanXMSS key is invalid.
+    BadPossessionProof,
 }
 
 #[derive(Debug, PartialEq, Clone)]

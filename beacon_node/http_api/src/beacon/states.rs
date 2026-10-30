@@ -14,10 +14,11 @@ use eth2::types::{
 };
 use ssz::Encode;
 use ssz_types::FixedVector;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use types::{
-    AttestationShufflingId, BeaconStateError, CommitteeCache, EthSpec, RelativeEpoch,
-    RelativeEpochError,
+    AttestationShufflingId, BeaconStateError, CommitteeCache, EthSpec, PqRegistryIndex,
+    RelativeEpoch, RelativeEpochError,
 };
 use warp::{Filter, Reply, filters::BoxedFilter, http::response::Builder};
 use warp_utils::query::multi_key_query;
@@ -1053,6 +1054,81 @@ pub fn get_beacon_state_validator_balances<T: BeaconChainTypes>(
                             }),
                         _ => Ok(warp::reply::json(&result).into_response()),
                     }
+                })
+            },
+        )
+        .boxed()
+}
+
+// GET beacon/states/{state_id}/pq_key_material?id
+pub fn get_beacon_state_pq_key_material<T: BeaconChainTypes>(
+    beacon_states_path: BeaconStatesPath<T>,
+) -> ResponseFilter {
+    beacon_states_path
+        .clone()
+        .and(warp::path("pq_key_material"))
+        .and(warp::path::end())
+        .and(multi_key_query::<eth2::types::PqKeyMaterialQuery>())
+        .then(
+            |state_id: StateId,
+             task_spawner: TaskSpawner<T::EthSpec>,
+             chain: Arc<BeaconChain<T>>,
+             query_res: Result<eth2::types::PqKeyMaterialQuery, warp::Rejection>| {
+                task_spawner.blocking_json_task(Priority::P1, move || {
+                    let query = query_res?;
+                    let (data, execution_optimistic, finalized) = state_id
+                        .map_state_and_execution_optimistic_and_finalized(
+                            &chain,
+                            |state, execution_optimistic, finalized| {
+                                if state.post_quantum_key_change_epochs().is_err() {
+                                    return Err(warp_utils::reject::custom_bad_request(
+                                        "the state is prior to the EIP-8450 fork and has no \
+                                         post-quantum key registry"
+                                            .to_string(),
+                                    ));
+                                }
+                                // A validator index, or a builder index with `BUILDER_INDEX_FLAG`
+                                // set. Unknown indices are skipped.
+                                let entry = |index: u64| {
+                                    let key_material = state.get_pq_key_material(index).ok()?;
+                                    let change_epoch = state.get_pq_key_change_epoch(index).ok()?;
+                                    Some(eth2::types::PqKeyMaterialData {
+                                        index,
+                                        xmss_public_key: key_material.xmss_public_key.clone(),
+                                        vrf_root: key_material.vrf_root,
+                                        change_epoch,
+                                    })
+                                };
+                                let data = match &query.id {
+                                    Some(ids) => ids
+                                        .iter()
+                                        .copied()
+                                        .collect::<BTreeSet<_>>()
+                                        .into_iter()
+                                        .filter_map(entry)
+                                        .collect::<Vec<_>>(),
+                                    // Every validator, then every builder
+                                    // (`get_pq_registry_indices`).
+                                    None => {
+                                        let builders = state.builders().map_or(0, |b| b.len());
+                                        (0..state.validators().len() as u64)
+                                            .map(PqRegistryIndex::Validator)
+                                            .chain(
+                                                (0..builders as u64).map(PqRegistryIndex::Builder),
+                                            )
+                                            .filter_map(|index| entry(index.as_u64()))
+                                            .collect()
+                                    }
+                                };
+                                Ok((data, execution_optimistic, finalized))
+                            },
+                        )?;
+
+                    Ok(eth2::types::ExecutionOptimisticFinalizedResponse {
+                        data,
+                        execution_optimistic: Some(execution_optimistic),
+                        finalized: Some(finalized),
+                    })
                 })
             },
         )

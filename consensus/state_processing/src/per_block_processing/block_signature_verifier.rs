@@ -4,12 +4,13 @@ use super::signature_sets::{Error as SignatureSetError, *};
 use crate::per_block_processing::errors::{
     AttestationInvalid, BlockOperationError, PayloadAttestationInvalid,
 };
+use crate::per_block_processing::is_valid_pq_possession_proof;
 use crate::{ConsensusContext, ContextError};
 use bls::{PublicKey, PublicKeyBytes, SignatureSet, verify_signature_sets};
 use std::borrow::Cow;
 use types::{
     AbstractExecPayload, BeaconState, BeaconStateError, ChainSpec, EthSpec, Hash256,
-    SignedBeaconBlock,
+    PqRegistryIndex, SignedBeaconBlock, SignedPqKeyRegistration,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -18,6 +19,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     /// All public keys were found but signature verification failed. The block is invalid.
     SignatureInvalid,
+    /// A leanXMSS proof of possession of a post-quantum key registration (EIP-8450) is invalid.
+    /// The block is invalid.
+    PqPossessionProofInvalid,
     /// An attestation in the block was invalid. The block is invalid.
     AttestationValidationError(BlockOperationError<AttestationInvalid>),
     /// A payload attestation in the block was invalid. The block is invalid.
@@ -91,6 +95,9 @@ where
     state: &'a BeaconState<E>,
     spec: &'a ChainSpec,
     sets: ParallelSignatureSets<'a>,
+    /// Post-quantum key registrations whose leanXMSS proofs of possession must be verified
+    /// alongside the BLS signatures (EIP-8450).
+    pq_key_registrations: Vec<&'a SignedPqKeyRegistration>,
 }
 
 #[derive(Default)]
@@ -124,6 +131,7 @@ where
             state,
             spec,
             sets: ParallelSignatureSets::default(),
+            pq_key_registrations: vec![],
         }
     }
 
@@ -182,6 +190,7 @@ where
         self.include_bls_to_execution_changes(block)?;
         self.include_execution_payload_bid(block)?;
         self.include_payload_attestations(block, ctxt)?;
+        self.include_pq_key_registrations(block)?;
 
         Ok(())
     }
@@ -423,11 +432,69 @@ where
         Ok(())
     }
 
+    /// Include the BLS authorizations and the leanXMSS proofs of possession of the block's
+    /// post-quantum key registrations (EIP-8450).
+    pub fn include_pq_key_registrations<Payload: AbstractExecPayload<E>>(
+        &mut self,
+        block: &'a SignedBeaconBlock<E, Payload>,
+    ) -> Result<()> {
+        if let Ok(pq_key_registrations) = block.message().body().pq_key_registrations() {
+            for signed_registration in pq_key_registrations.iter() {
+                self.sets.push(pq_key_registration_signature_set(
+                    self.state,
+                    self.get_pubkey.clone(),
+                    |builder_index| get_builder_pubkey_from_state(self.state, builder_index),
+                    signed_registration,
+                    self.spec,
+                )?);
+                self.pq_key_registrations.push(signed_registration);
+            }
+        }
+        Ok(())
+    }
+
     /// Verify all the signatures that have been included in `self`, returning `true` if and only if
     /// all the signatures are valid.
     ///
+    /// This includes the leanXMSS proofs of possession of post-quantum key registrations, which
+    /// are verified individually against the BLS public key of each registered validator or
+    /// builder. A registration for an unknown validator or builder makes its proof invalid.
+    ///
+    /// Builder public keys are read from the pre-state, although registrations are processed
+    /// after the parent's execution requests, whose builder deposits can reassign a builder index
+    /// to a new public key. A reassigned index holds a builder deposited at the current epoch,
+    /// which is not active, so the block is invalid whichever key is used.
+    ///
     /// See `ParallelSignatureSets::verify` for more info.
     pub fn verify(self) -> Result<()> {
+        let pq_proofs_valid = self.pq_key_registrations.iter().all(|signed_registration| {
+            let registration = &signed_registration.message;
+            let pubkey = match PqRegistryIndex::new(registration.index) {
+                PqRegistryIndex::Validator(validator_index) => self
+                    .state
+                    .validators()
+                    .get(validator_index as usize)
+                    .map(|validator| validator.pubkey),
+                PqRegistryIndex::Builder(builder_index) => self
+                    .state
+                    .get_builder(builder_index)
+                    .ok()
+                    .map(|builder| builder.pubkey),
+            };
+            pubkey.is_some_and(|pubkey| {
+                is_valid_pq_possession_proof(
+                    self.state,
+                    &pubkey,
+                    &registration.key_material.xmss_public_key,
+                    &signed_registration.possession,
+                    self.spec,
+                )
+            })
+        });
+        if !pq_proofs_valid {
+            return Err(Error::PqPossessionProofInvalid);
+        }
+
         if self.sets.verify() {
             Ok(())
         } else {

@@ -1075,6 +1075,21 @@ async fn invalid_signature_attester_slashing() {
                     })
                     .unwrap();
             }
+            BeaconBlockBodyRefMut::Eip8450(blk) => {
+                // Convert the Electra slashing into the Gloas type (EIP-7688). The SSZ bytes are
+                // the same, only the hash tree root differs.
+                let slashing = attester_slashing.as_electra().unwrap().clone();
+                blk.attester_slashings
+                    .push(AttesterSlashingGloas {
+                        attestation_1: IndexedAttestation::Electra(slashing.attestation_1)
+                            .to_gloas()
+                            .unwrap(),
+                        attestation_2: IndexedAttestation::Electra(slashing.attestation_2)
+                            .to_gloas()
+                            .unwrap(),
+                    })
+                    .unwrap();
+            }
         }
         snapshots[block_index].beacon_block =
             Arc::new(SignedBeaconBlock::from_block(block, signature));
@@ -1138,6 +1153,13 @@ async fn invalid_signature_attestation() {
 
 #[tokio::test]
 async fn invalid_signature_deposit() {
+    // EIP-8015 removes `deposits` from Heze block bodies.
+    if test_spec::<E>()
+        .fork_name_at_epoch(Epoch::new(0))
+        .heze_enabled()
+    {
+        return;
+    }
     let (chain_segment, ref_blobs) = get_chain_segment().await;
     let mut chain_segment_blobs = ref_blobs.clone();
     for &block_index in BLOCK_INDICES {

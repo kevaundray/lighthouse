@@ -87,6 +87,17 @@ impl<E: EthSpec> LoadCase for TransitionTest<E> {
                 spec.gloas_fork_epoch = Some(Epoch::new(0));
                 spec.heze_fork_epoch = Some(metadata.fork_epoch);
             }
+            ForkName::Eip8450 => {
+                spec.altair_fork_epoch = Some(Epoch::new(0));
+                spec.bellatrix_fork_epoch = Some(Epoch::new(0));
+                spec.capella_fork_epoch = Some(Epoch::new(0));
+                spec.deneb_fork_epoch = Some(Epoch::new(0));
+                spec.electra_fork_epoch = Some(Epoch::new(0));
+                spec.fulu_fork_epoch = Some(Epoch::new(0));
+                spec.gloas_fork_epoch = Some(Epoch::new(0));
+                spec.heze_fork_epoch = Some(Epoch::new(0));
+                spec.eip8450_fork_epoch = Some(metadata.fork_epoch);
+            }
         }
 
         // Load blocks
@@ -131,6 +142,10 @@ impl<E: EthSpec> Case for TransitionTest<E> {
         let mut expected = self.post.clone();
         let spec = &self.spec;
         let mut processed_blocks = 0;
+
+        // Post-Gloas epoch processing reads the slashings cache when it computes the proposer
+        // lookahead, so a Gloas pre-state needs its caches built before advancing.
+        state.build_caches(spec).unwrap();
 
         let mut result: Result<_, String> = self
             .blocks

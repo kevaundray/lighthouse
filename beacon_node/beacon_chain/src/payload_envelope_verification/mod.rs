@@ -417,14 +417,27 @@ pub fn build_new_payload_request<'a, E: EthSpec>(
         .map(state_processing::per_block_processing::deneb::kzg_commitment_to_versioned_hash)
         .collect();
 
-    Ok(execution_layer::NewPayloadRequest::Gloas(
-        execution_layer::NewPayloadRequestGloas {
-            execution_payload: &envelope.message.payload,
-            versioned_hashes,
-            parent_beacon_block_root: envelope.message.parent_beacon_block_root,
-            execution_requests: &envelope.message.execution_requests,
-        },
-    ))
+    if block.fork_name_unchecked().heze_enabled() {
+        Ok(execution_layer::NewPayloadRequest::Heze(
+            execution_layer::NewPayloadRequestHeze {
+                execution_payload: &envelope.message.payload,
+                versioned_hashes,
+                parent_beacon_block_root: envelope.message.parent_beacon_block_root,
+                execution_requests: &envelope.message.execution_requests,
+                // Matches `prepare_beacon_proposer`, which also passes no inclusion lists yet.
+                inclusion_list_transactions: types::ProgressiveTransactions::empty(),
+            },
+        ))
+    } else {
+        Ok(execution_layer::NewPayloadRequest::Gloas(
+            execution_layer::NewPayloadRequestGloas {
+                execution_payload: &envelope.message.payload,
+                versioned_hashes,
+                parent_beacon_block_root: envelope.message.parent_beacon_block_root,
+                execution_requests: &envelope.message.execution_requests,
+            },
+        ))
+    }
 }
 
 /// Recompute the execution block hash of an envelope's payload and verify it, along with the

@@ -334,6 +334,16 @@ pub enum BlockError {
         bid_parent_root: Hash256,
         block_parent_root: Hash256,
     },
+    /// The parent is not full and the bid's `parent_block_hash` is not the parent's execution
+    /// head (`latest_block_hash` of the parent's post-state).
+    ///
+    /// ## Peer scoring
+    ///
+    /// The block is invalid and the peer should be penalized.
+    BidParentBlockHashMismatch {
+        bid_parent_block_hash: ExecutionBlockHash,
+        parent_execution_head: ExecutionBlockHash,
+    },
     /// The slot of a Gloas data column sidecar does not match the slot of its bid.
     ///
     /// ## Peer scoring
@@ -945,7 +955,11 @@ impl<T: BeaconChainTypes> GossipVerifiedBlock<T> {
                 .map_err(BlockError::PerBlockProcessingError)?;
             verify_execution_request_list_lengths(parent_execution_requests)
                 .map_err(BlockError::PerBlockProcessingError)?;
-            let deposits_len = block.message().body().deposits().len();
+            let deposits_len = block
+                .message()
+                .body()
+                .deposits()
+                .map_or(0, |deposits| deposits.len());
             if deposits_len > 0 {
                 return Err(BlockError::PerBlockProcessingError(
                     BlockProcessingError::OperationListTooLong {
@@ -995,6 +1009,23 @@ impl<T: BeaconChainTypes> GossipVerifiedBlock<T> {
             return Err(BlockError::BidParentRootMismatch {
                 bid_parent_root: bid.message().parent_block_root(),
                 block_parent_root: block.message().parent_root(),
+            });
+        }
+
+        // [New in Gloas]: If the parent is not full, the bid must build on the parent's execution
+        // head. A Gloas block's `process_execution_payload_bid` asserts
+        // `bid.parent_block_hash == state.latest_block_hash` and nothing later in that block
+        // changes it, so the parent's execution head is the parent bid's `parent_block_hash`.
+        // Pre-Gloas parents carry no bid hashes and are skipped.
+        if let Ok(bid) = block.message().body().signed_execution_payload_bid()
+            && let Some(parent_payload_block_hash) = parent_block.execution_payload_block_hash
+            && let Some(parent_execution_head) = parent_block.execution_payload_parent_hash
+            && !block.is_parent_block_full(parent_payload_block_hash)
+            && bid.message().parent_block_hash() != parent_execution_head
+        {
+            return Err(BlockError::BidParentBlockHashMismatch {
+                bid_parent_block_hash: bid.message().parent_block_hash(),
+                parent_execution_head,
             });
         }
 

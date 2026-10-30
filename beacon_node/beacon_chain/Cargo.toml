@@ -84,6 +84,7 @@ zstd = { workspace = true }
 arbitrary = { workspace = true }
 beacon_chain = { path = ".", features = ["arbitrary"] }
 criterion = { workspace = true }
+lean-pq = { workspace = true }
 maplit = { workspace = true }
 mockall = { workspace = true }
 mockall_double = { workspace = true }

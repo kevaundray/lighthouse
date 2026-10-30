@@ -63,6 +63,7 @@ warp_utils = { workspace = true }
 [dev-dependencies]
 fork_choice = { workspace = true }
 genesis = { workspace = true }
+lean-pq = { workspace = true }
 proto_array = { workspace = true }
 
 [[test]]

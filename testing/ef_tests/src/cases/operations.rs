@@ -10,7 +10,8 @@ use state_processing::envelope_processing::verify_execution_payload_envelope;
 use state_processing::epoch_cache::initialize_epoch_cache;
 use state_processing::per_block_processing::process_operations::{
     process_builder_deposit_requests, process_builder_exit_requests,
-    process_consolidation_requests, process_deposit_requests, process_withdrawal_requests,
+    process_consolidation_requests, process_deposit_requests, process_pq_key_registrations,
+    process_withdrawal_requests,
 };
 use state_processing::{
     ConsensusContext,
@@ -34,7 +35,8 @@ use types::{
     BeaconState, BlindedPayload, BuilderDepositRequest, BuilderExitRequest, ConsolidationRequest,
     Deposit, DepositRequest, ExecutionPayload, ForkVersionDecode, FullPayload, PayloadAttestation,
     ProposerSlashing, SignedBlsToExecutionChange, SignedExecutionPayloadBid,
-    SignedExecutionPayloadEnvelope, SignedVoluntaryExit, SyncAggregate, WithdrawalRequest,
+    SignedExecutionPayloadEnvelope, SignedPqKeyRegistration, SignedVoluntaryExit, SyncAggregate,
+    WithdrawalRequest,
 };
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -678,6 +680,36 @@ impl<E: EthSpec> Operation<E> for SignedBlsToExecutionChange {
         _extra: &Operations<E, Self>,
     ) -> Result<(), BlockProcessingError> {
         process_bls_to_execution_changes(
+            state,
+            std::slice::from_ref(self),
+            VerifySignatures::True,
+            spec,
+        )
+    }
+}
+
+impl<E: EthSpec> Operation<E> for SignedPqKeyRegistration {
+    type Error = BlockProcessingError;
+
+    fn handler_name() -> String {
+        "pq_key_registration".into()
+    }
+
+    fn is_enabled_for_fork(fork_name: ForkName) -> bool {
+        fork_name.eip8450_enabled()
+    }
+
+    fn decode(path: &Path, _fork_name: ForkName, _spec: &ChainSpec) -> Result<Self, Error> {
+        ssz_decode_file(path)
+    }
+
+    fn apply_to(
+        &self,
+        state: &mut BeaconState<E>,
+        spec: &ChainSpec,
+        _extra: &Operations<E, Self>,
+    ) -> Result<(), BlockProcessingError> {
+        process_pq_key_registrations(
             state,
             std::slice::from_ref(self),
             VerifySignatures::True,

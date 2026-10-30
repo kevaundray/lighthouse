@@ -171,6 +171,7 @@ pub struct ExecutionBlockGenerator<E: EthSpec> {
     pub osaka_time: Option<u64>,     // fulu
     pub amsterdam_time: Option<u64>, // gloas
     pub heze_time: Option<u64>,      // heze
+    pub eip8450_time: Option<u64>,   // eip8450
     /*
      * deneb stuff
      */
@@ -211,6 +212,7 @@ impl<E: EthSpec> ExecutionBlockGenerator<E> {
         osaka_time: Option<u64>,
         amsterdam_time: Option<u64>,
         heze_time: Option<u64>,
+        eip8450_time: Option<u64>,
         kzg: Option<Arc<Kzg>>,
     ) -> Self {
         let mut generator = Self {
@@ -231,6 +233,7 @@ impl<E: EthSpec> ExecutionBlockGenerator<E> {
             osaka_time,
             amsterdam_time,
             heze_time,
+            eip8450_time,
             blobs_bundles: <_>::default(),
             blob_cells: <_>::default(),
             kzg,
@@ -285,6 +288,7 @@ impl<E: EthSpec> ExecutionBlockGenerator<E> {
 
     pub fn get_fork_at_timestamp(&self, timestamp: u64) -> ForkName {
         let forks = [
+            (self.eip8450_time, ForkName::Eip8450),
             (self.heze_time, ForkName::Heze),
             (self.amsterdam_time, ForkName::Gloas),
             (self.osaka_time, ForkName::Fulu),
@@ -862,28 +866,30 @@ impl<E: EthSpec> ExecutionBlockGenerator<E> {
                 _ => unreachable!(),
             },
             PayloadAttributes::V5(pa) => match self.get_fork_at_timestamp(pa.timestamp) {
-                ForkName::Heze => ExecutionPayload::Heze(ExecutionPayloadHeze {
-                    parent_hash: head_block_hash,
-                    fee_recipient: pa.suggested_fee_recipient,
-                    receipts_root: Hash256::repeat_byte(42),
-                    state_root: Hash256::repeat_byte(43),
-                    logs_bloom: vec![0; 256].try_into().unwrap(),
-                    prev_randao: pa.prev_randao,
-                    block_number: parent.block_number() + 1,
-                    gas_limit: DEFAULT_GAS_LIMIT,
-                    gas_used: GAS_USED,
-                    timestamp: pa.timestamp,
-                    extra_data: "block gen was here".as_bytes().to_vec().try_into().unwrap(),
-                    base_fee_per_gas: Uint256::from(1u64),
-                    block_hash: ExecutionBlockHash::zero(),
-                    transactions: ProgressiveVariableList::empty(),
-                    withdrawals: ProgressiveVariableList::new(pa.withdrawals.clone())
-                        .map_err(|e| format!("invalid withdrawals: {e:?}"))?,
-                    blob_gas_used: 0,
-                    excess_blob_gas: 0,
-                    block_access_list: ProgressiveVariableList::empty(),
-                    slot_number: pa.slot_number.into(),
-                }),
+                ForkName::Heze | ForkName::Eip8450 => {
+                    ExecutionPayload::Heze(ExecutionPayloadHeze {
+                        parent_hash: head_block_hash,
+                        fee_recipient: pa.suggested_fee_recipient,
+                        receipts_root: Hash256::repeat_byte(42),
+                        state_root: Hash256::repeat_byte(43),
+                        logs_bloom: vec![0; 256].try_into().unwrap(),
+                        prev_randao: pa.prev_randao,
+                        block_number: parent.block_number() + 1,
+                        gas_limit: DEFAULT_GAS_LIMIT,
+                        gas_used: GAS_USED,
+                        timestamp: pa.timestamp,
+                        extra_data: "block gen was here".as_bytes().to_vec().try_into().unwrap(),
+                        base_fee_per_gas: Uint256::from(1u64),
+                        block_hash: ExecutionBlockHash::zero(),
+                        transactions: ProgressiveVariableList::empty(),
+                        withdrawals: ProgressiveVariableList::new(pa.withdrawals.clone())
+                            .map_err(|e| format!("invalid withdrawals: {e:?}"))?,
+                        blob_gas_used: 0,
+                        excess_blob_gas: 0,
+                        block_access_list: ProgressiveVariableList::empty(),
+                        slot_number: pa.slot_number.into(),
+                    })
+                }
                 _ => unreachable!(),
             },
         };
@@ -1132,7 +1138,7 @@ pub fn generate_genesis_header<E: EthSpec>(spec: &ChainSpec) -> Option<Execution
             *header.transactions_root_mut() = empty_transactions_root;
             Some(header)
         }
-        ForkName::Heze => {
+        ForkName::Heze | ForkName::Eip8450 => {
             // TODO(heze): we are using a Fulu header for now, but this gets fixed up by the
             // genesis builder anyway which translates it to bid/latest_block_hash.
             let mut header = ExecutionPayloadHeader::Fulu(<_>::default());

@@ -1,0 +1,11 @@
+# Mainnet preset - EIP8450
+
+# Max operations per block
+# ---------------------------------------------------------------
+# 2**3 (= 8)
+MAX_PQ_KEY_REGISTRATIONS: 8
+
+# Time parameters
+# ---------------------------------------------------------------
+# 2**8 (= 256) epochs
+MIN_PQ_KEY_CHANGE_DELAY: 256

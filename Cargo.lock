@@ -1490,6 +1490,7 @@ dependencies = [
  "int_to_bytes",
  "itertools 0.14.0",
  "kzg",
+ "lean-pq",
  "lighthouse_version",
  "logging",
  "maplit",
@@ -2932,7 +2933,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 3.0.6",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -4098,6 +4099,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 
 [[package]]
+name = "fiat_shamir"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a#a39758de10f35c7b34023d061cc05dfc0b36d43a"
+dependencies = [
+ "parallel",
+ "primitives",
+ "serde",
+]
+
+[[package]]
 name = "field-offset"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4870,6 +4881,7 @@ dependencies = [
  "hashlink 0.11.1",
  "health_metrics",
  "hex",
+ "lean-pq",
  "lighthouse_network",
  "lighthouse_version",
  "logging",
@@ -5628,6 +5640,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "keccak_gkr"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a#a39758de10f35c7b34023d061cc05dfc0b36d43a"
+dependencies = [
+ "fiat_shamir",
+ "parallel",
+ "pcs",
+ "primitives",
+ "tracing",
+]
+
+[[package]]
 name = "konst"
 version = "0.2.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5692,10 +5716,14 @@ dependencies = [
  "eth2_network_config",
  "eth2_wallet",
  "ethereum_hashing",
+ "ethereum_serde_utils",
  "ethereum_ssz",
  "execution_layer",
+ "filesystem",
  "fixed_bytes",
+ "genesis",
  "hex",
+ "lean-pq",
  "lighthouse_network",
  "lighthouse_version",
  "log",
@@ -5705,14 +5733,76 @@ dependencies = [
  "serde",
  "serde_json",
  "snap",
+ "ssz_types",
  "state_processing",
  "store",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
  "tree_hash",
  "types",
  "validator_dir",
  "yaml_serde",
+ "zeroize",
+]
+
+[[package]]
+name = "lean-pq"
+version = "0.8.0"
+source = "git+https://github.com/ethereum/lean-pq-bindings.git?tag=v0.8.0#e61ca5576e878ea549095eb1a875a11de7fa51d3"
+dependencies = [
+ "leanvm",
+ "rand 0.9.5",
+ "signatures",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "lean_compiler"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a#a39758de10f35c7b34023d061cc05dfc0b36d43a"
+dependencies = [
+ "leanvm_core",
+ "primitives",
+]
+
+[[package]]
+name = "lean_da"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a#a39758de10f35c7b34023d061cc05dfc0b36d43a"
+dependencies = [
+ "fiat_shamir",
+ "parallel",
+ "pcs",
+ "primitives",
+ "serde",
+ "tracing",
+]
+
+[[package]]
+name = "leanvm"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a#a39758de10f35c7b34023d061cc05dfc0b36d43a"
+dependencies = [
+ "lean_da",
+ "leanvm_core",
+ "rand 0.9.5",
+ "rec_aggregation",
+ "signatures",
+]
+
+[[package]]
+name = "leanvm_core"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a#a39758de10f35c7b34023d061cc05dfc0b36d43a"
+dependencies = [
+ "fiat_shamir",
+ "keccak_gkr",
+ "parallel",
+ "pcs",
+ "primitives",
+ "tracing",
+ "verifier",
 ]
 
 [[package]]
@@ -6151,9 +6241,9 @@ checksum = "2e126dda6f34391ab7b444f9922055facc83c07a910da3eb16f1e4d9c45dc777"
 
 [[package]]
 name = "libz-sys"
-version = "1.1.29"
+version = "1.1.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85bc9657773828b90eeb625adff10eeac83cc21bbfd8e23a03eaa8a33c9e28d9"
+checksum = "ff20308ecabd635a2dc1dd5834a86c462cca20efba1d5d3ddab1f8aea3455cb2"
 dependencies = [
  "cc",
  "pkg-config",
@@ -7295,6 +7385,7 @@ dependencies = [
  "store",
  "superstruct",
  "tokio",
+ "tracing",
  "typenum",
  "types",
 ]
@@ -7339,6 +7430,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81fec4625e73cf41ef4bb6846cafa6d44736525f442ba45e407c4a000a13996f"
 dependencies = [
  "group 0.13.0",
+]
+
+[[package]]
+name = "parallel"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a#a39758de10f35c7b34023d061cc05dfc0b36d43a"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -7412,6 +7511,17 @@ checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
 dependencies = [
  "digest 0.10.7",
  "hmac 0.12.1",
+]
+
+[[package]]
+name = "pcs"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a#a39758de10f35c7b34023d061cc05dfc0b36d43a"
+dependencies = [
+ "fiat_shamir",
+ "parallel",
+ "primitives",
+ "tracing",
 ]
 
 [[package]]
@@ -7767,6 +7877,15 @@ dependencies = [
  "fixed-hash",
  "impl-codec",
  "uint 0.9.5",
+]
+
+[[package]]
+name = "primitives"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a#a39758de10f35c7b34023d061cc05dfc0b36d43a"
+dependencies = [
+ "parallel",
+ "serde",
 ]
 
 [[package]]
@@ -8304,6 +8423,26 @@ dependencies = [
  "rustls-pki-types",
  "time",
  "yasna 0.5.2",
+]
+
+[[package]]
+name = "rec_aggregation"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a#a39758de10f35c7b34023d061cc05dfc0b36d43a"
+dependencies = [
+ "bincode",
+ "keccak_gkr",
+ "lean_compiler",
+ "lean_da",
+ "leanvm_core",
+ "parallel",
+ "pcs",
+ "primitives",
+ "rand 0.9.5",
+ "serde",
+ "signatures",
+ "tracing",
+ "verifier",
 ]
 
 [[package]]
@@ -9285,6 +9424,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "signatures"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a#a39758de10f35c7b34023d061cc05dfc0b36d43a"
+dependencies = [
+ "parallel",
+ "primitives",
+ "rand 0.9.5",
+ "serde",
+]
+
+[[package]]
 name = "signing_method"
 version = "0.1.0"
 dependencies = [
@@ -9597,6 +9747,7 @@ dependencies = [
  "int_to_bytes",
  "integer-sqrt",
  "itertools 0.14.0",
+ "lean-pq",
  "lru",
  "merkle_proof",
  "metrics",
@@ -9899,7 +10050,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.5",
  "windows-sys 0.61.2",
@@ -11000,6 +11151,11 @@ name = "vec_map"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1bddf1187be692e79c5ffeab891132dfb0f236ed36a43c7ed39f1165ee20191"
+
+[[package]]
+name = "verifier"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a39758de10f35c7b34023d061cc05dfc0b36d43a#a39758de10f35c7b34023d061cc05dfc0b36d43a"
 
 [[package]]
 name = "version_check"

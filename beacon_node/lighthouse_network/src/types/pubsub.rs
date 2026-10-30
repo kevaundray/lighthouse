@@ -17,8 +17,8 @@ use types::{
     SignedAggregateAndProofBase, SignedAggregateAndProofElectra, SignedAggregateAndProofGloas,
     SignedBeaconBlock, SignedBlsToExecutionChange, SignedContributionAndProof,
     SignedExecutionPayloadBid, SignedExecutionPayloadEnvelope, SignedInclusionList,
-    SignedProposerPreferences, SignedVoluntaryExit, SingleAttestation, SubnetId,
-    SyncCommitteeMessage, SyncSubnetId, execution::SignedExecutionProofEnvelope,
+    SignedPqKeyRegistration, SignedProposerPreferences, SignedVoluntaryExit, SingleAttestation,
+    SubnetId, SyncCommitteeMessage, SyncSubnetId, execution::SignedExecutionProofEnvelope,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -43,6 +43,8 @@ pub enum PubsubMessage<E: EthSpec> {
     SyncCommitteeMessage(Box<(SyncSubnetId, SyncCommitteeMessage)>),
     /// Gossipsub message for BLS to execution change messages.
     BlsToExecutionChange(Box<SignedBlsToExecutionChange>),
+    /// Gossipsub message for EIP-8450 post-quantum key registrations.
+    PqKeyRegistration(Box<SignedPqKeyRegistration>),
     /// Gossipsub message providing notification of a signed execution payload envelope.
     ExecutionPayload(Box<SignedExecutionPayloadEnvelope<E>>),
     /// Gossipsub message providing notification of a payload attestation message.
@@ -175,6 +177,7 @@ impl<E: EthSpec> PubsubMessage<E> {
             PubsubMessage::SignedContributionAndProof(_) => GossipKind::SignedContributionAndProof,
             PubsubMessage::SyncCommitteeMessage(data) => GossipKind::SyncCommitteeMessage(data.0),
             PubsubMessage::BlsToExecutionChange(_) => GossipKind::BlsToExecutionChange,
+            PubsubMessage::PqKeyRegistration(_) => GossipKind::PqKeyRegistration,
             PubsubMessage::ExecutionPayload(_) => GossipKind::ExecutionPayload,
             PubsubMessage::PayloadAttestation(_) => GossipKind::PayloadAttestation,
             PubsubMessage::ExecutionPayloadBid(_) => GossipKind::ExecutionPayloadBid,
@@ -379,6 +382,13 @@ impl<E: EthSpec> PubsubMessage<E> {
                             bls_to_execution_change,
                         )))
                     }
+                    GossipKind::PqKeyRegistration => {
+                        let pq_key_registration = SignedPqKeyRegistration::from_ssz_bytes(data)
+                            .map_err(|e| format!("{:?}", e))?;
+                        Ok(PubsubMessage::PqKeyRegistration(Box::new(
+                            pq_key_registration,
+                        )))
+                    }
                     GossipKind::ExecutionPayload => {
                         let execution_payload_envelope =
                             SignedExecutionPayloadEnvelope::from_ssz_bytes(data)
@@ -507,6 +517,7 @@ impl<E: EthSpec> PubsubMessage<E> {
             PubsubMessage::SignedContributionAndProof(data) => data.as_ssz_bytes(),
             PubsubMessage::SyncCommitteeMessage(data) => data.1.as_ssz_bytes(),
             PubsubMessage::BlsToExecutionChange(data) => data.as_ssz_bytes(),
+            PubsubMessage::PqKeyRegistration(data) => data.as_ssz_bytes(),
             PubsubMessage::ExecutionPayload(data) => data.as_ssz_bytes(),
             PubsubMessage::PayloadAttestation(data) => data.as_ssz_bytes(),
             PubsubMessage::ExecutionPayloadBid(data) => data.as_ssz_bytes(),
@@ -636,6 +647,13 @@ impl<E: EthSpec> std::fmt::Display for PubsubMessage<E> {
                     data.message.validator_index, data.message.to_execution_address
                 )
             }
+            PubsubMessage::PqKeyRegistration(data) => {
+                write!(
+                    f,
+                    "Signed PQ key registration: index: {}, previous_change_epoch: {}",
+                    data.message.index, data.message.previous_change_epoch
+                )
+            }
             PubsubMessage::ExecutionPayload(data) => {
                 write!(
                     f,
@@ -726,6 +744,45 @@ mod tests {
                 "gossip must preserve the {fork} block variant"
             );
         }
+    }
+
+    #[test]
+    fn pq_key_registration_round_trips() {
+        let spec = ForkName::Eip8450.make_genesis_spec(E::default_spec());
+        let fork_context = ForkContext::new::<E>(Slot::new(0), Hash256::ZERO, &spec);
+        let topic = GossipTopic::new(
+            GossipKind::PqKeyRegistration,
+            GossipEncoding::default(),
+            fork_context.current_fork_digest(),
+        );
+        assert_eq!(
+            GossipTopic::decode(&topic.to_string()).map(|topic| topic.kind().clone()),
+            Ok(GossipKind::PqKeyRegistration)
+        );
+        let topic_hash = TopicHash::from_raw(String::from(topic));
+        // A builder index, with `BUILDER_INDEX_FLAG` set, travels as is.
+        let registration = types::SignedPqKeyRegistration {
+            message: types::PqKeyRegistration {
+                index: types::consts::gloas::BUILDER_INDEX_FLAG | 7,
+                key_material: types::PqKeyMaterial {
+                    xmss_public_key: vec![1; 32].try_into().unwrap(),
+                    vrf_root: Hash256::repeat_byte(2),
+                },
+                previous_change_epoch: Epoch::new(3),
+            },
+            possession: vec![4; 2404].try_into().unwrap(),
+            signature: Signature::empty(),
+        };
+        let message = PubsubMessage::<E>::PqKeyRegistration(Box::new(registration));
+
+        assert_eq!(
+            PubsubMessage::decode(
+                &topic_hash,
+                &message.encode(GossipEncoding::default()),
+                &fork_context
+            ),
+            Ok(message)
+        );
     }
 
     /// A spec with every fork up to Fulu scheduled at genesis.

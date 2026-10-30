@@ -1041,6 +1041,7 @@ where
             observed_proposer_slashings: <_>::default(),
             observed_attester_slashings: <_>::default(),
             observed_bls_to_execution_changes: <_>::default(),
+            observed_pq_key_registrations: <_>::default(),
             execution_layer: self.execution_layer.clone(),
             proof_engine: self.proof_engine,
             builders: self.builders,
@@ -1668,7 +1669,7 @@ mod test {
         .expect("should build state");
 
         assert_eq!(
-            state.eth1_data().block_hash,
+            state.eth1_data().unwrap().block_hash,
             Hash256::from_slice(&[0x42; 32]),
             "eth1 block hash should be co-ordinated junk"
         );

@@ -47,7 +47,9 @@ pub fn process_operations<E: EthSpec, Payload: AbstractExecPayload<E>>(
         ctxt,
         spec,
     )?;
-    process_deposits(state, &block_body.deposits().to_cow_slice(), spec)?;
+    if !state.fork_name_unchecked().heze_enabled() {
+        process_deposits(state, &block_body.deposits()?.to_cow_slice(), spec)?;
+    }
     process_exits(
         state,
         &block_body.voluntary_exits().to_cow_slice(),
@@ -83,6 +85,16 @@ pub fn process_operations<E: EthSpec, Payload: AbstractExecPayload<E>>(
         )?;
     }
 
+    // [New in EIP-8450]
+    if let Ok(pq_key_registrations) = block_body.pq_key_registrations() {
+        process_pq_key_registrations(
+            state,
+            pq_key_registrations.as_slice(),
+            verify_signatures,
+            spec,
+        )?;
+    }
+
     Ok(())
 }
 
@@ -92,7 +104,7 @@ pub fn process_operations<E: EthSpec, Payload: AbstractExecPayload<E>>(
 pub fn verify_operation_list_lengths<E: EthSpec, Payload: AbstractExecPayload<E>>(
     block_body: BeaconBlockBodyRef<E, Payload>,
 ) -> Result<(), BlockProcessingError> {
-    let checks: [(&str, usize, usize); 6] = [
+    let checks: [(&str, usize, usize); 7] = [
         (
             "proposer_slashings",
             block_body.proposer_slashings().len(),
@@ -128,6 +140,15 @@ pub fn verify_operation_list_lengths<E: EthSpec, Payload: AbstractExecPayload<E>
                 .map(|atts| atts.len())
                 .unwrap_or(0),
             E::MaxPayloadAttestations::to_usize(),
+        ),
+        // [New in EIP-8450]
+        (
+            "pq_key_registrations",
+            block_body
+                .pq_key_registrations()
+                .map(|registrations| registrations.len())
+                .unwrap_or(0),
+            E::MaxPqKeyRegistrations::to_usize(),
         ),
     ];
 
@@ -645,6 +666,48 @@ pub fn process_bls_to_execution_changes<E: EthSpec>(
     Ok(())
 }
 
+/// Validates each `SignedPqKeyRegistration` and writes the registered key material into the state
+/// (`process_pq_key_registration`, EIP-8450).
+///
+/// The registrations are applied in order, so a key registered earlier in `pq_key_registrations`
+/// is in use for the later ones.
+///
+/// Returns `Ok(())` if the validation and state updates completed successfully. Otherwise returns
+/// an `Err` describing the invalid object or cause of failure.
+pub fn process_pq_key_registrations<E: EthSpec>(
+    state: &mut BeaconState<E>,
+    pq_key_registrations: &[SignedPqKeyRegistration],
+    verify_signatures: VerifySignatures,
+    spec: &ChainSpec,
+) -> Result<(), BlockProcessingError> {
+    block_verify!(
+        pq_key_registrations.len() <= E::max_pq_key_registrations(),
+        BlockProcessingError::OperationListTooLong {
+            kind: "pq_key_registrations",
+            length: pq_key_registrations.len(),
+            max: E::max_pq_key_registrations(),
+        }
+    );
+
+    // The uniqueness check of each registration reads the cache, so build it once up front.
+    state.update_pq_pubkey_cache()?;
+
+    let current_epoch = state.current_epoch();
+    for (i, signed_registration) in pq_key_registrations.iter().enumerate() {
+        verify_pq_key_registration(state, signed_registration, verify_signatures, spec)
+            .map_err(|e| e.into_with_index(i))?;
+
+        let registration = &signed_registration.message;
+        state.set_pq_key_material(
+            registration.index,
+            registration.key_material.clone(),
+            current_epoch,
+        )?;
+    }
+
+    Ok(())
+}
+
 /// Validates each `Deposit` and updates the state, short-circuiting on an invalid object.
 ///
 /// Returns `Ok(())` if the validation and state updates completed successfully, otherwise returns
@@ -659,13 +722,13 @@ pub fn process_deposits<E: EthSpec>(
     let deposit_requests_start_index = state.deposit_requests_start_index().unwrap_or(u64::MAX);
     let eth1_deposit_index_limit = std::cmp::min(
         deposit_requests_start_index,
-        state.eth1_data().deposit_count,
+        state.eth1_data()?.deposit_count,
     );
 
-    if state.eth1_deposit_index() < eth1_deposit_index_limit {
+    if state.eth1_deposit_index()? < eth1_deposit_index_limit {
         let expected_deposit_len = std::cmp::min(
             E::MaxDeposits::to_u64(),
-            eth1_deposit_index_limit.safe_sub(state.eth1_deposit_index())?,
+            eth1_deposit_index_limit.safe_sub(state.eth1_deposit_index()?)?,
         );
         block_verify!(
             deposits.len() as u64 == expected_deposit_len,
@@ -692,7 +755,7 @@ pub fn process_deposits<E: EthSpec>(
             verify_deposit_merkle_proof(
                 state,
                 deposit,
-                state.eth1_deposit_index().safe_add(i as u64)?,
+                state.eth1_deposit_index()?.safe_add(i as u64)?,
                 spec,
             )
             .map_err(|e| e.into_with_index(i))
@@ -714,18 +777,22 @@ pub fn apply_deposit<E: EthSpec>(
     increment_eth1_deposit_index: bool,
     spec: &ChainSpec,
 ) -> Result<(), BlockProcessingError> {
-    let deposit_index = state.eth1_deposit_index() as usize;
+    // Only labels errors: EIP-8015 removes `eth1_deposit_index` from Heze states, where deposits
+    // are applied without a proof and without incrementing it.
+    let deposit_index = state
+        .eth1_deposit_index()
+        .map_or(0, |deposit_index| deposit_index as usize);
     if let Some(proof) = proof {
         let deposit = Deposit {
             proof,
             data: deposit_data.clone(),
         };
-        verify_deposit_merkle_proof(state, &deposit, state.eth1_deposit_index(), spec)
+        verify_deposit_merkle_proof(state, &deposit, state.eth1_deposit_index()?, spec)
             .map_err(|e| e.into_with_index(deposit_index))?;
     }
 
     if increment_eth1_deposit_index {
-        state.eth1_deposit_index_mut().safe_add_assign(1)?;
+        state.eth1_deposit_index_mut()?.safe_add_assign(1)?;
     }
 
     // Get an `Option<u64>` where `u64` is the validator index if this deposit public key

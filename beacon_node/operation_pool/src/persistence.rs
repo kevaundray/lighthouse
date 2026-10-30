@@ -2,16 +2,18 @@ use crate::OpPoolError;
 use crate::OperationPool;
 use crate::attestation_storage::AttestationMap;
 use crate::bls_to_execution_changes::{BlsToExecutionChanges, ReceivedPreCapella};
+use crate::pq_key_registrations::{PqKeyRegistrations, max_pool_len};
 use crate::sync_aggregate_id::SyncAggregateId;
 use educe::Educe;
 use parking_lot::RwLock;
-use ssz::{Decode, Encode};
+use ssz::{BYTES_PER_LENGTH_OFFSET, Decode, DecodeError, Encode};
 use ssz_derive::{Decode, Encode};
 use state_processing::SigVerifiedOp;
 use std::collections::HashSet;
 use std::mem;
 use store::{DBColumn, Error as StoreError, StoreItem};
 use superstruct::superstruct;
+use tracing::warn;
 use types::attestation::AttestationOnDisk;
 use types::*;
 
@@ -22,7 +24,7 @@ type PersistedSyncContributions<E> = Vec<(SyncAggregateId, Vec<SyncCommitteeCont
 /// Operations are stored in arbitrary order, so it's not a good idea to compare instances
 /// of this type (or its encoded form) for equality. Convert back to an `OperationPool` first.
 #[superstruct(
-    variants(V15, V20),
+    variants(V15, V20, V33),
     variant_attributes(derive(Educe, PartialEq, Debug, Encode, Decode), educe(Clone),),
     partial_getter_error(ty = "OpPoolError", expr = "OpPoolError::IncorrectOpPoolVariant")
 )]
@@ -32,14 +34,14 @@ pub struct PersistedOperationPool<E: EthSpec> {
     #[superstruct(only(V15))]
     pub attestations_v15: Vec<(AttestationBase<E>, Vec<u64>)>,
     /// Attestations and their attesting indices.
-    #[superstruct(only(V20))]
+    #[superstruct(only(V20, V33))]
     pub attestations: Vec<(AttestationOnDisk<E>, Vec<u64>)>,
     /// Mapping from sync contribution ID to sync contributions and aggregate.
     pub sync_contributions: PersistedSyncContributions<E>,
     #[superstruct(only(V15))]
     pub attester_slashings_v15: Vec<SigVerifiedOp<AttesterSlashingBase<E>, E>>,
     /// Attester slashings.
-    #[superstruct(only(V20))]
+    #[superstruct(only(V20, V33))]
     pub attester_slashings: Vec<SigVerifiedOp<AttesterSlashing<E>, E>>,
     /// Proposer slashings with fork information.
     pub proposer_slashings: Vec<SigVerifiedOp<ProposerSlashing, E>>,
@@ -50,6 +52,9 @@ pub struct PersistedOperationPool<E: EthSpec> {
     /// Validator indices with BLS to Execution Changes to be broadcast at the
     /// Capella fork.
     pub capella_bls_change_broadcast_indices: Vec<u64>,
+    /// Verified post-quantum key registrations (EIP-8450), oldest first.
+    #[superstruct(only(V33))]
+    pub pq_key_registrations: Vec<SignedPqKeyRegistration>,
 }
 
 impl<E: EthSpec> PersistedOperationPool<E> {
@@ -109,7 +114,14 @@ impl<E: EthSpec> PersistedOperationPool<E> {
             .copied()
             .collect();
 
-        PersistedOperationPool::V20(PersistedOperationPoolV20 {
+        let pq_key_registrations = operation_pool
+            .pq_key_registrations
+            .read()
+            .iter_fifo()
+            .cloned()
+            .collect();
+
+        PersistedOperationPool::V33(PersistedOperationPoolV33 {
             attestations,
             sync_contributions,
             attester_slashings,
@@ -117,6 +129,7 @@ impl<E: EthSpec> PersistedOperationPool<E> {
             voluntary_exits,
             bls_to_execution_changes,
             capella_bls_change_broadcast_indices,
+            pq_key_registrations,
         })
     }
 
@@ -130,8 +143,8 @@ impl<E: EthSpec> PersistedOperationPool<E> {
                     .map(|slashing| slashing.clone().into())
                     .collect(),
             ),
-            PersistedOperationPool::V20(pool_v20) => {
-                RwLock::new(pool_v20.attester_slashings.iter().cloned().collect())
+            PersistedOperationPool::V20(_) | PersistedOperationPool::V33(_) => {
+                RwLock::new(self.attester_slashings()?.iter().cloned().collect())
             }
         };
 
@@ -165,18 +178,15 @@ impl<E: EthSpec> PersistedOperationPool<E> {
                 }
                 RwLock::new(map)
             }
-            PersistedOperationPool::V20(pool_v20) => {
+            PersistedOperationPool::V20(_) | PersistedOperationPool::V33(_) => {
                 let mut map = AttestationMap::default();
                 for (att, attesting_indices) in
-                    pool_v20
-                        .attestations
-                        .iter()
-                        .map(|(att, attesting_indices)| {
-                            (
-                                AttestationRef::from(att.to_ref()).clone_as_attestation(),
-                                attesting_indices.clone(),
-                            )
-                        })
+                    self.attestations()?.iter().map(|(att, attesting_indices)| {
+                        (
+                            AttestationRef::from(att.to_ref()).clone_as_attestation(),
+                            attesting_indices.clone(),
+                        )
+                    })
                 {
                     map.insert(att, attesting_indices);
                 }
@@ -202,6 +212,13 @@ impl<E: EthSpec> PersistedOperationPool<E> {
             bls_to_execution_changes.insert(bls_to_execution_change, received_pre_capella);
         }
 
+        let mut pq_key_registrations = PqKeyRegistrations::default();
+        if let Ok(persisted_registrations) = self.pq_key_registrations_mut() {
+            for registration in mem::take(persisted_registrations) {
+                pq_key_registrations.insert(registration, max_pool_len::<E>());
+            }
+        }
+
         let op_pool = OperationPool {
             attestations,
             sync_contributions,
@@ -209,6 +226,7 @@ impl<E: EthSpec> PersistedOperationPool<E> {
             proposer_slashings,
             voluntary_exits,
             bls_to_execution_changes: RwLock::new(bls_to_execution_changes),
+            pq_key_registrations: RwLock::new(pq_key_registrations),
             payload_attestations: Default::default(),
             reward_cache: Default::default(),
             _phantom: Default::default(),
@@ -245,7 +263,74 @@ impl<E: EthSpec> StoreItem for PersistedOperationPoolV20<E> {
     }
 }
 
-/// Deserialization for `PersistedOperationPool` defaults to `PersistedOperationPool::V12`.
+impl<E: EthSpec> StoreItem for PersistedOperationPoolV33<E> {
+    fn db_column() -> DBColumn {
+        DBColumn::OpPool
+    }
+
+    fn as_store_bytes(&self) -> Vec<u8> {
+        self.as_ssz_bytes()
+    }
+
+    fn from_store_bytes(bytes: &[u8]) -> Result<Self, StoreError> {
+        PersistedOperationPoolV33::from_ssz_bytes(bytes).map_err(Into::into)
+    }
+}
+
+/// The length of the fixed part of `PersistedOperationPoolV20`: an offset for each of its 7
+/// variable-length fields.
+const V20_FIXED_LEN: usize = 7 * BYTES_PER_LENGTH_OFFSET;
+/// The length of the fixed part of `PersistedOperationPoolV33`: an offset for each of its 8
+/// variable-length fields.
+const V33_FIXED_LEN: usize = 8 * BYTES_PER_LENGTH_OFFSET;
+
+/// `PersistedOperationPoolV33` with its post-quantum key registrations left as raw bytes, so that
+/// a list in a pre-release layout can be dropped without losing the rest of the pool.
+#[derive(Decode)]
+struct PersistedOperationPoolV33RawPq<E: EthSpec> {
+    attestations: Vec<(AttestationOnDisk<E>, Vec<u64>)>,
+    sync_contributions: PersistedSyncContributions<E>,
+    attester_slashings: Vec<SigVerifiedOp<AttesterSlashing<E>, E>>,
+    proposer_slashings: Vec<SigVerifiedOp<ProposerSlashing, E>>,
+    voluntary_exits: Vec<SigVerifiedOp<SignedVoluntaryExit, E>>,
+    bls_to_execution_changes: Vec<SigVerifiedOp<SignedBlsToExecutionChange, E>>,
+    capella_bls_change_broadcast_indices: Vec<u64>,
+    pq_key_registrations: Vec<u8>,
+}
+
+/// Decode a `PersistedOperationPoolV33`. If its post-quantum key registrations do not decode
+/// (e.g. they were written by a pre-release layout), they are dropped with a warning and the
+/// rest of the pool is kept.
+fn decode_v33<E: EthSpec>(bytes: &[u8]) -> Result<PersistedOperationPoolV33<E>, DecodeError> {
+    let raw = PersistedOperationPoolV33RawPq::<E>::from_ssz_bytes(bytes)?;
+    let pq_key_registrations = Vec::<SignedPqKeyRegistration>::from_ssz_bytes(
+        &raw.pq_key_registrations,
+    )
+    .unwrap_or_else(|error| {
+        warn!(
+            ?error,
+            "Dropping persisted PQ key registrations that do not decode"
+        );
+        vec![]
+    });
+    Ok(PersistedOperationPoolV33 {
+        attestations: raw.attestations,
+        sync_contributions: raw.sync_contributions,
+        attester_slashings: raw.attester_slashings,
+        proposer_slashings: raw.proposer_slashings,
+        voluntary_exits: raw.voluntary_exits,
+        bls_to_execution_changes: raw.bls_to_execution_changes,
+        capella_bls_change_broadcast_indices: raw.capella_bls_change_broadcast_indices,
+        pq_key_registrations,
+    })
+}
+
+/// Deserialization for `PersistedOperationPool` decodes `PersistedOperationPool::V33`, or
+/// `PersistedOperationPool::V20` for pools written before EIP-8450, and reports the decoding error
+/// of the layout that was stored.
+///
+/// Every field of both layouts is variable-length, so the first SSZ offset equals the length of
+/// the fixed part, which tells the layouts apart: `V20_FIXED_LEN` or `V33_FIXED_LEN`.
 impl<E: EthSpec> StoreItem for PersistedOperationPool<E> {
     fn db_column() -> DBColumn {
         DBColumn::OpPool
@@ -256,9 +341,13 @@ impl<E: EthSpec> StoreItem for PersistedOperationPool<E> {
     }
 
     fn from_store_bytes(bytes: &[u8]) -> Result<Self, StoreError> {
-        // Default deserialization to the latest variant.
-        PersistedOperationPoolV20::from_ssz_bytes(bytes)
-            .map(Self::V20)
-            .map_err(Into::into)
+        let pool = match ssz::read_offset(bytes)? {
+            V33_FIXED_LEN => decode_v33(bytes).map(Self::V33),
+            V20_FIXED_LEN => PersistedOperationPoolV20::from_ssz_bytes(bytes).map(Self::V20),
+            first_offset => Err(DecodeError::BytesInvalid(format!(
+                "unknown persisted op pool layout with first offset {first_offset}"
+            ))),
+        };
+        pool.map_err(Into::into)
     }
 }

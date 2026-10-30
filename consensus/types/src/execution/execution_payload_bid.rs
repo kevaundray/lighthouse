@@ -135,7 +135,9 @@ impl<E: EthSpec> ForkVersionDecode for ExecutionPayloadBid<E> {
                 "unsupported fork for ExecutionPayloadBid: {fork_name}"
             ))),
             ForkName::Gloas => ExecutionPayloadBidGloas::from_ssz_bytes(bytes).map(Self::Gloas),
-            ForkName::Heze => ExecutionPayloadBidHeze::from_ssz_bytes(bytes).map(Self::Heze),
+            ForkName::Heze | ForkName::Eip8450 => {
+                ExecutionPayloadBidHeze::from_ssz_bytes(bytes).map(Self::Heze)
+            }
         }
     }
 }
@@ -167,7 +169,7 @@ impl<'de, E: EthSpec> ContextDeserialize<'de, ForkName> for ExecutionPayloadBid<
             ForkName::Gloas => {
                 Self::Gloas(Deserialize::deserialize(deserializer).map_err(convert_err)?)
             }
-            ForkName::Heze => {
+            ForkName::Heze | ForkName::Eip8450 => {
                 Self::Heze(Deserialize::deserialize(deserializer).map_err(convert_err)?)
             }
         })
@@ -178,12 +180,13 @@ impl<'a, E: EthSpec> ExecutionPayloadBidRef<'a, E> {
     /// Returns the name of the fork pertaining to `self`.
     ///
     /// Will return an `Err` if `self` has been instantiated to a variant conflicting with the fork
-    /// dictated by `self.slot()`.
+    /// dictated by `self.slot()`. Forks after Heze (Eip8450) use the Heze bid.
     pub fn fork_name(&self, spec: &ChainSpec) -> Result<ForkName, InconsistentFork> {
         let fork_at_slot = spec.fork_name_at_slot::<E>(self.slot());
         let object_fork = self.fork_name_unchecked();
+        let bid_fork_at_slot = fork_at_slot.execution_types_fork();
 
-        if fork_at_slot == object_fork {
+        if bid_fork_at_slot == object_fork {
             Ok(object_fork)
         } else {
             Err(InconsistentFork {

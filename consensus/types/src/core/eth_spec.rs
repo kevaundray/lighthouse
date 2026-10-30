@@ -184,6 +184,11 @@ pub trait EthSpec: 'static + Default + Sync + Send + Clone + Debug + PartialEq +
      */
     type InclusionListCommitteeSize: Unsigned + Clone + Sync + Send + Debug + PartialEq;
 
+    /*
+     * New in Eip8450
+     */
+    type MaxPqKeyRegistrations: Unsigned + Clone + Sync + Send + Debug + PartialEq;
+
     fn default_spec() -> ChainSpec;
 
     fn spec_name() -> EthSpecId;
@@ -480,6 +485,11 @@ pub trait EthSpec: 'static + Default + Sync + Send + Clone + Debug + PartialEq +
     fn inclusion_list_committee_size() -> usize {
         Self::InclusionListCommitteeSize::to_usize()
     }
+
+    /// Returns the `MAX_PQ_KEY_REGISTRATIONS` constant for this specification.
+    fn max_pq_key_registrations() -> usize {
+        Self::MaxPqKeyRegistrations::to_usize()
+    }
 }
 
 /// Macro to inherit some type values from another EthSpec.
@@ -557,6 +567,7 @@ impl EthSpec for MainnetEthSpec {
     type MaxBuilderDepositRequestsPerPayload = U64;
     type MaxBuilderExitRequestsPerPayload = U16;
     type InclusionListCommitteeSize = U16;
+    type MaxPqKeyRegistrations = U8;
 
     fn default_spec() -> ChainSpec {
         ChainSpec::mainnet()
@@ -655,7 +666,8 @@ impl EthSpec for MinimalEthSpec {
         MaxPayloadAttestations,
         MaxBuilderDepositRequestsPerPayload,
         MaxBuilderExitRequestsPerPayload,
-        InclusionListCommitteeSize
+        InclusionListCommitteeSize,
+        MaxPqKeyRegistrations
     });
 
     fn default_spec() -> ChainSpec {
@@ -754,6 +766,7 @@ impl EthSpec for GnosisEthSpec {
     type MaxBuilderDepositRequestsPerPayload = U64;
     type MaxBuilderExitRequestsPerPayload = U16;
     type InclusionListCommitteeSize = U16;
+    type MaxPqKeyRegistrations = U8;
 
     fn default_spec() -> ChainSpec {
         ChainSpec::gnosis()

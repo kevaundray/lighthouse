@@ -1572,6 +1572,11 @@ impl<T: BeaconChainTypes> NetworkService<T> {
                             bls_to_execution_change,
                         ),
                 ),
+            PubsubMessage::PqKeyRegistration(registration) => self
+                .handle_beacon_processor_send_result(
+                    self.network_beacon_processor
+                        .send_gossip_pq_key_registration(message_id, peer_id, registration),
+                ),
             PubsubMessage::ExecutionPayload(signed_execution_payload_envelope) => {
                 trace!(%peer_id, "Received a signed execution payload envelope");
                 self.handle_beacon_processor_send_result(

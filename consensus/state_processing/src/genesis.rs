@@ -5,8 +5,8 @@ use crate::GloasVerificationContext;
 use crate::common::DepositDataTree;
 use crate::upgrade::electra::upgrade_state_to_electra;
 use crate::upgrade::{
-    upgrade_to_altair, upgrade_to_bellatrix, upgrade_to_capella, upgrade_to_deneb, upgrade_to_fulu,
-    upgrade_to_gloas, upgrade_to_heze,
+    upgrade_to_altair, upgrade_to_bellatrix, upgrade_to_capella, upgrade_to_deneb,
+    upgrade_to_eip8450, upgrade_to_fulu, upgrade_to_gloas, upgrade_to_heze,
 };
 use fixed_bytes::FixedBytesExtended;
 use safe_arith::{ArithError, SafeArith};
@@ -40,7 +40,7 @@ pub fn initialize_beacon_state_from_eth1<E: EthSpec>(
         deposit_tree
             .push_leaf(deposit.data.tree_hash_root())
             .map_err(BlockProcessingError::MerkleTreeError)?;
-        state.eth1_data_mut().deposit_root = deposit_tree.root();
+        state.eth1_data_mut()?.deposit_root = deposit_tree.root();
         let Deposit { proof, data } = deposit;
         apply_deposit(&mut state, data, Some(proof), true, spec)?;
     }
@@ -152,6 +152,9 @@ pub fn initialize_beacon_state_from_eth1<E: EthSpec>(
         // Remove intermediate Electra fork from `state.fork`.
         state.fork_mut().previous_version = spec.fulu_fork_version;
 
+        // Mirrors `create_genesis_state` in the pyspec test helpers. `upgrade_to_heze` needs it.
+        *state.deposit_requests_start_index_mut()? = state.eth1_deposit_index()?;
+
         // Override latest execution payload header.
         if let Some(ExecutionPayloadHeader::Fulu(ref header)) = execution_payload_header {
             *state.latest_execution_payload_header_fulu_mut()? = header.clone();
@@ -183,10 +186,24 @@ pub fn initialize_beacon_state_from_eth1<E: EthSpec>(
         .heze_fork_epoch
         .is_some_and(|fork_epoch| fork_epoch == E::genesis_epoch())
     {
+        // All genesis deposits have been applied, so the EIP-6110 transition is complete.
+        let deposit_index = state.eth1_deposit_index()?;
+        *state.deposit_requests_start_index_mut()? = deposit_index;
         upgrade_to_heze(&mut state, spec)?;
 
         // Remove intermediate Gloas fork from `state.fork`.
         state.fork_mut().previous_version = spec.heze_fork_version;
+    }
+
+    // Upgrade to eip8450 if configured from genesis.
+    if spec
+        .eip8450_fork_epoch
+        .is_some_and(|fork_epoch| fork_epoch == E::genesis_epoch())
+    {
+        upgrade_to_eip8450(&mut state, spec)?;
+
+        // Remove intermediate Heze fork from `state.fork`.
+        state.fork_mut().previous_version = spec.eip8450_fork_version;
     }
 
     // From Gloas onwards the genesis block body embeds `state.latest_execution_payload_bid`
@@ -234,6 +251,10 @@ pub fn genesis_block<E: EthSpec>(
         }
         BeaconBlock::Heze(heze_block) => {
             heze_block.body.signed_execution_payload_bid.message =
+                state.latest_execution_payload_bid_heze()?.clone();
+        }
+        BeaconBlock::Eip8450(eip8450_block) => {
+            eip8450_block.body.signed_execution_payload_bid.message =
                 state.latest_execution_payload_bid_heze()?.clone();
         }
     }

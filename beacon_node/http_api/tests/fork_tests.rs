@@ -2,18 +2,26 @@
 use beacon_chain::custody_context::NodeCustodyType;
 use beacon_chain::{
     StateSkipConfig,
-    test_utils::{DEFAULT_ETH1_BLOCK_HASH, HARNESS_GENESIS_TIME, RelativeSyncCommittee},
+    test_utils::{
+        BeaconChainHarness, DEFAULT_ETH1_BLOCK_HASH, EphemeralHarnessType, HARNESS_GENESIS_TIME,
+        RelativeSyncCommittee,
+    },
 };
 use bls::PublicKey;
-use eth2::types::{IndexedErrorMessage, PtcDuty, StateId, SyncSubcommittee};
+use eth2::types::{IndexedErrorMessage, PqKeyMaterialData, PtcDuty, StateId, SyncSubcommittee};
 use execution_layer::test_utils::generate_genesis_header;
 use fixed_bytes::FixedBytesExtended;
 use genesis::{InteropGenesisBuilder, bls_withdrawal_credentials};
 use http_api::test_utils::*;
+use state_processing::per_block_processing::get_pq_possession_signing_root;
 use state_processing::state_advance::complete_state_advance;
 use std::collections::HashSet;
+use std::sync::LazyLock;
 use types::{
-    Address, BeaconState, ChainSpec, Epoch, EthSpec, ForkName, Hash256, Slot, Spec,
+    Address, BeaconState, ChainSpec, Epoch, EthSpec, ForkName, Hash256, PQ_POSSESSION_XMSS_INDEX,
+    PqKeyMaterial, PqKeyRegistration, SignedPqKeyRegistration, Slot, Spec, VrfRoot, XmssPublicKey,
+    XmssSignature,
+    consts::gloas::BUILDER_INDEX_FLAG,
     test_utils::{generate_deterministic_keypair, generate_deterministic_keypairs},
 };
 
@@ -797,4 +805,288 @@ async fn bls_to_execution_changes_update_all_around_capella_fork() {
     for validator in head_state.validators() {
         assert!(validator.has_eth1_withdrawal_credential(&spec));
     }
+}
+
+fn eip8450_spec(eip8450_fork_epoch: Epoch) -> ChainSpec {
+    let mut spec = ForkName::Heze.make_genesis_spec(E::default_spec());
+    spec.eip8450_fork_epoch = Some(eip8450_fork_epoch);
+    spec
+}
+
+/// leanXMSS keys from fixed seeds. Key generation and signing are only fast in optimized builds.
+static XMSS_KEYS: LazyLock<Vec<lean_pq::xmss::SecretKey>> = LazyLock::new(|| {
+    (1..=2_u8)
+        .map(|seed| lean_pq::xmss::SecretKey::from_seed([seed; 32]))
+        .collect()
+});
+
+/// A registration of `xmss_key` for `validator_index`, with a valid proof of possession and BLS
+/// authorization.
+fn pq_key_registration(
+    harness: &BeaconChainHarness<EphemeralHarnessType<E>>,
+    validator_index: u64,
+    xmss_key: &lean_pq::xmss::SecretKey,
+    previous_change_epoch: Epoch,
+) -> SignedPqKeyRegistration {
+    let state = harness.get_current_state();
+    let xmss_public_key =
+        XmssPublicKey::try_from(xmss_key.public_key().to_bytes().to_vec()).unwrap();
+    let validator_pubkey = state
+        .get_validator(validator_index as usize)
+        .unwrap()
+        .pubkey;
+    let possession_root =
+        get_pq_possession_signing_root(&state, &validator_pubkey, &xmss_public_key, &harness.spec);
+    let possession = xmss_key
+        .sign(&possession_root.0, PQ_POSSESSION_XMSS_INDEX)
+        .unwrap();
+
+    PqKeyRegistration {
+        index: validator_index,
+        key_material: PqKeyMaterial {
+            xmss_public_key,
+            vrf_root: Hash256::repeat_byte(validator_index as u8),
+        },
+        previous_change_epoch,
+    }
+    .sign(
+        XmssSignature::try_from(possession.to_bytes().to_vec()).unwrap(),
+        &harness.validator_keypairs[validator_index as usize].sk,
+        state.genesis_validators_root(),
+        &harness.spec,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pq_key_registrations_around_eip8450_fork() {
+    let validator_count = E::sync_committee_size();
+    let fork_epoch = Epoch::new(1);
+    let spec = eip8450_spec(fork_epoch);
+    let tester = InteractiveTester::<E>::new(Some(spec.clone()), validator_count).await;
+    let harness = &tester.harness;
+    let client = &tester.client;
+
+    let never_registered = harness.spec.far_future_epoch;
+    let registration = pq_key_registration(harness, 0, &XMSS_KEYS[0], never_registered);
+    // A valid BLS authorization, with the proof of possession of another key and validator.
+    let bad_possession = SignedPqKeyRegistration {
+        possession: registration.possession.clone(),
+        ..pq_key_registration(harness, 1, &XMSS_KEYS[1], never_registered)
+    };
+
+    // Before the fork the head state has no registry: submissions and reads are rejected.
+    let error = client
+        .post_beacon_pool_pq_key_registrations(std::slice::from_ref(&registration))
+        .await
+        .unwrap_err();
+    assert_server_indexed_error(error, 400, vec![0]);
+    assert_eq!(
+        client
+            .get_beacon_states_pq_key_material(StateId::Head, None)
+            .await
+            .unwrap_err()
+            .status()
+            .unwrap(),
+        400
+    );
+    assert!(
+        client
+            .get_beacon_pool_pq_key_registrations()
+            .await
+            .unwrap()
+            .data
+            .is_empty()
+    );
+
+    // Advance to the first block of the fork.
+    let fork_slot = fork_epoch.start_slot(E::slots_per_epoch());
+    harness.extend_to_slot(fork_slot).await;
+    assert_eq!(harness.head_slot(), fork_slot);
+
+    let error = client
+        .post_beacon_pool_pq_key_registrations(std::slice::from_ref(&bad_possession))
+        .await
+        .unwrap_err();
+    assert_server_indexed_error(error, 400, vec![0]);
+
+    client
+        .post_beacon_pool_pq_key_registrations(std::slice::from_ref(&registration))
+        .await
+        .unwrap();
+    // Submitting it again is accepted as a duplicate.
+    client
+        .post_beacon_pool_pq_key_registrations(std::slice::from_ref(&registration))
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .get_beacon_pool_pq_key_registrations()
+            .await
+            .unwrap()
+            .data,
+        vec![registration.clone()]
+    );
+
+    // The next block includes the registration.
+    let head_block_root = harness.extend_slots(1).await;
+    let head_block = harness
+        .chain
+        .get_block(&head_block_root)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        head_block
+            .message()
+            .body()
+            .pq_key_registrations()
+            .unwrap()
+            .as_slice(),
+        std::slice::from_ref(&registration)
+    );
+
+    // The head state holds the keys, changed at the block's epoch.
+    let change_epoch = head_block.slot().epoch(E::slots_per_epoch());
+    let response = client
+        .get_beacon_states_pq_key_material(StateId::Head, Some(&[0, 1]))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.finalized, Some(false));
+    assert_eq!(
+        response.data,
+        vec![
+            PqKeyMaterialData {
+                index: 0,
+                xmss_public_key: registration.message.key_material.xmss_public_key.clone(),
+                vrf_root: registration.message.key_material.vrf_root,
+                change_epoch,
+            },
+            PqKeyMaterialData {
+                index: 1,
+                xmss_public_key: XmssPublicKey::default(),
+                vrf_root: VrfRoot::default(),
+                change_epoch: never_registered,
+            },
+        ]
+    );
+    let all_keys = client
+        .get_beacon_states_pq_key_material(StateId::Head, None)
+        .await
+        .unwrap()
+        .unwrap()
+        .data;
+    assert_eq!(all_keys.len(), validator_count);
+
+    // The applied registration is not packed again.
+    let head_block_root = harness.extend_slots(1).await;
+    let head_block = harness
+        .chain
+        .get_block(&head_block_root)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        head_block
+            .message()
+            .body()
+            .pq_key_registrations()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// The state endpoint takes builder indices with `BUILDER_INDEX_FLAG` set and returns them as
+/// given, after every validator when no id is given. An unregistered builder's change epoch is its
+/// deposit epoch. The pool endpoint verifies a flagged index against the builder registry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pq_key_registrations_with_flagged_builder_ids() {
+    let validator_count = E::sync_committee_size();
+    let builder_validators = vec![1, 2];
+    let spec = ForkName::Eip8450.make_genesis_spec(E::default_spec());
+    let tester = InteractiveTester::<E>::new_with_initializer_and_mutator(
+        Some(spec),
+        validator_count,
+        Some(Box::new(move |builder| {
+            builder
+                .mock_execution_layer()
+                .deterministic_keypairs(validator_count)
+                .genesis_builders(builder_validators, 32_000_000_000)
+                .fresh_ephemeral_store()
+        })),
+        None,
+        Default::default(),
+        true,
+        NodeCustodyType::Fullnode,
+    )
+    .await;
+    let harness = &tester.harness;
+    let client = &tester.client;
+    let builder = |builder_index: u64| BUILDER_INDEX_FLAG | builder_index;
+    let deposit_epoch = Epoch::new(0);
+    let unregistered = |index: u64, change_epoch: Epoch| PqKeyMaterialData {
+        index,
+        xmss_public_key: XmssPublicKey::default(),
+        vrf_root: VrfRoot::default(),
+        change_epoch,
+    };
+
+    // Unknown indices, including a builder outside the registry, are skipped.
+    let response = client
+        .get_beacon_states_pq_key_material(
+            StateId::Head,
+            Some(&[builder(1), 0, builder(2), builder(0)]),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        response.data,
+        vec![
+            unregistered(0, harness.spec.far_future_epoch),
+            unregistered(builder(0), deposit_epoch),
+            unregistered(builder(1), deposit_epoch),
+        ]
+    );
+
+    let all_keys = client
+        .get_beacon_states_pq_key_material(StateId::Head, None)
+        .await
+        .unwrap()
+        .unwrap()
+        .data;
+    let indices = all_keys.iter().map(|entry| entry.index).collect::<Vec<_>>();
+    let mut expected = (0..validator_count as u64).collect::<Vec<_>>();
+    expected.extend([builder(0), builder(1)]);
+    assert_eq!(indices, expected);
+
+    // A builder registers only once its deposit epoch is finalized.
+    let state = harness.get_current_state();
+    let builder_pubkey = state.get_builder(0).unwrap().pubkey;
+    let xmss_public_key =
+        XmssPublicKey::try_from(XMSS_KEYS[0].public_key().to_bytes().to_vec()).unwrap();
+    let possession_root =
+        get_pq_possession_signing_root(&state, &builder_pubkey, &xmss_public_key, &harness.spec);
+    let possession = XMSS_KEYS[0]
+        .sign(&possession_root.0, PQ_POSSESSION_XMSS_INDEX)
+        .unwrap();
+    let registration = PqKeyRegistration {
+        index: builder(0),
+        key_material: PqKeyMaterial {
+            xmss_public_key,
+            vrf_root: VrfRoot::default(),
+        },
+        previous_change_epoch: deposit_epoch,
+    }
+    .sign(
+        XmssSignature::try_from(possession.to_bytes().to_vec()).unwrap(),
+        &harness.validator_keypairs[1].sk,
+        state.genesis_validators_root(),
+        &harness.spec,
+    );
+    let error = client
+        .post_beacon_pool_pq_key_registrations(std::slice::from_ref(&registration))
+        .await
+        .unwrap_err();
+    assert_server_indexed_error(error, 400, vec![0]);
 }

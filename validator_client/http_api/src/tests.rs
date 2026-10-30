@@ -219,7 +219,12 @@ impl ApiTester {
     }
 
     pub async fn test_get_lighthouse_spec(self) -> Self {
-        let result = if self.spec.is_heze_scheduled() {
+        let result = if self.spec.is_eip8450_scheduled() {
+            self.client
+                .get_lighthouse_spec::<ConfigAndPresetEip8450>()
+                .await
+                .map(|res| ConfigAndPreset::Eip8450(res.data))
+        } else if self.spec.is_heze_scheduled() {
             self.client
                 .get_lighthouse_spec::<ConfigAndPresetHeze>()
                 .await

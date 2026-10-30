@@ -6,6 +6,7 @@ mod indexed_attestations;
 mod mnemonic_validators;
 mod mock_el;
 mod parse_ssz;
+mod pq_key_registration;
 mod skip_slots;
 mod state_root;
 mod transition_blocks;
@@ -588,6 +589,15 @@ fn main() {
                                 until Heze is triggered on mainnet.")
                         .display_order(0)
                 )
+                .arg(
+                    Arg::new("eip8450-time")
+                        .long("eip8450-time")
+                        .value_name("UNIX_TIMESTAMP")
+                        .action(ArgAction::Set)
+                        .help("The payload timestamp at which the EIP-8450 fork activates. It uses \
+                                the same engine API as Heze. No default is provided.")
+                        .display_order(0)
+                )
         )
         .subcommand(
             Command::new("http-sync")
@@ -657,6 +667,7 @@ fn main() {
                         .display_order(0)
                 )
         )
+        .subcommand(pq_key_registration::cli_app())
         .get_matches();
 
     let result = matches
@@ -788,6 +799,8 @@ fn run<E: EthSpec>(env_builder: EnvironmentBuilder<E>, matches: &ArgMatches) -> 
             http_sync::run::<E>(env, network_config, matches)
                 .map_err(|e| format!("Failed to run http-sync command: {}", e))
         }
+        Some(("pq-key-registration", matches)) => pq_key_registration::run::<E>(env, matches)
+            .map_err(|e| format!("Failed to run pq-key-registration command: {}", e)),
         Some((other, _)) => Err(format!("Unknown subcommand {}. See --help.", other)),
         _ => Err("No subcommand provided. See --help.".to_string()),
     }
